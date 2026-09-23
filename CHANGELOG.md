@@ -7,6 +7,7 @@ All notable changes to Formualizer will be documented in this file.
 ### Performance
 
 - Made repeated builtin loading a no-op once every builtin is registered. `load_builtins` runs from every formula-planning snapshot (once per ordered-fallback proposal on the Calamine authoritative route) and from template canonicalization, and it used to inspect the metadata of all ~409 builtins and take the registry write lock for each on every call. A completed pass is now remembered until a user registration displaces a builtin, and an already-registered builtin is detected under a read lock before any metadata inspection. User overrides of builtin names and their restoration by the next load behave as before. Remaining snapshot work is one metadata inspection per requested function.
+- Stopped the Arrow ingest builder from allocating full-capacity lane builders it then drops. After a chunk flush, the next chunk's builders are created only when another row arrives, so the final flush of a sheet load (partial or at an exact chunk multiple) allocates nothing. Text payload space is no longer pre-reserved at 12 bytes per row for every column: the first chunk grows it on demand and later chunks reserve what the column's previous chunk used. Chunk layout, lane presence, null semantics and formats are unchanged.
 
 ## [0.9.3] - 2026-09-11
 
