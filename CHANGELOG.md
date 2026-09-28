@@ -9,6 +9,10 @@ All notable changes to Formualizer will be documented in this file.
 - Made repeated builtin loading a no-op once every builtin is registered. `load_builtins` runs from every formula-planning snapshot (once per ordered-fallback proposal on the Calamine authoritative route) and from template canonicalization, and it used to inspect the metadata of all ~409 builtins and take the registry write lock for each on every call. A completed pass is now remembered until a user registration displaces a builtin, and an already-registered builtin is detected under a read lock before any metadata inspection. User overrides of builtin names and their restoration by the next load behave as before. Remaining snapshot work is one metadata inspection per requested function.
 - Stopped the Arrow ingest builder from allocating full-capacity lane builders it then drops. After a chunk flush, the next chunk's builders are created only when another row arrives, so the final flush of a sheet load (partial or at an exact chunk multiple) allocates nothing. Text payload space is no longer pre-reserved at 12 bytes per row for every column: the first chunk grows it on demand and later chunks reserve what the column's previous chunk used. Chunk layout, lane presence, null semantics and formats are unchanged.
 
+### Fixed
+
+- Fixed `XLOOKUP` searching when its lookup and return arrays have different lengths. `=XLOOKUP(2,A1:A3,B1:B4)` returned a value; Excel returns `#VALUE!` whenever the two arrays declare different lengths along the lookup axis, before any search and regardless of `if_not_found`. Lengths are the ones the formula declares: `A1:A6` against `B1:B5` is `#VALUE!` even with row 6 blank, and `A:A` against `B1:B10` is `#VALUE!` because `A:A` declares every row, while `A:A` against `B:B` still searches.
+
 ## [0.9.3] - 2026-09-11
 
 - Aligned Rust product crates and Python/npm bindings at 0.9.3. Parser/common move together to **3.1.2** because the date/time text parsing change below lives in `formualizer-common`; `formualizer-parse` moves in lockstep with no source change and product crates now pin `formualizer-parse = "3.1.2"`. SheetPort spec remains 0.3.1.

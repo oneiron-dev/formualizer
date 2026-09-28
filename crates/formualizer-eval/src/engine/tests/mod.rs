@@ -235,4 +235,5 @@ mod excel_function_probes;
 mod format_channel_t1;
 mod round6_functions;
 mod temporal_lookup_semantics;
+mod xlookup_declared_length;
 mod xlookup_excel_parity;
