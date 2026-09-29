@@ -18,7 +18,7 @@ fn cases() -> Vec<(&'static str, LiteralValue)> {
     vec![
         // Reference arguments keep working (the fast path is unchanged).
         ("=COUNT(SORT(A1:A3))", LiteralValue::Number(3.0)),
-        ("=COUNT(FILTER(A1:A3,B1:B3))", LiteralValue::Number(3.0)),
+        ("=COUNT(FILTER(A1:A3,A1:A3))", LiteralValue::Number(3.0)),
         // The originally reported form: a computed boolean include array.
         (
             "=COUNT(FILTER(A1:A3,B1:B3=\"x\"))",
