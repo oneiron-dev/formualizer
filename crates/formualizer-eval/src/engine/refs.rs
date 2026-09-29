@@ -155,6 +155,38 @@ pub(crate) enum LocalBindingStyle {
     LambdaParameters,
 }
 
+/// Arguments Excel reads only as a reference (its sheet, position or shape),
+/// never for their values. They are not calculation dependencies, so a
+/// formula such as `=ROWS(A$1:A5)` in A5 is not circular. `cell_info` is the
+/// CELL info_type when it is a literal; the contents/type forms read values.
+pub(crate) fn reference_only_argument(name: &str, index: usize, cell_info: Option<&str>) -> bool {
+    let name = name.strip_prefix("_xlfn.").unwrap_or(name);
+    if name.eq_ignore_ascii_case("CELL") {
+        return index == 1
+            && cell_info.is_some_and(|info| {
+                !info.eq_ignore_ascii_case("contents") && !info.eq_ignore_ascii_case("type")
+            });
+    }
+    index == 0
+        && [
+            "ROW", "ROWS", "COLUMN", "COLUMNS", "AREAS", "ISREF", "SHEET",
+        ]
+        .iter()
+        .any(|f| name.eq_ignore_ascii_case(f))
+}
+
+fn tree_cell_info(name: &str, args: &[ASTNode]) -> Option<String> {
+    if !name.eq_ignore_ascii_case("CELL") {
+        return None;
+    }
+    match args.first().map(|arg| &arg.node_type) {
+        Some(ASTNodeType::Literal(formualizer_common::LiteralValue::Text(info))) => {
+            Some(info.clone())
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn visit_tree_references<C>(
     ast: &ASTNode,
     context: &mut C,
@@ -238,7 +270,20 @@ pub(crate) fn visit_tree_references<C>(
                         }
                     }
                     _ => {
-                        for arg in args.iter().rev() {
+                        let cell_info = tree_cell_info(name, args);
+                        for (index, arg) in args.iter().enumerate().rev() {
+                            // Names and tables keep their definition dependency.
+                            if matches!(
+                                arg.node_type,
+                                ASTNodeType::Reference {
+                                    reference: ReferenceType::Cell { .. }
+                                        | ReferenceType::Range { .. },
+                                    ..
+                                }
+                            ) && reference_only_argument(name, index, cell_info.as_deref())
+                            {
+                                continue;
+                            }
                             stack.push(Frame::Node(arg));
                         }
                     }
@@ -288,12 +333,38 @@ pub(crate) fn visit_arena_references<C>(
             visit_arena_references(left_id, context, data_store, sheet_registry, visitor)?;
             visit_arena_references(right_id, context, data_store, sheet_registry, visitor)
         }
-        AstNodeData::Function { .. } => {
-            let arg_count = data_store(context).get_args(ast_id).map_or(0, <[_]>::len);
-            for index in 0..arg_count {
-                let child = data_store(context)
+        AstNodeData::Function { name_id, .. } => {
+            let store = data_store(context);
+            let name = store.resolve_ast_string(name_id).to_owned();
+            let arg_count = store.get_args(ast_id).map_or(0, <[_]>::len);
+            let cell_info = if name.eq_ignore_ascii_case("CELL") {
+                store
                     .get_args(ast_id)
-                    .expect("args disappeared")[index];
+                    .and_then(|args| args.first().copied())
+                    .and_then(|first| match store.get_node(first) {
+                        Some(AstNodeData::Literal(value)) => match store.retrieve_value(*value) {
+                            formualizer_common::LiteralValue::Text(info) => Some(info),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+            } else {
+                None
+            };
+            for index in 0..arg_count {
+                let store = data_store(context);
+                let child = store.get_args(ast_id).expect("args disappeared")[index];
+                if matches!(
+                    store.get_node(child),
+                    Some(AstNodeData::Reference {
+                        ref_type: crate::engine::arena::CompactRefType::Cell { .. }
+                            | crate::engine::arena::CompactRefType::Range { .. },
+                        ..
+                    })
+                ) && reference_only_argument(&name, index, cell_info.as_deref())
+                {
+                    continue;
+                }
                 visit_arena_references(child, context, data_store, sheet_registry, visitor)?;
             }
             Ok(())
