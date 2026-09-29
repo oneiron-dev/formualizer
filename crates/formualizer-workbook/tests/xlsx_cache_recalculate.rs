@@ -998,3 +998,24 @@ fn sheet_qualified_names_resolve_in_their_sheet() {
         assert!(sheet.contains(expected), "{expected}: {sheet}");
     }
 }
+#[test]
+fn range_names_are_references() {
+    // INDEX, OFFSET and ROWS take a range name as the range it names.
+    let mut p = parts(
+        "<row r=\"2\"><c r=\"B2\"><v>2</v></c></row><row r=\"6\"><c r=\"B6\" cm=\"1\"><f t=\"array\" ref=\"B6\">INDEX(Years,B2,1)</f><v>0</v></c><c r=\"C6\"><f>INDEX(Years,B2,1)</f><v>0</v></c><c r=\"D6\"><f>OFFSET(Years,1,0,1,1)</f><v>0</v></c><c r=\"E6\"><f>ROWS(Years)</f><v>0</v></c></row><row r=\"18\"><c r=\"B18\"><v>2022</v></c></row><row r=\"19\"><c r=\"B19\"><v>2023</v></c></row><row r=\"20\"><c r=\"B20\"><v>2024</v></c></row><row r=\"21\"><c r=\"B21\"><v>1</v></c></row>",
+    );
+    let wb = p.get_mut("xl/workbook.xml").unwrap();
+    *wb = wb.replace(
+        "</workbook>",
+        "<definedNames><definedName name=\"Years\">Sheet1!$B$18:$B$20</definedName></definedNames></workbook>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "INDEX(Years,B2,1)</f><v>2023</v></c><c r=\"C6\"><f>INDEX(Years,B2,1)</f><v>2023</v>",
+        "<f>OFFSET(Years,1,0,1,1)</f><v>2023</v>",
+        "<f>ROWS(Years)</f><v>3</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected}: {sheet}");
+    }
+}

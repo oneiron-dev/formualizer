@@ -26823,8 +26823,33 @@ where
     ) -> Option<Result<ReferenceType, ExcelError>> {
         let current_id = self.graph.sheet_id(current_sheet)?;
         let named = self.graph.resolve_name_entry(name, current_id)?;
-        let NamedDefinition::Formula { ast, .. } = &named.definition else {
-            return None;
+        // A name for a cell or range is that reference (INDEX(Years,2) picks
+        // from it like INDEX(B18:B26,2)).
+        let ast = match &named.definition {
+            NamedDefinition::Cell(cell) => {
+                return Some(Ok(ReferenceType::Cell {
+                    sheet: Some(self.graph.sheet_name(cell.sheet_id).to_string()),
+                    row: cell.coord.row() + 1,
+                    col: cell.coord.col() + 1,
+                    row_abs: cell.coord.row_abs(),
+                    col_abs: cell.coord.col_abs(),
+                }));
+            }
+            NamedDefinition::Range(range) => {
+                return Some(Ok(ReferenceType::Range {
+                    sheet: Some(self.graph.sheet_name(range.start.sheet_id).to_string()),
+                    start_row: Some(range.start.coord.row() + 1),
+                    start_col: Some(range.start.coord.col() + 1),
+                    end_row: Some(range.end.coord.row() + 1),
+                    end_col: Some(range.end.coord.col() + 1),
+                    start_row_abs: range.start.coord.row_abs(),
+                    start_col_abs: range.start.coord.col_abs(),
+                    end_row_abs: range.end.coord.row_abs(),
+                    end_col_abs: range.end.coord.col_abs(),
+                }));
+            }
+            NamedDefinition::Literal(_) => return None,
+            NamedDefinition::Formula { ast, .. } => ast,
         };
         if !self.yields_reference(ast) {
             return None;
