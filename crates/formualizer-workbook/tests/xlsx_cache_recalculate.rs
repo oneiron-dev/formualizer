@@ -1089,3 +1089,27 @@ fn formulas_reading_array_members_see_the_array_result() {
         assert!(sheet.contains(expected), "{expected}: {sheet}");
     }
 }
+#[test]
+fn references_that_only_look_circular_are_calculated() {
+    // Each K cell looks up an earlier K cell through a range that includes
+    // itself; nothing reads its own value, so Excel calculates them.
+    let rows: String = [(3, "a"), (4, "b"), (5, "a"), (6, "c")]
+        .iter()
+        .map(|(r, key)| {
+            format!(
+                "<row r=\"{r}\"><c r=\"J{r}\" t=\"inlineStr\"><is><t>{key}</t></is></c><c r=\"K{r}\"><f>IF(COUNTIF($J$3:J{r},J{r})=1,MAX($K$2:K{p})+1,INDEX($K$3:K{r},MATCH(J{r},$J$3:J{r},0)))</f><v>0</v></c></row>",
+                p = r - 1
+            )
+        })
+        .collect();
+    let out = recalculate_xlsx_bytes(&pack(&parts(&rows)), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for (cell, value) in [("K3", 1), ("K4", 2), ("K5", 1), ("K6", 3)] {
+        let at = sheet.find(&format!("r=\"{cell}\"")).unwrap();
+        assert!(
+            sheet[at..].contains(&format!("</f><v>{value}</v>"))
+                && sheet[at..].find(&format!("</f><v>{value}</v>")) < sheet[at..].find("</c>"),
+            "{cell}={value}: {sheet}"
+        );
+    }
+}

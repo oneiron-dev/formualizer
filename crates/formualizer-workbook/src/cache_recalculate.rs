@@ -429,6 +429,13 @@ pub fn recalculate_xlsx_bytes(
     }
     let mut config = options.eval_config.clone();
     config.date_system = date_system;
+    // Excel finds circular references while it calculates: a formula whose
+    // references only look circular (INDEX($K$3:K9,...) picking an earlier
+    // row) is not one. The file's calcPr decides whether real ones iterate.
+    config.cycle.detection = formualizer_eval::engine::CycleDetection::Runtime;
+    if let Some(settings) = crate::traits::SpreadsheetReader::calc_settings(&adapter) {
+        config.cycle = crate::calc_pr::apply_calc_settings_to_cycle(&settings, config.cycle);
+    }
     // XLSX dates are serial caches. Native chrono materialization cannot retain
     // Excel-1900 phantom serial 60 and can discard fractional duration precision.
     config.temporal_egress = formualizer_eval::engine::TemporalEgress::Serial;
