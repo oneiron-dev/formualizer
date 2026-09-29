@@ -1531,8 +1531,10 @@ impl CalamineAdapter {
         // (name, formula_text) and drops localSheetId. We recover only the scoped
         // defined-name metadata we need here with a targeted streaming pass over
         // workbook.xml, avoiding a full file String allocation or any sheet XML reparse.
+        // Text is not trimmed: an entity splits a definition such as
+        // 'A &amp; B'!$A$1 into text events whose edge spaces belong to the
+        // sheet name. convert_defined_name trims the whole definition.
         let mut xml = XmlReader::from_reader(BufReader::new(entry));
-        xml.config_mut().trim_text(true);
 
         let mut out = Vec::new();
         let mut seen: HashSet<(DefinedNameScope, Option<String>, String)> = HashSet::new();

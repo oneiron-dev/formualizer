@@ -923,3 +923,22 @@ fn structured_references_wait_for_formulas_in_the_table() {
         "{sheet}"
     );
 }
+#[test]
+fn defined_names_keep_spaces_around_entities_in_sheet_names() {
+    // 'A &amp; B'!$A$2 is split by the entity into text events; the spaces
+    // around it are part of the sheet name.
+    let mut p = parts(
+        "<row r=\"1\"><c r=\"A1\"><f>Yr+1</f><v>0</v></c><c r=\"B1\"><f>\"1-JAN\"&amp;Yr</f><v>0</v></c></row><row r=\"2\"><c r=\"A2\"><f>2000+26</f><v>0</v></c></row>",
+    );
+    let wb = p.get_mut("xl/workbook.xml").unwrap();
+    *wb = wb
+        .replace(
+            "</workbook>",
+            "<definedNames><definedName name=\"Yr\">'A &amp; B'!$A$2</definedName></definedNames></workbook>",
+        )
+        .replace("name=\"Sheet1\"", "name=\"A &amp; B\"");
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    assert!(sheet.contains("<f>Yr+1</f><v>2027</v>"), "{sheet}");
+    assert!(sheet.contains("<v>1-JAN2026</v>"), "{sheet}");
+}
