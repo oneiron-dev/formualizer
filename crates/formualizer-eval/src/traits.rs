@@ -1829,6 +1829,11 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
         None
     }
 
+    /// File name of the workbook, when it was read from a file.
+    fn workbook_file_name(&self) -> Option<String> {
+        None
+    }
+
     /// Excel-style 1-based active-sheet index for a sheet name, if known.
     fn sheet_index_by_name(&self, _sheet: &str) -> Option<usize> {
         None
@@ -2042,6 +2047,10 @@ pub trait FunctionContext<'ctx> {
         None
     }
 
+    fn workbook_file_name(&self) -> Option<String> {
+        None
+    }
+
     fn sheet_index_by_name(&self, _sheet: &str) -> Option<usize> {
         None
     }
@@ -2176,6 +2185,10 @@ impl<'a> FunctionContext<'a> for DefaultFunctionContext<'a> {
 
     fn workbook_sheet_count(&self) -> Option<usize> {
         self.base.workbook_sheet_count()
+    }
+
+    fn workbook_file_name(&self) -> Option<String> {
+        self.base.workbook_file_name()
     }
 
     fn sheet_index_by_name(&self, sheet: &str) -> Option<usize> {

@@ -480,6 +480,9 @@ impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
     fn workbook_sheet_count(&self) -> Option<usize> {
         self.engine.workbook_sheet_count()
     }
+    fn workbook_file_name(&self) -> Option<String> {
+        self.engine.workbook_file_name()
+    }
     fn sheet_index_by_name(&self, sheet: &str) -> Option<usize> {
         self.engine.sheet_index_by_name(sheet)
     }
