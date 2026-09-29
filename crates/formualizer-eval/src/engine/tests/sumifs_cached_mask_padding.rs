@@ -17,17 +17,23 @@ fn sumifs_cached_mask_padding_uses_slice_and_padding_branches() {
     let chunk_rows = 64usize;
     let total_rows = 256u32;
     {
+        // Whole columns of one sheet share its used height, so the shorter
+        // criteria column lives on another sheet.
         let mut ab = engine.begin_bulk_ingest_arrow();
-        ab.add_sheet("Sheet1", 2, chunk_rows);
+        ab.add_sheet("Sheet1", 1, chunk_rows);
+        ab.add_sheet("Sheet2", 1, chunk_rows);
         for i in 0..total_rows {
-            let a = LiteralValue::Int((i + 1) as i64);
+            ab.append_row("Sheet1", &[LiteralValue::Int((i + 1) as i64)])
+                .unwrap();
+        }
+        for i in 0..100 {
             // "Yes" at a few rows, and at row 100 to set used region.
             let b = if i == 0 || i == 50 || i == 99 {
                 LiteralValue::Text("Yes".into())
             } else {
                 LiteralValue::Empty
             };
-            ab.append_row("Sheet1", &[a, b]).unwrap();
+            ab.append_row("Sheet2", &[b]).unwrap();
         }
         ab.finish().unwrap();
     }
@@ -35,7 +41,7 @@ fn sumifs_cached_mask_padding_uses_slice_and_padding_branches() {
     // Drive SUMIFS through the engine to ensure it uses cached criteria masks.
     // Placed in column E so the whole-column refs (A:A/B:B) are not
     // self-inclusive — a SUMIFS *in* column A/B would be circular per #120.
-    let formula = parse("=SUMIFS(A:A, B:B, \"Yes\")").unwrap();
+    let formula = parse("=SUMIFS(A:A, Sheet2!A:A, \"Yes\")").unwrap();
     engine.set_cell_formula("Sheet1", 1, 5, formula).unwrap();
     engine.evaluate_cell("Sheet1", 1, 5).unwrap();
 

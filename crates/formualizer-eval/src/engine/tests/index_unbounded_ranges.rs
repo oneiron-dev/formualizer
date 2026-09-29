@@ -134,21 +134,28 @@ fn index_whole_column_zero_row_returns_entire_used_column() {
 }
 
 #[test]
-fn index_whole_column_out_of_range_is_ref_error() {
+fn index_whole_column_past_the_data_is_a_blank_cell() {
     let mut engine = new_engine();
     engine
         .set_cell_value("Sheet1", 2, 2, LiteralValue::Int(42))
         .unwrap();
-    // Used region of column B ends at row 2; asking for row 5 is out of range.
+    // B:B is rows 1-1048576 whatever its data: row 5 is a blank cell.
     engine
-        .set_cell_formula("Sheet1", 1, 4, parse("=INDEX(B:B,5,1)").unwrap())
+        .set_cell_formula("Sheet1", 1, 4, parse("=INDEX(B:B,5,1)&\"\"").unwrap())
         .unwrap();
-    // Negative index is always #REF!.
+    // Beyond the grid and negative indexes are #REF!.
     engine
         .set_cell_formula("Sheet1", 2, 4, parse("=INDEX(B:B,-1,1)").unwrap())
         .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 3, 4, parse("=INDEX(B:B,1048577,1)").unwrap())
+        .unwrap();
     engine.evaluate_all().unwrap();
-    for row in [1u32, 2u32] {
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 4),
+        Some(LiteralValue::Text(String::new()))
+    );
+    for row in [2u32, 3u32] {
         match engine.get_cell_value("Sheet1", row, 4) {
             Some(LiteralValue::Error(e)) => assert_eq!(e.kind, ExcelErrorKind::Ref),
             other => panic!("Sheet1!R{row}C4: expected #REF!, got {other:?}"),

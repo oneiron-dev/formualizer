@@ -1113,3 +1113,23 @@ fn references_that_only_look_circular_are_calculated() {
         );
     }
 }
+#[test]
+fn whole_columns_span_the_grid() {
+    // A:A and D:D line up row by row, and INDEX reaches rows past the data.
+    let p = parts(
+        "<row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"D1\"><v>9</v></c></row>\
+         <row r=\"2\"><c r=\"A2\"><v>2</v></c><c r=\"D2\"><v>9</v></c></row>\
+         <row r=\"3\"><c r=\"A3\" t=\"inlineStr\"><is><t>x</t></is></c></row>\
+         <row r=\"20\"><c r=\"P20\"><f>SUMPRODUCT((A:A&gt;0)*(D:D=9))</f><v>0</v></c><c r=\"Q20\"><f>SUMPRODUCT(A:A,D:D)</f><v>0</v></c><c r=\"R20\"><f>INDEX($A:$A,65536)&amp;\"\"</f><v>0</v></c><c r=\"S20\"><f>ROWS(INDEX($A:$C,0,2))</f><v>0</v></c></row>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "(D:D=9))</f><v>2</v>",
+        "<f>SUMPRODUCT(A:A,D:D)</f><v>27</v>",
+        "<f>INDEX($A:$A,65536)&amp;\"\"</f><v></v>",
+        "<f>ROWS(INDEX($A:$C,0,2))</f><v>1048576</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected}: {sheet}");
+    }
+}

@@ -2032,24 +2032,23 @@ impl Function for SequenceFn {
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         // Extract numbers (allow float but coerce to i64 for dimensions)
-        let num = |a: &ArgumentHandle| -> Result<f64, ExcelError> {
-            Ok(match a.value()?.into_literal() {
-                LiteralValue::Int(i) => i as f64,
-                LiteralValue::Number(n) => n,
-                _other => {
-                    return Err(ExcelError::new(ExcelErrorKind::Value));
-                }
-            })
+        // An omitted argument (SEQUENCE(5,,10)) takes its default of 1.
+        let num = |index: usize| -> Result<f64, ExcelError> {
+            let Some(a) = args.get(index).filter(|a| !a.is_omitted()) else {
+                return Ok(1.0);
+            };
+            match a.value()?.into_literal() {
+                LiteralValue::Int(i) => Ok(i as f64),
+                LiteralValue::Number(n) => Ok(n),
+                LiteralValue::Error(e) => Err(e),
+                other => crate::coercion::to_number_lenient(&other)
+                    .map_err(|_| ExcelError::new(ExcelErrorKind::Value)),
+            }
         };
-        let rows_f = num(&args[0])?;
-        let rows = rows_f as i64;
-        let cols = if args.len() >= 2 {
-            num(&args[1])? as i64
-        } else {
-            1
-        };
-        let start = if args.len() >= 3 { num(&args[2])? } else { 1.0 };
-        let step = if args.len() >= 4 { num(&args[3])? } else { 1.0 };
+        let rows = num(0)? as i64;
+        let cols = num(1)? as i64;
+        let start = num(2)?;
+        let step = num(3)?;
         if rows <= 0 || cols <= 0 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new(ExcelErrorKind::Value),

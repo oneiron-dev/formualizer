@@ -91,6 +91,9 @@ fn arg_byref_reference() -> Vec<ArgSchema> {
 /// whole-column/whole-row (or open-ended) ranges are clamped to the used
 /// region via `ctx.resolve_range_view`, mirroring how MATCH/VLOOKUP resolve
 /// the same references. An empty resolved view yields `#REF!`.
+const EXCEL_MAX_ROW: u32 = 1_048_576;
+const EXCEL_MAX_COL: u32 = 16_384;
+
 fn resolve_reference_bounds<'b>(
     ctx: &dyn FunctionContext<'b>,
     base: &ReferenceType,
@@ -108,6 +111,18 @@ fn resolve_reference_bounds<'b>(
                 (start_row, start_col, end_row, end_col)
             {
                 return Ok((sheet.clone(), *sr, *sc, *er, *ec));
+            }
+            // A whole column or row (A:A, 1:1) spans the full grid, not just the
+            // cells in use: INDEX(A:A,65536) is the blank cell A65536.
+            if start_row.is_none() && end_row.is_none() {
+                if let (Some(sc), Some(ec)) = (start_col, end_col) {
+                    return Ok((sheet.clone(), 1, *sc, EXCEL_MAX_ROW, *ec));
+                }
+            }
+            if start_col.is_none() && end_col.is_none() {
+                if let (Some(sr), Some(er)) = (start_row, end_row) {
+                    return Ok((sheet.clone(), *sr, 1, *er, EXCEL_MAX_COL));
+                }
             }
             let rv = ctx.resolve_range_view(base, ctx.current_sheet())?;
             if rv.is_empty() {
@@ -231,20 +246,27 @@ impl IndexFn {
         if row < 0 || col < 0 {
             return Some(Err(ExcelError::new(ExcelErrorKind::Ref)));
         }
-        let range_ref = |sheet, sr, sc, er, ec| ReferenceType::Range {
-            sheet,
-            start_row: Some(sr),
-            start_col: Some(sc),
-            end_row: Some(er),
-            end_col: Some(ec),
-            start_row_abs: false,
-            start_col_abs: false,
-            end_row_abs: false,
-            end_col_abs: false,
+        // Whole columns and rows stay open-ended (A:A, not A1:A1048576).
+        let full_rows = sr == 1 && er == EXCEL_MAX_ROW;
+        let full_cols = sc == 1 && ec == EXCEL_MAX_COL;
+        let range_ref = |sheet, sr: u32, sc: u32, er: u32, ec: u32| {
+            let rows_open = full_rows && sr == 1 && er == EXCEL_MAX_ROW;
+            let cols_open = full_cols && sc == 1 && ec == EXCEL_MAX_COL;
+            ReferenceType::Range {
+                sheet,
+                start_row: (!rows_open).then_some(sr),
+                start_col: (!cols_open).then_some(sc),
+                end_row: (!rows_open).then_some(er),
+                end_col: (!cols_open).then_some(ec),
+                start_row_abs: false,
+                start_col_abs: false,
+                end_row_abs: false,
+                end_col_abs: false,
+            }
         };
         if col == 0 {
             if row == 0 {
-                return Some(Ok(range_ref(sheet, sr, sc, er, ec)));
+                return Some(Ok(base));
             }
             let r = sr + (row as u32) - 1;
             if r > er {

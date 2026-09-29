@@ -115,8 +115,19 @@ impl Function for DateFn {
             year
         };
 
+        // Excel's dates run from serial 0 to 9999-12-31; anything else is #NUM!.
+        if !(0..=9999).contains(&adjusted_year) {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                ExcelError::new_num(),
+            )));
+        }
         let date = create_date_normalized(adjusted_year, month, day)?;
         let serial = date_to_serial_for(ctx.date_system(), &date);
+        if chrono::Datelike::year(&date) > 9999 || serial < 0.0 {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                ExcelError::new_num(),
+            )));
+        }
 
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
             serial,
