@@ -1008,9 +1008,8 @@ pub struct HyperlinkFn;
 /// The returned value is `friendly_name` when the second argument is present,
 /// otherwise `link_location`.
 ///
-/// Known divergence: the friendly name is always returned as text, whereas
-/// Excel passes numbers and booleans through with their original type, so
-/// `=ISNUMBER(HYPERLINK("x",1))` is FALSE here and TRUE in Excel.
+/// As in Excel, the friendly name keeps its type: numbers and booleans pass
+/// through, so `=ISNUMBER(HYPERLINK("x",1))` is TRUE.
 ///
 /// ```yaml,sandbox
 /// title: "Hyperlink with a friendly name"
@@ -1029,7 +1028,7 @@ pub struct HyperlinkFn;
 ///   - INDIRECT
 /// faq:
 ///   - q: "What does HYPERLINK return?"
-///     a: "The friendly name when provided, otherwise the link location, always as text."
+///     a: "The friendly name when provided (keeping its type), otherwise the link location as text."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: HYPERLINK
@@ -1066,22 +1065,25 @@ impl Function for HyperlinkFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let link = hyperlink_text(&args[0])?;
+        let link = hyperlink_value(&args[0], true)?;
         if args.len() < 2 {
             return Ok(link);
         }
-        hyperlink_text(&args[1])
+        // The friendly name shows as the value it is: 42 stays a number.
+        hyperlink_value(&args[1], false)
     }
 }
 
-/// Coerces a HYPERLINK argument to its display text.
+/// A HYPERLINK argument's display value: the link location as text, the
+/// friendly name as the value it is (a blank cell shows 0).
 ///
 /// Errors propagate as the argument's own error. Multi-cell references and
 /// array constants cannot name a hyperlink target, so they surface `#VALUE!`
 /// instead of leaking a debug-formatted array literal into the cell text.
 /// A 1x1 array collapses to its single element.
-fn hyperlink_text<'a, 'b>(
+fn hyperlink_value<'a, 'b>(
     arg: &ArgumentHandle<'a, 'b>,
+    as_text: bool,
 ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
     let lit = match arg.value()? {
         crate::traits::CalcValue::Scalar(lit) => lit,
@@ -1102,13 +1104,16 @@ fn hyperlink_text<'a, 'b>(
             )));
         }
     };
+    let lit = match lit {
+        LiteralValue::Array(arr) if arr.len() == 1 && arr[0].len() == 1 => arr[0][0].clone(),
+        other => other,
+    };
     Ok(crate::traits::CalcValue::Scalar(match lit {
         LiteralValue::Error(e) => LiteralValue::Error(e),
-        LiteralValue::Array(arr) if arr.len() == 1 && arr[0].len() == 1 => {
-            LiteralValue::Text(crate::coercion::to_text_invariant(&arr[0][0]))
-        }
         LiteralValue::Array(_) => LiteralValue::Error(ExcelError::new_value()),
-        other => LiteralValue::Text(crate::coercion::to_text_invariant(&other)),
+        other if as_text => LiteralValue::Text(crate::coercion::to_text_invariant(&other)),
+        LiteralValue::Empty => LiteralValue::Number(0.0),
+        other => other,
     }))
 }
 

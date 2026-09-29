@@ -1,7 +1,8 @@
 //! CELL / HYPERLINK builtins.
 //!
 //! CELL answers `contents`, `address`, `col`, `row` and `type` for a reference;
-//! HYPERLINK returns its friendly name or link location as text.
+//! HYPERLINK returns its friendly name (keeping its type) or its link location
+//! as text.
 use crate::engine::{Engine, EvalConfig};
 use crate::test_workbook::TestWorkbook;
 use formualizer_common::{ExcelErrorKind, LiteralValue};
@@ -55,6 +56,19 @@ fn assert_error(formula: &str, expected: ExcelErrorKind) {
 fn hyperlink_returns_friendly_name() {
     assert_text(r#"=HYPERLINK("https://example.com","Example")"#, "Example");
     assert_text(r#"=HYPERLINK("https://example.com","")"#, "");
+}
+
+#[test]
+fn hyperlink_friendly_name_keeps_its_type() {
+    assert_int(r#"=HYPERLINK("https://example.com",42)"#, 42);
+    assert_eq!(
+        eval_formula(r#"=ISNUMBER(HYPERLINK("x",1))"#),
+        LiteralValue::Boolean(true)
+    );
+    assert_eq!(
+        eval_formula(r#"=HYPERLINK("x",TRUE)"#),
+        LiteralValue::Boolean(true)
+    );
 }
 
 #[test]
