@@ -111,6 +111,16 @@ pub(super) fn scan(
                 if path.len() == 1 && !xml::path_is(path, xml::MAIN, &["worksheet"]) {
                     return Err(unsupported("worksheet root/namespace", "worksheet"));
                 }
+                // Foreign-namespace markup outside sheetData (extLst data
+                // validation xm:f, AlternateContent control anchors xdr:row)
+                // is not cell content; cell readers only consume sheetData.
+                if element.ns != xml::MAIN
+                    && path.len() > 2
+                    && path[1].local != "sheetData"
+                    && element.local != "dimension"
+                {
+                    return Ok(());
+                }
                 let structural = [
                     "worksheet",
                     "sheetData",

@@ -577,6 +577,30 @@ fn multi_cell_arrays_and_rich_value_metadata_stay_unsupported() {
     reject(&with_metadata(parts(array), &other));
 }
 #[test]
+fn extension_markup_outside_cells_is_not_workbook_or_cell_metadata() {
+    let mut p = single("1+1", "<v>9</v>");
+    let wb = p.get_mut("xl/workbook.xml").unwrap();
+    *wb = wb.replace("</sheets>", "</sheets><extLst><ext uri=\"{140A7094-0E35-4892-8432-C4D2E57EDEB5}\" xmlns:x15=\"http://schemas.microsoft.com/office/spreadsheetml/2010/11/main\"><x15:workbookPr chartTrackingRefBase=\"1\"/></ext></extLst>");
+    let sheet = p.get_mut(SHEET).unwrap();
+    *sheet = sheet.replace("</sheetData>", "</sheetData><extLst><ext uri=\"{CCE6A557-97BC-4b89-ADB6-D9C93CAAB3DF}\" xmlns:x14=\"http://schemas.microsoft.com/office/spreadsheetml/2009/9/main\"><x14:dataValidations count=\"1\" xmlns:xm=\"http://schemas.microsoft.com/office/excel/2006/main\"><x14:dataValidation type=\"list\"><x14:formula1><xm:f>Sheet1!$A$1:$A$2</xm:f></x14:formula1><xm:sqref>B1</xm:sqref></x14:dataValidation></x14:dataValidations></ext></extLst>");
+    let input = pack(&p);
+    let out = recalculate_xlsx_bytes(&input, Default::default()).unwrap();
+    assert_eq!(data(&out.bytes, 0), Data::Float(2.0));
+    assert!(member(&out.bytes, SHEET).contains("<xm:f>Sheet1!$A$1:$A$2</xm:f>"));
+    // A non-empty foreign workbookPr would be read by Calamine as the epoch.
+    let wb = p.get_mut("xl/workbook.xml").unwrap();
+    *wb = wb.replace(
+        "<x15:workbookPr chartTrackingRefBase=\"1\"/>",
+        "<x15:workbookPr chartTrackingRefBase=\"1\"></x15:workbookPr>",
+    );
+    reject(&p);
+    // Foreign lookalikes inside sheetData remain unsupported.
+    let mut p = single("1+1", "<v>9</v>");
+    let sheet = p.get_mut(SHEET).unwrap();
+    *sheet = sheet.replace("<f>1+1</f>", "<f>1+1</f><x:v xmlns:x=\"urn:other\">3</x:v>");
+    reject(&p);
+}
+#[test]
 fn multiple_changed_members_relocate_growing_and_shrinking_payloads() {
     let old = (0..2048u32)
         .map(|n| format!("{:08x}", n.wrapping_mul(2_654_435_761)))

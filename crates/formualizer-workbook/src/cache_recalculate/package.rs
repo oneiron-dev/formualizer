@@ -421,6 +421,20 @@ pub(super) fn discover(
         if path.len() == 1 && !xml::path_is(path, xml::MAIN, &["workbook"]) {
             return Err(unsupported("workbook XML root/namespace", "XLSX package"));
         }
+        // Extension payloads (for example x15:workbookPr chartTrackingRefBase)
+        // are not workbook metadata. A foreign workbookPr must still be empty:
+        // Calamine reads any non-empty workbookPr start tag as the date system.
+        if e.ns != xml::MAIN
+            && path
+                .iter()
+                .any(|a| a.ns == xml::MAIN && a.local == "extLst")
+        {
+            if e.local == "workbookPr" && !matches!(node.kind, xml::Kind::Open { empty: true, .. })
+            {
+                return Err(unsupported("foreign workbook metadata lookalike", &e.local));
+            }
+            return Ok(());
+        }
         if [
             "workbook",
             "sheets",
