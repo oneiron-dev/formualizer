@@ -556,4 +556,10 @@ impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
     ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
         self.engine.build_row_visibility_mask(view, mode)
     }
+    fn nested_aggregate_cells(
+        &self,
+        view: &RangeView<'_>,
+    ) -> Option<std::collections::HashSet<(usize, usize)>> {
+        self.engine.nested_aggregate_cells(view)
+    }
 }

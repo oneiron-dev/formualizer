@@ -14405,6 +14405,61 @@ where
         )
     }
 
+    /// Cells of `view` whose formulas call SUBTOTAL or AGGREGATE, as
+    /// `(row, column)` offsets within the view. Those functions skip them so
+    /// that nested subtotals are not counted twice.
+    fn nested_aggregate_cells_in_view(
+        &self,
+        view: &RangeView<'_>,
+    ) -> Option<std::collections::HashSet<(usize, usize)>> {
+        let (rows, cols) = view.dims();
+        let mut out = std::collections::HashSet::new();
+        if rows == 0 || cols == 0 {
+            return Some(out);
+        }
+        let sheet_id = self.graph.sheet_id(view.sheet_name())?;
+        let (sr, sc) = (view.start_row() as u32, view.start_col() as u32);
+        let (er, ec) = (sr + rows as u32 - 1, sc + cols as u32 - 1);
+
+        let data_store = self.graph.data_store();
+        let mut verdicts: FxHashMap<AstNodeId, bool> = FxHashMap::default();
+        for vertex in self.graph.vertices_in_region(sheet_id, sr, er, sc, ec) {
+            let Some(ast_id) = self.graph.get_formula_id(vertex) else {
+                continue;
+            };
+            let calls = *verdicts
+                .entry(ast_id)
+                .or_insert_with(|| arena_formula_calls_aggregate(data_store, ast_id));
+            if calls && let Some(addr) = self.graph.vertex_grid_addr(vertex) {
+                out.insert(((addr.row() - sr) as usize, (addr.col() - sc) as usize));
+            }
+        }
+
+        // FormulaPlane spans hold one formula for a whole family of cells.
+        let query = crate::formula_plane::region_index::Region::rect(sheet_id, sr, er, sc, ec);
+        let authority = self.graph.formula_authority();
+        for found in authority.span_domains.find_intersections(query).matches {
+            let Some(part) = found.value.domain.intersection(query) else {
+                continue;
+            };
+            let (row_range, col_range) = part.axis_ranges();
+            let ((r0, r1), (c0, c1)) = (row_range.query_bounds(), col_range.query_bounds());
+            let first = PlacementCoord::new(sheet_id, r0, c0);
+            if !self
+                .formula_plane_span_ast_at(found.value.span, first)
+                .is_some_and(|ast| tree_formula_calls_aggregate(&ast))
+            {
+                continue;
+            }
+            for r in r0..=r1.min(er) {
+                for c in c0..=c1.min(ec) {
+                    out.insert(((r - sr) as usize, (c - sc) as usize));
+                }
+            }
+        }
+        Some(out)
+    }
+
     fn build_row_visibility_mask_for_view(
         &self,
         view: &RangeView<'_>,
@@ -27928,6 +27983,70 @@ where
     ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
         self.build_row_visibility_mask_for_view(view, mode)
     }
+
+    fn nested_aggregate_cells(
+        &self,
+        view: &RangeView<'_>,
+    ) -> Option<std::collections::HashSet<(usize, usize)>> {
+        self.nested_aggregate_cells_in_view(view)
+    }
+}
+
+/// Whether a stored formula calls SUBTOTAL or AGGREGATE anywhere.
+fn arena_formula_calls_aggregate(
+    data_store: &crate::engine::arena::DataStore,
+    root: AstNodeId,
+) -> bool {
+    use crate::engine::arena::AstNodeData;
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        match data_store.get_node(id) {
+            Some(AstNodeData::Function { name_id, .. }) => {
+                if is_aggregate_function_name(data_store.resolve_ast_string(*name_id)) {
+                    return true;
+                }
+                if let Some(args) = data_store.get_args(id) {
+                    stack.extend(args.iter().copied());
+                }
+            }
+            Some(AstNodeData::UnaryOp { expr_id, .. }) => stack.push(*expr_id),
+            Some(AstNodeData::BinaryOp {
+                left_id, right_id, ..
+            }) => {
+                stack.push(*left_id);
+                stack.push(*right_id);
+            }
+            Some(AstNodeData::Array { .. }) => {
+                if let Some((_, _, elements)) = data_store.get_array_elems(id) {
+                    stack.extend(elements.iter().copied());
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn tree_formula_calls_aggregate(ast: &ASTNode) -> bool {
+    match &ast.node_type {
+        ASTNodeType::Function { name, args } => {
+            is_aggregate_function_name(name) || args.iter().any(tree_formula_calls_aggregate)
+        }
+        ASTNodeType::Call { callee, args } => {
+            tree_formula_calls_aggregate(callee) || args.iter().any(tree_formula_calls_aggregate)
+        }
+        ASTNodeType::UnaryOp { expr, .. } => tree_formula_calls_aggregate(expr),
+        ASTNodeType::BinaryOp { left, right, .. } => {
+            tree_formula_calls_aggregate(left) || tree_formula_calls_aggregate(right)
+        }
+        ASTNodeType::Array(rows) => rows.iter().flatten().any(tree_formula_calls_aggregate),
+        _ => false,
+    }
+}
+
+fn is_aggregate_function_name(name: &str) -> bool {
+    let name = name.strip_prefix("_xlfn.").unwrap_or(name);
+    name.eq_ignore_ascii_case("SUBTOTAL") || name.eq_ignore_ascii_case("AGGREGATE")
 }
 
 impl<R> Engine<R>

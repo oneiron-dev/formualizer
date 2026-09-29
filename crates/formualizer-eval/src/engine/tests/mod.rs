@@ -171,6 +171,7 @@ mod inspect;
 mod intersection_and_error_values;
 mod lambda_helpers;
 mod let_lambda;
+mod nested_subtotals;
 mod npv_variadic;
 mod offset_dynamic;
 mod omitted_arguments;

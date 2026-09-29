@@ -1428,13 +1428,21 @@ impl AggregateCollector {
         op: AggregateOp,
         visibility_policy: VisibilityPolicy,
         error_policy: ErrorPolicy,
+        skip_nested: bool,
     ) -> Result<Self, ExcelError> {
         let mut out = Self::default();
 
         for arg in args.iter().skip(start_idx) {
             match resolve_aggregate_argument(arg, ctx)? {
                 AggregateArgument::Range(view) => {
-                    out.collect_range_arg(&view, ctx, op, visibility_policy, error_policy)?;
+                    out.collect_range_arg(
+                        &view,
+                        ctx,
+                        op,
+                        visibility_policy,
+                        error_policy,
+                        skip_nested,
+                    )?;
                 }
                 AggregateArgument::ReferenceError(error) => {
                     out.consume_scalar_value(LiteralValue::Error(error), op, error_policy)?;
@@ -1455,7 +1463,16 @@ impl AggregateCollector {
         op: AggregateOp,
         visibility_policy: VisibilityPolicy,
         error_policy: ErrorPolicy,
+        skip_nested: bool,
     ) -> Result<(), ExcelError> {
+        // Cells that hold SUBTOTAL or AGGREGATE formulas are left out so a
+        // subtotal over subtotals does not count them twice.
+        let nested = if skip_nested {
+            ctx.nested_aggregate_cells(view)
+                .filter(|cells| !cells.is_empty())
+        } else {
+            None
+        };
         let visibility_mask = match visibility_policy {
             VisibilityPolicy::IncludeAll => None,
             VisibilityPolicy::ExcludeManualOrFilterHidden => {
@@ -1477,8 +1494,12 @@ impl AggregateCollector {
                 }
 
                 for col in 0..cols {
-                    // Phase-1 contract: nested SUBTOTAL/AGGREGATE exclusion is deferred.
-                    // Nested aggregate results are treated as ordinary scalar values.
+                    if nested
+                        .as_ref()
+                        .is_some_and(|cells| cells.contains(&(rel_row, col)))
+                    {
+                        continue;
+                    }
                     self.consume_range_value(view.get_cell(rel_row, col), op, error_policy)?;
                 }
             }
@@ -1723,6 +1744,7 @@ impl Function for SubtotalFn {
             op,
             visibility,
             ErrorPolicy::Propagate,
+            true,
         ) {
             Ok(c) => c,
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
@@ -1791,9 +1813,9 @@ impl Function for AggregateFn {
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
 
-        // Options 0-3 also skip nested SUBTOTAL/AGGREGATE results (not yet
-        // distinguished here); 4-7 are the same hidden-row/error choices
-        // without that exclusion.
+        // Options 0-3 also skip nested SUBTOTAL/AGGREGATE results; 4-7 are
+        // the same hidden-row/error choices without that exclusion.
+        let skip_nested = (0..=3).contains(&options);
         let (visibility, error_policy) = match options {
             0 | 4 => (VisibilityPolicy::IncludeAll, ErrorPolicy::Propagate),
             1 | 5 => (
@@ -1820,6 +1842,7 @@ impl Function for AggregateFn {
                 op,
                 visibility,
                 error_policy,
+                skip_nested,
             ) {
                 Ok(c) => c,
                 Err(e) => {
@@ -1857,6 +1880,7 @@ impl Function for AggregateFn {
             AggregateOp::Sum,
             visibility,
             error_policy,
+            skip_nested,
         ) {
             Ok(c) => c,
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),

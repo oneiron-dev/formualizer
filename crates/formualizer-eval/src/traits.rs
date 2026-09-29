@@ -1982,6 +1982,16 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
     ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
         None
     }
+
+    /// Optional: `(row, column)` offsets within `view` of the cells whose
+    /// formulas call SUBTOTAL or AGGREGATE, which those functions skip.
+    /// Returns None if not supported by the underlying context.
+    fn nested_aggregate_cells(
+        &self,
+        _view: &RangeView<'_>,
+    ) -> Option<std::collections::HashSet<(usize, usize)>> {
+        None
+    }
 }
 
 /// Minimal backend capability descriptor for planning and adapters.
@@ -2115,6 +2125,15 @@ pub trait FunctionContext<'ctx> {
     ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
         None
     }
+
+    /// Optional: offsets within `view` of cells whose formulas call SUBTOTAL
+    /// or AGGREGATE (see [`EvaluationContext::nested_aggregate_cells`]).
+    fn nested_aggregate_cells(
+        &self,
+        _view: &RangeView<'_>,
+    ) -> Option<std::collections::HashSet<(usize, usize)>> {
+        None
+    }
 }
 
 /// Default adapter that wraps an EvaluationContext and provides the narrow FunctionContext.
@@ -2245,5 +2264,12 @@ impl<'a> FunctionContext<'a> for DefaultFunctionContext<'a> {
         mode: VisibilityMaskMode,
     ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
         self.base.build_row_visibility_mask(view, mode)
+    }
+
+    fn nested_aggregate_cells(
+        &self,
+        view: &RangeView<'_>,
+    ) -> Option<std::collections::HashSet<(usize, usize)>> {
+        self.base.nested_aggregate_cells(view)
     }
 }
