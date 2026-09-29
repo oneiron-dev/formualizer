@@ -1749,8 +1749,9 @@ pub struct CellFn;
 /// - `"col"`      — the 1-based column of the upper-left cell
 /// - `"row"`      — the 1-based row of the upper-left cell
 /// - `"type"`     — `"b"` for a blank cell, `"l"` for text, `"v"` for any value
+/// - `"filename"` — `[Book.xlsx]Sheet` for a workbook read from a file, else `""`
 ///
-/// Other `info_type` values (`format`, `filename`, `parentheses`, `prefix`,
+/// Other `info_type` values (`format`, `parentheses`, `prefix`,
 /// `protect`, `width`) and calls without a reference return `#VALUE!`, as do
 /// 3-D references and a non-reference argument for `address`, `col` or `row`.
 /// An argument that evaluates to an error propagates that error unchanged.
@@ -1862,6 +1863,16 @@ impl Function for CellFn {
         let Some(reference) = reference else {
             return Ok(scalar(non_reference_error(&args[1])?));
         };
+
+        // `[Book.xlsx]Sheet` for the reference's sheet; empty text while the
+        // workbook has never been saved to a file.
+        if info_type == "filename" {
+            let sheet = reference_sheet(&reference).unwrap_or(ctx.current_sheet());
+            return Ok(scalar(LiteralValue::Text(match ctx.workbook_file_name() {
+                Some(name) => format!("[{name}]{sheet}"),
+                None => String::new(),
+            })));
+        }
 
         let Some(reference_info) = ctx.inspect_reference(&reference)? else {
             return Ok(scalar(LiteralValue::Error(ExcelError::new_value())));

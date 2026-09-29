@@ -228,6 +228,10 @@ impl<'a, R: EvaluationContext> EvaluationContext for DynamicRefCollector<'a, R> 
         self.engine.is_value_name(name, current_sheet)
     }
 
+    fn workbook_file_name(&self) -> Option<String> {
+        self.engine.workbook_file_name()
+    }
+
     fn cancellation_token(&self) -> Option<crate::engine::CancelToken> {
         self.engine.cancellation_token()
     }

@@ -1158,3 +1158,16 @@ fn arrays_larger_than_ten_thousand_cells_fill_their_extent() {
         &sheet[sheet.len() - 300..]
     );
 }
+#[test]
+fn cell_filename_names_the_workbook_and_sheet() {
+    let p = parts(
+        "<row r=\"1\"><c r=\"A1\"><f>MID(CELL(\"filename\",A1),FIND(\"]\",CELL(\"filename\",A1))+1,255)</f><v>0</v></c></row>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    assert!(member(&out.bytes, SHEET).contains("<v>Sheet1</v>"));
+    let mut options = XlsxRecalculateOptions::default();
+    options.eval_config.workbook_file_name = Some("Budget.xlsx".into());
+    let p = parts("<row r=\"1\"><c r=\"A1\"><f>CELL(\"filename\",A1)</f><v>0</v></c></row>");
+    let out = recalculate_xlsx_bytes(&pack(&p), options).unwrap();
+    assert!(member(&out.bytes, SHEET).contains("<v>[Budget.xlsx]Sheet1</v>"));
+}

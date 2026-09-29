@@ -429,6 +429,11 @@ pub fn recalculate_xlsx_bytes(
     }
     let mut config = options.eval_config.clone();
     config.date_system = date_system;
+    // The package was saved to a file, so CELL("filename") names one; a host
+    // that knows the file's name sets it in `eval_config`.
+    config
+        .workbook_file_name
+        .get_or_insert_with(|| "workbook.xlsx".to_string());
     // Excel spills any array that fits the grid; the package cell limit is
     // the only bound here (the default 10,000-cell cap refused SEQUENCE(30000)).
     config.spill.max_spill_cells = config

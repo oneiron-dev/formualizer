@@ -774,6 +774,10 @@ pub struct EvalConfig {
     /// Fallback maximum row bound for open-ended references (e.g. `A:A`, `A1:A`).
     ///
     /// This is only used when used-bounds cannot be determined.
+    /// File name of the workbook (`Budget.xlsx`) when it was read from a file:
+    /// `CELL("filename")` reports `[name]Sheet`. `None` is an unsaved workbook,
+    /// for which it is empty text.
+    pub workbook_file_name: Option<String>,
     pub max_open_ended_rows: u32,
 
     /// Fallback maximum column bound for open-ended references (e.g. `1:1`, `A1:1`).
@@ -890,6 +894,7 @@ impl Default for EvalConfig {
             range_expansion_limit: 64,
             // Open-ended reference defaults (Excel max dimensions).
             // Lower these to cap `A:A` / `1:1` when used-bounds are unknown.
+            workbook_file_name: None,
             max_open_ended_rows: 1_048_576,
             max_open_ended_cols: 16_384,
             stripe_height: 256,

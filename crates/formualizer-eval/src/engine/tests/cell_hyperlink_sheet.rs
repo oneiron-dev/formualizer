@@ -1,6 +1,6 @@
 //! CELL / HYPERLINK builtins.
 //!
-//! CELL answers `contents`, `address`, `col`, `row` and `type` for a reference;
+//! CELL answers `contents`, `address`, `col`, `row`, `type` and `filename` for a reference;
 //! HYPERLINK returns its friendly name or link location as text.
 use crate::engine::{Engine, EvalConfig};
 use crate::test_workbook::TestWorkbook;
@@ -171,9 +171,28 @@ fn cell_contents_on_blank_is_empty_in_graph() {
 #[test]
 fn cell_unsupported_info_type_is_value_error() {
     assert_error(r#"=CELL("format",A1)"#, ExcelErrorKind::Value);
-    assert_error(r#"=CELL("filename",A1)"#, ExcelErrorKind::Value);
     assert_error(r#"=CELL("protect",A1)"#, ExcelErrorKind::Value);
     assert_error(r#"=CELL("width",A1)"#, ExcelErrorKind::Value);
+}
+
+#[test]
+fn cell_filename_is_empty_until_the_workbook_has_a_file() {
+    assert_text(r#"=CELL("filename",A1)"#, "");
+    let mut engine = Engine::new(
+        TestWorkbook::new(),
+        EvalConfig {
+            workbook_file_name: Some("Budget.xlsx".into()),
+            ..EvalConfig::default()
+        },
+    );
+    engine
+        .set_cell_formula("Sheet1", 1, 20, parse(r#"=CELL("filename",A1)"#).unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 20),
+        Some(LiteralValue::Text("[Budget.xlsx]Sheet1".into()))
+    );
 }
 
 #[test]

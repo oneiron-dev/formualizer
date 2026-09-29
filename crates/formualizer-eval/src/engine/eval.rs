@@ -27089,6 +27089,10 @@ where
         Some(self.graph.sheet_reg().active_len())
     }
 
+    fn workbook_file_name(&self) -> Option<String> {
+        self.config.workbook_file_name.clone()
+    }
+
     fn sheet_index_by_name(&self, sheet: &str) -> Option<usize> {
         self.graph.sheet_reg().active_position(sheet)
     }
