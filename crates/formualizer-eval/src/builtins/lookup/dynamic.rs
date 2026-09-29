@@ -2666,29 +2666,47 @@ impl Function for FilterFn {
             ));
         }
 
+        // `include` is one column as tall as `array` (keep rows) or one row
+        // as wide as `array` (keep columns); any other shape is #VALUE!.
         let (include_rows, include_cols) = include_view.dims();
-        if include_rows != array_rows && include_rows != 1 {
+        let by_rows = include_cols == 1 && include_rows == array_rows;
+        if !by_rows && !(include_rows == 1 && include_cols == array_cols) {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new(ExcelErrorKind::Value),
             )));
         }
+        let mut keep = Vec::with_capacity(include_rows.max(include_cols));
+        for i in 0..include_rows.max(include_cols) {
+            let flag = if by_rows {
+                include_view.get_cell(i, 0)
+            } else {
+                include_view.get_cell(0, i)
+            };
+            keep.push(match flag {
+                LiteralValue::Boolean(b) => b,
+                LiteralValue::Empty => false,
+                LiteralValue::Error(e) => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+                }
+                LiteralValue::Text(_) => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                        ExcelError::new(ExcelErrorKind::Value),
+                    )));
+                }
+                other => other.is_truthy(),
+            });
+        }
 
         let mut result: Vec<Vec<LiteralValue>> = Vec::new();
         for r in 0..array_rows {
-            let include_r = if include_rows == array_rows { r } else { 0 };
-            let mut include = false;
-            for c in 0..include_cols {
-                if include_view.get_cell(include_r, c).is_truthy() {
-                    include = true;
-                    break;
-                }
+            if by_rows && !keep[r] {
+                continue;
             }
-
-            if include {
-                let mut row_out: Vec<LiteralValue> = Vec::with_capacity(array_cols);
-                for c in 0..array_cols {
-                    row_out.push(array_view.get_cell(r, c));
-                }
+            let row_out: Vec<LiteralValue> = (0..array_cols)
+                .filter(|&c| by_rows || keep[c])
+                .map(|c| array_view.get_cell(r, c))
+                .collect();
+            if !row_out.is_empty() {
                 result.push(row_out);
             }
         }
@@ -4172,6 +4190,78 @@ mod tests {
             }
             other => panic!("expected array got {other:?}"),
         }
+    }
+
+    /// A one-row `include` as wide as `array` keeps columns; errors in
+    /// `include` propagate, text is #VALUE!, other shapes are #VALUE!.
+    #[test]
+    fn filter_keeps_columns_for_a_row_include() {
+        let wb = TestWorkbook::new()
+            .with_function(Arc::new(FilterFn))
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Int(1))
+            .with_cell_a1("Sheet1", "B1", LiteralValue::Int(2))
+            .with_cell_a1("Sheet1", "C1", LiteralValue::Int(3))
+            .with_cell_a1("Sheet1", "A2", LiteralValue::Int(4))
+            .with_cell_a1("Sheet1", "B2", LiteralValue::Int(5))
+            .with_cell_a1("Sheet1", "C2", LiteralValue::Int(6));
+        let ctx = wb.interpreter();
+        let f = ctx.context.get_function("", "FILTER").unwrap();
+        let array_range = range("A1:C2", 1, 1, 2, 3);
+        let row = |flags: Vec<LiteralValue>| {
+            ASTNode::new(
+                ASTNodeType::Array(vec![flags.into_iter().map(lit).collect()]),
+                None,
+            )
+        };
+        let run = |include: &ASTNode| {
+            f.dispatch(
+                &[
+                    ArgumentHandle::new(&array_range, &ctx),
+                    ArgumentHandle::new(include, &ctx),
+                ],
+                &ctx.function_context(None),
+            )
+            .unwrap()
+            .into_literal()
+        };
+        let include = row(vec![
+            LiteralValue::Boolean(true),
+            LiteralValue::Int(0),
+            LiteralValue::Int(2),
+        ]);
+        assert_eq!(
+            run(&include),
+            LiteralValue::Array(vec![
+                vec![LiteralValue::Number(1.0), LiteralValue::Number(3.0)],
+                vec![LiteralValue::Number(4.0), LiteralValue::Number(6.0)],
+            ])
+        );
+        let include = row(vec![
+            LiteralValue::Boolean(true),
+            LiteralValue::Error(ExcelError::new(ExcelErrorKind::Na)),
+            LiteralValue::Boolean(false),
+        ]);
+        assert_eq!(
+            run(&include),
+            LiteralValue::Error(ExcelError::new(ExcelErrorKind::Na))
+        );
+        let include = row(vec![
+            LiteralValue::Boolean(true),
+            LiteralValue::Text("x".into()),
+            LiteralValue::Boolean(false),
+        ]);
+        assert_eq!(
+            run(&include),
+            LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value))
+        );
+        let include = row(vec![
+            LiteralValue::Boolean(true),
+            LiteralValue::Boolean(true),
+        ]);
+        assert_eq!(
+            run(&include),
+            LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value))
+        );
     }
 
     #[test]
