@@ -280,6 +280,7 @@ pub enum EvaluatedArg<'a> {
     Range(Box<dyn Range>),
 }
 
+#[derive(Clone, Copy)]
 enum ArgumentExpr<'a> {
     Ast(&'a ASTNode),
     Arena {
@@ -308,7 +309,31 @@ pub struct ArgumentHandle<'a, 'b> {
     cached_value: std::cell::OnceCell<Result<crate::traits::CalcValue<'b>, ExcelError>>,
 }
 
+/// A clone shares whatever this handle has already evaluated or resolved.
+impl<'a, 'b> Clone for ArgumentHandle<'a, 'b> {
+    fn clone(&self) -> Self {
+        Self {
+            expr: self.expr,
+            interp: self.interp,
+            cached_ast: self.cached_ast.clone(),
+            cached_ref: self.cached_ref.clone(),
+            cached_reference_or_value: self.cached_reference_or_value.clone(),
+            cached_resolved: self.cached_resolved.clone(),
+            cached_value: self.cached_value.clone(),
+        }
+    }
+}
+
 impl<'a, 'b> ArgumentHandle<'a, 'b> {
+    /// A handle for a literal element, evaluated by the same interpreter.
+    /// Used when a scalar parameter is lifted over an array argument.
+    pub(crate) fn literal<'n>(&self, node: &'n ASTNode) -> ArgumentHandle<'n, 'b>
+    where
+        'a: 'n,
+    {
+        ArgumentHandle::new(node, self.interp)
+    }
+
     pub(crate) fn new(node: &'a ASTNode, interp: &'a Interpreter<'b>) -> Self {
         Self {
             expr: ArgumentExpr::Ast(node),

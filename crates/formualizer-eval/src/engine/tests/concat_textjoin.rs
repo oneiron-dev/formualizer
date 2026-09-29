@@ -67,7 +67,7 @@ fn concat_and_textjoin_expand_ranges_and_computed_arrays_in_formulas() {
 }
 
 #[test]
-fn concatenate_uses_top_left_of_arena_literal_and_computed_arrays() {
+fn concatenate_lifts_over_arena_literal_and_computed_arrays() {
     let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
     for (col, rows) in [
         (
@@ -77,7 +77,7 @@ fn concatenate_uses_top_left_of_arena_literal_and_computed_arrays() {
                 vec![LiteralValue::Int(3), LiteralValue::Int(4)],
             ],
         ),
-        (2, Vec::new()),
+        (4, Vec::new()),
     ] {
         let formula = ASTNode::new(
             ASTNodeType::Function {
@@ -93,13 +93,18 @@ fn concatenate_uses_top_left_of_arena_literal_and_computed_arrays() {
             .set_cell_formula("Sheet1", 1, col, formula)
             .expect("set arena literal formula");
     }
-    set_formula(&mut engine, 1, 3, "=CONCATENATE(SEQUENCE(2,2),\"!\")");
+    set_formula(&mut engine, 1, 6, "=CONCATENATE(SEQUENCE(2,2),\"!\")");
 
     engine.evaluate_all().expect("evaluate formulas");
 
+    // Each element is concatenated and the results spill.
     assert_text(&engine, 1, 1, "top!");
-    assert_text(&engine, 1, 2, "!");
-    assert_text(&engine, 1, 3, "1!");
+    assert_text(&engine, 1, 2, "2!");
+    assert_text(&engine, 2, 1, "3!");
+    assert_text(&engine, 2, 2, "4!");
+    assert_text(&engine, 1, 4, "!");
+    assert_text(&engine, 1, 6, "1!");
+    assert_text(&engine, 2, 7, "4!");
 }
 
 #[test]

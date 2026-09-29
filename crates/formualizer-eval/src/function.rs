@@ -262,6 +262,23 @@ pub trait Function: Send + Sync + 'static {
                 .map(|result| self.apply_format_propagation(result));
         }
 
+        // A single-value parameter holding an array evaluates per element.
+        if let Some(spec) = crate::lift::lift_spec(self.name())
+            && let Some(lifted) =
+                crate::lift::lift_call(spec, args, |call| self.dispatch_scalar(call, ctx))?
+        {
+            return Ok(lifted);
+        }
+        self.dispatch_scalar(args, ctx)
+    }
+
+    /// Validate arguments against the schema, then evaluate (no array lifting).
+    #[doc(hidden)]
+    fn dispatch_scalar<'a, 'b, 'c>(
+        &self,
+        args: &'c [crate::traits::ArgumentHandle<'a, 'b>],
+        ctx: &dyn crate::traits::FunctionContext<'b>,
+    ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         // Central argument validation (includes min-arity check)
         {
             use crate::args::{ValidationOptions, validate_and_prepare};

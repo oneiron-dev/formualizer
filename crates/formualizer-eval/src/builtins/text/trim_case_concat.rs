@@ -914,22 +914,26 @@ mod tests {
     }
 
     #[test]
-    fn concatenate_uses_top_left_of_literal_arrays_in_ast_evaluation() {
+    fn concatenate_lifts_over_literal_arrays_in_ast_evaluation() {
         let wb = TestWorkbook::new().with_function(std::sync::Arc::new(ConcatenateFn));
         let ctx = wb.interpreter();
         let concatenate = ctx.context.get_function("", "CONCATENATE").unwrap();
         let suffix = lit(LiteralValue::Text("!".into()));
+        let text = |s: &str| LiteralValue::Text(s.into());
 
         for (rows, expected) in [
             (
                 vec![
                     vec![LiteralValue::Text("top".into()), LiteralValue::Int(2)],
-                    vec![LiteralValue::Int(3)],
+                    vec![LiteralValue::Int(3), LiteralValue::Int(4)],
                 ],
-                "top!",
+                LiteralValue::Array(vec![
+                    vec![text("top!"), text("2!")],
+                    vec![text("3!"), text("4!")],
+                ]),
             ),
-            (Vec::new(), "!"),
-            (vec![Vec::new(), vec![LiteralValue::Int(9)]], "!"),
+            (Vec::new(), text("!")),
+            (vec![Vec::new(), vec![LiteralValue::Int(9)]], text("!")),
         ] {
             let array = lit(LiteralValue::Array(rows));
             let out = concatenate
@@ -942,7 +946,7 @@ mod tests {
                 )
                 .unwrap()
                 .into_literal();
-            assert_eq!(out, LiteralValue::Text(expected.into()));
+            assert_eq!(out, expected);
         }
     }
 
@@ -1092,7 +1096,7 @@ mod tests {
     }
 
     #[test]
-    fn concatenate_keeps_legacy_top_left_range_behavior() {
+    fn concatenate_lifts_over_ranges() {
         let wb = TestWorkbook::new()
             .with_function(std::sync::Arc::new(ConcatenateFn))
             .with_range(
@@ -1118,7 +1122,13 @@ mod tests {
             )
             .unwrap()
             .into_literal();
-        assert_eq!(out, LiteralValue::Text("top!".into()));
+        assert_eq!(
+            out,
+            LiteralValue::Array(vec![vec![
+                LiteralValue::Text("top!".into()),
+                LiteralValue::Text("ignored!".into()),
+            ]])
+        );
     }
 
     #[test]

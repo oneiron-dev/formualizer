@@ -11,6 +11,7 @@ pub mod function_contract;
 pub mod function_registry;
 pub mod instant;
 pub mod interpreter;
+pub(crate) mod lift;
 pub mod locale;
 pub mod rng;
 pub mod stripes;

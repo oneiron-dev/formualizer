@@ -118,7 +118,7 @@ fn iferror_arity_errors_are_value() {
  */
 
 #[test]
-fn iferror_array_arg_passes_array_through_with_elementwise_errors() {
+fn iferror_array_arg_replaces_error_elements() {
     let wb = TestWorkbook::new();
     let mut engine = Engine::new(wb, EvalConfig::default());
     // A1:A3 = 1,2,3 ; B1=1, B2=0 (div error), B3=3
@@ -141,13 +141,11 @@ fn iferror_array_arg_passes_array_through_with_elementwise_errors() {
         engine.get_cell_value("Sheet1", 1, 3),
         Some(LiteralValue::Number(1.0))
     );
-    // Element-wise error inside the array is NOT replaced by the fallback.
-    match engine.get_cell_value("Sheet1", 2, 3) {
-        Some(LiteralValue::Error(e)) => {
-            assert_eq!(e.kind, formualizer_common::ExcelErrorKind::Div)
-        }
-        other => panic!("expected #DIV/0! spilled at C2, got {other:?}"),
-    }
+    // Each error element inside the array takes the fallback.
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 2, 3),
+        Some(LiteralValue::Number(0.0))
+    );
     assert_eq!(
         engine.get_cell_value("Sheet1", 3, 3),
         Some(LiteralValue::Number(1.0))

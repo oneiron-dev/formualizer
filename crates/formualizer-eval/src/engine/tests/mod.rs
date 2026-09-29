@@ -1,6 +1,7 @@
 mod active_span_gate_audit;
 mod adopt_file_sheets;
 mod arena_debug;
+mod array_lifting;
 mod ast_edge_invariant;
 mod cancellation;
 mod change_log;

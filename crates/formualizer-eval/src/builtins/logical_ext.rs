@@ -329,10 +329,48 @@ impl Function for IfErrorFn {
         }
         match args[0].value() {
             Ok(cv) if matches!(cv.as_scalar(), Some(LiteralValue::Error(_))) => args[1].value(),
-            Ok(cv) => Ok(cv),
+            Ok(cv) => match crate::lift::array_rows(&cv) {
+                Some(rows) => Ok(replace_errors(args, rows, |_| true)),
+                None => Ok(cv),
+            },
             Err(_) => args[1].value(),
         }
     }
+}
+
+/// IFERROR/IFNA over an array value: each caught error element takes the
+/// matching element of the fallback, which is evaluated only when needed.
+fn replace_errors<'b>(
+    args: &[ArgumentHandle<'_, 'b>],
+    rows: Vec<Vec<LiteralValue>>,
+    catches: impl Fn(&ExcelError) -> bool,
+) -> crate::traits::CalcValue<'b> {
+    let caught = |v: &LiteralValue| matches!(v, LiteralValue::Error(e) if catches(e));
+    if !rows.iter().flatten().any(caught) {
+        return crate::lift::array_result(rows, args[0].date_system());
+    }
+    let fallback = match args[1].value() {
+        Ok(value) => {
+            crate::lift::array_rows(&value).unwrap_or_else(|| vec![vec![value.into_literal()]])
+        }
+        Err(error) => vec![vec![LiteralValue::Error(error)]],
+    };
+    let (height, width) = crate::lift::broadcast_dims([&rows, &fallback]);
+    let out = (0..height)
+        .map(|r| {
+            (0..width)
+                .map(|c| {
+                    let value = crate::lift::broadcast_get(&rows, r, c);
+                    if caught(&value) {
+                        crate::lift::broadcast_get(&fallback, r, c)
+                    } else {
+                        value
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    crate::lift::array_result(out, args[0].date_system())
 }
 
 #[derive(Debug)]
@@ -421,7 +459,12 @@ impl Function for IfNaFn {
             Some(LiteralValue::Error(e)) if e.kind == formualizer_common::ExcelErrorKind::Na => {
                 args[1].value()
             }
-            _ => Ok(value),
+            _ => match crate::lift::array_rows(&value) {
+                Some(rows) => Ok(replace_errors(args, rows, |e| {
+                    e.kind == formualizer_common::ExcelErrorKind::Na
+                })),
+                None => Ok(value),
+            },
         }
     }
 }

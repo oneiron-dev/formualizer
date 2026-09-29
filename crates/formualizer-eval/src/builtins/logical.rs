@@ -398,8 +398,9 @@ pub struct IfFn;
 /// # Remarks
 /// - Condition coercion: booleans are used directly, numbers use `0` as FALSE and non-zero as TRUE.
 /// - A blank condition is treated as FALSE.
-/// - Text or other non-numeric/non-boolean conditions return `#VALUE!`.
+/// - Text `"TRUE"`/`"FALSE"` (any case) are logical; other text conditions return `#VALUE!`.
 /// - With only two arguments, the FALSE branch defaults to logical `FALSE`.
+/// - An array condition selects element-wise between the (broadcast) branches.
 ///
 /// # Examples
 ///
@@ -497,20 +498,13 @@ impl Function for IfFn {
             )));
         }
 
-        let condition = args[0].value()?.into_literal();
-        let b = match condition {
-            LiteralValue::Boolean(b) => b,
-            LiteralValue::Number(n) => n != 0.0,
-            LiteralValue::Int(i) => i != 0,
-            LiteralValue::Empty => false,
-            LiteralValue::Error(error) => {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
-            }
-            _ => {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                    ExcelError::new_value().with_message("IF condition must be boolean or number"),
-                )));
-            }
+        let condition = args[0].value()?;
+        if let Some(conditions) = crate::lift::array_rows(&condition) {
+            return Ok(if_over_array(args, conditions));
+        }
+        let b = match if_condition(condition.into_literal()) {
+            Ok(b) => b,
+            Err(error) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error))),
         };
 
         if b {
@@ -525,6 +519,55 @@ impl Function for IfFn {
     }
 }
 
+/// IF condition coercion: logical, number (non-zero is TRUE), blank is FALSE,
+/// and the text "TRUE"/"FALSE" in any case. Other text is `#VALUE!`.
+fn if_condition(condition: LiteralValue) -> Result<bool, ExcelError> {
+    match condition {
+        LiteralValue::Boolean(b) => Ok(b),
+        LiteralValue::Number(n) => Ok(n != 0.0),
+        LiteralValue::Int(i) => Ok(i != 0),
+        LiteralValue::Empty => Ok(false),
+        LiteralValue::Error(error) => Err(error),
+        LiteralValue::Text(text) if text.eq_ignore_ascii_case("TRUE") => Ok(true),
+        LiteralValue::Text(text) if text.eq_ignore_ascii_case("FALSE") => Ok(false),
+        _ => Err(ExcelError::new_value().with_message("IF condition must be boolean or number")),
+    }
+}
+
+/// IF with an array condition selects element-wise between both branches,
+/// each broadcast to the combined shape (a missing FALSE branch is FALSE).
+fn if_over_array<'b>(
+    args: &[ArgumentHandle<'_, 'b>],
+    conditions: Vec<Vec<LiteralValue>>,
+) -> crate::traits::CalcValue<'b> {
+    let branch = |index: usize| -> Vec<Vec<LiteralValue>> {
+        let value = match args.get(index) {
+            None => return vec![vec![LiteralValue::Boolean(false)]],
+            Some(arg) => match arg.value() {
+                Ok(value) => value,
+                Err(error) => return vec![vec![LiteralValue::Error(error)]],
+            },
+        };
+        crate::lift::array_rows(&value).unwrap_or_else(|| vec![vec![value.into_literal()]])
+    };
+    let (when_true, when_false) = (branch(1), branch(2));
+    let (height, width) = crate::lift::broadcast_dims([&conditions, &when_true, &when_false]);
+    let rows = (0..height)
+        .map(|r| {
+            (0..width)
+                .map(
+                    |c| match if_condition(crate::lift::broadcast_get(&conditions, r, c)) {
+                        Ok(true) => crate::lift::broadcast_get(&when_true, r, c),
+                        Ok(false) => crate::lift::broadcast_get(&when_false, r, c),
+                        Err(error) => LiteralValue::Error(error),
+                    },
+                )
+                .collect()
+        })
+        .collect();
+    crate::lift::array_result(rows, args[0].date_system())
+}
+
 fn try_resolve_if_reference_or_value<'b>(
     args: &[ArgumentHandle<'_, 'b>],
 ) -> Result<Option<FunctionResolution<'b>>, ExcelError> {
@@ -537,22 +580,14 @@ fn try_resolve_if_reference_or_value<'b>(
         )));
     }
     let condition = args[0].value()?.into_literal();
-    let selected = match condition {
-        LiteralValue::Boolean(value) => value,
-        LiteralValue::Number(value) => value != 0.0,
-        LiteralValue::Int(value) => value != 0,
-        LiteralValue::Empty => false,
-        LiteralValue::Error(error) => {
+    if matches!(condition, LiteralValue::Array(_)) {
+        return Ok(None);
+    }
+    let selected = match if_condition(condition) {
+        Ok(selected) => selected,
+        Err(error) => {
             return Ok(Some(FunctionResolution::Value(
                 crate::traits::CalcValue::Scalar(LiteralValue::Error(error)),
-            )));
-        }
-        LiteralValue::Array(_) => return Ok(None),
-        _ => {
-            return Ok(Some(FunctionResolution::Value(
-                crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                    ExcelError::new_value().with_message("IF condition must be boolean or number"),
-                )),
             )));
         }
     };

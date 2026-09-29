@@ -169,7 +169,7 @@ fn semantic_fixture(mode: FormulaPlaneMode) -> Engine<TestWorkbook> {
         "=IF(FALSE,$B$2)",
         "=IF(TRUE,,1)",
         "=IF($A$3,$B$2,$C$2)",
-        "=IF($D$1:$D$3>0,$B$2,$C$2)",
+        "=IF(\"x\",$B$2,$C$2)",
         "=IF(TRUE,IF(FALSE,$B$1,$B$2),$C$1)",
         "=CHOOSE(4,$B$1,$B$2)",
         "=CHOOSE(1.5,$B$1,$B$2)",
