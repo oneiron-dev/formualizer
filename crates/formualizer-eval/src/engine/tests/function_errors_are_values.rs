@@ -49,3 +49,16 @@ fn is_functions_see_errors_from_inner_calls() {
         other => panic!("expected #REF!, got {other:?}"),
     }
 }
+
+#[test]
+fn sequence_defaults_and_date_range() {
+    assert_eq!(eval("=SUM(SEQUENCE(3,,10))"), LiteralValue::Number(33.0));
+    assert_eq!(eval("=SUM(SEQUENCE(2,2))"), LiteralValue::Number(10.0));
+    for formula in ["=DATE(21,202021,0)", "=DATE(10000,1,1)", "=DATE(1900,1,-1)"] {
+        match eval(formula) {
+            LiteralValue::Error(e) => assert_eq!(e.kind, ExcelErrorKind::Num, "{formula}"),
+            other => panic!("{formula}: expected #NUM!, got {other:?}"),
+        }
+    }
+    assert_eq!(eval("=DATE(9999,12,31)*1"), LiteralValue::Number(2958465.0));
+}

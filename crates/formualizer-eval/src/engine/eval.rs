@@ -1087,6 +1087,10 @@ impl ComputedWriteChunkPlan {
     }
 }
 
+/// Excel's grid size.
+const EXCEL_MAX_ROWS: u32 = 1_048_576;
+const EXCEL_MAX_COLUMNS: u32 = 16_384;
+
 /// How a formula's array result lands in the grid under legacy array
 /// semantics (see [`Engine::declare_array_formula`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27497,8 +27501,19 @@ where
                         self.sheet_bounds(sheet_name)
                             .map(|_| self.config.max_open_ended_cols)
                     },
-                    |first, last| self.used_rows_for_columns(sheet_name, first, last),
-                    |first, last| self.used_cols_for_rows(sheet_name, first, last),
+                    // Whole columns (rows) of one sheet all end at the sheet's
+                    // last used row (column), so A:A and D:D line up element by
+                    // element as their full-height counterparts do in Excel.
+                    |first, last| {
+                        self.used_rows_for_columns(sheet_name, first, last)
+                            .and_then(|_| {
+                                self.used_rows_for_columns(sheet_name, 1, EXCEL_MAX_COLUMNS)
+                            })
+                    },
+                    |first, last| {
+                        self.used_cols_for_rows(sheet_name, first, last)
+                            .and_then(|_| self.used_cols_for_rows(sheet_name, 1, EXCEL_MAX_ROWS))
+                    },
                 );
                 let (sr, sc, er, ec) = extent
                     .map(|extent| {
