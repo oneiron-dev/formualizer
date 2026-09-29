@@ -10,6 +10,7 @@ mod array_shape;
 mod choose;
 mod core;
 mod dynamic;
+mod groupby;
 mod legacy; // classic LOOKUP function (vector & array forms)
 pub(crate) mod lookup_utils; // shared helper utilities for lookup family
 mod reference_info; // modern lookup & dynamic array subset (XLOOKUP, FILTER, UNIQUE)
@@ -49,6 +50,7 @@ pub fn register_builtins() {
 
     // Dynamic / modern lookup subset (Sprint 5 initial)
     dynamic::register_builtins();
+    groupby::register_builtins();
 
     // Stack and array-shaping functions
     stack::register_builtins();

@@ -97,6 +97,11 @@ pub type CowValue<'a> = Cow<'a, LiteralValue>;
 pub trait CustomCallable: Send + Sync {
     fn arity(&self) -> usize;
 
+    /// Whether the callable can be invoked with `count` arguments.
+    fn accepts(&self, count: usize) -> bool {
+        self.arity() == count
+    }
+
     fn invoke<'ctx>(
         &self,
         interp: &Interpreter<'ctx>,

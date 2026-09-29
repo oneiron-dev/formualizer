@@ -161,6 +161,7 @@ mod formula_plane_structural_tail_precision;
 mod formula_plane_structural_w0_oracle;
 mod fragmented_source_transaction;
 mod function_closure_tranche_a_oracles;
+mod groupby_pivotby;
 mod indirect;
 mod info_reference_context;
 mod inspect;

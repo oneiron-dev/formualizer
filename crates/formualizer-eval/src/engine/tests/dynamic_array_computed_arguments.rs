@@ -245,8 +245,8 @@ fn groupby_and_pivotby_accept_computed_arguments() {
             .unwrap();
     }
     for (row, formula) in [
-        (1, "=COUNT(GROUPBY(A1:A3,B1:B3*1,\"SUM\"))"),
-        (2, "=COUNT(PIVOTBY(A1:A3,A1:A3,B1:B3*1,\"SUM\"))"),
+        (1, "=COUNT(GROUPBY(A1:A3,B1:B3*1,SUM))"),
+        (2, "=COUNT(PIVOTBY(A1:A3,A1:A3,B1:B3*1,SUM))"),
     ] {
         engine
             .set_cell_formula("Sheet1", row, 5, parse(formula).unwrap())
@@ -255,8 +255,8 @@ fn groupby_and_pivotby_accept_computed_arguments() {
     engine.evaluate_all().unwrap();
 
     for (row, formula) in [
-        (1, "=COUNT(GROUPBY(A1:A3,B1:B3*1,\"SUM\"))"),
-        (2, "=COUNT(PIVOTBY(A1:A3,A1:A3,B1:B3*1,\"SUM\"))"),
+        (1, "=COUNT(GROUPBY(A1:A3,B1:B3*1,SUM))"),
+        (2, "=COUNT(PIVOTBY(A1:A3,A1:A3,B1:B3*1,SUM))"),
     ] {
         match engine.get_cell_value("Sheet1", row, 5) {
             Some(LiteralValue::Error(error)) => {

@@ -355,24 +355,125 @@ fn scalar<'b>(value: LiteralValue) -> CalcValue<'b> {
     CalcValue::Scalar(value)
 }
 
-/// The LAMBDA a helper receives as its last argument. `Err` carries the
-/// value to return instead: an error argument propagates, and anything else
-/// that is not a LAMBDA, or a LAMBDA with the wrong number of parameters,
-/// is `#VALUE!`.
+/// A built-in function named as a value, such as `SUM` in
+/// `BYROW(A1:B2,SUM)`: Excel's eta-reduced lambda, equivalent to
+/// `LAMBDA(a,b,...,SUM(a,b,...))` for any argument count SUM accepts.
+struct EtaCallable {
+    name: String,
+    min_args: usize,
+    max_args: Option<usize>,
+}
+
+impl CustomCallable for EtaCallable {
+    fn arity(&self) -> usize {
+        self.min_args.max(1)
+    }
+
+    fn accepts(&self, count: usize) -> bool {
+        count >= self.min_args.max(1) && self.max_args.is_none_or(|max| count <= max)
+    }
+
+    fn invoke<'ctx>(
+        &self,
+        interp: &crate::interpreter::Interpreter<'ctx>,
+        args: &[LiteralValue],
+    ) -> Result<CalcValue<'ctx>, ExcelError> {
+        if !self.accepts(args.len()) {
+            return Ok(CalcValue::Scalar(LiteralValue::Error(value_error(
+                format!("{} cannot take {} argument(s)", self.name, args.len()),
+            ))));
+        }
+        // Bind each argument to a name no formula can spell and call the
+        // function on those names, the same path a written LAMBDA takes.
+        let mut env = LocalEnv::default();
+        let mut params = Vec::with_capacity(args.len());
+        for (i, value) in args.iter().enumerate() {
+            let name = format!("\u{1}ETA{i}");
+            env = env.with_binding(&name, LocalBinding::Value(value.clone()));
+            params.push(ASTNode::new(
+                ASTNodeType::Reference {
+                    original: name.clone(),
+                    reference: ReferenceType::NamedRange(name),
+                },
+                None,
+            ));
+        }
+        let body = ASTNode::new(
+            ASTNodeType::Function {
+                name: self.name.clone(),
+                args: params,
+            },
+            None,
+        );
+        interp.with_local_env(env).evaluate_ast(&body)
+    }
+}
+
+/// The eta-reduced lambda for an argument written as a bare function name
+/// (`SUM`, or `_xleta.SUM` as stored in a file).
+fn eta_callable(arg: &ArgumentHandle<'_, '_>) -> Option<Arc<dyn CustomCallable>> {
+    let ASTNodeType::Reference {
+        reference: ReferenceType::NamedRange(name),
+        ..
+    } = &arg.ast().node_type
+    else {
+        return None;
+    };
+    let bare = ["_xleta.", "_xlfn."]
+        .iter()
+        .find_map(|prefix| {
+            name.get(..prefix.len())
+                .filter(|head| head.eq_ignore_ascii_case(prefix))
+                .map(|_| &name[prefix.len()..])
+        })
+        .unwrap_or(name);
+    let fun = arg.interpreter().context.get_function("", bare)?;
+    let max_args = (!fun.variadic()).then(|| fun.arg_schema().len().max(fun.min_args()));
+    Some(Arc::new(EtaCallable {
+        name: fun.name().to_string(),
+        min_args: fun.min_args(),
+        max_args,
+    }))
+}
+
+/// A function-valued argument: a LAMBDA, or a built-in function named as a
+/// value. `Err` carries the value to return instead: an error argument
+/// propagates and anything else is `#VALUE!`.
+pub(crate) fn function_arg(
+    arg: &ArgumentHandle<'_, '_>,
+) -> Result<Result<Arc<dyn CustomCallable>, LiteralValue>, ExcelError> {
+    let value = match arg.value() {
+        Ok(value) => value,
+        Err(error) => match eta_callable(arg) {
+            Some(callable) => return Ok(Ok(callable)),
+            None => return Err(error),
+        },
+    };
+    Ok(match value {
+        CalcValue::Callable(callable) => Ok(callable),
+        other => match other.into_literal() {
+            LiteralValue::Error(error) => match eta_callable(arg) {
+                Some(callable) if error.kind == ExcelErrorKind::Name => Ok(callable),
+                _ => Err(LiteralValue::Error(error)),
+            },
+            _ => Err(error_value(ExcelErrorKind::Value, "Expected a LAMBDA")),
+        },
+    })
+}
+
+/// The LAMBDA a helper receives as its last argument, which must take
+/// `arity` parameters; otherwise `Err` carries the value to return.
 fn lambda_arg(
     arg: &ArgumentHandle<'_, '_>,
     arity: usize,
 ) -> Result<Result<Arc<dyn CustomCallable>, LiteralValue>, ExcelError> {
-    Ok(match arg.value()? {
-        CalcValue::Callable(callable) if callable.arity() == arity => Ok(callable),
-        CalcValue::Callable(_) => Err(error_value(
+    Ok(match function_arg(arg)? {
+        Ok(callable) if callable.accepts(arity) => Ok(callable),
+        Ok(_) => Err(error_value(
             ExcelErrorKind::Value,
             "LAMBDA has the wrong number of parameters",
         )),
-        other => match other.into_literal() {
-            error @ LiteralValue::Error(_) => Err(error),
-            _ => Err(error_value(ExcelErrorKind::Value, "Expected a LAMBDA")),
-        },
+        Err(value) => Err(value),
     })
 }
 
@@ -393,7 +494,7 @@ fn array_value(rows: Grid) -> LiteralValue {
     }
 }
 
-fn invoke(
+pub(crate) fn invoke(
     arg: &ArgumentHandle<'_, '_>,
     callable: &Arc<dyn CustomCallable>,
     values: &[LiteralValue],
@@ -407,7 +508,7 @@ fn invoke(
 /// One element of a helper's result array. A LAMBDA result that is itself a
 /// multi-cell array cannot nest, so the whole helper returns `#CALC!`; a blank
 /// result reads as 0, like a formula that refers to an empty cell.
-fn element_value(value: LiteralValue) -> Option<LiteralValue> {
+pub(crate) fn element_value(value: LiteralValue) -> Option<LiteralValue> {
     match value {
         LiteralValue::Array(rows) => {
             if rows.len() == 1 && rows[0].len() == 1 {
