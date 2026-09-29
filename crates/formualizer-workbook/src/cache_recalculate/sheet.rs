@@ -29,6 +29,10 @@ pub(super) struct Cell {
     formula_kind: String,
     shared_id: Option<u32>,
     shared_range: Option<(u32, u32, u32, u32)>,
+    shared_ref_span: Option<Range<usize>>,
+    /// A replacement `ref="..."` attribute for the transient ingestion view
+    /// when a shared-formula master is not the top-left cell of its range.
+    pub reanchored_ref: Option<(Range<usize>, String)>,
     has_formula: bool,
     dynamic_array: bool,
 }
@@ -239,6 +243,8 @@ pub(super) fn scan(
                             formula_kind: String::new(),
                             shared_id: None,
                             shared_range: None,
+                            shared_ref_span: None,
+                            reanchored_ref: None,
                             has_formula: false,
                             dynamic_array,
                         });
@@ -286,6 +292,8 @@ pub(super) fn scan(
                             if cell.formula_kind == "shared" {
                                 cell.shared_id = Some(integer(node.required("si")?)?);
                                 cell.shared_range = node.value("ref").map(rect).transpose()?;
+                                cell.shared_ref_span =
+                                    node.attribute("", "ref").map(|a| a.span.clone());
                             }
                             if *empty {
                                 cell.formula_end = node.span.end;
@@ -407,17 +415,40 @@ pub(super) fn scan(
         return Err(unsupported("workbook logical cell limit", "workbook"));
     }
     let mut anchors = HashMap::new();
-    for cell in &cells {
+    for cell in &mut cells {
         if let Some(id) = cell.shared_id {
             if !cell.formula_text.trim().is_empty() {
-                let range = cell
+                let mut range = cell
                     .shared_range
                     .ok_or_else(|| unsupported("unbounded shared formula anchor", "worksheet"))?;
+                // The master's text is relative to the master cell, while
+                // readers expand from the range's top-left. Re-anchor the
+                // range at the master (members are checked against it below).
                 if (cell.row, cell.col) != (range.0, range.1) {
-                    return Err(unsupported(
-                        "non-top-left shared formula anchor",
-                        "worksheet",
-                    ));
+                    if cell.row < range.0
+                        || cell.col < range.1
+                        || cell.row > range.2
+                        || cell.col > range.3
+                    {
+                        return Err(unsupported(
+                            "non-top-left shared formula anchor",
+                            "worksheet",
+                        ));
+                    }
+                    range = (cell.row, cell.col, range.2, range.3);
+                    let span = cell.shared_ref_span.clone().ok_or_else(|| {
+                        unsupported("unbounded shared formula anchor", "worksheet")
+                    })?;
+                    let reference = format!(
+                        "ref=\"{}:{}\"",
+                        formualizer_common::coord::col_letters_from_1based(range.1)
+                            .map_err(|_| unsupported("invalid A1 coordinate", "worksheet"))?
+                            + &range.0.to_string(),
+                        formualizer_common::coord::col_letters_from_1based(range.3)
+                            .map_err(|_| unsupported("invalid A1 coordinate", "worksheet"))?
+                            + &range.2.to_string(),
+                    );
+                    cell.reanchored_ref = Some((span, reference));
                 }
                 let area = u64::from(range.2 - range.0 + 1) * u64::from(range.3 - range.1 + 1);
                 if area > options.limits.max_cells as u64 || anchors.insert(id, range).is_some() {

@@ -639,6 +639,28 @@ fn worksheet_tables_answer_structured_references() {
     assert!(sheet.contains("<tablePart"));
 }
 #[test]
+fn shared_formula_master_below_its_range_start_is_the_expansion_origin() {
+    // The master (B2) is relative to itself although ref starts at B1.
+    let rows = "<row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"B1\"><v>7</v></c></row>\
+        <row r=\"2\"><c r=\"A2\"><v>2</v></c><c r=\"B2\"><f t=\"shared\" ref=\"B1:B3\" si=\"0\">A2*10</f><v>0</v></c></row>\
+        <row r=\"3\"><c r=\"A3\"><v>3</v></c><c r=\"B3\"><f t=\"shared\" si=\"0\"/><v>0</v></c></row>";
+    let input = pack(&parts(rows));
+    let out = recalculate_xlsx_bytes(&input, Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    assert!(
+        sheet.contains("ref=\"B1:B3\" si=\"0\">A2*10</f><v>20</v>"),
+        "{sheet}"
+    );
+    assert!(
+        sheet.contains("<f t=\"shared\" si=\"0\"/><v>30</v>"),
+        "{sheet}"
+    );
+    // A member above or left of the master cannot be expanded from it.
+    let rows = "<row r=\"2\"><c r=\"B2\"><f t=\"shared\" ref=\"A2:B3\" si=\"0\">1</f><v>0</v></c></row>\
+        <row r=\"3\"><c r=\"A3\"><f t=\"shared\" si=\"0\"/><v>0</v></c></row>";
+    reject(&parts(rows));
+}
+#[test]
 fn multiple_changed_members_relocate_growing_and_shrinking_payloads() {
     let old = (0..2048u32)
         .map(|n| format!("{:08x}", n.wrapping_mul(2_654_435_761)))
