@@ -652,12 +652,13 @@ impl Function for ModFn {
 pub struct CeilingFn; // CEILING(number, [significance]) legacy semantics simplified
 /// Rounds a number up to the nearest multiple of a significance.
 ///
-/// This implementation defaults significance to `1` and normalizes negative significance to positive.
+/// Follows Excel's sign rules: a negative number with a positive significance rounds
+/// toward zero, and with a negative significance away from zero.
 ///
 /// # Remarks
 /// - If `significance` is omitted, `1` is used.
-/// - `significance = 0` returns `#DIV/0!`.
-/// - Negative significance is treated as its absolute value in this fallback behavior.
+/// - `significance = 0` returns `0`.
+/// - A positive number with a negative significance returns `#NUM!`.
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -679,7 +680,7 @@ pub struct CeilingFn; // CEILING(number, [significance]) legacy semantics simpli
 ///   - ROUNDUP
 /// faq:
 ///   - q: "What happens if CEILING significance is 0?"
-///     a: "It returns #DIV/0! because a zero multiple is invalid."
+///     a: "It returns 0."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: CEILING
@@ -721,7 +722,7 @@ impl Function for CeilingFn {
             }
             other => coerce_num(&other)?,
         };
-        let mut sig = if args.len() == 2 {
+        let sig = if args.len() == 2 {
             match args[1].value()?.into_literal() {
                 LiteralValue::Error(e) => {
                     return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
@@ -731,20 +732,50 @@ impl Function for CeilingFn {
         } else {
             1.0
         };
-        if sig == 0.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::from_error_string("#DIV/0!"),
-            )));
-        }
-        if sig < 0.0 {
-            sig = sig.abs(); /* Excel nuances: #NUM! when sign mismatch; simplified TODO */
-        }
-        let k = (n / sig).ceil();
+        // A zero significance gives 0; a positive number cannot round to a
+        // negative multiple; two negatives round away from zero.
+        let result = if sig == 0.0 || n == 0.0 {
+            0.0
+        } else if sig < 0.0 {
+            if n > 0.0 {
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                    ExcelError::new_num(),
+                )));
+            }
+            round_magnitude_to_multiple(n, -sig, true)
+        } else {
+            round_to_multiple(n, sig, true)
+        };
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            k * sig,
+            result,
         )))
     }
 }
+
+/// The multiple of `significance` (> 0) at or above (`up`) or at or below
+/// `number`. A quotient within floating-point noise of a whole number counts
+/// as that number, as in Excel (`CEILING(0.1*3,0.1)` is 0.3, not 0.4).
+fn round_to_multiple(number: f64, significance: f64, up: bool) -> f64 {
+    let q = number / significance;
+    let whole = q.round();
+    let steps = if (q - whole).abs() <= whole.abs().max(1.0) * 1e-14 {
+        whole
+    } else if up {
+        q.ceil()
+    } else {
+        q.floor()
+    };
+    steps * significance + 0.0
+}
+
+/// Magnitude rounding for negative numbers: `-round_to_multiple(|n|, sig)`,
+/// i.e. away from zero when `up`, toward zero otherwise.
+fn round_magnitude_to_multiple(number: f64, significance: f64, up: bool) -> f64 {
+    -round_to_multiple(-number, significance, up) + 0.0
+}
+
+static ARG_NUM_LENIENT_THREE: std::sync::LazyLock<Vec<ArgSchema>> =
+    std::sync::LazyLock::new(|| vec![ArgSchema::number_lenient_scalar(); 3]);
 
 #[derive(Debug)]
 pub struct CeilingMathFn; // CEILING.MATH(number,[significance],[mode])
@@ -799,7 +830,7 @@ impl Function for CeilingMathFn {
         true
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        &ARG_NUM_LENIENT_TWO[..]
+        &ARG_NUM_LENIENT_THREE[..]
     } // allow up to 3 handled manually
     fn eval<'a, 'b, 'c>(
         &self,
@@ -824,7 +855,10 @@ impl Function for CeilingMathFn {
                 }
                 other => {
                     let v = coerce_num(&other)?;
-                    if v == 0.0 { 1.0 } else { v.abs() }
+                    if v == 0.0 {
+                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(0.0)));
+                    }
+                    v.abs()
                 }
             }
         } else {
@@ -840,12 +874,10 @@ impl Function for CeilingMathFn {
         } else {
             false
         };
-        let result = if n >= 0.0 {
-            (n / sig).ceil() * sig
-        } else if mode_nonzero {
-            (n / sig).floor() * sig /* away from zero */
+        let result = if n < 0.0 && mode_nonzero {
+            round_magnitude_to_multiple(n, sig, true) /* away from zero */
         } else {
-            (n / sig).ceil() * sig /* toward +inf (less negative) */
+            round_to_multiple(n, sig, true) /* toward +inf */
         };
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
             result,
@@ -857,12 +889,13 @@ impl Function for CeilingMathFn {
 pub struct FloorFn; // FLOOR(number,[significance])
 /// Rounds a number down to the nearest multiple of a significance.
 ///
-/// This implementation defaults significance to `1` and normalizes negative significance to positive.
+/// Follows Excel's sign rules: a negative number with a positive significance rounds
+/// away from zero, and with a negative significance toward zero.
 ///
 /// # Remarks
 /// - If `significance` is omitted, `1` is used.
 /// - `significance = 0` returns `#DIV/0!`.
-/// - Negative significance is treated as its absolute value in this fallback behavior.
+/// - A positive number with a negative significance returns `#NUM!`.
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -926,7 +959,7 @@ impl Function for FloorFn {
             }
             other => coerce_num(&other)?,
         };
-        let mut sig = if args.len() == 2 {
+        let sig = if args.len() == 2 {
             match args[1].value()?.into_literal() {
                 LiteralValue::Error(e) => {
                     return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
@@ -936,17 +969,26 @@ impl Function for FloorFn {
         } else {
             1.0
         };
-        if sig == 0.0 {
+        // A zero significance divides by zero; a positive number cannot
+        // round to a negative multiple; two negatives round toward zero.
+        let result = if n == 0.0 {
+            0.0
+        } else if sig == 0.0 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::from_error_string("#DIV/0!"),
             )));
-        }
-        if sig < 0.0 {
-            sig = sig.abs();
-        }
-        let k = (n / sig).floor();
+        } else if sig < 0.0 {
+            if n > 0.0 {
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                    ExcelError::new_num(),
+                )));
+            }
+            round_magnitude_to_multiple(n, -sig, false)
+        } else {
+            round_to_multiple(n, sig, false)
+        };
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            k * sig,
+            result,
         )))
     }
 }
@@ -1004,7 +1046,7 @@ impl Function for FloorMathFn {
         true
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        &ARG_NUM_LENIENT_TWO[..]
+        &ARG_NUM_LENIENT_THREE[..]
     }
     fn eval<'a, 'b, 'c>(
         &self,
@@ -1029,7 +1071,10 @@ impl Function for FloorMathFn {
                 }
                 other => {
                     let v = coerce_num(&other)?;
-                    if v == 0.0 { 1.0 } else { v.abs() }
+                    if v == 0.0 {
+                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(0.0)));
+                    }
+                    v.abs()
                 }
             }
         } else {
@@ -1045,12 +1090,10 @@ impl Function for FloorMathFn {
         } else {
             false
         };
-        let result = if n >= 0.0 {
-            (n / sig).floor() * sig
-        } else if mode_nonzero {
-            (n / sig).ceil() * sig
+        let result = if n < 0.0 && mode_nonzero {
+            round_magnitude_to_multiple(n, sig, false) /* toward zero */
         } else {
-            (n / sig).floor() * sig
+            round_to_multiple(n, sig, false) /* toward -inf */
         };
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
             result,
@@ -2870,7 +2913,7 @@ impl Function for CeilingPreciseFn {
         } else {
             1.0
         };
-        let result = (n / sig).ceil() * sig;
+        let result = round_to_multiple(n, sig, true);
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
             result,
         )))
@@ -2957,7 +3000,7 @@ impl Function for FloorPreciseFn {
         } else {
             1.0
         };
-        let result = (n / sig).floor() * sig;
+        let result = round_to_multiple(n, sig, false);
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
             result,
         )))
@@ -3044,7 +3087,7 @@ impl Function for IsoCeilingFn {
         } else {
             1.0
         };
-        let result = (n / sig).ceil() * sig;
+        let result = round_to_multiple(n, sig, true);
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
             result,
         )))
@@ -3822,6 +3865,50 @@ mod tests_numeric {
             .into_literal(),
             LiteralValue::Number(4.0)
         );
+    }
+
+    #[test]
+    fn ceiling_floor_follow_excel_sign_rules() {
+        let wb = TestWorkbook::new()
+            .with_function(std::sync::Arc::new(CeilingFn))
+            .with_function(std::sync::Arc::new(FloorFn))
+            .with_function(std::sync::Arc::new(CeilingMathFn))
+            .with_function(std::sync::Arc::new(FloorMathFn))
+            .with_function(std::sync::Arc::new(CeilingPreciseFn))
+            .with_function(std::sync::Arc::new(FloorPreciseFn));
+        let ctx = interp(&wb);
+        let eval = |f: &str| {
+            ctx.evaluate_ast(&formualizer_parse::parser::parse(f).unwrap())
+                .unwrap()
+                .into_literal()
+        };
+        let num = |f: &str, want: f64| match eval(f) {
+            LiteralValue::Number(n) => assert!((n - want).abs() < 1e-12, "{f}: {n} != {want}"),
+            other => panic!("{f}: expected {want}, got {other:?}"),
+        };
+        let err = |f: &str, kind: formualizer_common::ExcelErrorKind| match eval(f) {
+            LiteralValue::Error(e) => assert_eq!(e.kind, kind, "{f}"),
+            other => panic!("{f}: expected {kind:?}, got {other:?}"),
+        };
+        num("=CEILING(-2.5,-2)", -4.0);
+        num("=CEILING(-45.67,-2)", -46.0);
+        num("=CEILING(-2.5,2)", -2.0);
+        num("=CEILING(2.5,0)", 0.0);
+        err("=CEILING(2.5,-2)", formualizer_common::ExcelErrorKind::Num);
+        num("=FLOOR(-2.5,-2)", -2.0);
+        num("=FLOOR(-45.67,-2)", -44.0);
+        num("=FLOOR(-2.5,2)", -4.0);
+        err("=FLOOR(2.5,-2)", formualizer_common::ExcelErrorKind::Num);
+        err("=FLOOR(2.5,0)", formualizer_common::ExcelErrorKind::Div);
+        num("=CEILING.MATH(-5.5,2,-1)", -6.0);
+        num("=CEILING.MATH(-5.5,2)", -4.0);
+        num("=FLOOR.MATH(-5.5,2,-1)", -4.0);
+        num("=FLOOR.MATH(-5.5,2)", -6.0);
+        num("=CEILING.MATH(5.5,0)", 0.0);
+        // Quotients within floating-point noise of a whole number are whole.
+        num("=CEILING(0.1*3,0.1)", 0.30000000000000004);
+        num("=FLOOR(0.3,0.1)", 0.30000000000000004);
+        num("=CEILING.PRECISE(0.7,0.1)", 0.7000000000000001);
     }
 
     #[test]
