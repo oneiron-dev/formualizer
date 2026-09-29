@@ -92,6 +92,7 @@ mod date_function_duration_cells;
 mod date_math_parity;
 mod date_text_arithmetic;
 mod edate_eomonth_engine;
+mod error_range_arguments;
 mod external_book_refs;
 
 mod hardening_503;

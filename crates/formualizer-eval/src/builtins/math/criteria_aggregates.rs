@@ -255,6 +255,10 @@ fn eval_if_family<'a, 'b>(
         ($arg:expr) => {
             match range_or_scalar($arg, ctx)? {
                 RangeOrScalar::Range(view) => (Some(view), None),
+                // An error in place of a range (COUNTIF(#REF!,1)) is the result.
+                RangeOrScalar::Scalar(LiteralValue::Error(error)) => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
+                }
                 RangeOrScalar::Scalar(value) => (None, Some(value)),
                 RangeOrScalar::ReferenceError(error) => {
                     return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
@@ -279,10 +283,11 @@ fn eval_if_family<'a, 'b>(
             logical_count_cells = logical_cells;
             match argument {
                 AggregateArgument::Range(view) => (Some(view), None),
-                AggregateArgument::Scalar(value) => (None, Some(value)),
-                AggregateArgument::ReferenceError(error) => {
+                AggregateArgument::Scalar(LiteralValue::Error(error))
+                | AggregateArgument::ReferenceError(error) => {
                     return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
                 }
+                AggregateArgument::Scalar(value) => (None, Some(value)),
             }
         } else {
             resolve_range_or_scalar!(&args[0])

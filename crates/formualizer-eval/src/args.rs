@@ -184,7 +184,8 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
         // (e.g. blank == 0, numeric text == number, etc.)
         LiteralValue::Int(i) => Ok(CriteriaPredicate::Eq(LiteralValue::Number(*i as f64))),
         LiteralValue::Boolean(b) => Ok(CriteriaPredicate::Eq(LiteralValue::Boolean(*b))),
-        LiteralValue::Error(e) => Err(e.clone()),
+        // An error criterion counts the cells holding that error.
+        LiteralValue::Error(e) => Ok(CriteriaPredicate::Eq(LiteralValue::Error(e.clone()))),
         LiteralValue::Array(arr) => {
             // Treat 1x1 array literals as scalars for criteria parsing
             if arr.len() == 1 && arr.first().map(|r| r.len()).unwrap_or(0) == 1 {
