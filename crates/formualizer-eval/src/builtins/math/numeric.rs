@@ -394,7 +394,7 @@ impl Function for RoundFn {
 
 /// Direction for [`round_decimal`].
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RoundMode {
+pub(crate) enum RoundMode {
     /// Half away from zero (ROUND).
     Nearest,
     /// Away from zero (ROUNDUP).
@@ -406,7 +406,7 @@ enum RoundMode {
 /// Rounds to `digits` decimal places the way Excel does: on the number's
 /// 15-significant-digit decimal form, so 1.005 (stored as 1.00499999...)
 /// rounds to 1.01 and 0.1+0.2 rounds up to 0.3, not 0.4.
-fn round_decimal(n: f64, digits: i32, mode: RoundMode) -> f64 {
+pub(crate) fn round_decimal(n: f64, digits: i32, mode: RoundMode) -> f64 {
     if n == 0.0 || !n.is_finite() {
         return n;
     }

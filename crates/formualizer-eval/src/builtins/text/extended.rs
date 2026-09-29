@@ -684,9 +684,12 @@ impl Function for DollarFn {
             2
         };
 
-        // Round to specified decimals
-        let factor = 10f64.powi(decimals);
-        let rounded = (num * factor).round() / factor;
+        // Round like ROUND: on the 15-digit decimal value, so 1.005 shows as 1.01.
+        let rounded = crate::builtins::math::numeric::round_decimal(
+            num,
+            decimals,
+            crate::builtins::math::numeric::RoundMode::Nearest,
+        );
 
         // Format with thousands separator and currency symbol
         let abs_val = rounded.abs();
@@ -860,9 +863,12 @@ impl Function for FixedFn {
             false
         };
 
-        // Round to specified decimals
-        let factor = 10f64.powi(decimals);
-        let rounded = (num * factor).round() / factor;
+        // Round like ROUND: on the 15-digit decimal value, so 1.005 shows as 1.01.
+        let rounded = crate::builtins::math::numeric::round_decimal(
+            num,
+            decimals,
+            crate::builtins::math::numeric::RoundMode::Nearest,
+        );
 
         let decimals_usize = decimals.max(0) as usize;
 
@@ -954,6 +960,24 @@ mod tests {
 
     fn make_num_ast(n: f64) -> ASTNode {
         ASTNode::new(ASTNodeType::Literal(LiteralValue::Number(n)), None)
+    }
+
+    #[test]
+    fn dollar_and_fixed_round_the_decimal_value() {
+        let wb = TestWorkbook::new()
+            .with_function(std::sync::Arc::new(DollarFn))
+            .with_function(std::sync::Arc::new(FixedFn));
+        let ctx = interp(&wb);
+        let eval = |f: &str| {
+            ctx.evaluate_ast(&formualizer_parse::parser::parse(f).unwrap())
+                .unwrap()
+                .into_literal()
+        };
+        let text = |s: &str| LiteralValue::Text(s.into());
+        assert_eq!(eval("=DOLLAR(1.005,2)"), text("$1.01"));
+        assert_eq!(eval("=DOLLAR(1234.567,2)"), text("$1,234.57"));
+        assert_eq!(eval("=FIXED(1.005,2)"), text("1.01"));
+        assert_eq!(eval("=FIXED(2.675,2,TRUE)"), text("2.68"));
     }
 
     #[test]
