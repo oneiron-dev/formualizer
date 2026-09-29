@@ -535,6 +535,28 @@ fn office_growth_hint_padding_is_admitted_and_retained() {
     let other = pack_with_local_extra(&single("1+1", "<v>99</v>"), 0x5455, &[1, 0, 0, 0, 0]);
     assert!(recalculate_xlsx_bytes(&other, Default::default()).is_err());
 }
+#[test]
+fn local_headers_differing_in_deflate_hints_and_time_are_admitted() {
+    // Excel writes some local headers with deflate speed hints (flag bits 1-2)
+    // and a zero timestamp that the central directory does not repeat.
+    let input = pack(&single("1+1", "<v>99</v>"));
+    let (headers, _) = directory(&input);
+    let mut hinted = input.clone();
+    for &a in &headers {
+        let local = h32(&input, a + 42);
+        let flags = h16(&input, local + 6) as u16 | 0b110;
+        hinted[local + 6..local + 8].copy_from_slice(&flags.to_le_bytes());
+        hinted[local + 10..local + 14].copy_from_slice(&[0, 0, 33, 0]);
+    }
+    let out = recalculate_xlsx_bytes(&hinted, Default::default()).unwrap();
+    assert_eq!(data(&out.bytes, 0), Data::Float(2.0));
+    // Any other flag difference still refuses the package.
+    let mut other = input.clone();
+    let local = h32(&input, headers[0] + 42);
+    let flags = h16(&input, local + 6) as u16 | 0x0800;
+    other[local + 6..local + 8].copy_from_slice(&flags.to_le_bytes());
+    assert!(recalculate_xlsx_bytes(&other, Default::default()).is_err());
+}
 fn with_metadata(mut p: BTreeMap<String, String>, metadata: &str) -> BTreeMap<String, String> {
     let ct = p.get_mut("[Content_Types].xml").unwrap();
     *ct = ct.replace("</Types>","<Override PartName=\"/xl/metadata.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml\"/></Types>");
