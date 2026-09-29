@@ -94,6 +94,7 @@ mod date_text_arithmetic;
 mod edate_eomonth_engine;
 mod error_range_arguments;
 mod external_book_refs;
+mod function_errors_are_values;
 
 mod hardening_503;
 

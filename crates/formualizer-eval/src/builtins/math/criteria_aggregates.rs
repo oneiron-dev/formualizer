@@ -774,6 +774,29 @@ fn eval_if_family<'a, 'b>(
                     continue;
                 }
 
+                // A matching cell of the summed range that holds an error makes
+                // the result that error (non-numbers are null in the lane).
+                if agg_type != AggregationType::Count
+                    && let Some(sv) = sum_view.as_ref()
+                {
+                    let target_col = sum_slices
+                        .as_ref()
+                        .and_then(|cols| cols.get(c).and_then(|a| a.as_ref()));
+                    for i in 0..row_len {
+                        let matched = mask_opt
+                            .as_ref()
+                            .is_none_or(|mask| mask.is_valid(i) && mask.value(i));
+                        if matched
+                            && target_col.is_none_or(|tc| tc.is_null(i))
+                            && let LiteralValue::Error(error) = sv.get_cell(row_start + i, c)
+                        {
+                            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                                error,
+                            )));
+                        }
+                    }
+                }
+
                 match mask_opt {
                     Some(mask) => {
                         if agg_type == AggregationType::Count {

@@ -130,6 +130,19 @@ pub struct Interpreter<'a> {
     parameter_bindings: Option<InterpreterParameterBindings<'a>>,
 }
 
+/// A function's error is its value: ISNUMBER(SEARCH("x",#REF!)) is FALSE and
+/// IF(FALSE,...) never sees it. Only cancellation aborts the formula.
+fn error_as_value<'a>(
+    result: Result<crate::traits::CalcValue<'a>, ExcelError>,
+) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+    match result {
+        Err(error) if error.kind != ExcelErrorKind::Cancelled => {
+            Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)))
+        }
+        other => other,
+    }
+}
+
 impl<'a> Interpreter<'a> {
     pub fn new(context: &'a dyn EvaluationContext, current_sheet: &'a str) -> Self {
         Self {
@@ -794,7 +807,7 @@ impl<'a> Interpreter<'a> {
                         self.current_sheet,
                     );
 
-                    return fun.dispatch(&handles, &fctx);
+                    return error_as_value(fun.dispatch(&handles, &fctx));
                 }
 
                 if let Some(callable) = self.resolve_local_callable(name) {
@@ -1287,7 +1300,7 @@ impl<'a> Interpreter<'a> {
                 self.current_cell,
                 self.current_sheet,
             );
-            return fun.dispatch(&handles, &fctx);
+            return error_as_value(fun.dispatch(&handles, &fctx));
         }
 
         if let Some(callable) = self.resolve_local_callable(name) {
