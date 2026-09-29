@@ -569,21 +569,17 @@ pub struct IsFormulaFn; // Requires provenance tracking (not yet) => always FALS
 /// Current engine metadata does not track formula provenance at this call site.
 ///
 /// # Remarks
-/// - This implementation currently returns FALSE for all inputs.
-/// - Errors are not raised solely due to provenance unavailability.
+/// - Returns TRUE when the referenced cell holds a formula, FALSE otherwise.
+/// - An argument that is not a reference returns `#VALUE!`.
 /// - Arity mismatch returns `#VALUE!`.
 ///
 /// # Examples
 ///
 /// ```yaml,sandbox
-/// title: "Literal value"
-/// formula: '=ISFORMULA(10)'
-/// expected: false
-/// ```
-///
-/// ```yaml,sandbox
-/// title: "Computed value in expression context"
-/// formula: '=ISFORMULA(1+1)'
+/// title: "Constant cell"
+/// grid:
+///   A1: 10
+/// formula: '=ISFORMULA(A1)'
 /// expected: false
 /// ```
 ///
@@ -593,8 +589,8 @@ pub struct IsFormulaFn; // Requires provenance tracking (not yet) => always FALS
 ///   - ISNUMBER
 ///   - ISTEXT
 /// faq:
-///   - q: "Can ISFORMULA currently detect formula provenance?"
-///     a: "Not yet. This implementation always returns FALSE because provenance metadata is not tracked here."
+///   - q: "What does ISFORMULA return for a value that is not a reference?"
+///     a: "#VALUE!, as in Excel."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: ISFORMULA
@@ -621,19 +617,40 @@ impl Function for IsFormulaFn {
     fn arg_schema(&self) -> &'static [ArgSchema] {
         &ARG_ANY_ONE[..]
     }
+    // The argument is read as a reference, never evaluated.
+    fn dispatch<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+    ) -> Result<CalcValue<'b>, ExcelError> {
+        self.eval(args, ctx)
+    }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        if args.len() != 1 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+        let value_error = || {
+            Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_value(),
-            )));
+            )))
+        };
+        if args.len() != 1 {
+            return value_error();
         }
-        // Formula provenance metadata is not tracked yet, so ISFORMULA currently returns FALSE.
+        // TRUE when the referenced cell holds a formula; anything that is
+        // not a reference is #VALUE!.
+        let Ok(reference) = args[0].as_reference_or_eval() else {
+            return value_error();
+        };
+        let Some(cell) = ctx
+            .inspect_reference(&reference)?
+            .and_then(|info| info.first_cell)
+        else {
+            return value_error();
+        };
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Boolean(
-            false,
+            ctx.formula_text_at_cell(cell)?.is_some(),
         )))
     }
 }

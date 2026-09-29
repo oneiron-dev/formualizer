@@ -290,3 +290,41 @@ fn formula_text_sheet_sheets_and_isref_functions_evaluate_directly() {
         Some(LiteralValue::Text("=3+4".into()))
     );
 }
+
+#[test]
+fn isformula_reports_formula_cells() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("=1+2").unwrap())
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 2, 1, LiteralValue::Number(3.0))
+        .unwrap();
+    for (row, formula) in [
+        (1, "=ISFORMULA(A1)"),
+        (2, "=ISFORMULA(A2)"),
+        (3, "=ISFORMULA(A9)"),
+        (4, "=ISFORMULA(10)"),
+    ] {
+        engine
+            .set_cell_formula("Sheet1", row, 3, parse(formula).unwrap())
+            .unwrap();
+    }
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 3),
+        Some(LiteralValue::Boolean(true))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 2, 3),
+        Some(LiteralValue::Boolean(false))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 3, 3),
+        Some(LiteralValue::Boolean(false))
+    );
+    assert_eq!(
+        err_kind(engine.get_cell_value("Sheet1", 4, 3)),
+        Some(ExcelErrorKind::Value)
+    );
+}
