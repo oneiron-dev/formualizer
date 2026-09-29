@@ -1537,6 +1537,16 @@ mod tests {
         }
 
         #[test]
+        fn space_intersection_with_whole_row_range() {
+            for ast in parse_both("=A:A 2:2") {
+                match ast.node_type {
+                    ASTNodeType::BinaryOp { op, .. } => assert_eq!(op, " "),
+                    other => panic!("expected BinaryOp(\" \", ...), got {other:?}"),
+                }
+            }
+        }
+
+        #[test]
         fn space_intersection_inside_function() {
             for ast in parse_both("=SUM(A1:A3 A2:C2)") {
                 match ast.node_type {

@@ -295,6 +295,12 @@ impl<'a> Interpreter<'a> {
                         .with_message(format!("Unknown function: {name}")))
                 }
             }
+            ASTNodeType::BinaryOp { op, left, right } if op == " " => {
+                let lref = self.evaluate_ast_as_reference(left)?;
+                let rref = self.evaluate_ast_as_reference(right)?;
+                crate::reference::intersect_references(&lref, &rref)?
+                    .ok_or_else(|| ExcelError::new(ExcelErrorKind::Null))
+            }
             ASTNodeType::BinaryOp { op, left, right } if op == ":" => {
                 let lref = self.evaluate_ast_as_reference(left)?;
                 let rref = self.evaluate_ast_as_reference(right)?;
@@ -381,7 +387,7 @@ impl<'a> Interpreter<'a> {
                 right_id,
             } => {
                 let op = data_store.resolve_ast_string(*op_id);
-                if op != ":" {
+                if op != ":" && op != " " {
                     return Err(ExcelError::new(ExcelErrorKind::Ref)
                         .with_message("Expression cannot be used as a reference"));
                 }
@@ -389,6 +395,10 @@ impl<'a> Interpreter<'a> {
                     self.evaluate_arena_ast_as_reference(*left_id, data_store, sheet_registry)?;
                 let rref =
                     self.evaluate_arena_ast_as_reference(*right_id, data_store, sheet_registry)?;
+                if op == " " {
+                    return crate::reference::intersect_references(&lref, &rref)?
+                        .ok_or_else(|| ExcelError::new(ExcelErrorKind::Null));
+                }
                 crate::reference::combine_references(&lref, &rref)
             }
             _ => Err(ExcelError::new(ExcelErrorKind::Ref)
@@ -675,6 +685,19 @@ impl<'a> Interpreter<'a> {
                 right_id,
             } => {
                 let op = data_store.resolve_ast_string(*op_id);
+                if op == " " {
+                    let intersection = self
+                        .evaluate_arena_ast_as_reference(*left_id, data_store, sheet_registry)
+                        .and_then(|lref| {
+                            let rref = self.evaluate_arena_ast_as_reference(
+                                *right_id,
+                                data_store,
+                                sheet_registry,
+                            )?;
+                            crate::reference::intersect_references(&lref, &rref)
+                        });
+                    return self.intersection_value(intersection);
+                }
                 if op == ":" {
                     let lref =
                         self.evaluate_arena_ast_as_reference(*left_id, data_store, sheet_registry)?;
@@ -977,11 +1000,38 @@ impl<'a> Interpreter<'a> {
             return Ok(self.annotate_cell_value(sheet.as_deref(), *row, *col, value));
         }
 
-        let view = self
+        let view = match self
             .context
-            .resolve_range_view(reference, self.current_sheet)?
-            .with_cancel_token(self.context.cancellation_token());
+            .resolve_range_view(reference, self.current_sheet)
+        {
+            Ok(view) => view,
+            // An undefined name is a #NAME? value that ISERROR, IFERROR,
+            // ERROR.TYPE and TYPE can inspect, not a failed evaluation.
+            Err(error)
+                if error.kind == ExcelErrorKind::Name
+                    && matches!(reference, ReferenceType::NamedRange(_)) =>
+            {
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
+            }
+            Err(error) => return Err(error),
+        }
+        .with_cancel_token(self.context.cancellation_token());
         Ok(crate::traits::CalcValue::Range(view))
+    }
+
+    /// The value of a space-operator intersection: the shared cells, or
+    /// `#NULL!` when the references do not overlap.
+    fn intersection_value(
+        &self,
+        intersection: Result<Option<ReferenceType>, ExcelError>,
+    ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        match intersection {
+            Ok(Some(reference)) => self.eval_reference_to_calc(&reference),
+            Ok(None) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                ExcelError::new(ExcelErrorKind::Null),
+            ))),
+            Err(error) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error))),
+        }
     }
 
     fn eval_reference(&self, reference: &ReferenceType) -> Result<LiteralValue, ExcelError> {
@@ -1223,6 +1273,13 @@ impl<'a> Interpreter<'a> {
         left_node: &ASTNode,
         right_node: &ASTNode,
     ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        if op == " " {
+            let intersection = self.evaluate_ast_as_reference(left_node).and_then(|lref| {
+                let rref = self.evaluate_ast_as_reference(right_node)?;
+                crate::reference::intersect_references(&lref, &rref)
+            });
+            return self.intersection_value(intersection);
+        }
         let left_calc = self.evaluate_ast(left_node)?;
         let left_format = left_calc.format_id();
         let left = left_calc.into_literal();

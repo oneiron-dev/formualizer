@@ -165,6 +165,7 @@ mod groupby_pivotby;
 mod indirect;
 mod info_reference_context;
 mod inspect;
+mod intersection_and_error_values;
 mod lambda_helpers;
 mod let_lambda;
 mod npv_variadic;

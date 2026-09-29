@@ -713,6 +713,17 @@ fn next_starts_reference_expression(formula: &str, mut offset: usize) -> bool {
         return false;
     }
 
+    if bytes[offset].is_ascii_digit() {
+        // A whole-row range such as `2:2` or `2:$5`.
+        let mut end = offset;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        return bytes.get(end) == Some(&b':')
+            && bytes
+                .get(end + 1)
+                .is_some_and(|b| b.is_ascii_digit() || *b == b'$');
+    }
     matches!(bytes[offset], b'(' | b'[' | b'\'' | b'$') || bytes[offset].is_ascii_alphabetic()
 }
 

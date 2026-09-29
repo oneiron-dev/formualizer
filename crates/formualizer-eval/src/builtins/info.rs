@@ -1063,10 +1063,11 @@ impl Function for TypeFn {
                 ExcelError::new_value(),
             )));
         }
-        let v = args[0].value()?.into_literal(); // Propagate errors directly
-        if let LiteralValue::Error(e) = v {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
-        }
+        // An error argument is a value of type 16, not a failure of TYPE.
+        let v = match args[0].value() {
+            Ok(v) => v.into_literal(),
+            Err(e) => LiteralValue::Error(e),
+        };
         let code = match v {
             LiteralValue::Int(_)
             | LiteralValue::Number(_)
@@ -1078,7 +1079,7 @@ impl Function for TypeFn {
             LiteralValue::Text(_) => 2,
             LiteralValue::Boolean(_) => 4,
             LiteralValue::Array(_) => 64,
-            LiteralValue::Error(_) => unreachable!(),
+            LiteralValue::Error(_) => 16,
             LiteralValue::Pending => 1, // treat as blank/zero numeric; may change
         };
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Int(code)))
@@ -1618,7 +1619,10 @@ impl Function for ErrorTypeFn {
                 ExcelError::new_value(),
             )));
         }
-        let v = args[0].value()?.into_literal();
+        let v = match args[0].value() {
+            Ok(v) => v.into_literal(),
+            Err(e) => LiteralValue::Error(e),
+        };
         match v {
             LiteralValue::Error(e) => {
                 let code = error_type_code(e.kind);
@@ -2121,14 +2125,12 @@ mod tests {
                 .into_literal(),
             LiteralValue::Int(4)
         );
-        match f
-            .dispatch(&a_err, &ctx.function_context(None))
-            .unwrap()
-            .into_literal()
-        {
-            LiteralValue::Error(e) => assert_eq!(e, "#VALUE!"),
-            _ => panic!(),
-        }
+        assert_eq!(
+            f.dispatch(&a_err, &ctx.function_context(None))
+                .unwrap()
+                .into_literal(),
+            LiteralValue::Int(16)
+        );
         assert_eq!(
             f.dispatch(&a_arr, &ctx.function_context(None))
                 .unwrap()

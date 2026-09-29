@@ -182,6 +182,73 @@ pub fn combine_references(
     })
 }
 
+/// Intersect two references with the space operator (`A1:C3 B2:D4`).
+/// `Ok(None)` when they share no cell, which Excel reports as `#NULL!`.
+pub fn intersect_references(
+    a: &ReferenceType,
+    b: &ReferenceType,
+) -> Result<Option<ReferenceType>, ExcelError> {
+    // Whole rows and columns span the sheet.
+    fn to_bounds(r: &ReferenceType) -> Option<SheetBounds> {
+        match r {
+            ReferenceType::Cell {
+                sheet, row, col, ..
+            } => Some((sheet.clone(), (*row, *col, *row, *col))),
+            ReferenceType::Range {
+                sheet,
+                start_row,
+                start_col,
+                end_row,
+                end_col,
+                ..
+            } => Some((
+                sheet.clone(),
+                (
+                    start_row.unwrap_or(1),
+                    start_col.unwrap_or(1),
+                    end_row.unwrap_or(1_048_576),
+                    end_col.unwrap_or(16_384),
+                ),
+            )),
+            _ => None,
+        }
+    }
+    let unsupported =
+        || ExcelError::new(ExcelErrorKind::Value).with_message("Unsupported reference for ' '");
+    let (sheet_a, (a_sr, a_sc, a_er, a_ec)) = to_bounds(a).ok_or_else(unsupported)?;
+    let (sheet_b, (b_sr, b_sc, b_er, b_ec)) = to_bounds(b).ok_or_else(unsupported)?;
+    let sheet = match (sheet_a, sheet_b) {
+        (Some(x), Some(y)) if x != y => return Ok(None),
+        (x, y) => x.or(y),
+    };
+    let (sr, sc) = (a_sr.max(b_sr), a_sc.max(b_sc));
+    let (er, ec) = (a_er.min(b_er), a_ec.min(b_ec));
+    if sr > er || sc > ec {
+        return Ok(None);
+    }
+    Ok(Some(if sr == er && sc == ec {
+        ReferenceType::Cell {
+            sheet,
+            row: sr,
+            col: sc,
+            row_abs: false,
+            col_abs: false,
+        }
+    } else {
+        ReferenceType::Range {
+            sheet,
+            start_row: Some(sr),
+            start_col: Some(sc),
+            end_row: Some(er),
+            end_col: Some(ec),
+            start_row_abs: false,
+            start_col_abs: false,
+            end_row_abs: false,
+            end_col_abs: false,
+        }
+    }))
+}
+
 impl fmt::Display for Coord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.col_abs() {
