@@ -619,7 +619,8 @@ fn collect_holidays(
     let mut holidays = Vec::new();
     for arg in args.iter().skip(arg_start) {
         match arg.value() {
-            Ok(CalcValue::Scalar(lit)) => {
+            // A date-formatted scalar such as DATE(2024,1,3) arrives annotated.
+            Ok(CalcValue::Scalar(lit) | CalcValue::AnnotatedScalar(lit, _)) => {
                 collect_holidays_from_literal(&lit, &mut holidays, system)
             }
             Ok(CalcValue::Range(rv)) => {
@@ -1396,6 +1397,29 @@ mod tests {
             }
             other => panic!("expected #VALUE! error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_single_date_holiday_is_excluded() {
+        use formualizer_parse::parser::parse;
+        let wb = TestWorkbook::new()
+            .with_function(std::sync::Arc::new(NetworkdaysFn))
+            .with_function(std::sync::Arc::new(WorkdayFn))
+            .with_function(std::sync::Arc::new(super::super::date_time::DateFn));
+        let eval = |f: &str| {
+            wb.interpreter()
+                .evaluate_ast(&parse(f).unwrap())
+                .unwrap()
+                .into_literal()
+        };
+        assert_eq!(
+            eval("=NETWORKDAYS(DATE(2024,1,1),DATE(2024,1,5),DATE(2024,1,3))"),
+            LiteralValue::Int(4)
+        );
+        assert_eq!(
+            eval("=WORKDAY(DATE(2024,1,1),5,DATE(2024,1,3))"),
+            LiteralValue::Number(45300.0)
+        );
     }
 
     #[test]
