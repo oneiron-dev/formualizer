@@ -601,6 +601,13 @@ fn extension_markup_outside_cells_is_not_workbook_or_cell_metadata() {
     reject(&p);
 }
 #[test]
+fn volatile_formulas_are_recalculated_not_refused() {
+    let rows = "<row r=\"1\"><c r=\"A1\"><f>TODAY()</f><v>1</v></c></row><row r=\"2\"><c r=\"A2\"><f>1+1</f><v>9</v></c></row>";
+    let out = recalculate_xlsx_bytes(&pack(&parts(rows)), Default::default()).unwrap();
+    assert!(matches!(data(&out.bytes, 0), Data::Float(n) if n > 45_000.0));
+    assert_eq!(data(&out.bytes, 1), Data::Float(2.0));
+}
+#[test]
 fn multiple_changed_members_relocate_growing_and_shrinking_payloads() {
     let old = (0..2048u32)
         .map(|n| format!("{:08x}", n.wrapping_mul(2_654_435_761)))

@@ -223,7 +223,7 @@ impl Function for NumberValueFn {
     }
 }
 
-// TEXT(value, format_text) - limited formatting (#,0,0.00, percent, yyyy, mm, dd, hh:mm) naive
+// TEXT(value, format_text) - Excel number-format codes
 #[derive(Debug)]
 pub struct TextFn;
 /// Formats a value as text using a format pattern.

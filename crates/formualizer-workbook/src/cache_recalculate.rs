@@ -496,7 +496,11 @@ pub fn recalculate_xlsx_bytes(
             {
                 return Err(unsupported("source formula was not ingested", &sheet.name));
             }
-            if snapshot.staleness != Staleness::Current {
+            // Volatile formulas (TODAY, NOW, RAND, ...) stay dirty by design;
+            // evaluate_all has just computed them for this pass.
+            if snapshot.staleness != Staleness::Current
+                && !(snapshot.volatile && snapshot.staleness == Staleness::Dirty)
+            {
                 return Err(unsupported("formula result is not current", &sheet.name));
             }
             let stats = summary.sheets.entry(sheet.name.clone()).or_default();
