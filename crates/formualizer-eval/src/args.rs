@@ -95,6 +95,20 @@ pub struct ValidationOptions {
 
 // Legacy adapter removed in clean break.
 
+/// A criterion operand that Excel reads as a number (`"5"`, `" 1e3 "`,
+/// `"90%"`). Rust spellings such as `inf` or `NaN` stay text.
+fn criteria_number(text: &str) -> Option<f64> {
+    if text
+        .chars()
+        .any(|c| c.is_alphabetic() && !matches!(c, 'e' | 'E'))
+    {
+        return None;
+    }
+    crate::locale::Locale::invariant()
+        .parse_number_invariant(text)
+        .filter(|n| n.is_finite())
+}
+
 pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError> {
     match v {
         LiteralValue::Text(s) => {
@@ -115,7 +129,7 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
                 if let Some(rhs) = s_trim.strip_prefix(op) {
                     let rhs_trim = rhs.trim();
                     // Try numeric parse for comparisons
-                    if let Ok(n) = rhs_trim.parse::<f64>() {
+                    if let Some(n) = criteria_number(rhs_trim) {
                         return Ok(match *op {
                             ">=" => CriteriaPredicate::Ge(n),
                             "<=" => CriteriaPredicate::Le(n),
@@ -155,6 +169,11 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
                 return Ok(CriteriaPredicate::Eq(LiteralValue::Boolean(true)));
             } else if lower == "false" {
                 return Ok(CriteriaPredicate::Eq(LiteralValue::Boolean(false)));
+            }
+            // A number written as text ("111111") is a numeric criterion, as
+            // if written "=111111".
+            if let Some(n) = criteria_number(&plain) {
+                return Ok(CriteriaPredicate::Eq(LiteralValue::Number(n)));
             }
             // Plain text equality
             Ok(CriteriaPredicate::Eq(LiteralValue::Text(plain)))
@@ -372,4 +391,46 @@ pub fn validate_and_prepare<'a, 'b>(
     }
 
     Ok(PreparedArgs { items })
+}
+
+#[cfg(test)]
+mod criteria_tests {
+    use super::*;
+    use crate::builtins::criteria_match;
+
+    fn text(s: &str) -> LiteralValue {
+        LiteralValue::Text(s.into())
+    }
+
+    #[test]
+    fn numeric_text_criterion_matches_numbers() {
+        // SUMIF(A:A,"111111",B:B) sums rows holding the number 111111.
+        for criterion in ["111111", " 111111 ", "=111111"] {
+            let pred = parse_criteria(&text(criterion)).unwrap();
+            assert!(
+                criteria_match(&pred, &LiteralValue::Number(111111.0)),
+                "{criterion}"
+            );
+            assert!(criteria_match(&pred, &text("111111")), "{criterion}");
+            assert!(
+                !criteria_match(&pred, &LiteralValue::Number(11111.0)),
+                "{criterion}"
+            );
+        }
+        let pct = parse_criteria(&text(">=50%")).unwrap();
+        assert!(criteria_match(&pct, &LiteralValue::Number(0.5)));
+        assert!(!criteria_match(&pct, &LiteralValue::Number(0.4)));
+    }
+
+    #[test]
+    fn number_like_words_stay_text() {
+        for word in ["inf", "NaN", "infinity"] {
+            let pred = parse_criteria(&text(word)).unwrap();
+            assert!(criteria_match(&pred, &text(word)), "{word}");
+            assert!(
+                !criteria_match(&pred, &LiteralValue::Number(f64::INFINITY)),
+                "{word}"
+            );
+        }
+    }
 }

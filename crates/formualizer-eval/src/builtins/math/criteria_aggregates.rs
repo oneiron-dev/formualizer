@@ -1932,9 +1932,9 @@ mod tests {
     }
 
     #[test]
-    fn sumif_numeric_zero_matches_blank_in_text_column() {
-        // Regression test: if the criteria range is text-typed (no numeric fast-path column),
-        // numeric criteria should still match blanks (Excel semantics: blank coerces to 0).
+    fn sumif_numeric_zero_skips_blank_in_text_column() {
+        // A blank cell is not the number 0 for criteria: Excel's SUMIF(range,0,...)
+        // and COUNTIF(range,0) skip blanks, whatever else the column holds.
         let wb = TestWorkbook::new().with_function(std::sync::Arc::new(SumIfFn));
         let ctx = interp(&wb);
 
@@ -1959,7 +1959,7 @@ mod tests {
             f.dispatch(&args, &ctx.function_context(None))
                 .unwrap()
                 .into_literal(),
-            LiteralValue::Number(5.0)
+            LiteralValue::Number(0.0)
         );
     }
 

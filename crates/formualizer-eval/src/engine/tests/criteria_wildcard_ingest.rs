@@ -33,6 +33,7 @@ fn wildcard_masks_preserve_scalar_contract_for_base_and_overlay() {
             }
             let range = ReferenceType::range(Some("S".into()), Some(2), Some(1), Some(8), Some(1));
             let pred = crate::args::parse_criteria(&LiteralValue::Text("*".into())).unwrap();
+            // "*" matches text only; the one non-text cell is not counted.
             if overlay {
                 let view = engine.resolve_range_view(&range, "S").unwrap();
                 assert_eq!(
@@ -50,7 +51,7 @@ fn wildcard_masks_preserve_scalar_contract_for_base_and_overlay() {
                     .build_criteria_mask(&view, 0, &pred)
                     .unwrap()
                     .true_count(),
-                7,
+                6,
                 "mixed data must retain a cacheable scalar-equivalent mask"
             );
             for pattern in ["1*", "?", "TRUE*", "~*"] {

@@ -126,15 +126,20 @@ mod tests {
     }
 
     #[test]
-    fn test_numeric_coercion() {
+    fn test_wildcards_match_text_only() {
+        // Excel: COUNTIF(A:A,"123*") does not count the number 123.
         let pred = create_text_like("123*");
 
-        assert!(criteria_match(&pred, &LiteralValue::Number(123.0)));
-        assert!(criteria_match(&pred, &LiteralValue::Number(123.456)));
-        assert!(criteria_match(&pred, &LiteralValue::Int(123)));
+        assert!(!criteria_match(&pred, &LiteralValue::Number(123.0)));
+        assert!(!criteria_match(&pred, &LiteralValue::Number(123.456)));
+        assert!(!criteria_match(&pred, &LiteralValue::Int(123)));
+        assert!(!criteria_match(
+            &create_text_like("TRUE*"),
+            &LiteralValue::Boolean(true)
+        ));
 
-        assert!(!criteria_match(&pred, &LiteralValue::Number(12.3)));
-        assert!(!criteria_match(&pred, &LiteralValue::Int(12)));
+        assert!(criteria_match(&pred, &LiteralValue::Text("123abc".into())));
+        assert!(criteria_match(&pred, &LiteralValue::Text("123".into())));
     }
 
     #[test]
@@ -142,7 +147,8 @@ mod tests {
         let pred_empty = create_text_like("*");
         let pred_something = create_text_like("some*");
 
-        assert!(criteria_match(&pred_empty, &LiteralValue::Empty));
+        // "*" counts text, including empty text, but not blank cells.
+        assert!(!criteria_match(&pred_empty, &LiteralValue::Empty));
         assert!(criteria_match(&pred_empty, &LiteralValue::Text("".into())));
 
         assert!(!criteria_match(&pred_something, &LiteralValue::Empty));

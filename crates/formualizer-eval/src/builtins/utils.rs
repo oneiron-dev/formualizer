@@ -343,6 +343,10 @@ fn values_equal_invariant(a: &LiteralValue, b: &LiteralValue) -> bool {
         (LiteralValue::Text(x), LiteralValue::Empty) if x.is_empty() => true,
         (LiteralValue::Empty, LiteralValue::Text(y)) if y.is_empty() => true,
         (LiteralValue::Empty, LiteralValue::Empty) => true,
+        // A blank cell is not the number 0 for criteria: COUNTIF(A:A,0)
+        // skips blanks and COUNTIF(A:A,"<>0") counts them.
+        (LiteralValue::Number(_) | LiteralValue::Int(_), LiteralValue::Empty)
+        | (LiteralValue::Empty, LiteralValue::Number(_) | LiteralValue::Int(_)) => false,
         // Date/time/duration equality: compare by serial value.
         // This matches criteria semantics (COUNTIF(S), SUMIF(S), database criteria, etc.) where
         // date-like values participate in numeric comparisons.
@@ -359,19 +363,11 @@ fn values_equal_invariant(a: &LiteralValue, b: &LiteralValue) -> bool {
     }
 }
 
+/// Wildcard criteria (`"a*"`, `"?*"`, `"*"`) match text only: numbers,
+/// logicals and blank cells never match, as in Excel.
 fn text_like_match(pattern: &str, case_insensitive: bool, v: &LiteralValue) -> bool {
     let s = match v {
         LiteralValue::Text(t) => t.clone(),
-        LiteralValue::Number(n) => n.to_string(),
-        LiteralValue::Int(i) => i.to_string(),
-        LiteralValue::Boolean(b) => {
-            if *b {
-                "TRUE".into()
-            } else {
-                "FALSE".into()
-            }
-        }
-        LiteralValue::Empty => String::new(),
         _ => return false,
     };
     let (pat, text) = if case_insensitive {

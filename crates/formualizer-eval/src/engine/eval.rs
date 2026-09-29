@@ -2754,6 +2754,41 @@ fn compute_criteria_mask(
             | crate::args::CriteriaPredicate::Ne(formualizer_common::LiteralValue::Int(_))
     );
 
+    // Numeric equality also matches text that reads as the same number
+    // (COUNTIF(A:A,"0010") counts "0010" and 10). The numeric lanes hold no
+    // text, so a column with text takes the scalar-equivalent mask.
+    let numeric_equality = matches!(
+        pred,
+        crate::args::CriteriaPredicate::Eq(
+            formualizer_common::LiteralValue::Number(_) | formualizer_common::LiteralValue::Int(_)
+        ) | crate::args::CriteriaPredicate::Ne(
+            formualizer_common::LiteralValue::Number(_) | formualizer_common::LiteralValue::Int(_)
+        )
+    );
+    if numeric_equality {
+        for tags in view.type_tags_slices() {
+            let (_, _, cols) = tags.ok()?;
+            let tags = cols.get(col_in_view)?;
+            if tags
+                .values()
+                .iter()
+                .any(|tag| *tag == crate::arrow_store::TypeTag::Text as u8)
+            {
+                let mut mask = BooleanBuilder::new();
+                for chunk in view.iter_row_chunks() {
+                    let chunk = chunk.ok()?;
+                    for row in chunk.row_start..chunk.row_start + chunk.row_len {
+                        mask.append_value(crate::builtins::criteria_match(
+                            pred,
+                            &view.get_cell(row, col_in_view),
+                        ));
+                    }
+                }
+                return Some(std::sync::Arc::new(mask.finish()));
+            }
+        }
+    }
+
     // OPTIMIZED PATH: For numeric predicates, apply per-chunk and concatenate boolean masks.
     // This avoids materializing the full numeric column (64-bit per element) and instead
     // concatenates boolean masks (1-bit per element) - a 64x memory reduction.
