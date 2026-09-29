@@ -560,6 +560,12 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         self.interp.local_env().clone()
     }
 
+    /// The interpreter evaluating this argument; helpers such as MAP invoke
+    /// a LAMBDA argument through it.
+    pub(crate) fn interpreter(&self) -> &'a Interpreter<'b> {
+        self.interp
+    }
+
     pub fn inline_array_literal(&self) -> Result<Option<Vec<Vec<LiteralValue>>>, ExcelError> {
         match &self.expr {
             ArgumentExpr::Ast(node) => match &node.node_type {

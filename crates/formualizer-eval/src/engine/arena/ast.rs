@@ -37,6 +37,12 @@ impl TableSpecId {
     }
 }
 
+/// Function name that stores a postfix call such as `LAMBDA(x,x+1)(5)` as a
+/// `Function` node whose first argument is the callee and whose remaining
+/// arguments are the call arguments. The control character keeps it apart
+/// from every name the parser can produce.
+pub const CALL_EXPRESSION_NAME: &str = "\u{1}CALL";
+
 /// Compact representation of AST nodes in the arena
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AstNodeData {
