@@ -728,16 +728,9 @@ impl<'a> Interpreter<'a> {
                     "^" => self
                         .power(left, right)
                         .map(crate::traits::CalcValue::Scalar),
-                    "&" => Ok(crate::traits::CalcValue::Scalar(match (left, right) {
-                        (LiteralValue::Error(error), _) | (_, LiteralValue::Error(error)) => {
-                            LiteralValue::Error(error)
-                        }
-                        (left, right) => LiteralValue::Text(format!(
-                            "{}{}",
-                            crate::coercion::to_text_invariant(&left),
-                            crate::coercion::to_text_invariant(&right)
-                        )),
-                    })),
+                    "&" => self
+                        .concat(left, right)
+                        .map(crate::traits::CalcValue::Scalar),
                     _ => Err(ExcelError::new(ExcelErrorKind::NImpl)
                         .with_message(format!("Binary op '{op}'"))),
                 }
@@ -1244,16 +1237,9 @@ impl<'a> Interpreter<'a> {
             "^" => self
                 .power(left, right)
                 .map(crate::traits::CalcValue::Scalar),
-            "&" => Ok(crate::traits::CalcValue::Scalar(match (left, right) {
-                (LiteralValue::Error(error), _) | (_, LiteralValue::Error(error)) => {
-                    LiteralValue::Error(error)
-                }
-                (left, right) => LiteralValue::Text(format!(
-                    "{}{}",
-                    crate::coercion::to_text_invariant(&left),
-                    crate::coercion::to_text_invariant(&right)
-                )),
-            })),
+            "&" => self
+                .concat(left, right)
+                .map(crate::traits::CalcValue::Scalar),
             ":" => {
                 let left_ref = self.evaluate_ast_as_reference(left_node)?;
                 let right_ref = self.evaluate_ast_as_reference(right_node)?;
@@ -1547,6 +1533,24 @@ impl<'a> Interpreter<'a> {
             }
             (l, r) => f(l, r),
         }
+    }
+
+    /// `&`: text concatenation, element-wise over arrays. An error operand
+    /// (element) propagates, before any text coercion.
+    fn concat(&self, left: LiteralValue, right: LiteralValue) -> Result<LiteralValue, ExcelError> {
+        fn join(left: LiteralValue, right: LiteralValue) -> Result<LiteralValue, ExcelError> {
+            Ok(match (left, right) {
+                (LiteralValue::Error(error), _) | (_, LiteralValue::Error(error)) => {
+                    LiteralValue::Error(error)
+                }
+                (left, right) => LiteralValue::Text(format!(
+                    "{}{}",
+                    crate::coercion::to_text_invariant(&left),
+                    crate::coercion::to_text_invariant(&right)
+                )),
+            })
+        }
+        self.broadcast_apply(left, right, join)
     }
 
     /* ---------- coercion helpers ---------- */

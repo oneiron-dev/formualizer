@@ -103,3 +103,18 @@ fn mismatched_lifted_shapes_pad_with_na() {
     ));
     assert_number("=SUM(ROUND(B1:B3,{0}))", 6.0);
 }
+
+#[test]
+fn concatenation_is_element_wise_over_arrays() {
+    // A1:A3 & B1:B3 = "a1","b2","a3"
+    assert_number("=MATCH(\"b2\",A1:A3&B1:B3,0)", 2.0);
+    assert_number("=ROWS(A1:A3&\"-\")", 3.0);
+    assert_number("=SUM(--(A1:A3&B1:B3=\"a3\"))", 1.0);
+    let mut engine = engine();
+    assert_eq!(
+        eval(&mut engine, "=INDEX(A1:A3&B1:B3,3)"),
+        LiteralValue::Text("a3".into())
+    );
+    // An error element stays an error in its own position only.
+    assert_number("=SUM(--ISERROR({1,\"x\"}&IF({TRUE,FALSE},NA(),1)))", 1.0);
+}
