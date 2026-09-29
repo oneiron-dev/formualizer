@@ -466,6 +466,14 @@ impl<'a> Interpreter<'a> {
         &self,
         reference: &ReferenceType,
     ) -> Result<ReferenceType, ExcelError> {
+        if let ReferenceType::NamedRange(name) = reference
+            && self.resolve_local_name(name).is_none()
+            && let Some(resolved) = self
+                .context
+                .resolve_name_reference(name, self.current_sheet)
+        {
+            return resolved;
+        }
         self.effective_reference(reference)
             .map(|reference| reference.into_owned())
     }

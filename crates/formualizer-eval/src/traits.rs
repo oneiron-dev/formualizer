@@ -735,6 +735,14 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                     if matches!(reference, ReferenceType::External(_)) {
                         return None;
                     }
+                    if let ReferenceType::NamedRange(name) = reference
+                        && self
+                            .interp
+                            .context
+                            .is_value_name(name, self.interp.current_sheet())
+                    {
+                        return None;
+                    }
                     Some(self.interp.reference_for_current_offset(reference))
                 }
                 ASTNodeType::BinaryOp { op, .. } if op == ":" => {
@@ -785,6 +793,14 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                         }
                         let reference = data_store
                             .reconstruct_reference_type_for_eval(ref_type, sheet_registry);
+                        if let ReferenceType::NamedRange(name) = &reference
+                            && self
+                                .interp
+                                .context
+                                .is_value_name(name, self.interp.current_sheet())
+                        {
+                            return None;
+                        }
                         Some(self.interp.reference_for_current_offset(&reference))
                     }
                     crate::engine::arena::AstNodeData::BinaryOp { op_id, .. }
@@ -1720,6 +1736,24 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
         _current_sheet: &str,
     ) -> Result<RangeView<'c>, ExcelError> {
         Err(ExcelError::new(ExcelErrorKind::NImpl))
+    }
+
+    /// The reference a name defined by a reference-returning formula
+    /// (`OFFSET(...)`, `A1:INDEX(...)`) evaluates to. `None` when `name` is not
+    /// such a name, so callers keep the name itself.
+    fn resolve_name_reference(
+        &self,
+        _name: &str,
+        _current_sheet: &str,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        None
+    }
+
+    /// Whether `name` is defined by a formula that yields a value rather than a
+    /// reference (`{0,1,2}`, `MATCH(...)`, `days+1`): arguments that accept a
+    /// reference or a value take its value.
+    fn is_value_name(&self, _name: &str, _current_sheet: &str) -> bool {
+        false
     }
 
     /// Resolve a single-cell reference as a scalar value.

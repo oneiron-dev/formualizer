@@ -216,6 +216,18 @@ impl<'a, R: EvaluationContext> FunctionProvider for DynamicRefCollector<'a, R> {
 }
 
 impl<'a, R: EvaluationContext> EvaluationContext for DynamicRefCollector<'a, R> {
+    fn resolve_name_reference(
+        &self,
+        name: &str,
+        current_sheet: &str,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        self.engine.resolve_name_reference(name, current_sheet)
+    }
+
+    fn is_value_name(&self, name: &str, current_sheet: &str) -> bool {
+        self.engine.is_value_name(name, current_sheet)
+    }
+
     fn cancellation_token(&self) -> Option<crate::engine::CancelToken> {
         self.engine.cancellation_token()
     }

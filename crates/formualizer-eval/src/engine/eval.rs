@@ -5093,6 +5093,70 @@ where
         Ok(())
     }
 
+    /// Whether a name's formula is reference-shaped: a reference, a `:` range
+    /// or a call to a function that can return a reference (OFFSET, INDEX).
+    fn yields_reference(&self, ast: &formualizer_parse::parser::ASTNode) -> bool {
+        use formualizer_parse::parser::ASTNodeType;
+        match &ast.node_type {
+            ASTNodeType::Reference { .. } => true,
+            ASTNodeType::BinaryOp { op, .. } => op == ":",
+            ASTNodeType::Function { name, .. } => self
+                .function_capabilities("", name)
+                .is_some_and(|caps| caps.contains(crate::function::FnCaps::RETURNS_REFERENCE)),
+            _ => false,
+        }
+    }
+
+    /// Run `f` one level deeper into named-formula evaluation. Names that
+    /// refer to themselves, directly or through other names, are #NAME?.
+    fn in_named_formula<T>(f: impl FnOnce() -> Result<T, ExcelError>) -> Result<T, ExcelError> {
+        thread_local! {
+            static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            }
+        }
+        let depth = DEPTH.with(|d| {
+            d.set(d.get() + 1);
+            d.get()
+        });
+        let _guard = Guard;
+        if depth > 64 {
+            return Err(ExcelError::new(ExcelErrorKind::Name)
+                .with_message("Named formula refers to itself".to_string()));
+        }
+        f()
+    }
+
+    /// Evaluate a named formula in `sheet_id` as a range view: it may yield a
+    /// reference (OFFSET(...)), an array constant ({0,1,2}) or a single value.
+    fn evaluate_named_formula<'c>(
+        &'c self,
+        sheet_id: SheetId,
+        ast: &formualizer_parse::parser::ASTNode,
+    ) -> Result<RangeView<'c>, ExcelError> {
+        Self::in_named_formula(|| {
+            let sheet = self.graph.sheet_name(sheet_id);
+            let cell_ref = self.graph.make_cell_ref(sheet, 0, 0);
+            let interpreter = Interpreter::new_with_cell(self, sheet, cell_ref);
+            match interpreter.evaluate_ast(ast)? {
+                crate::traits::CalcValue::Range(view) => Ok(view),
+                other => match other.into_literal() {
+                    LiteralValue::Array(rows) => {
+                        Ok(RangeView::from_owned_rows(rows, self.config.date_system))
+                    }
+                    value => Ok(RangeView::from_owned_rows(
+                        vec![vec![value]],
+                        self.config.date_system,
+                    )),
+                },
+            }
+        })
+    }
+
     /// Whether the formula at `address` is dirty only because it is volatile
     /// or reads a volatile result: the last recalc computed its value and
     /// re-marked it for the next one.
@@ -26738,6 +26802,46 @@ impl<R> crate::traits::EvaluationContext for Engine<R>
 where
     R: EvaluationContext,
 {
+    fn is_value_name(&self, name: &str, current_sheet: &str) -> bool {
+        let Some(current_id) = self.graph.sheet_id(current_sheet) else {
+            return false;
+        };
+        match self.graph.resolve_name_entry(name, current_id) {
+            Some(named) => match &named.definition {
+                NamedDefinition::Formula { ast, .. } => !self.yields_reference(ast),
+                NamedDefinition::Literal(_) => true,
+                _ => false,
+            },
+            None => false,
+        }
+    }
+
+    fn resolve_name_reference(
+        &self,
+        name: &str,
+        current_sheet: &str,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        let current_id = self.graph.sheet_id(current_sheet)?;
+        let named = self.graph.resolve_name_entry(name, current_id)?;
+        let NamedDefinition::Formula { ast, .. } = &named.definition else {
+            return None;
+        };
+        if !self.yields_reference(ast) {
+            return None;
+        }
+        let sheet_id = match named.scope {
+            NameScope::Sheet(id) => id,
+            NameScope::Workbook => current_id,
+        };
+        let sheet = self.graph.sheet_name(sheet_id);
+        let cell_ref = self.graph.make_cell_ref(sheet, 0, 0);
+        let interpreter = Interpreter::new_with_cell(self, sheet, cell_ref);
+        match Self::in_named_formula(|| Ok(interpreter.try_evaluate_ast_as_reference(ast))) {
+            Ok(result) => result,
+            Err(err) => Some(Err(err)),
+        }
+    }
+
     fn clock(&self) -> &dyn crate::timezone::ClockProvider {
         &self.clock
     }
@@ -27357,13 +27461,16 @@ where
                                 self.config.date_system,
                             ));
                         }
-                        NamedDefinition::Formula { .. } => {
-                            if let Some(value) = self.graph.get_value(named.vertex) {
-                                return Ok(RangeView::from_owned_rows(
-                                    vec![vec![value]],
-                                    self.config.date_system,
-                                ));
+                        NamedDefinition::Formula { ast, .. } => {
+                            // A named formula evaluates where it is used: it may
+                            // yield a reference (OFFSET(...)), an array constant
+                            // ({0,1,2}) or a single value.
+                            let context_sheet = match named.scope {
+                                NameScope::Sheet(id) => Some(id),
+                                NameScope::Workbook => self.graph.sheet_id(current_sheet),
                             }
+                            .unwrap_or_else(|| self.graph.default_sheet_id());
+                            return self.evaluate_named_formula(context_sheet, ast);
                         }
                     }
                 }

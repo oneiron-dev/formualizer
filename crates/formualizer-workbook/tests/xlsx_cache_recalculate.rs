@@ -942,3 +942,59 @@ fn defined_names_keep_spaces_around_entities_in_sheet_names() {
     assert!(sheet.contains("<f>Yr+1</f><v>2027</v>"), "{sheet}");
     assert!(sheet.contains("<v>1-JAN2026</v>"), "{sheet}");
 }
+#[test]
+fn names_defined_by_formulas_and_constants() {
+    // Names may hold a formula (MATCH over other names), an array constant
+    // or a reference-returning formula (OFFSET); each evaluates where used.
+    let mut p = parts(
+        "<row r=\"1\"><c r=\"A1\"><v>2020</v></c><c r=\"B1\" t=\"inlineStr\"><is><t>April</t></is></c><c r=\"C1\" t=\"inlineStr\"><is><t>Monday</t></is></c></row>\
+         <row r=\"2\"><c r=\"A2\"><f>MonOpt</f><v>0</v></c><c r=\"B2\"><f>WkOpt</f><v>0</v></c><c r=\"C2\"><f>SUM(Days)</f><v>0</v></c><c r=\"D2\"><f>WEEKDAY(DATE(Yr,MonOpt,1),WkOpt)</f><v>0</v></c><c r=\"E2\"><f>INDEX(Days+1,2)</f><v>0</v></c><c r=\"F2\"><f>DATE(Yr,MonOpt,1)</f><v>0</v></c></row>\
+         <row r=\"3\"><c r=\"G3\"><v>5</v></c><c r=\"H3\"><f>SUM(Filled)</f><v>0</v></c><c r=\"I3\"><f>ROWS(Filled)</f><v>0</v></c><c r=\"J3\"><f>MATCH(7,Filled,0)</f><v>0</v></c><c r=\"K3\"><f>INDEX(Filled,2)</f><v>0</v></c><c r=\"L3\"><f>COUNTIF(Filled,\"&gt;5\")</f><v>0</v></c></row>\
+         <row r=\"4\"><c r=\"G4\"><v>7</v></c></row><row r=\"5\"><c r=\"G5\"><v>9</v></c></row>",
+    );
+    let wb = p.get_mut("xl/workbook.xml").unwrap();
+    *wb = wb.replace(
+        "</workbook>",
+        "<definedNames><definedName name=\"Days\">{0,1,2,3,4,5,6}</definedName><definedName name=\"Filled\">OFFSET(Sheet1!$G$3,0,0,COUNT(Sheet1!$G:$G),1)</definedName><definedName name=\"MonOpt\">MATCH(Mon,Months,0)</definedName><definedName name=\"Mon\">Sheet1!$B$1</definedName><definedName name=\"Months\">{\"January\",\"February\",\"March\",\"April\"}</definedName><definedName name=\"Yr\">Sheet1!$A$1</definedName><definedName name=\"WkOpt\">MATCH(WS,Weekdays,0)+10</definedName><definedName name=\"WS\">Sheet1!$C$1</definedName><definedName name=\"Weekdays\">{\"Monday\",\"Tuesday\"}</definedName></definedNames></workbook>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<f>MonOpt</f><v>4</v>",
+        "<f>WkOpt</f><v>11</v>",
+        "<f>SUM(Days)</f><v>21</v>",
+        "<f>WEEKDAY(DATE(Yr,MonOpt,1),WkOpt)</f><v>3</v>",
+        "<f>INDEX(Days+1,2)</f><v>2</v>",
+        "<f>DATE(Yr,MonOpt,1)</f><v>43922</v>",
+        "<f>SUM(Filled)</f><v>21</v>",
+        "<f>ROWS(Filled)</f><v>3</v>",
+        "<f>MATCH(7,Filled,0)</f><v>2</v>",
+        "<f>INDEX(Filled,2)</f><v>7</v>",
+        "<f>COUNTIF(Filled,\"&gt;5\")</f><v>2</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected}: {sheet}");
+    }
+}
+#[test]
+fn sheet_qualified_names_resolve_in_their_sheet() {
+    // Sheet1!Yr names the sheet-level name Yr of Sheet1, and names may be
+    // defined in terms of names that come later in the file.
+    let mut p = parts(
+        "<row r=\"1\"><c r=\"A1\"><v>2021</v></c><c r=\"B1\"><f>firstdate</f><v>0</v></c><c r=\"C1\"><f>Sheet1!firstdate</f><v>0</v></c><c r=\"E1\"><f>INDEX(calendar,2)</f><v>0</v></c><c r=\"F1\"><f>YrNext</f><v>0</v></c></row>",
+    );
+    let wb = p.get_mut("xl/workbook.xml").unwrap();
+    *wb = wb.replace(
+        "</workbook>",
+        "<definedNames><definedName name=\"calendar\" localSheetId=\"0\">days+Sheet1!firstdate</definedName><definedName name=\"days\">{0,1,2,3,4,5,6}</definedName><definedName name=\"firstdate\" localSheetId=\"0\">DATE(Sheet1!Yr,1,1)</definedName><definedName name=\"Yr\" localSheetId=\"0\">Sheet1!$A$1</definedName><definedName name=\"YrNext\">Sheet1!Yr+1</definedName></definedNames></workbook>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<f>firstdate</f><v>44197</v>",
+        "<f>Sheet1!firstdate</f><v>44197</v>",
+        "<f>INDEX(calendar,2)</f><v>44198</v>",
+        "<f>YrNext</f><v>2022</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected}: {sheet}");
+    }
+}

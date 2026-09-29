@@ -1514,7 +1514,8 @@ impl CalamineAdapter {
         out
     }
 
-    fn scan_defined_names_from_reader<R>(reader: R, sheet_names: &[String]) -> Vec<DefinedName>
+    /// Every `<definedName>` in workbook.xml as (name, localSheetId, text).
+    fn read_defined_name_texts<R>(reader: R) -> Vec<(String, Option<usize>, String)>
     where
         R: Read + Seek,
     {
@@ -1533,11 +1534,10 @@ impl CalamineAdapter {
         // workbook.xml, avoiding a full file String allocation or any sheet XML reparse.
         // Text is not trimmed: an entity splits a definition such as
         // 'A &amp; B'!$A$1 into text events whose edge spaces belong to the
-        // sheet name. convert_defined_name trims the whole definition.
+        // sheet name. Consumers trim the whole definition.
         let mut xml = XmlReader::from_reader(BufReader::new(entry));
 
         let mut out = Vec::new();
-        let mut seen: HashSet<(DefinedNameScope, Option<String>, String)> = HashSet::new();
         let mut buf = Vec::new();
         let mut inner_buf = Vec::new();
         let mut in_defined_names = false;
@@ -1578,18 +1578,8 @@ impl CalamineAdapter {
                         }
                     }
 
-                    if let Some(name) = name
-                        && let Some(converted) =
-                            Self::convert_defined_name(&name, &value, local_sheet_id, sheet_names)
-                    {
-                        let key = (
-                            converted.scope.clone(),
-                            converted.scope_sheet.clone(),
-                            converted.name.clone(),
-                        );
-                        if seen.insert(key) {
-                            out.push(converted);
-                        }
+                    if let Some(name) = name {
+                        out.push((name, local_sheet_id, value));
                     }
                 }
                 Ok(Event::Eof) => break,
@@ -1597,7 +1587,60 @@ impl CalamineAdapter {
                 _ => {}
             }
         }
+        out
+    }
 
+    fn scan_defined_names_from_reader<R>(reader: R, sheet_names: &[String]) -> Vec<DefinedName>
+    where
+        R: Read + Seek,
+    {
+        let mut out = Vec::new();
+        let mut seen: HashSet<(DefinedNameScope, Option<String>, String)> = HashSet::new();
+        for (name, local_sheet_id, value) in Self::read_defined_name_texts(reader) {
+            if let Some(converted) =
+                Self::convert_defined_name(&name, &value, local_sheet_id, sheet_names)
+            {
+                let key = (
+                    converted.scope.clone(),
+                    converted.scope_sheet.clone(),
+                    converted.name.clone(),
+                );
+                if seen.insert(key) {
+                    out.push(converted);
+                }
+            }
+        }
+        out
+    }
+
+    /// Names defined by a formula or a constant (`{0,1,2}`,
+    /// `MATCH(Month,Months,0)`) rather than a plain cell or range, as
+    /// (name, scope sheet, formula AST). Built-in `_xlnm.` names are skipped.
+    fn scan_formula_names_from_reader<R>(
+        reader: R,
+        sheet_names: &[String],
+    ) -> Vec<(String, Option<String>, ASTNode)>
+    where
+        R: Read + Seek,
+    {
+        let mut out = Vec::new();
+        for (name, local_sheet_id, value) in Self::read_defined_name_texts(reader) {
+            if name.starts_with("_xlnm.")
+                || Self::convert_defined_name(&name, &value, local_sheet_id, sheet_names).is_some()
+            {
+                continue;
+            }
+            let text = value.trim();
+            let text = text.strip_prefix('=').unwrap_or(text);
+            if text.is_empty() {
+                continue;
+            }
+            let Ok(ast) = formualizer_parse::parse(format!("={text}")) else {
+                continue;
+            };
+            let scope_sheet = local_sheet_id.and_then(|idx| sheet_names.get(idx).cloned());
+            out.push((name, scope_sheet, ast));
+        }
         out
     }
 
@@ -2190,6 +2233,37 @@ where
                     engine
                         .define_name(&dn.name, definition, scope)
                         .map_err(|e| calamine::Error::Io(std::io::Error::other(e.to_string())))?;
+                }
+            }
+
+            // Names defined by a formula or constant. A name may read another
+            // formula name defined later in the file, so define in passes until
+            // no more succeed; the rest stay undefined (#NAME?).
+            {
+                Self::cancellation_checkpoint(cancel.as_ref())?;
+                let sheet_names = self.cached_names.clone().unwrap_or_default();
+                let mut pending =
+                    Self::scan_formula_names_from_reader(self.cancellable_reader(), &sheet_names);
+                loop {
+                    let before = pending.len();
+                    pending.retain(|(name, scope_sheet, ast)| {
+                        let scope = match scope_sheet {
+                            None => NameScope::Workbook,
+                            Some(sheet) => match engine.sheet_id(sheet) {
+                                Some(id) => NameScope::Sheet(id),
+                                None => return false,
+                            },
+                        };
+                        let definition = NamedDefinition::Formula {
+                            ast: ast.clone(),
+                            dependencies: Vec::new(),
+                            range_deps: Vec::new(),
+                        };
+                        engine.define_name(name, definition, scope).is_err()
+                    });
+                    if pending.is_empty() || pending.len() == before {
+                        break;
+                    }
                 }
             }
 
