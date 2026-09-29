@@ -165,9 +165,7 @@ fn invalid_date_time_text_remains_value_error() {
         "=\"\"+0",
         "=\"13/13/13\"+0",
         "=\"123-456\"+0",
-        "=\"03-01-01\"+0",
         "=\"15/01/2003\"+0",
-        "=\"2003/1/1\"+0",
         "=\"1/1/03T12:00\"+0",
     ];
 
@@ -184,28 +182,48 @@ fn invalid_date_time_text_remains_value_error() {
 }
 
 #[test]
-fn month_day_without_year_and_malformed_time_remain_value_errors() {
-    // #290 non-goals, pinned at the eval layer. Month-plus-day-without-year
-    // ("Jan-03", "1/03") and the month-name-plus-day form ("Jan 3") must not
-    // be filled with a wall-clock year, and "12:00.5" (a single-colon time
-    // with a stray dot) must not be silently accepted as 12:00.
-    let cases = [
+fn excel_date_shapes_and_year_less_dates_use_the_clock_year() {
+    // Excel en-US reads m-d-y with dashes and y/m/d with a four-digit year.
+    for (formula, serial_1900) in [("=\"03-01-01\"+0", 36951.0), ("=\"2003/1/1\"+0", 37622.0)] {
+        assert_expected(
+            DateSystem::Excel1900,
+            formula,
+            "excel en-US",
+            Expected::Number(serial_1900),
+        );
+        assert_expected(
+            DateSystem::Excel1904,
+            formula,
+            "excel en-US",
+            Expected::Number(serial_1900 - 1462.0),
+        );
+    }
+    // Date text without a year reads in the evaluation clock's year, as
+    // Excel's DATEVALUE documents; a malformed time stays #VALUE!.
+    use chrono::Datelike;
+    let year = chrono::Utc::now().year();
+    let jan3 = NaiveDate::from_ymd_opt(year, 1, 3).unwrap();
+    let expected = formualizer_common::date_to_serial_for(DateSystem::Excel1900, &jan3);
+    for formula in [
         "=\"Jan-03\"+0",
         "=\"1/03\"+0",
         "=\"Jan 3\"+0",
-        "=\"12:00.5\"+0",
-    ];
-
-    for system in [DateSystem::Excel1900, DateSystem::Excel1904] {
-        for formula in cases {
-            assert_expected(
-                system,
-                formula,
-                "oracle: lo-verified",
-                Expected::Error(ExcelErrorKind::Value),
-            );
+        "=\"3-Jan\"+0",
+    ] {
+        match eval_formula(DateSystem::Excel1900, formula) {
+            LiteralValue::Number(n) => assert!(
+                n == expected || (n - expected).abs() == 365.0 || (n - expected).abs() == 366.0,
+                "{formula}: {n} vs {expected}"
+            ),
+            other => panic!("{formula}: {other:?}"),
         }
     }
+    assert_expected(
+        DateSystem::Excel1900,
+        "=\"12:00.5\"+0",
+        "oracle: lo-verified",
+        Expected::Error(ExcelErrorKind::Value),
+    );
 }
 
 #[test]
@@ -282,4 +300,36 @@ fn non_arithmetic_text_semantics_are_unchanged() {
             assert_expected(system, formula, "oracle: lo-verified", expected);
         }
     }
+}
+
+#[test]
+fn date_functions_and_value_read_date_text() {
+    for (formula, expected) in [
+        ("=MONTH(\"July\"&1)", 7.0),
+        ("=MONTH(\"3/15/2021\")", 3.0),
+        ("=DAY(\"15-Mar-2021\")", 15.0),
+        ("=YEAR(\"1 January 2023\")", 2023.0),
+        ("=DAYS(\"15-MAR-2021\",\"1-FEB-2021\")", 42.0),
+        ("=EOMONTH(\"3/15/2021\",0)", 44286.0),
+        ("=WEEKDAY(\"3/15/2021\")", 2.0),
+        ("=VALUE(\"1/2/2023\")", 44928.0),
+        ("=DATEVALUE(\"1\"&\"June\"&\"2021\")", 44348.0),
+        ("=--\"Jan 5 2023\"", 44931.0),
+    ] {
+        match eval_formula(DateSystem::Excel1900, formula) {
+            LiteralValue::Number(n) => assert_eq!(n, expected, "{formula}"),
+            LiteralValue::Int(n) => assert_eq!(n as f64, expected, "{formula}"),
+            other => assert_eq!(
+                other.as_serial_number_for(DateSystem::Excel1900),
+                Some(expected),
+                "{formula}"
+            ),
+        }
+    }
+    assert_expected(
+        DateSystem::Excel1900,
+        "=MONTH(\"not a date\")",
+        "excel",
+        Expected::Error(ExcelErrorKind::Value),
+    );
 }

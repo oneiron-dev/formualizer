@@ -376,6 +376,13 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         self.interp.context.date_system()
     }
 
+    /// The evaluation clock's year, which Excel uses for date text that omits
+    /// the year (`Jan 3`).
+    pub(crate) fn current_year(&self) -> i32 {
+        use chrono::Datelike;
+        self.interp.context.clock().today().year()
+    }
+
     /// Returns whether this handle represents an explicitly omitted argument slot.
     ///
     /// This is false for absent arguments, explicit empty text, and blank references.

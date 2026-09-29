@@ -41,6 +41,16 @@ pub fn to_number_lenient(value: &LiteralValue) -> Result<f64, ExcelError> {
 /// converted to serials using the workbook's date system instead of the
 /// implicit Excel-1900 default.
 pub fn to_serial_lenient(value: &LiteralValue, system: DateSystem) -> Result<f64, ExcelError> {
+    to_serial_lenient_in_year(value, system, None)
+}
+
+/// [`to_serial_lenient`] that also reads date/time text (the date functions'
+/// argument coercion); year-less date text reads in `current_year`.
+pub fn to_serial_lenient_in_year(
+    value: &LiteralValue,
+    system: DateSystem,
+    current_year: Option<i32>,
+) -> Result<f64, ExcelError> {
     match value {
         LiteralValue::Date(_)
         | LiteralValue::DateTime(_)
@@ -48,6 +58,14 @@ pub fn to_serial_lenient(value: &LiteralValue, system: DateSystem) -> Result<f64
         | LiteralValue::Duration(_) => value.as_serial_number_for(system).ok_or_else(|| {
             ExcelError::new(ExcelErrorKind::Value)
                 .with_message("Cannot convert to date/time serial")
+        }),
+        LiteralValue::Text(s) => to_number_lenient(value).or_else(|error| {
+            formualizer_common::parse_excel_datetime_text_to_serial_in_year_for(
+                system,
+                s,
+                current_year,
+            )
+            .ok_or(error)
         }),
         _ => to_number_lenient(value),
     }
@@ -101,15 +119,23 @@ pub fn to_number_lenient_with_locale(
 /// parsed by `formualizer-common` and encoded in the workbook's date system.
 /// Aggregate arguments, comparisons, criteria, and functions such as `N`
 /// continue to use their existing coercion policies.
+/// Year-less date text (`Jan 3`) reads in `current_year`, Excel's clock year.
 pub(crate) fn to_arithmetic_number_with_locale(
     value: &LiteralValue,
     loc: &crate::locale::Locale,
     system: DateSystem,
+    current_year: Option<i32>,
 ) -> Result<f64, ExcelError> {
     match value {
         LiteralValue::Text(s) => loc
             .parse_number_invariant(s)
-            .or_else(|| formualizer_common::parse_excel_datetime_text_to_serial_for(system, s))
+            .or_else(|| {
+                formualizer_common::parse_excel_datetime_text_to_serial_in_year_for(
+                    system,
+                    s,
+                    current_year,
+                )
+            })
             .ok_or_else(|| {
                 ExcelError::new(ExcelErrorKind::Value)
                     .with_message(format!("Cannot convert '{s}' to arithmetic operand"))

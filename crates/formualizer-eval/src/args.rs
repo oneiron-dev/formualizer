@@ -296,7 +296,21 @@ pub fn validate_and_prepare<'a, 'b>(
                                 }
                             }
                             CoercionPolicy::NumberLenientText => {
-                                match crate::coercion::to_number_lenient(v.as_ref()) {
+                                // Excel's lenient text coercion also reads
+                                // date/time text ("3/15/2021", "10:30 AM").
+                                match crate::coercion::to_number_lenient(v.as_ref()).or_else(
+                                    |error| match v.as_ref() {
+                                        LiteralValue::Text(text) => {
+                                            formualizer_common::parse_excel_datetime_text_to_serial_in_year_for(
+                                                arg.date_system(),
+                                                text,
+                                                Some(arg.current_year()),
+                                            )
+                                            .ok_or(error)
+                                        }
+                                        _ => Err(error),
+                                    },
+                                ) {
                                     Ok(n) => Cow::Owned(LiteralValue::Number(n)),
                                     Err(e) => {
                                         if options.warn_only {

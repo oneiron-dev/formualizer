@@ -115,8 +115,11 @@ impl Function for DateValueFn {
             }
         };
 
-        if let Some(date) =
-            parse_excel_date_text(&date_text).or_else(|| parse_legacy_datevalue_text(&date_text))
+        if let Some(date) = formualizer_common::parse_excel_date_text_in_year(
+            &date_text,
+            Some(args[0].current_year()),
+        )
+        .or_else(|| parse_legacy_datevalue_text(&date_text))
         {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
                 date_to_serial_for(system, &date),

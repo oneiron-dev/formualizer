@@ -1188,6 +1188,7 @@ impl<'a> Interpreter<'a> {
             &v,
             &self.context.locale(),
             self.context.date_system(),
+            self.current_year(),
         ) {
             Ok(n) => match crate::coercion::sanitize_numeric(f(n)) {
                 Ok(n2) => Ok(LiteralValue::Number(n2)),
@@ -1195,6 +1196,12 @@ impl<'a> Interpreter<'a> {
             },
             Err(e) => Ok(LiteralValue::Error(e)),
         }
+    }
+
+    /// Year for date text that omits it (`Jan 3`): Excel uses its clock's year.
+    fn current_year(&self) -> Option<i32> {
+        use chrono::Datelike;
+        Some(self.context.clock().today().year())
     }
 
     /* ===================  binary ops  =================== */
@@ -1335,11 +1342,13 @@ impl<'a> Interpreter<'a> {
                 &l,
                 &self.context.locale(),
                 self.context.date_system(),
+                self.current_year(),
             );
             let b = crate::coercion::to_arithmetic_number_with_locale(
                 &r,
                 &self.context.locale(),
                 self.context.date_system(),
+                self.current_year(),
             );
             match (a, b) {
                 (Ok(a), Ok(b)) => match crate::coercion::sanitize_numeric(f(a, b)) {
@@ -1357,11 +1366,13 @@ impl<'a> Interpreter<'a> {
                 &l,
                 &self.context.locale(),
                 self.context.date_system(),
+                self.current_year(),
             );
             let rn = crate::coercion::to_arithmetic_number_with_locale(
                 &r,
                 &self.context.locale(),
                 self.context.date_system(),
+                self.current_year(),
             );
             let (a, b) = match (ln, rn) {
                 (Ok(a), Ok(b)) => (a, b),
@@ -1385,11 +1396,13 @@ impl<'a> Interpreter<'a> {
                 &l,
                 &self.context.locale(),
                 self.context.date_system(),
+                self.current_year(),
             );
             let rn = crate::coercion::to_arithmetic_number_with_locale(
                 &r,
                 &self.context.locale(),
                 self.context.date_system(),
+                self.current_year(),
             );
             let (a, b) = match (ln, rn) {
                 (Ok(a), Ok(b)) => (a, b),

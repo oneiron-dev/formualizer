@@ -95,7 +95,13 @@ impl Function for ValueFn {
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         let s = to_text(&args[0])?;
-        let Some(n) = ctx.locale().parse_number_invariant(&s) else {
+        // Numeric text, then date/time text (VALUE("1/2/2023") is a serial).
+        let Ok(n) = crate::coercion::to_arithmetic_number_with_locale(
+            &LiteralValue::Text(s),
+            &ctx.locale(),
+            ctx.date_system(),
+            Some(args[0].current_year()),
+        ) else {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_value(),
             )));
@@ -313,6 +319,7 @@ impl Function for TextFn {
                 &LiteralValue::Text(t.clone()),
                 &ctx.locale(),
                 ctx.date_system(),
+                Some(args[0].current_year()),
             ) {
                 Ok(n) => n,
                 Err(_) => {

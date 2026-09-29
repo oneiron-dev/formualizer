@@ -42,7 +42,8 @@ fn coerce_to_serial(arg: &ArgumentHandle, system: DateSystem) -> Result<f64, Exc
     if let LiteralValue::Error(e) = v {
         return Err(e);
     }
-    crate::coercion::to_serial_lenient(&v, system).map_err(|_| ExcelError::new_value())
+    crate::coercion::to_serial_lenient_in_year(&v, system, Some(arg.current_year()))
+        .map_err(|_| ExcelError::new_value())
 }
 
 fn coerce_to_int(arg: &ArgumentHandle) -> Result<i64, ExcelError> {

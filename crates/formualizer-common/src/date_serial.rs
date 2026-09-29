@@ -68,6 +68,14 @@ pub fn time_to_fraction(time: &NaiveTime) -> f64 {
 /// a four-digit year. Parsing has no locale parameter and never consults the
 /// host locale.
 pub fn parse_excel_date_text(input: &str) -> Option<NaiveDate> {
+    parse_excel_date_text_in_year(input, None)
+}
+
+/// [`parse_excel_date_text`] plus Excel's forms that omit the year
+/// (`Jan 3`, `3-Jan`, `July1`, `1/3`), which Excel reads in the current year.
+/// With `current_year` absent those forms are rejected, keeping parsing
+/// independent of the wall clock.
+pub fn parse_excel_date_text_in_year(input: &str, current_year: Option<i32>) -> Option<NaiveDate> {
     let text = input.trim();
     if text.is_empty() {
         return None;
@@ -77,7 +85,150 @@ pub fn parse_excel_date_text(input: &str) -> Option<NaiveDate> {
         return Some(date);
     }
 
-    parse_iso_date(text).or_else(|| parse_month_name_date(text))
+    parse_iso_date(text)
+        .or_else(|| parse_month_name_date(text))
+        .or_else(|| parse_general_date(text, current_year))
+}
+
+#[derive(Clone, Copy)]
+enum DateToken {
+    Number { value: u32, digits: usize },
+    Month(u32),
+}
+
+/// Excel's en-US date shapes over numbers and English month names separated
+/// by spaces, `-`, `/` or `,` (a month name may touch its number: `July1`,
+/// `1June2021`): `d Mon y`, `Mon d y`, `Mon y` (4-digit or > 31: first of the
+/// month), `m-d-y` / `y-m-d`, `m/y` with a 4-digit year, and year-less
+/// `Mon d`, `d Mon`, `m/d` in `current_year`.
+fn parse_general_date(text: &str, current_year: Option<i32>) -> Option<NaiveDate> {
+    let mut tokens = Vec::new();
+    let mut separators = String::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            let digits = &text[start..i];
+            if digits.len() > 4 {
+                return None;
+            }
+            tokens.push(DateToken::Number {
+                value: digits.parse().ok()?,
+                digits: digits.len(),
+            });
+        } else if b.is_ascii_alphabetic() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            let word = &text[start..i];
+            let month = parse_month_name(word)
+                .or_else(|| word.eq_ignore_ascii_case("sept").then_some(9))?;
+            tokens.push(DateToken::Month(month));
+        } else if matches!(b, b' ' | b'-' | b'/' | b',') {
+            separators.push(b as char);
+            i += 1;
+        } else {
+            return None;
+        }
+    }
+    let day_in = |year: i32, month: u32, day: u32| NaiveDate::from_ymd_opt(year, month, day);
+    let year_of = |value: u32, digits: usize| match digits {
+        4 => Some(value as i32),
+        1 | 2 if value <= 29 => Some(2000 + value as i32),
+        1 | 2 => Some(1900 + value as i32),
+        _ => None,
+    };
+    use DateToken::{Month, Number};
+    match tokens.as_slice() {
+        [
+            Month(m),
+            Number {
+                value: d,
+                digits: 1 | 2,
+            },
+            Number {
+                value: y,
+                digits: yd,
+            },
+        ]
+        | [
+            Number {
+                value: d,
+                digits: 1 | 2,
+            },
+            Month(m),
+            Number {
+                value: y,
+                digits: yd,
+            },
+        ] => day_in(year_of(*y, *yd)?, *m, *d),
+        [Month(m), Number { value, digits }] => {
+            if *digits == 4 {
+                day_in(*value as i32, *m, 1)
+            } else if *value <= 31 {
+                day_in(current_year?, *m, *value)
+            } else {
+                day_in(year_of(*value, *digits)?, *m, 1)
+            }
+        }
+        [
+            Number {
+                value: d,
+                digits: 1 | 2,
+            },
+            Month(m),
+        ] => day_in(current_year?, *m, *d),
+        _ if separators.contains(' ') || separators.contains(',') => None,
+        [
+            Number {
+                value: a,
+                digits: ad,
+            },
+            Number {
+                value: b,
+                digits: 1 | 2,
+            },
+            Number {
+                value: c,
+                digits: cd,
+            },
+        ] => {
+            if *ad == 4 {
+                day_in(*a as i32, *b, *c).filter(|_| *cd <= 2)
+            } else if *ad <= 2 {
+                day_in(year_of(*c, *cd)?, *a, *b)
+            } else {
+                None
+            }
+        }
+        [
+            Number {
+                value: m,
+                digits: 1 | 2,
+            },
+            Number {
+                value: y,
+                digits: 4,
+            },
+        ] => day_in(*y as i32, *m, 1),
+        [
+            Number {
+                value: m,
+                digits: 1 | 2,
+            },
+            Number {
+                value: d,
+                digits: 1 | 2,
+            },
+        ] => day_in(current_year?, *m, *d),
+        _ => None,
+    }
 }
 
 fn parse_numeric_slash_date(text: &str) -> Option<NaiveDate> {
@@ -256,6 +407,15 @@ fn strip_fractional_seconds(text: &str) -> String {
 /// date. There is no locale parameter, and parsing is independent of the host
 /// locale.
 pub fn parse_excel_datetime_text(input: &str) -> Option<NaiveDateTime> {
+    parse_excel_datetime_text_in_year(input, None)
+}
+
+/// [`parse_excel_datetime_text`] whose date part may omit the year (see
+/// [`parse_excel_date_text_in_year`]).
+pub fn parse_excel_datetime_text_in_year(
+    input: &str,
+    current_year: Option<i32>,
+) -> Option<NaiveDateTime> {
     let text = input.trim();
     text.char_indices()
         .filter(|(_, ch)| *ch == 'T' || ch.is_ascii_whitespace())
@@ -264,7 +424,7 @@ pub fn parse_excel_datetime_text(input: &str) -> Option<NaiveDateTime> {
             let date = if ch == 'T' {
                 parse_iso_date(&text[..index])?
             } else {
-                parse_excel_date_text(&text[..index])?
+                parse_excel_date_text_in_year(&text[..index], current_year)?
             };
             let time = parse_excel_time_text(&text[time_start..])?;
             Some(date.and_time(time))
@@ -278,10 +438,20 @@ pub fn parse_excel_datetime_text(input: &str) -> Option<NaiveDateTime> {
 /// locale parameter. Date-bearing results honor the selected workbook date
 /// system; time-only results are fractional days in either system.
 pub fn parse_excel_datetime_text_to_serial_for(system: DateSystem, input: &str) -> Option<f64> {
-    if let Some(datetime) = parse_excel_datetime_text(input) {
+    parse_excel_datetime_text_to_serial_in_year_for(system, input, None)
+}
+
+/// [`parse_excel_datetime_text_to_serial_for`] accepting year-less dates in
+/// `current_year`, as Excel does with its clock's year.
+pub fn parse_excel_datetime_text_to_serial_in_year_for(
+    system: DateSystem,
+    input: &str,
+    current_year: Option<i32>,
+) -> Option<f64> {
+    if let Some(datetime) = parse_excel_datetime_text_in_year(input, current_year) {
         return Some(datetime_to_serial_for(system, &datetime));
     }
-    if let Some(date) = parse_excel_date_text(input) {
+    if let Some(date) = parse_excel_date_text_in_year(input, current_year) {
         return Some(date_to_serial_for(system, &date));
     }
     parse_excel_time_text(input).map(|time| time_to_fraction(&time))
@@ -639,8 +809,8 @@ mod tests {
             assert_eq!(parse_excel_date_text(input), Some(expected), "{input}");
         }
 
-        // oracle: lo-verified. A short year is not accepted in ISO year position.
-        assert_eq!(parse_excel_date_text("03-01-01"), None);
+        // Excel en-US reads a short leading number as the month (m-d-y).
+        assert_eq!(parse_excel_date_text("03-01-01"), Some(date(2001, 3, 1)));
         assert_eq!(
             parse_excel_datetime_text_to_serial_for(DateSystem::Excel1900, "12:00"),
             Some(0.5)
@@ -652,7 +822,8 @@ mod tests {
         // oracle: lo-verified. Arithmetic follows en-US m/d/y, unlike DATEVALUE's
         // separately retained legacy fallbacks.
         assert_eq!(parse_excel_date_text("15/01/2003"), None);
-        assert_eq!(parse_excel_date_text("2003/1/1"), None);
+        // A four-digit leading year reads as y/m/d, as in Excel.
+        assert_eq!(parse_excel_date_text("2003/1/1"), Some(date(2003, 1, 1)));
         assert_eq!(parse_excel_datetime_text("1/1/03T12:00"), None);
         assert_eq!(
             parse_excel_datetime_text("2003-01-01T12:00"),
@@ -725,11 +896,60 @@ mod tests {
     fn month_year_only_requires_a_four_digit_year() {
         // A one- or two-digit trailing token is a day, not a year: the
         // month-year form is held to an unambiguous four-digit year so that
-        // "Jan 3" is not silently read as 2003-01-01 (#290). Excel and
-        // LibreOffice reject the month-plus-day-without-year shape.
+        // "Jan 3" is not silently read as 2003-01-01 (#290). Without a
+        // current year the month-plus-day shape is rejected; Excel reads it in
+        // the clock's year (see `parse_excel_date_text_in_year`).
         assert_eq!(parse_excel_date_text("Jan 3"), None);
         assert_eq!(parse_excel_date_text("Mar 05"), None);
-        assert_eq!(parse_excel_date_text("Dec 99"), None);
+        // A number that cannot be a day is a two-digit year.
+        assert_eq!(parse_excel_date_text("Dec 99"), Some(date(1999, 12, 1)));
+    }
+
+    #[test]
+    fn general_english_date_shapes() {
+        for (text, expected) in [
+            ("1 January 2023", date(2023, 1, 1)),
+            ("15 Mar 2021", date(2021, 3, 15)),
+            ("15-MAR-2021", date(2021, 3, 15)),
+            ("Jan 5 2023", date(2023, 1, 5)),
+            ("1June2021", date(2021, 6, 1)),
+            ("3-15-2021", date(2021, 3, 15)),
+            ("3/2021", date(2021, 3, 1)),
+            ("Mar-2021", date(2021, 3, 1)),
+            ("Dec 99", date(1999, 12, 1)),
+            ("Sept 9, 2020", date(2020, 9, 9)),
+        ] {
+            assert_eq!(parse_excel_date_text(text), Some(expected), "{text}");
+        }
+        for text in ["2023", "Foo 3 2023", "13/45/2020", "1 2 3", "Jan Feb 2020"] {
+            assert_eq!(parse_excel_date_text(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn year_less_dates_use_the_supplied_current_year() {
+        for (text, expected) in [
+            ("July1", date(2026, 7, 1)),
+            ("Jan 3", date(2026, 1, 3)),
+            ("3-Jan", date(2026, 1, 3)),
+            ("1/3", date(2026, 1, 3)),
+            ("Jan-23", date(2026, 1, 23)),
+        ] {
+            assert_eq!(parse_excel_date_text(text), None, "{text} without a year");
+            assert_eq!(
+                parse_excel_date_text_in_year(text, Some(2026)),
+                Some(expected),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            parse_excel_datetime_text_to_serial_in_year_for(
+                DateSystem::Excel1900,
+                "Jan 3",
+                Some(2026)
+            ),
+            Some(46025.0)
+        );
     }
 
     #[test]
