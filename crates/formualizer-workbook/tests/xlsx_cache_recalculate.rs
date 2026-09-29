@@ -878,3 +878,48 @@ fn excel_width_worksheets_recalculate() {
     assert_eq!(range.get_value((0, 16_382)), Some(&Data::Float(6.0)));
     assert_eq!(range.get_value((0, 16_383)), Some(&Data::Float(7.0)));
 }
+#[test]
+fn structured_references_wait_for_formulas_in_the_table() {
+    // D1:F1 read table columns whose cells are formulas stored later in the
+    // sheet; Share reads another column of its own table.
+    let rows = "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>Item</t></is></c><c r=\"B1\" t=\"inlineStr\"><is><t>Qty</t></is></c><c r=\"C1\" t=\"inlineStr\"><is><t>Share</t></is></c><c r=\"D1\"><f>SUM(Sales[Qty])</f><v>0</v></c><c r=\"E1\"><f>MAX(Sales[Qty])</f><v>0</v></c><c r=\"F1\"><f>SUM(Sales[Share])</f><v>0</v></c></row>\
+        <row r=\"2\"><c r=\"A2\"><v>4</v></c><c r=\"B2\"><f>A2*1</f><v>0</v></c><c r=\"C2\"><f>B2/SUM(Sales[Qty])</f><v>0</v></c></row>\
+        <row r=\"3\"><c r=\"A3\"><v>6</v></c><c r=\"B3\"><f>A3*1</f><v>0</v></c><c r=\"C3\"><f>B3/SUM(Sales[Qty])</f><v>0</v></c></row>";
+    let mut p = parts(rows);
+    let sheet = p.get_mut(SHEET).unwrap();
+    *sheet = sheet.replace(
+        "</sheetData>",
+        &format!("</sheetData><tableParts count=\"1\"><tablePart xmlns:r=\"{OFFICE}\" r:id=\"rId1\"/></tableParts>"),
+    );
+    p.insert(
+        "xl/worksheets/_rels/sheet1.xml.rels".into(),
+        format!("<Relationships xmlns=\"{RELS}\"><Relationship Id=\"rId1\" Type=\"{OFFICE}/table\" Target=\"../tables/table1.xml\"/></Relationships>"),
+    );
+    p.insert(
+        "xl/tables/table1.xml".into(),
+        format!("<table xmlns=\"{MAIN}\" id=\"1\" name=\"Table1\" displayName=\"Sales\" ref=\"A1:C3\" totalsRowShown=\"0\"><tableColumns count=\"3\"><tableColumn id=\"1\" name=\"Item\"/><tableColumn id=\"2\" name=\"Qty\"/><tableColumn id=\"3\" name=\"Share\"/></tableColumns></table>"),
+    );
+    let ct = p.get_mut("[Content_Types].xml").unwrap();
+    *ct = ct.replace("</Types>", "<Override PartName=\"/xl/tables/table1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml\"/></Types>");
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "SUM(Sales[Qty])</f><v>10</v>",
+        "MAX(Sales[Qty])</f><v>6</v>",
+        "SUM(Sales[Share])</f><v>1</v>",
+        "B2/SUM(Sales[Qty])</f><v>0.4</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected}: {sheet}");
+    }
+    // A calculated column that looks up its own whole table reads the other
+    // columns; it is not a circular reference.
+    let mut p = p;
+    let sheet = p.get_mut(SHEET).unwrap();
+    *sheet = sheet.replace("B2/SUM(Sales[Qty])", "VLOOKUP(A3,Sales[],2,FALSE)");
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    assert!(
+        sheet.contains("VLOOKUP(A3,Sales[],2,FALSE)</f><v>6</v>"),
+        "{sheet}"
+    );
+}

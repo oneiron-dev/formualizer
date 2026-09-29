@@ -67,6 +67,58 @@ impl TableEntrySnapshot {
         self.range.start.sheet_id
     }
 
+    /// The cells a structured reference into this table reads, as range
+    /// dependencies, so formulas inside the table are computed first. A
+    /// formula inside the area does not depend on its own column: a
+    /// calculated column such as `VLOOKUP(G2,Table1[],2,FALSE)` reads the
+    /// other columns, as Excel's single-pass result shows.
+    fn dependency_ranges(
+        &self,
+        specifier: Option<&formualizer_parse::parser::TableSpecifier>,
+        placement: Option<CellRef>,
+    ) -> Vec<SharedRangeRef<'static>> {
+        use formualizer_common::AxisBound;
+        let geometry = crate::engine::graph::tables::TableGeometry {
+            start_row: self.range.start.coord.row(),
+            start_col: self.range.start.coord.col(),
+            end_row: self.range.end.coord.row(),
+            end_col: self.range.end.coord.col(),
+            header_row: self.header_row,
+            totals_row: self.totals_row,
+            headers: &self.headers,
+        };
+        let Some((r1, c1, r2, c2)) =
+            crate::engine::graph::tables::structured_dependency_area(&geometry, specifier)
+        else {
+            return Vec::new();
+        };
+        let area = |c1: u32, c2: u32| SharedRangeRef {
+            sheet: SharedSheetLocator::Id(self.sheet_id()),
+            start_row: Some(AxisBound::new(r1, true)),
+            start_col: Some(AxisBound::new(c1, true)),
+            end_row: Some(AxisBound::new(r2, true)),
+            end_col: Some(AxisBound::new(c2, true)),
+        };
+        match placement {
+            Some(cell)
+                if cell.sheet_id == self.sheet_id()
+                    && (r1..=r2).contains(&cell.coord.row())
+                    && (c1..=c2).contains(&cell.coord.col()) =>
+            {
+                let own = cell.coord.col();
+                let mut ranges = Vec::new();
+                if own > c1 {
+                    ranges.push(area(c1, own - 1));
+                }
+                if own < c2 {
+                    ranges.push(area(own + 1, c2));
+                }
+                ranges
+            }
+            _ => vec![area(c1, c2)],
+        }
+    }
+
     fn col_index(&self, header: &str) -> Option<usize> {
         let header_key = header.to_lowercase();
         self.headers
@@ -173,6 +225,8 @@ impl<'a> SourceRegistryView<'a> {
 }
 
 pub(crate) struct IngestPipeline<'a> {
+    /// Cell of the formula being ingested.
+    placement: Option<CellRef>,
     data_store: &'a mut DataStore,
     sheet_registry: &'a mut SheetRegistry,
     names: NameRegistryView<'a>,
@@ -194,6 +248,7 @@ impl<'a> IngestPipeline<'a> {
         policy: CollectPolicy,
     ) -> Self {
         Self {
+            placement: None,
             data_store,
             sheet_registry,
             names,
@@ -261,7 +316,11 @@ impl<'a> IngestPipeline<'a> {
                     .then_some(self.function_provider),
             );
         let mut dep_plan = DependencyPlanRow::default();
-        self.collect_dependencies_tree(&ast_for_oracles, placement.sheet_id, &mut dep_plan)?;
+        self.placement = Some(placement);
+        let collected =
+            self.collect_dependencies_tree(&ast_for_oracles, placement.sheet_id, &mut dep_plan);
+        self.placement = None;
+        collected?;
         dep_plan.volatile = self.ast_is_volatile(&ast_for_oracles);
         dep_plan.dynamic = metadata.labels.has_flag(CanonicalLabels::FLAG_DYNAMIC);
         dep_plan.dedup_and_sort();
@@ -510,8 +569,10 @@ impl<'a> IngestPipeline<'a> {
                 Ok(())
             }
             SemanticReference::Table(tref) => {
-                if self.tables.resolve(&tref.name).is_some() {
+                if let Some(table) = self.tables.resolve(&tref.name) {
                     plan.table_refs.push(tref.name.clone());
+                    plan.range_deps
+                        .extend(table.dependency_ranges(tref.specifier.as_ref(), self.placement));
                     Ok(())
                 } else if self.sources.resolve_table(&tref.name).is_some() {
                     plan.source_refs.push(tref.name.clone());
@@ -2275,8 +2336,11 @@ mod tests {
                     Ok(())
                 }
                 ReferenceType::Table(tref) => {
-                    if self.tables.resolve(&tref.name).is_some() {
+                    if let Some(table) = self.tables.resolve(&tref.name) {
                         plan.table_refs.push(tref.name.clone());
+                        plan.range_deps.extend(
+                            table.dependency_ranges(tref.specifier.as_ref(), self.placement),
+                        );
                         Ok(())
                     } else if self.sources.resolve_table(&tref.name).is_some() {
                         plan.source_refs.push(tref.name.clone());

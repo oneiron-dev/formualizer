@@ -226,7 +226,7 @@ pub(crate) fn static_structured_area(
     specifier: Option<&formualizer_parse::parser::TableSpecifier>,
     row0: u32,
 ) -> Result<Option<(u32, u32, u32, u32)>, ExcelError> {
-    use formualizer_parse::parser::{SpecialItem, TableRowSpecifier, TableSpecifier};
+    use formualizer_parse::parser::{SpecialItem, TableSpecifier};
 
     match specifier {
         Some(
@@ -242,6 +242,28 @@ pub(crate) fn static_structured_area(
         ) => return Ok(None),
         _ => {}
     }
+
+    let (r1, c1, r2, c2) = structured_area(table, specifier, Some(row0))?;
+    Ok(Some((r1 + 1, c1 + 1, r2 + 1, c2 + 1)))
+}
+
+/// The 0-based area `(r1, c1, r2, c2)` a structured reference reads, for
+/// dependency planning: a formula reading `Table1[Qty]` must be computed after
+/// the formulas in that column. `None` for `#This Row` forms (resolved per
+/// cell) and references that do not resolve (they evaluate to an error).
+pub(crate) fn structured_dependency_area(
+    table: &TableGeometry<'_>,
+    specifier: Option<&formualizer_parse::parser::TableSpecifier>,
+) -> Option<(u32, u32, u32, u32)> {
+    structured_area(table, specifier, None).ok()
+}
+
+fn structured_area(
+    table: &TableGeometry<'_>,
+    specifier: Option<&formualizer_parse::parser::TableSpecifier>,
+    row0: Option<u32>,
+) -> Result<(u32, u32, u32, u32), ExcelError> {
+    use formualizer_parse::parser::{SpecialItem, TableRowSpecifier, TableSpecifier};
 
     let data_start = table.start_row + u32::from(table.header_row);
     let data_end = table.end_row - u32::from(table.totals_row);
@@ -302,6 +324,9 @@ pub(crate) fn static_structured_area(
             }
             TableSpecifier::SpecialItem(SpecialItem::ThisRow)
             | TableSpecifier::Row(TableRowSpecifier::Current) => {
+                let Some(row0) = row0 else {
+                    return Err(ExcelError::new(ExcelErrorKind::Value));
+                };
                 // Outside the table body the implicit intersection fails.
                 if row0 < data_start || row0 > table.end_row {
                     return Err(ExcelError::new(ExcelErrorKind::Value));
@@ -319,7 +344,7 @@ pub(crate) fn static_structured_area(
     if r1 > r2 {
         return Err(reference_error());
     }
-    Ok(Some((r1 + 1, c1 + 1, r2 + 1, c2 + 1)))
+    Ok((r1, c1, r2, c2))
 }
 
 /// An A1 reference for a resolved structured-reference area.

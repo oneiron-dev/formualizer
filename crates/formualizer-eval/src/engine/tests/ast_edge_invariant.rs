@@ -214,6 +214,47 @@ fn collect_ast_reference(
         SemanticReference::Table(table) => {
             if let Some(entry) = context.graph.resolve_table_entry(&table.name) {
                 context.shape.symbols.insert(entry.vertex);
+                // The area the reference reads, minus the formula's own column
+                // when the formula sits inside it.
+                let geometry = crate::engine::graph::tables::TableGeometry {
+                    start_row: entry.range.start.coord.row(),
+                    start_col: entry.range.start.coord.col(),
+                    end_row: entry.range.end.coord.row(),
+                    end_col: entry.range.end.coord.col(),
+                    header_row: entry.header_row,
+                    totals_row: entry.totals_row,
+                    headers: &entry.headers,
+                };
+                if let Some((r1, c1, r2, c2)) =
+                    crate::engine::graph::tables::structured_dependency_area(
+                        &geometry,
+                        table.specifier.as_ref(),
+                    )
+                {
+                    let sheet_id = entry.range.start.sheet_id;
+                    let key = |c1: u32, c2: u32| RangeKey {
+                        sheet_id,
+                        start_row: Some(r1),
+                        start_col: Some(c1),
+                        end_row: Some(r2),
+                        end_col: Some(c2),
+                    };
+                    let cell = context.formula_cell;
+                    if cell.sheet_id == sheet_id
+                        && (r1..=r2).contains(&cell.coord.row())
+                        && (c1..=c2).contains(&cell.coord.col())
+                    {
+                        let own = cell.coord.col();
+                        if own > c1 {
+                            context.shape.ranges.insert(key(c1, own - 1));
+                        }
+                        if own < c2 {
+                            context.shape.ranges.insert(key(own + 1, c2));
+                        }
+                    } else {
+                        context.shape.ranges.insert(key(c1, c2));
+                    }
+                }
             }
         }
         SemanticReference::ExternalSource(_)
