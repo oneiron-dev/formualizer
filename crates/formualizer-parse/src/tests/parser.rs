@@ -1730,6 +1730,36 @@ mod tests {
         }
 
         #[test]
+        fn range_colon_before_a_function_is_a_range_operator() {
+            // `A1:INDEX(...)` is A1, the range operator and a call, not a
+            // function named "A1:INDEX".
+            use crate::tokenizer::{TokenStream, TokenType, Tokenizer};
+            for formula in [
+                "=SUM($C1:INDEX($C1:$C3,2))",
+                "=SUM(Sheet1!C1:OFFSET(C1,1,0))",
+            ] {
+                let classic = Tokenizer::new(formula).unwrap();
+                let kinds: Vec<_> = classic
+                    .items
+                    .iter()
+                    .map(|t| (t.token_type, t.value.as_str()))
+                    .collect();
+                assert_eq!(kinds[1].0, TokenType::Operand, "{formula}");
+                assert_eq!(kinds[2], (TokenType::OpInfix, ":"), "{formula}");
+                assert_eq!(kinds[3].0, TokenType::Func, "{formula}");
+                let span = TokenStream::new(formula).unwrap();
+                assert_eq!(span.spans[1].token_type, TokenType::Operand);
+                assert_eq!(span.spans[2].token_type, TokenType::OpInfix);
+                assert_eq!(span.spans[3].token_type, TokenType::Func);
+            }
+            let pretty = pretty_parse_render("=SUM(C1:INDEX(C1:C3,2))").unwrap();
+            assert_eq!(pretty, "=SUM(C1:INDEX(C1:C3, 2))");
+            // A quoted sheet name may contain a colon.
+            let classic = Tokenizer::new("='a:b'!A1").unwrap();
+            assert_eq!(classic.items.len(), 1);
+        }
+
+        #[test]
         fn pretty_print_intersection_and_colon() {
             // Intersection space prints with single-space gap; colon prints tight.
             let pretty = pretty_parse_render("=A1:A3 B1:B3").unwrap();

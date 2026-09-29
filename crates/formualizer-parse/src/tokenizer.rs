@@ -621,6 +621,32 @@ pub(crate) fn tokenize_spans_with_dialect(
     Ok(tokenizer.spans)
 }
 
+/// In `A1:INDEX(`, the accumulated operand ends with a function name after a
+/// range colon. Returns the colon's offset when the text after the last
+/// unquoted `:` is a function name and a reference precedes it.
+fn range_colon_before_function(formula: &str, start: usize, end: usize) -> Option<usize> {
+    let bytes = formula.as_bytes();
+    let mut quoted = false;
+    let mut colon = None;
+    for (i, &b) in bytes.iter().enumerate().take(end).skip(start) {
+        match b {
+            b'\'' => quoted = !quoted,
+            b':' if !quoted => colon = Some(i),
+            _ => {}
+        }
+    }
+    let colon = colon?;
+    let name = &formula[colon + 1..end];
+    let is_name = name
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_');
+    (colon > start && is_name).then_some(colon)
+}
+
 fn operand_subtype(value_str: &str) -> TokenSubType {
     if value_str.starts_with('"') {
         TokenSubType::Text
@@ -1438,10 +1464,24 @@ impl<'a> SpanTokenizer<'a> {
                 end: self.offset + 1,
             }
         } else if self.has_token() {
+            let mut name_start = self.token_start;
+            if let Some(colon) =
+                range_colon_before_function(self.formula, self.token_start, self.offset)
+            {
+                let operand = &self.formula[self.token_start..colon];
+                self.push_span(
+                    TokenType::Operand,
+                    operand_subtype(operand),
+                    self.token_start,
+                    colon,
+                );
+                self.push_span(TokenType::OpInfix, TokenSubType::None, colon, colon + 1);
+                name_start = colon + 1;
+            }
             let token = TokenSpan {
                 token_type: TokenType::Func,
                 subtype: TokenSubType::Open,
-                start: self.token_start,
+                start: name_start,
                 end: self.offset + 1,
             };
             self.token_start = self.offset + 1;
@@ -2184,13 +2224,27 @@ impl Tokenizer {
             self.save_token();
             Token::make_subexp_from_slice(&self.formula, false, self.offset, self.offset + 1)
         } else if self.has_token() {
-            // Function call
-            let token = Token::make_subexp_from_slice(
-                &self.formula,
-                true,
-                self.token_start,
-                self.offset + 1,
-            );
+            // Function call; `A1:INDEX(` also yields the range operand and `:`.
+            let mut name_start = self.token_start;
+            if let Some(colon) =
+                range_colon_before_function(&self.formula, self.token_start, self.offset)
+            {
+                self.items.push(Token::make_operand_from_slice(
+                    &self.formula,
+                    self.token_start,
+                    colon,
+                ));
+                self.items.push(Token::from_slice(
+                    &self.formula,
+                    TokenType::OpInfix,
+                    TokenSubType::None,
+                    colon,
+                    colon + 1,
+                ));
+                name_start = colon + 1;
+            }
+            let token =
+                Token::make_subexp_from_slice(&self.formula, true, name_start, self.offset + 1);
             self.token_start = self.offset + 1;
             self.token_end = self.offset + 1;
             token
