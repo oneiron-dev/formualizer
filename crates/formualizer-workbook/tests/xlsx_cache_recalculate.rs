@@ -799,7 +799,10 @@ fn actual_expansion_and_output_limits_are_enforced() {
     let mut p = single("1+1", "<v>99</v>");
     let xml = p.get_mut(SHEET).unwrap();
     *xml = xml.replace("<sheetData>", "<dimension ref=\"A1:XFD1\"/><sheetData>");
-    reject(&p);
+    let mut o = XlsxRecalculateOptions::default();
+    o.limits.max_columns = 256;
+    assert!(recalculate_xlsx_bytes(&pack(&p), o).is_err());
+    assert!(recalculate_xlsx_bytes(&pack(&p), Default::default()).is_ok());
 }
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
