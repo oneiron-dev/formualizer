@@ -940,9 +940,9 @@ mod tests {
 
     #[test]
     fn let_undefined_symbol_before_binding_errors() {
-        match eval_result("=LET(x,y,y,2,x)") {
-            Ok(LiteralValue::Error(err)) | Err(err) => assert_eq!(err.kind, ExcelErrorKind::Name),
-            Ok(other) => panic!("expected #NAME?, got {other:?}"),
+        match eval("=LET(x,y,y,2,x)") {
+            LiteralValue::Error(err) => assert_eq!(err.kind, ExcelErrorKind::Name),
+            other => panic!("expected #NAME?, got {other:?}"),
         }
     }
 

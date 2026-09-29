@@ -268,13 +268,14 @@ fn limits_and_precancellation() {
 }
 #[test]
 fn unsupported_spill_does_not_return_a_partial_package() {
-    assert!(
-        recalculate_xlsx_bytes(
-            &fixture("SEQUENCE(2)", "99"),
-            XlsxRecalculateOptions::default()
-        )
-        .is_err()
+    // A dynamic array that now spills past the extent recorded in the file.
+    let p = parts(
+        "<row r=\"1\"><c r=\"A1\" cm=\"1\"><f t=\"array\" ref=\"A1\">SEQUENCE(2)</f><v>99</v></c></row>",
     );
+    assert!(recalculate_xlsx_bytes(&pack(&p), XlsxRecalculateOptions::default()).is_err());
+    // Without the array flag the formula is a legacy one: its top-left value.
+    let out = recalculate_xlsx_bytes(&fixture("SEQUENCE(2)", "99"), Default::default()).unwrap();
+    assert_eq!(data(&out.bytes, 0), Data::Float(1.0));
 }
 #[test]
 fn error_locations_are_bounded() {
@@ -300,11 +301,14 @@ fn typed_text_controls_fail_instead_of_silent_corruption() {
 #[test]
 fn modern_scalar_errors_are_cached_and_can_be_recalculated_again() {
     for (formula, token) in [
-        ("SEQUENCE(2)", "#SPILL!"),
-        ("FILTER(A2:A2,FALSE)", "#CALC!"),
+        (
+            " cm=\"1\"><f t=\"array\" ref=\"A1\">SEQUENCE(2)</f>",
+            "#SPILL!",
+        ),
+        ("><f>FILTER(A2:A2,FALSE)</f>", "#CALC!"),
     ] {
         let p = parts(&format!(
-            "<row r=\"1\"><c r=\"A1\"><f>{formula}</f><v>99</v></c></row><row r=\"2\"><c r=\"A2\"><v>7</v></c></row>"
+            "<row r=\"1\"><c r=\"A1\"{formula}<v>99</v></c></row><row r=\"2\"><c r=\"A2\"><v>7</v></c></row>"
         ));
         let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
         assert_eq!(out.summary.errors, 1);
@@ -529,6 +533,28 @@ fn office_growth_hint_padding_is_admitted_and_retained() {
     );
     // Other local extras (here an extended timestamp) stay unsupported.
     let other = pack_with_local_extra(&single("1+1", "<v>99</v>"), 0x5455, &[1, 0, 0, 0, 0]);
+    assert!(recalculate_xlsx_bytes(&other, Default::default()).is_err());
+}
+#[test]
+fn local_headers_differing_in_deflate_hints_and_time_are_admitted() {
+    // Excel writes some local headers with deflate speed hints (flag bits 1-2)
+    // and a zero timestamp that the central directory does not repeat.
+    let input = pack(&single("1+1", "<v>99</v>"));
+    let (headers, _) = directory(&input);
+    let mut hinted = input.clone();
+    for &a in &headers {
+        let local = h32(&input, a + 42);
+        let flags = h16(&input, local + 6) as u16 | 0b110;
+        hinted[local + 6..local + 8].copy_from_slice(&flags.to_le_bytes());
+        hinted[local + 10..local + 14].copy_from_slice(&[0, 0, 33, 0]);
+    }
+    let out = recalculate_xlsx_bytes(&hinted, Default::default()).unwrap();
+    assert_eq!(data(&out.bytes, 0), Data::Float(2.0));
+    // Any other flag difference still refuses the package.
+    let mut other = input.clone();
+    let local = h32(&input, headers[0] + 42);
+    let flags = h16(&input, local + 6) as u16 | 0x0800;
+    other[local + 6..local + 8].copy_from_slice(&flags.to_le_bytes());
     assert!(recalculate_xlsx_bytes(&other, Default::default()).is_err());
 }
 fn with_metadata(mut p: BTreeMap<String, String>, metadata: &str) -> BTreeMap<String, String> {
@@ -922,4 +948,168 @@ fn structured_references_wait_for_formulas_in_the_table() {
         sheet.contains("VLOOKUP(A3,Sales[],2,FALSE)</f><v>6</v>"),
         "{sheet}"
     );
+}
+#[test]
+fn defined_names_keep_spaces_around_entities_in_sheet_names() {
+    // 'A &amp; B'!$A$2 is split by the entity into text events; the spaces
+    // around it are part of the sheet name.
+    let mut p = parts(
+        "<row r=\"1\"><c r=\"A1\"><f>Yr+1</f><v>0</v></c><c r=\"B1\"><f>\"1-JAN\"&amp;Yr</f><v>0</v></c></row><row r=\"2\"><c r=\"A2\"><f>2000+26</f><v>0</v></c></row>",
+    );
+    let wb = p.get_mut("xl/workbook.xml").unwrap();
+    *wb = wb
+        .replace(
+            "</workbook>",
+            "<definedNames><definedName name=\"Yr\">'A &amp; B'!$A$2</definedName></definedNames></workbook>",
+        )
+        .replace("name=\"Sheet1\"", "name=\"A &amp; B\"");
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    assert!(sheet.contains("<f>Yr+1</f><v>2027</v>"), "{sheet}");
+    assert!(sheet.contains("<v>1-JAN2026</v>"), "{sheet}");
+}
+#[test]
+fn names_defined_by_formulas_and_constants() {
+    // Names may hold a formula (MATCH over other names), an array constant
+    // or a reference-returning formula (OFFSET); each evaluates where used.
+    let mut p = parts(
+        "<row r=\"1\"><c r=\"A1\"><v>2020</v></c><c r=\"B1\" t=\"inlineStr\"><is><t>April</t></is></c><c r=\"C1\" t=\"inlineStr\"><is><t>Monday</t></is></c></row>\
+         <row r=\"2\"><c r=\"A2\"><f>MonOpt</f><v>0</v></c><c r=\"B2\"><f>WkOpt</f><v>0</v></c><c r=\"C2\"><f>SUM(Days)</f><v>0</v></c><c r=\"D2\"><f>WEEKDAY(DATE(Yr,MonOpt,1),WkOpt)</f><v>0</v></c><c r=\"E2\"><f>INDEX(Days+1,2)</f><v>0</v></c><c r=\"F2\"><f>DATE(Yr,MonOpt,1)</f><v>0</v></c></row>\
+         <row r=\"3\"><c r=\"G3\"><v>5</v></c><c r=\"H3\"><f>SUM(Filled)</f><v>0</v></c><c r=\"I3\"><f>ROWS(Filled)</f><v>0</v></c><c r=\"J3\"><f>MATCH(7,Filled,0)</f><v>0</v></c><c r=\"K3\"><f>INDEX(Filled,2)</f><v>0</v></c><c r=\"L3\"><f>COUNTIF(Filled,\"&gt;5\")</f><v>0</v></c></row>\
+         <row r=\"4\"><c r=\"G4\"><v>7</v></c></row><row r=\"5\"><c r=\"G5\"><v>9</v></c></row>",
+    );
+    let wb = p.get_mut("xl/workbook.xml").unwrap();
+    *wb = wb.replace(
+        "</workbook>",
+        "<definedNames><definedName name=\"Days\">{0,1,2,3,4,5,6}</definedName><definedName name=\"Filled\">OFFSET(Sheet1!$G$3,0,0,COUNT(Sheet1!$G:$G),1)</definedName><definedName name=\"MonOpt\">MATCH(Mon,Months,0)</definedName><definedName name=\"Mon\">Sheet1!$B$1</definedName><definedName name=\"Months\">{\"January\",\"February\",\"March\",\"April\"}</definedName><definedName name=\"Yr\">Sheet1!$A$1</definedName><definedName name=\"WkOpt\">MATCH(WS,Weekdays,0)+10</definedName><definedName name=\"WS\">Sheet1!$C$1</definedName><definedName name=\"Weekdays\">{\"Monday\",\"Tuesday\"}</definedName></definedNames></workbook>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<f>MonOpt</f><v>4</v>",
+        "<f>WkOpt</f><v>11</v>",
+        "<f>SUM(Days)</f><v>21</v>",
+        "<f>WEEKDAY(DATE(Yr,MonOpt,1),WkOpt)</f><v>3</v>",
+        "<f>INDEX(Days+1,2)</f><v>2</v>",
+        "<f>DATE(Yr,MonOpt,1)</f><v>43922</v>",
+        "<f>SUM(Filled)</f><v>21</v>",
+        "<f>ROWS(Filled)</f><v>3</v>",
+        "<f>MATCH(7,Filled,0)</f><v>2</v>",
+        "<f>INDEX(Filled,2)</f><v>7</v>",
+        "<f>COUNTIF(Filled,\"&gt;5\")</f><v>2</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected}: {sheet}");
+    }
+}
+#[test]
+fn sheet_qualified_names_resolve_in_their_sheet() {
+    // Sheet1!Yr names the sheet-level name Yr of Sheet1, and names may be
+    // defined in terms of names that come later in the file.
+    let mut p = parts(
+        "<row r=\"1\"><c r=\"A1\"><v>2021</v></c><c r=\"B1\"><f>firstdate</f><v>0</v></c><c r=\"C1\"><f>Sheet1!firstdate</f><v>0</v></c><c r=\"E1\"><f>INDEX(calendar,2)</f><v>0</v></c><c r=\"F1\"><f>YrNext</f><v>0</v></c></row>",
+    );
+    let wb = p.get_mut("xl/workbook.xml").unwrap();
+    *wb = wb.replace(
+        "</workbook>",
+        "<definedNames><definedName name=\"calendar\" localSheetId=\"0\">days+Sheet1!firstdate</definedName><definedName name=\"days\">{0,1,2,3,4,5,6}</definedName><definedName name=\"firstdate\" localSheetId=\"0\">DATE(Sheet1!Yr,1,1)</definedName><definedName name=\"Yr\" localSheetId=\"0\">Sheet1!$A$1</definedName><definedName name=\"YrNext\">Sheet1!Yr+1</definedName></definedNames></workbook>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<f>firstdate</f><v>44197</v>",
+        "<f>Sheet1!firstdate</f><v>44197</v>",
+        "<f>INDEX(calendar,2)</f><v>44198</v>",
+        "<f>YrNext</f><v>2022</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected}: {sheet}");
+    }
+}
+#[test]
+fn range_names_are_references() {
+    // INDEX, OFFSET and ROWS take a range name as the range it names.
+    let mut p = parts(
+        "<row r=\"2\"><c r=\"B2\"><v>2</v></c></row><row r=\"6\"><c r=\"B6\" cm=\"1\"><f t=\"array\" ref=\"B6\">INDEX(Years,B2,1)</f><v>0</v></c><c r=\"C6\"><f>INDEX(Years,B2,1)</f><v>0</v></c><c r=\"D6\"><f>OFFSET(Years,1,0,1,1)</f><v>0</v></c><c r=\"E6\"><f>ROWS(Years)</f><v>0</v></c></row><row r=\"18\"><c r=\"B18\"><v>2022</v></c></row><row r=\"19\"><c r=\"B19\"><v>2023</v></c></row><row r=\"20\"><c r=\"B20\"><v>2024</v></c></row><row r=\"21\"><c r=\"B21\"><v>1</v></c></row>",
+    );
+    let wb = p.get_mut("xl/workbook.xml").unwrap();
+    *wb = wb.replace(
+        "</workbook>",
+        "<definedNames><definedName name=\"Years\">Sheet1!$B$18:$B$20</definedName></definedNames></workbook>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "INDEX(Years,B2,1)</f><v>2023</v></c><c r=\"C6\"><f>INDEX(Years,B2,1)</f><v>2023</v>",
+        "<f>OFFSET(Years,1,0,1,1)</f><v>2023</v>",
+        "<f>ROWS(Years)</f><v>3</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected}: {sheet}");
+    }
+}
+#[test]
+fn formulas_without_the_array_flag_take_the_implicit_intersection() {
+    // A formula stored without t="array" is a legacy formula: an array result
+    // shows its top-left value and a range result the cell in the formula's
+    // row or column. A legacy array formula fills exactly its extent.
+    let p = parts(
+        "<row r=\"1\"><c r=\"A1\"><v>10</v></c><c r=\"C1\"><f>{1,2,3}</f><v>0</v></c></row>\
+         <row r=\"2\"><c r=\"A2\"><v>20</v></c><c r=\"B2\"><f>A1:A3</f><v>0</v></c></row>\
+         <row r=\"3\"><c r=\"A3\"><v>30</v></c></row>\
+         <row r=\"5\"><c r=\"B5\"><f t=\"array\" ref=\"B5:C6\">{1,2,3;4,5,6;7,8,9}</f><v>0</v></c><c r=\"C5\"><v>0</v></c><c r=\"E5\"><f t=\"array\" ref=\"E5:E7\">{1;2}</f><v>0</v></c></row>\
+         <row r=\"6\"><c r=\"B6\"><v>0</v></c><c r=\"C6\"><v>0</v></c><c r=\"E6\"><v>0</v></c></row>\
+         <row r=\"7\"><c r=\"E7\"><v>0</v></c></row>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<f>{1,2,3}</f><v>1</v>",
+        "<f>A1:A3</f><v>20</v>",
+        "<f t=\"array\" ref=\"B5:C6\">{1,2,3;4,5,6;7,8,9}</f><v>1</v></c><c r=\"C5\"><v>2</v>",
+        "<c r=\"B6\"><v>4</v></c><c r=\"C6\"><v>5</v>",
+        "<c r=\"E6\"><v>2</v>",
+        "<c r=\"E7\" t=\"e\"><v>#N/A</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected}: {sheet}");
+    }
+}
+#[test]
+fn formulas_reading_array_members_see_the_array_result() {
+    let p = parts(
+        "<row r=\"1\"><c r=\"A1\"><f>C3*10</f><v>0</v></c><c r=\"B1\"><f>D3+1</f><v>0</v></c></row>\
+         <row r=\"3\"><c r=\"B3\"><f t=\"array\" ref=\"B3:D3\">{1,2,3}+A5</f><v>1</v></c><c r=\"C3\"><v>2</v></c><c r=\"D3\"><v>3</v></c></row>\
+         <row r=\"5\"><c r=\"A5\"><v>100</v></c><c r=\"B5\"><f>C7*10</f><v>0</v></c></row>\
+         <row r=\"7\"><c r=\"B7\" cm=\"1\"><f t=\"array\" ref=\"B7:D7\">{1,2,3}+A5</f><v>1</v></c><c r=\"C7\"><v>2</v></c><c r=\"D7\"><v>3</v></c></row>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<f>C3*10</f><v>1020</v>",
+        "<f>D3+1</f><v>104</v>",
+        "<f>C7*10</f><v>1020</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected}: {sheet}");
+    }
+}
+#[test]
+fn references_that_only_look_circular_are_calculated() {
+    // Each K cell looks up an earlier K cell through a range that includes
+    // itself; nothing reads its own value, so Excel calculates them.
+    let rows: String = [(3, "a"), (4, "b"), (5, "a"), (6, "c")]
+        .iter()
+        .map(|(r, key)| {
+            format!(
+                "<row r=\"{r}\"><c r=\"J{r}\" t=\"inlineStr\"><is><t>{key}</t></is></c><c r=\"K{r}\"><f>IF(COUNTIF($J$3:J{r},J{r})=1,MAX($K$2:K{p})+1,INDEX($K$3:K{r},MATCH(J{r},$J$3:J{r},0)))</f><v>0</v></c></row>",
+                p = r - 1
+            )
+        })
+        .collect();
+    let out = recalculate_xlsx_bytes(&pack(&parts(&rows)), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for (cell, value) in [("K3", 1), ("K4", 2), ("K5", 1), ("K6", 3)] {
+        let at = sheet.find(&format!("r=\"{cell}\"")).unwrap();
+        assert!(
+            sheet[at..].contains(&format!("</f><v>{value}</v>"))
+                && sheet[at..].find(&format!("</f><v>{value}</v>")) < sheet[at..].find("</c>"),
+            "{cell}={value}: {sheet}"
+        );
+    }
 }

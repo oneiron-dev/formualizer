@@ -143,11 +143,13 @@ fn audit_directory(
         if !growth_hint_only(&bytes[local + 30 + local_name_len..data]) {
             return Err(unsupported("ZIP local extra metadata", name));
         }
+        // The deflate speed hints (flag bits 1-2) and the timestamps do not
+        // change what a member holds; Excel writes some headers that differ
+        // there only.
         if bytes.get(local + 30..local + 30 + local_name_len) != Some(raw_name)
-            || u16_at(bytes, local + 6)? != flags
+            || (u16_at(bytes, local + 6)? ^ flags) & !0b110 != 0
             || u16_at(bytes, local + 8)? != u16_at(bytes, at + 10)?
             || bytes[local + 14..local + 26] != bytes[at + 16..at + 28]
-            || bytes[local + 10..local + 14] != bytes[at + 12..at + 16]
             || u16_at(bytes, local + 4)? != u16_at(bytes, at + 6)?
         {
             return Err(unsupported("inconsistent ZIP local/central metadata", name));

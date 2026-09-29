@@ -1101,11 +1101,10 @@ mod computed_array_tests {
         );
         assert_eq!(scalar_calls.load(Ordering::SeqCst), 1);
 
-        let computed = evaluate(&wb, "=SUM(COMPUTED_FAILURE())").unwrap_err();
-        assert_eq!(computed.kind, ExcelErrorKind::Num);
-        assert_eq!(
-            computed.message.as_deref(),
-            Some("computed failure sentinel")
+        assert_exact_error_value(
+            evaluate(&wb, "=SUM(COMPUTED_FAILURE())"),
+            ExcelErrorKind::Num,
+            Some("computed failure sentinel"),
         );
         assert_eq!(failure_calls.load(Ordering::SeqCst), 1);
 

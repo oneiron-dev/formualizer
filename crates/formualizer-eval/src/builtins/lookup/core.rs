@@ -388,6 +388,10 @@ impl Function for MatchFn {
         } else {
             // Handle array literals and other non-reference values
             let v = args[1].value()?.into_literal();
+            // An error in place of the lookup array is the result.
+            if let LiteralValue::Error(e) = v {
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+            }
             let values: Vec<LiteralValue> = match v {
                 LiteralValue::Array(rows) => {
                     // Flatten the array (MATCH works on 1D, so take first row or column)

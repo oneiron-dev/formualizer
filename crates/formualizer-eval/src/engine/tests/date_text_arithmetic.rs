@@ -260,13 +260,13 @@ fn date_typed_arithmetic_uses_the_1904_workbook_system() {
 
 #[test]
 fn known_comparison_and_criteria_divergences_remain_pinned() {
-    // Formualizer currently type-orders text below numbers here; LO returns FALSE.
-    // The comparison-coercion divergence is tracked separately from #289.
+    // Comparison operators do not read text as a date or number: text sorts
+    // above every number, as in Excel and LibreOffice.
     assert_expected(
         DateSystem::Excel1900,
         "=\"1/1/03\"<37623",
-        "oracle: lo-verified divergence",
-        Expected::Boolean(true),
+        "oracle: lo-verified",
+        Expected::Boolean(false),
     );
 
     // Formualizer does not date-coerce COUNTIF criteria here; LO returns 1.

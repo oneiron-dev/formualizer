@@ -109,6 +109,24 @@ fn criteria_number(text: &str) -> Option<f64> {
         .filter(|n| n.is_finite())
 }
 
+/// An Excel error value written as criteria text (`#N/A`, `#DIV/0!`).
+fn criteria_error(text: &str) -> Option<ExcelErrorKind> {
+    ExcelErrorKind::try_parse(text).filter(|kind| {
+        matches!(
+            kind,
+            ExcelErrorKind::Null
+                | ExcelErrorKind::Ref
+                | ExcelErrorKind::Name
+                | ExcelErrorKind::Value
+                | ExcelErrorKind::Div
+                | ExcelErrorKind::Na
+                | ExcelErrorKind::Num
+                | ExcelErrorKind::Spill
+                | ExcelErrorKind::Calc
+        )
+    })
+}
+
 pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError> {
     match v {
         LiteralValue::Text(s) => {
@@ -141,7 +159,13 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
                         });
                     }
                     // Fallback: non-numeric equals/neq text (support Excel-style quoted strings: ="aa")
-                    let lit = LiteralValue::Text(unquote(rhs_trim));
+                    // An error spelled out ("<>#N/A") compares against error cells.
+                    let lit = match criteria_error(rhs_trim) {
+                        Some(kind) if matches!(*op, "=" | "<>") => {
+                            LiteralValue::Error(ExcelError::new(kind))
+                        }
+                        _ => LiteralValue::Text(unquote(rhs_trim)),
+                    };
                     return Ok(match *op {
                         "=" => CriteriaPredicate::Eq(lit),
                         "<>" => CriteriaPredicate::Ne(lit),
@@ -175,16 +199,23 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
             if let Some(n) = criteria_number(&plain) {
                 return Ok(CriteriaPredicate::Eq(LiteralValue::Number(n)));
             }
+            if let Some(kind) = criteria_error(&plain) {
+                return Ok(CriteriaPredicate::Eq(LiteralValue::Error(ExcelError::new(
+                    kind,
+                ))));
+            }
             // Plain text equality
             Ok(CriteriaPredicate::Eq(LiteralValue::Text(plain)))
         }
-        LiteralValue::Empty => Ok(CriteriaPredicate::IsBlank),
+        // A reference to an empty cell is the criterion 0.
+        LiteralValue::Empty => Ok(CriteriaPredicate::Eq(LiteralValue::Number(0.0))),
         LiteralValue::Number(n) => Ok(CriteriaPredicate::Eq(LiteralValue::Number(*n))),
         // Normalize integer criteria to Number for Excel-style numeric coercions
         // (e.g. blank == 0, numeric text == number, etc.)
         LiteralValue::Int(i) => Ok(CriteriaPredicate::Eq(LiteralValue::Number(*i as f64))),
         LiteralValue::Boolean(b) => Ok(CriteriaPredicate::Eq(LiteralValue::Boolean(*b))),
-        LiteralValue::Error(e) => Err(e.clone()),
+        // An error criterion counts the cells holding that error.
+        LiteralValue::Error(e) => Ok(CriteriaPredicate::Eq(LiteralValue::Error(e.clone()))),
         LiteralValue::Array(arr) => {
             // Treat 1x1 array literals as scalars for criteria parsing
             if arr.len() == 1 && arr.first().map(|r| r.len()).unwrap_or(0) == 1 {

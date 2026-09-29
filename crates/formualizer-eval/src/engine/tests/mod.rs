@@ -32,6 +32,7 @@ mod load_fast_mappings;
 mod perf_ranges;
 mod perf_tranche;
 mod reference_only_arguments;
+mod spill_readers;
 mod structured_reference_areas;
 //mod mark_dirty_benchmarks;
 mod mark_dirty_multi_source;
@@ -92,7 +93,9 @@ mod date_function_duration_cells;
 mod date_math_parity;
 mod date_text_arithmetic;
 mod edate_eomonth_engine;
+mod error_range_arguments;
 mod external_book_refs;
+mod function_errors_are_values;
 
 mod hardening_503;
 

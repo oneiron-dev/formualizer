@@ -343,6 +343,8 @@ fn values_equal_invariant(a: &LiteralValue, b: &LiteralValue) -> bool {
         (LiteralValue::Text(x), LiteralValue::Empty) if x.is_empty() => true,
         (LiteralValue::Empty, LiteralValue::Text(y)) if y.is_empty() => true,
         (LiteralValue::Empty, LiteralValue::Empty) => true,
+        (LiteralValue::Error(x), LiteralValue::Error(y)) => x.kind == y.kind,
+        (LiteralValue::Error(_), _) | (_, LiteralValue::Error(_)) => false,
         // A blank cell is not the number 0 for criteria: COUNTIF(A:A,0)
         // skips blanks and COUNTIF(A:A,"<>0") counts them.
         (LiteralValue::Number(_) | LiteralValue::Int(_), LiteralValue::Empty)

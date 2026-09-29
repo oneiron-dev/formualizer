@@ -391,6 +391,18 @@ impl<'a, R: EvaluationContext> FunctionProvider for RecordingContext<'a, R> {
 }
 
 impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
+    fn resolve_name_reference(
+        &self,
+        name: &str,
+        current_sheet: &str,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        self.engine.resolve_name_reference(name, current_sheet)
+    }
+
+    fn is_value_name(&self, name: &str, current_sheet: &str) -> bool {
+        self.engine.is_value_name(name, current_sheet)
+    }
+
     /* ── intercept-and-record ── */
 
     fn resolve_range_view<'c>(

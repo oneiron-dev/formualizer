@@ -535,11 +535,11 @@ fn interpreter_broadcast_scalar_over_array() {
 }
 
 #[test]
-fn interpreter_incompatible_broadcast_is_value_error() {
+fn interpreter_mismatched_arrays_pad_with_na() {
     let wb = TestWorkbook::new();
     let ctx = interp(&wb);
 
-    // {1,2} + {1,2,3} -> #VALUE!
+    // {1,2} + {1,2,3} -> {2,4,#N/A}: Excel pads the shorter array with #N/A.
     let l = LiteralValue::Array(vec![vec![LiteralValue::Int(1), LiteralValue::Int(2)]]);
     let r = LiteralValue::Array(vec![vec![
         LiteralValue::Int(1),
@@ -557,8 +557,13 @@ fn interpreter_incompatible_broadcast_is_value_error() {
         None,
     );
     match ctx.evaluate_ast(&n).unwrap().into_literal() {
-        LiteralValue::Error(e) => assert_eq!(e, "#VALUE!"),
-        v => panic!("expected value error, got {v:?}"),
+        LiteralValue::Array(rows) => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], LiteralValue::Number(2.0));
+            assert_eq!(rows[0][1], LiteralValue::Number(4.0));
+            assert!(matches!(&rows[0][2], LiteralValue::Error(e) if e == "#N/A"));
+        }
+        v => panic!("expected padded array, got {v:?}"),
     }
 }
 

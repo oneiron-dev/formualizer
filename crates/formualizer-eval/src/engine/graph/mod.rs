@@ -3848,7 +3848,7 @@ impl DependencyGraph {
         )
     }
 
-    fn collect_range_dependents_for_rect(
+    pub(crate) fn collect_range_dependents_for_rect(
         &self,
         sheet_id: SheetId,
         start_row: u32,

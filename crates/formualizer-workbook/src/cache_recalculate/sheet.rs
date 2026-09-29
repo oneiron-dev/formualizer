@@ -26,7 +26,7 @@ pub(super) struct Cell {
     pub formula_text: String,
     pub value: Option<ValueNode>,
     pub inline: Option<Range<usize>>,
-    formula_kind: String,
+    pub formula_kind: String,
     shared_id: Option<u32>,
     shared_range: Option<(u32, u32, u32, u32)>,
     shared_ref_span: Option<Range<usize>>,

@@ -255,6 +255,10 @@ fn eval_if_family<'a, 'b>(
         ($arg:expr) => {
             match range_or_scalar($arg, ctx)? {
                 RangeOrScalar::Range(view) => (Some(view), None),
+                // An error in place of a range (COUNTIF(#REF!,1)) is the result.
+                RangeOrScalar::Scalar(LiteralValue::Error(error)) => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
+                }
                 RangeOrScalar::Scalar(value) => (None, Some(value)),
                 RangeOrScalar::ReferenceError(error) => {
                     return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
@@ -279,10 +283,11 @@ fn eval_if_family<'a, 'b>(
             logical_count_cells = logical_cells;
             match argument {
                 AggregateArgument::Range(view) => (Some(view), None),
-                AggregateArgument::Scalar(value) => (None, Some(value)),
-                AggregateArgument::ReferenceError(error) => {
+                AggregateArgument::Scalar(LiteralValue::Error(error))
+                | AggregateArgument::ReferenceError(error) => {
                     return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
                 }
+                AggregateArgument::Scalar(value) => (None, Some(value)),
             }
         } else {
             resolve_range_or_scalar!(&args[0])
@@ -767,6 +772,29 @@ fn eval_if_family<'a, 'b>(
 
                 if impossible {
                     continue;
+                }
+
+                // A matching cell of the summed range that holds an error makes
+                // the result that error (non-numbers are null in the lane).
+                if agg_type != AggregationType::Count
+                    && let Some(sv) = sum_view.as_ref()
+                {
+                    let target_col = sum_slices
+                        .as_ref()
+                        .and_then(|cols| cols.get(c).and_then(|a| a.as_ref()));
+                    for i in 0..row_len {
+                        let matched = mask_opt
+                            .as_ref()
+                            .is_none_or(|mask| mask.is_valid(i) && mask.value(i));
+                        if matched
+                            && target_col.is_none_or(|tc| tc.is_null(i))
+                            && let LiteralValue::Error(error) = sv.get_cell(row_start + i, c)
+                        {
+                            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                                error,
+                            )));
+                        }
+                    }
                 }
 
                 match mask_opt {

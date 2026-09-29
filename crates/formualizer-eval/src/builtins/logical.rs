@@ -223,13 +223,14 @@ fn logical_result<'b>(
 pub struct AndFn;
 /// Returns TRUE only when all supplied values evaluate to TRUE.
 ///
-/// `AND` evaluates arguments left to right and short-circuits on a decisive `FALSE`.
+/// `AND` evaluates every argument left to right.
 ///
 /// # Remarks
 /// - Booleans and numbers are accepted (`0` is FALSE, non-zero is TRUE).
-/// - Blank values are treated as FALSE.
-/// - Text and other non-coercible values yield `#VALUE!` unless a prior FALSE short-circuits.
-/// - If no decisive FALSE is found, the first encountered error is returned.
+/// - Text and blank cells inside references and arrays are skipped.
+/// - Text given directly counts when it reads "TRUE"/"FALSE"; other text is skipped.
+/// - The first error in argument order is returned, even after a FALSE.
+/// - `#VALUE!` when no logical value is found.
 ///
 /// # Examples
 ///
@@ -252,7 +253,7 @@ pub struct AndFn;
 ///   - XOR
 /// faq:
 ///   - q: "What happens with blanks and text in AND?"
-///     a: "Blank values evaluate as FALSE; non-coercible text yields #VALUE! unless a prior FALSE short-circuits."
+///     a: "Blank cells and text are skipped unless direct text reads TRUE/FALSE; #VALUE! when nothing logical remains."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: AND
@@ -297,13 +298,14 @@ impl Function for AndFn {
 pub struct OrFn;
 /// Returns TRUE when any supplied value evaluates to TRUE.
 ///
-/// `OR` evaluates arguments left to right and short-circuits on a decisive `TRUE`.
+/// `OR` evaluates every argument left to right.
 ///
 /// # Remarks
 /// - Booleans and numbers are accepted (`0` is FALSE, non-zero is TRUE).
-/// - Blank values are ignored.
-/// - Text and other non-coercible values yield `#VALUE!` if no prior TRUE short-circuits.
-/// - If no TRUE is found, the first encountered error is returned.
+/// - Text and blank cells inside references and arrays are skipped.
+/// - Text given directly counts when it reads "TRUE"/"FALSE"; other text is skipped.
+/// - The first error in argument order is returned, even after a TRUE.
+/// - `#VALUE!` when no logical value is found.
 ///
 /// # Examples
 ///
@@ -326,7 +328,7 @@ pub struct OrFn;
 ///   - XOR
 /// faq:
 ///   - q: "How does OR treat blanks and text?"
-///     a: "Blanks are ignored; non-coercible text returns #VALUE! unless a prior TRUE already short-circuits."
+///     a: "Blank cells and text in references are skipped; direct text other than TRUE/FALSE returns #VALUE!."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: OR
@@ -911,6 +913,7 @@ mod tests {
             ArgumentHandle::new(&a_true, &ctx),
             ArgumentHandle::new(&errcall, &ctx),
         ];
+        // Excel: OR(TRUE, error) is the error.
         let out = or.eval(&hs, &fctx).unwrap().into_literal();
         match out {
             LiteralValue::Error(e) => assert_eq!(e.to_string(), "#VALUE!"),
@@ -1039,5 +1042,59 @@ mod tests {
             evaluate_formula("=IF(\"abc\",1,2)", &wb),
             ExcelErrorKind::Value,
         );
+    }
+}
+
+#[cfg(test)]
+mod excel_logical_tests {
+    use crate::engine::{Engine, EvalConfig};
+    use crate::test_workbook::TestWorkbook;
+    use formualizer_common::{ExcelErrorKind, LiteralValue};
+    use formualizer_parse::parser::parse;
+
+    fn eval(formula: &str) -> LiteralValue {
+        let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+        engine
+            .set_cell_formula("Sheet1", 1, 1, parse("=1/0").unwrap())
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", 2, 1, LiteralValue::Text("x".into()))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", 3, 1, LiteralValue::Boolean(true))
+            .unwrap();
+        engine
+            .set_cell_formula("Sheet1", 1, 5, parse(formula).unwrap())
+            .unwrap();
+        engine.evaluate_all().unwrap();
+        engine.get_cell_value("Sheet1", 1, 5).unwrap()
+    }
+
+    #[test]
+    fn errors_win_over_a_deciding_value() {
+        for formula in [
+            "=OR(TRUE,A1)",
+            "=OR(A1,TRUE)",
+            "=AND(FALSE,A1)",
+            "=OR(TRUE,A1:A3)",
+        ] {
+            match eval(formula) {
+                LiteralValue::Error(e) => assert_eq!(e.kind, ExcelErrorKind::Div, "{formula}"),
+                other => panic!("{formula}: expected #DIV/0!, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn text_and_blanks_in_references_are_skipped() {
+        assert_eq!(eval("=AND(A2:A4)"), LiteralValue::Boolean(true));
+        assert_eq!(eval("=OR(A2,FALSE)"), LiteralValue::Boolean(false));
+        assert_eq!(eval("=AND(\"true\",1)"), LiteralValue::Boolean(true));
+        match eval("=AND(A2:A2)") {
+            LiteralValue::Error(e) => assert_eq!(e.kind, ExcelErrorKind::Value),
+            other => panic!("expected #VALUE!, got {other:?}"),
+        }
+        // Direct text that is not TRUE/FALSE is skipped too.
+        assert_eq!(eval("=OR(\"x\",TRUE)"), LiteralValue::Boolean(true));
     }
 }

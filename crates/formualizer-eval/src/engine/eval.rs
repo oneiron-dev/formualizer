@@ -1087,6 +1087,52 @@ impl ComputedWriteChunkPlan {
     }
 }
 
+/// How a formula's array result lands in the grid under legacy array
+/// semantics (see [`Engine::declare_array_formula`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArrayFormulaShape {
+    /// A dynamic array: the result spills.
+    Dynamic,
+    /// A legacy (CSE) array entered over `rows` x `cols` cells.
+    Fixed { rows: u32, cols: u32 },
+}
+
+/// Fit an array formula's result to the cells it was entered over: a single
+/// row or column repeats, positions beyond the result are #N/A and the rest
+/// of a larger result is dropped.
+fn fit_array_formula_result(value: LiteralValue, rows: u32, cols: u32) -> LiteralValue {
+    let source = match value {
+        LiteralValue::Array(source) if !source.is_empty() && !source[0].is_empty() => source,
+        LiteralValue::Array(_) => vec![vec![LiteralValue::Error(ExcelError::new(
+            ExcelErrorKind::Value,
+        ))]],
+        other => vec![vec![other]],
+    };
+    let (height, width) = (source.len(), source[0].len());
+    let fitted: Vec<Vec<LiteralValue>> = (0..rows as usize)
+        .map(|i| {
+            (0..cols as usize)
+                .map(|j| {
+                    let (si, sj) = (
+                        if height == 1 { 0 } else { i },
+                        if width == 1 { 0 } else { j },
+                    );
+                    source
+                        .get(si)
+                        .and_then(|row| row.get(sj))
+                        .cloned()
+                        .unwrap_or_else(|| LiteralValue::Error(ExcelError::new(ExcelErrorKind::Na)))
+                })
+                .collect()
+        })
+        .collect();
+    if rows == 1 && cols == 1 {
+        fitted[0][0].clone()
+    } else {
+        LiteralValue::Array(fitted)
+    }
+}
+
 pub struct Engine<R> {
     pub(crate) graph: DependencyGraph,
     resolver: R,
@@ -1161,6 +1207,14 @@ pub struct Engine<R> {
     staged_formula_index: StagedFormulaIndex,
     // Occupancy invalidation only: never a formula/read dependency.
     blocked_pending_spills: Vec<(VertexId, CellRef, Region)>,
+    /// Legacy array semantics, as a workbook file stores formulas: `None`
+    /// lets every formula spill. `Some` spills only declared dynamic arrays,
+    /// fits declared legacy (CSE) arrays to their extent and takes the
+    /// implicit intersection of any other formula's array or range result.
+    array_formula_shapes: Option<FxHashMap<(SheetId, u32, u32), ArrayFormulaShape>>,
+    /// Areas (sheet, rows, cols; 0-based) whose values an array formula's
+    /// spill changed during the current pass, with the anchor that wrote them.
+    spill_writes: Vec<(VertexId, SheetId, u32, u32, u32, u32)>,
     /// Per-sheet row visibility sidecar state.
     row_visibility: FxHashMap<SheetId, RowVisibilityState>,
     /// Cached row visibility masks keyed by sheet/span/mode/version.
@@ -3101,6 +3155,8 @@ where
             staged_formulas: std::collections::HashMap::new(),
             staged_formula_index: StagedFormulaIndex::default(),
             blocked_pending_spills: Vec::new(),
+            array_formula_shapes: None,
+            spill_writes: Vec::new(),
             row_visibility: FxHashMap::default(),
             row_visibility_mask_cache: std::sync::RwLock::new(FxHashMap::default()),
             formula_parse_diagnostics: Vec::new(),
@@ -3270,6 +3326,8 @@ where
             staged_formulas: std::collections::HashMap::new(),
             staged_formula_index: StagedFormulaIndex::default(),
             blocked_pending_spills: Vec::new(),
+            array_formula_shapes: None,
+            spill_writes: Vec::new(),
             row_visibility: FxHashMap::default(),
             row_visibility_mask_cache: std::sync::RwLock::new(FxHashMap::default()),
             formula_parse_diagnostics: Vec::new(),
@@ -5091,6 +5149,125 @@ where
         self.record_formula_plane_structural_change(StructuralScope::OpaqueGlobal);
         self.mark_topology_edited();
         Ok(())
+    }
+
+    /// Evaluate formulas as a workbook file stores them: only formulas declared
+    /// with [`Self::declare_array_formula`] produce arrays; any other
+    /// formula's array or range result is implicitly intersected with its cell.
+    pub fn use_legacy_array_semantics(&mut self) {
+        self.array_formula_shapes
+            .get_or_insert_with(FxHashMap::default);
+    }
+
+    /// Declare the array formula anchored at `row`/`col` (1-based): a dynamic
+    /// array spills, a legacy (CSE) array fills its `rows` x `cols` extent.
+    pub fn declare_array_formula(
+        &mut self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+        rows: u32,
+        cols: u32,
+        dynamic: bool,
+    ) {
+        let Some(sheet_id) = self.graph.sheet_id(sheet) else {
+            return;
+        };
+        let shape = if dynamic {
+            ArrayFormulaShape::Dynamic
+        } else {
+            ArrayFormulaShape::Fixed { rows, cols }
+        };
+        self.array_formula_shapes
+            .get_or_insert_with(FxHashMap::default)
+            .insert(
+                (sheet_id, row.saturating_sub(1), col.saturating_sub(1)),
+                shape,
+            );
+    }
+
+    /// The value a formula at `cell` produces from its evaluated result under
+    /// the declared array semantics.
+    fn shape_formula_result<'c>(
+        &self,
+        interpreter: &Interpreter<'c>,
+        cell: CellRef,
+        result: crate::traits::CalcValue<'c>,
+    ) -> LiteralValue {
+        let Some(shapes) = &self.array_formula_shapes else {
+            return result.into_literal();
+        };
+        match shapes.get(&(cell.sheet_id, cell.coord.row(), cell.coord.col())) {
+            Some(ArrayFormulaShape::Dynamic) => result.into_literal(),
+            Some(ArrayFormulaShape::Fixed { rows, cols }) => {
+                fit_array_formula_result(result.into_literal(), *rows, *cols)
+            }
+            None => interpreter.eval_implicit_intersection_calc(result),
+        }
+    }
+
+    /// Whether a name's formula is reference-shaped: a reference, a `:` range
+    /// or a call to a function that can return a reference (OFFSET, INDEX).
+    fn yields_reference(&self, ast: &formualizer_parse::parser::ASTNode) -> bool {
+        use formualizer_parse::parser::ASTNodeType;
+        match &ast.node_type {
+            ASTNodeType::Reference { .. } => true,
+            ASTNodeType::BinaryOp { op, .. } => op == ":",
+            ASTNodeType::Function { name, .. } => self
+                .function_capabilities("", name)
+                .is_some_and(|caps| caps.contains(crate::function::FnCaps::RETURNS_REFERENCE)),
+            _ => false,
+        }
+    }
+
+    /// Run `f` one level deeper into named-formula evaluation. Names that
+    /// refer to themselves, directly or through other names, are #NAME?.
+    fn in_named_formula<T>(f: impl FnOnce() -> Result<T, ExcelError>) -> Result<T, ExcelError> {
+        thread_local! {
+            static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            }
+        }
+        let depth = DEPTH.with(|d| {
+            d.set(d.get() + 1);
+            d.get()
+        });
+        let _guard = Guard;
+        if depth > 64 {
+            return Err(ExcelError::new(ExcelErrorKind::Name)
+                .with_message("Named formula refers to itself".to_string()));
+        }
+        f()
+    }
+
+    /// Evaluate a named formula in `sheet_id` as a range view: it may yield a
+    /// reference (OFFSET(...)), an array constant ({0,1,2}) or a single value.
+    fn evaluate_named_formula<'c>(
+        &'c self,
+        sheet_id: SheetId,
+        ast: &formualizer_parse::parser::ASTNode,
+    ) -> Result<RangeView<'c>, ExcelError> {
+        Self::in_named_formula(|| {
+            let sheet = self.graph.sheet_name(sheet_id);
+            let cell_ref = self.graph.make_cell_ref(sheet, 0, 0);
+            let interpreter = Interpreter::new_with_cell(self, sheet, cell_ref);
+            match interpreter.evaluate_ast(ast)? {
+                crate::traits::CalcValue::Range(view) => Ok(view),
+                other => match other.into_literal() {
+                    LiteralValue::Array(rows) => {
+                        Ok(RangeView::from_owned_rows(rows, self.config.date_system))
+                    }
+                    value => Ok(RangeView::from_owned_rows(
+                        vec![vec![value]],
+                        self.config.date_system,
+                    )),
+                },
+            }
+        })
     }
 
     /// Whether the formula at `address` is dirty only because it is volatile
@@ -20000,8 +20177,9 @@ where
             Ok(cv) => {
                 let derived_format = cv.format_id();
                 self.record_derived_format(vertex_id, derived_format);
-                let result_literal =
-                    crate::engine::result_finalization::finalize_formula_result(cv.into_literal());
+                let result_literal = crate::engine::result_finalization::finalize_formula_result(
+                    self.shape_formula_result(&interpreter, cell_ref, cv),
+                );
                 let output_sheet_name = sheet_name.to_string();
                 self.write_computed_overlay_format_0based(
                     &output_sheet_name,
@@ -24181,6 +24359,9 @@ where
         let mut cycle_errors = 0;
         let mut replan_iterations = 0;
         const MAX_REPLAN: usize = 5;
+        let mut spill_passes = 0;
+        const MAX_SPILL_PASSES: usize = 8;
+        self.spill_writes.clear();
         let mut telemetry = self
             .config
             .enable_virtual_dep_telemetry
@@ -24217,8 +24398,16 @@ where
             for v in &changed_vertices {
                 self.graph.set_dirty(*v, true);
             }
+            let spill_readers = spill_passes < MAX_SPILL_PASSES && self.dirty_spill_readers();
+            self.spill_writes.clear();
+            if spill_readers {
+                spill_passes += 1;
+            }
 
             if changed_vertices.is_empty() {
+                if spill_readers {
+                    continue;
+                }
                 if let Some(t) = telemetry.as_mut() {
                     t.bailout_reason = Some("converged");
                 }
@@ -24307,6 +24496,9 @@ where
 
         let mut replan_iterations = 0;
         const MAX_REPLAN: usize = 5;
+        let mut spill_passes = 0;
+        const MAX_SPILL_PASSES: usize = 8;
+        self.spill_writes.clear();
         let mut telemetry = self
             .config
             .enable_virtual_dep_telemetry
@@ -24363,8 +24555,16 @@ where
             for v in &changed_vertices {
                 self.graph.set_dirty(*v, true);
             }
+            let spill_readers = spill_passes < MAX_SPILL_PASSES && self.dirty_spill_readers();
+            self.spill_writes.clear();
+            if spill_readers {
+                spill_passes += 1;
+            }
 
             if changed_vertices.is_empty() {
+                if spill_readers {
+                    continue;
+                }
                 if let Some(t) = telemetry.as_mut() {
                     t.bailout_reason = Some("converged");
                 }
@@ -24949,6 +25149,40 @@ where
         Ok(())
     }
 
+    /// Mark dirty the formulas that read cells a spill changed during the
+    /// last pass (they may have run before the spill landed). Returns whether
+    /// any formula needs another pass.
+    fn dirty_spill_readers(&mut self) -> bool {
+        let writes = std::mem::take(&mut self.spill_writes);
+        let mut sources: Vec<VertexId> = Vec::new();
+        for (anchor, sheet_id, r1, c1, r2, c2) in writes {
+            for row in r1..=r2 {
+                for col in c1..=c2 {
+                    let cell =
+                        CellRef::new(sheet_id, crate::reference::Coord::new(row, col, true, true));
+                    if let Some(vertex) = self.graph.get_vertex_for_cell(&cell)
+                        && vertex != anchor
+                    {
+                        sources.push(vertex);
+                    }
+                }
+            }
+            sources.extend(
+                self.graph
+                    .collect_range_dependents_for_rect(sheet_id, r1, c1, r2, c2)
+                    .into_iter()
+                    .filter(|&vertex| vertex != anchor),
+            );
+        }
+        if sources.is_empty() {
+            return false;
+        }
+        sources.sort_unstable();
+        sources.dedup();
+        self.graph.mark_dirty_many(&sources);
+        !self.graph.get_evaluation_vertices().is_empty()
+    }
+
     fn changed_virtual_dep_vertices(
         &mut self,
         to_evaluate: &[VertexId],
@@ -25173,6 +25407,9 @@ where
 
         let mut replan_iterations = 0;
         const MAX_REPLAN: usize = 5;
+        let mut spill_passes = 0;
+        const MAX_SPILL_PASSES: usize = 8;
+        self.spill_writes.clear();
         let mut telemetry = self
             .config
             .enable_virtual_dep_telemetry
@@ -25265,8 +25502,16 @@ where
             for v in &changed_vertices {
                 self.graph.set_dirty(*v, true);
             }
+            let spill_readers = spill_passes < MAX_SPILL_PASSES && self.dirty_spill_readers();
+            self.spill_writes.clear();
+            if spill_readers {
+                spill_passes += 1;
+            }
 
             if changed_vertices.is_empty() {
+                if spill_readers {
+                    continue;
+                }
                 if let Some(t) = telemetry.as_mut() {
                     t.bailout_reason = Some("converged");
                 }
@@ -26037,7 +26282,9 @@ where
                     .unwrap()
                     .insert(vertex_id, format);
                 self.record_derived_format(vertex_id, format);
-                crate::engine::result_finalization::finalize_formula_result(cv.into_literal())
+                crate::engine::result_finalization::finalize_formula_result(
+                    self.shape_formula_result(&interpreter, cell_ref, cv),
+                )
             })
     }
 
@@ -26738,6 +26985,71 @@ impl<R> crate::traits::EvaluationContext for Engine<R>
 where
     R: EvaluationContext,
 {
+    fn is_value_name(&self, name: &str, current_sheet: &str) -> bool {
+        let Some(current_id) = self.graph.sheet_id(current_sheet) else {
+            return false;
+        };
+        match self.graph.resolve_name_entry(name, current_id) {
+            Some(named) => match &named.definition {
+                NamedDefinition::Formula { ast, .. } => !self.yields_reference(ast),
+                NamedDefinition::Literal(_) => true,
+                _ => false,
+            },
+            None => false,
+        }
+    }
+
+    fn resolve_name_reference(
+        &self,
+        name: &str,
+        current_sheet: &str,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        let current_id = self.graph.sheet_id(current_sheet)?;
+        let named = self.graph.resolve_name_entry(name, current_id)?;
+        // A name for a cell or range is that reference (INDEX(Years,2) picks
+        // from it like INDEX(B18:B26,2)).
+        let ast = match &named.definition {
+            NamedDefinition::Cell(cell) => {
+                return Some(Ok(ReferenceType::Cell {
+                    sheet: Some(self.graph.sheet_name(cell.sheet_id).to_string()),
+                    row: cell.coord.row() + 1,
+                    col: cell.coord.col() + 1,
+                    row_abs: cell.coord.row_abs(),
+                    col_abs: cell.coord.col_abs(),
+                }));
+            }
+            NamedDefinition::Range(range) => {
+                return Some(Ok(ReferenceType::Range {
+                    sheet: Some(self.graph.sheet_name(range.start.sheet_id).to_string()),
+                    start_row: Some(range.start.coord.row() + 1),
+                    start_col: Some(range.start.coord.col() + 1),
+                    end_row: Some(range.end.coord.row() + 1),
+                    end_col: Some(range.end.coord.col() + 1),
+                    start_row_abs: range.start.coord.row_abs(),
+                    start_col_abs: range.start.coord.col_abs(),
+                    end_row_abs: range.end.coord.row_abs(),
+                    end_col_abs: range.end.coord.col_abs(),
+                }));
+            }
+            NamedDefinition::Literal(_) => return None,
+            NamedDefinition::Formula { ast, .. } => ast,
+        };
+        if !self.yields_reference(ast) {
+            return None;
+        }
+        let sheet_id = match named.scope {
+            NameScope::Sheet(id) => id,
+            NameScope::Workbook => current_id,
+        };
+        let sheet = self.graph.sheet_name(sheet_id);
+        let cell_ref = self.graph.make_cell_ref(sheet, 0, 0);
+        let interpreter = Interpreter::new_with_cell(self, sheet, cell_ref);
+        match Self::in_named_formula(|| Ok(interpreter.try_evaluate_ast_as_reference(ast))) {
+            Ok(result) => result,
+            Err(err) => Some(Err(err)),
+        }
+    }
+
     fn clock(&self) -> &dyn crate::timezone::ClockProvider {
         &self.clock
     }
@@ -27357,13 +27669,16 @@ where
                                 self.config.date_system,
                             ));
                         }
-                        NamedDefinition::Formula { .. } => {
-                            if let Some(value) = self.graph.get_value(named.vertex) {
-                                return Ok(RangeView::from_owned_rows(
-                                    vec![vec![value]],
-                                    self.config.date_system,
-                                ));
+                        NamedDefinition::Formula { ast, .. } => {
+                            // A named formula evaluates where it is used: it may
+                            // yield a reference (OFFSET(...)), an array constant
+                            // ({0,1,2}) or a single value.
+                            let context_sheet = match named.scope {
+                                NameScope::Sheet(id) => Some(id),
+                                NameScope::Workbook => self.graph.sheet_id(current_sheet),
                             }
+                            .unwrap_or_else(|| self.graph.default_sheet_id());
+                            return self.evaluate_named_formula(context_sheet, ast);
                         }
                     }
                 }
@@ -28435,7 +28750,7 @@ where
                             .insert(vertex_id, format);
                         self.record_derived_format(vertex_id, format);
                         crate::engine::result_finalization::finalize_formula_result(
-                            cv.into_literal(),
+                            self.shape_formula_result(&interpreter, cell_ref, cv),
                         )
                     })
             }
@@ -28713,6 +29028,43 @@ where
                         delta.record_cell(cell.sheet_id, cell.coord.row(), cell.coord.col());
                     }
                 }
+            }
+        }
+
+        // Formulas that read these cells may have run before the spill landed;
+        // remember the area so they are evaluated again.
+        let width = rows.first().map_or(0, |r| r.len()).max(1);
+        let spill_changed = prev_spill_cells.iter().any(|cell| !targets.contains(cell))
+            || targets.iter().enumerate().any(|(idx, cell)| {
+                let new = rows
+                    .get(idx / width)
+                    .and_then(|r| r.get(idx % width))
+                    .cloned()
+                    .unwrap_or(LiteralValue::Empty);
+                let sheet_name = self.graph.sheet_name(cell.sheet_id);
+                self.get_cell_value(sheet_name, cell.coord.row() + 1, cell.coord.col() + 1)
+                    .unwrap_or(LiteralValue::Empty)
+                    != new
+            });
+        if spill_changed {
+            for cells in [&prev_spill_cells[..], targets] {
+                let Some(first) = cells.first() else {
+                    continue;
+                };
+                let (mut r1, mut c1, mut r2, mut c2) = (
+                    first.coord.row(),
+                    first.coord.col(),
+                    first.coord.row(),
+                    first.coord.col(),
+                );
+                for cell in cells {
+                    r1 = r1.min(cell.coord.row());
+                    c1 = c1.min(cell.coord.col());
+                    r2 = r2.max(cell.coord.row());
+                    c2 = c2.max(cell.coord.col());
+                }
+                self.spill_writes
+                    .push((anchor_vertex, first.sheet_id, r1, c1, r2, c2));
             }
         }
 

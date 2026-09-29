@@ -325,6 +325,21 @@ impl DependencyGraph {
     /// sheet's scope - substituting the default sheet for missing context is
     /// what leaked references onto unrelated sheets in issue #110.
     pub fn resolve_name_entry_in_scope(&self, name: &str, scope: NameScope) -> Option<&NamedRange> {
+        // `Sheet1!Name` / `'My Sheet'!Name` names the name as seen from that
+        // sheet: its sheet-level name, else the workbook-level one.
+        if let Some((sheet, local)) = name.rsplit_once('!')
+            && !local.is_empty()
+            && !sheet.is_empty()
+            && !sheet.starts_with('[')
+        {
+            let sheet = match sheet.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+                Some(quoted) => quoted.replace("''", "'"),
+                None => sheet.to_string(),
+            };
+            if let Some(sheet_id) = self.sheet_id(&sheet) {
+                return self.resolve_name_entry_in_scope(local, NameScope::Sheet(sheet_id));
+            }
+        }
         let workbook_entry = || {
             if self.config.case_sensitive_names {
                 self.named_ranges.get(name)
