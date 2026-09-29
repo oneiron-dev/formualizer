@@ -98,3 +98,36 @@ fn error_text_and_empty_criteria() {
     assert_eq!(eval("=COUNTIF(A1:A5,B9)"), LiteralValue::Number(0.0));
     assert_eq!(eval("=COUNTIF(A1:A5,\"\")"), LiteralValue::Number(3.0));
 }
+
+#[test]
+fn text_criteria_keep_their_spaces() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    for (row, key) in [(1, "   2E"), (2, "2E"), (3, "   2E")] {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Text(key.into()))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", row, 2, LiteralValue::Number(row as f64))
+            .unwrap();
+    }
+    engine
+        .set_cell_value("Sheet1", 5, 1, LiteralValue::Text("   2E".into()))
+        .unwrap();
+    let formulas = [
+        "=SUMIFS(B1:B3,A1:A3,\"=\"&A5)",
+        "=COUNTIF(A1:A3,A5)",
+        "=COUNTIF(A1:A3,\"2E\")",
+        "=COUNTIF(B1:B3,\" 2 \")",
+    ];
+    for (i, formula) in formulas.iter().enumerate() {
+        engine
+            .set_cell_formula("Sheet1", 1 + i as u32, 4, parse(formula).unwrap())
+            .unwrap();
+    }
+    engine.evaluate_all().unwrap();
+    let value = |row| engine.get_cell_value("Sheet1", row, 4).unwrap();
+    assert_eq!(value(1), LiteralValue::Number(4.0));
+    assert_eq!(value(2), LiteralValue::Number(2.0));
+    assert_eq!(value(3), LiteralValue::Number(1.0));
+    assert_eq!(value(4), LiteralValue::Number(1.0));
+}

@@ -1133,3 +1133,28 @@ fn whole_columns_span_the_grid() {
         assert!(sheet.contains(expected), "{expected}: {sheet}");
     }
 }
+#[test]
+fn arrays_larger_than_ten_thousand_cells_fill_their_extent() {
+    // A legacy array over 1001 x 10 cells (more than the engine's default
+    // spill cap) fills its extent like any other.
+    let mut rows = String::new();
+    for r in 1..=1001 {
+        rows.push_str(&format!("<row r=\"{r}\">"));
+        for c in ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"] {
+            if (r, c) == (1, "A") {
+                rows.push_str("<c r=\"A1\"><f t=\"array\" ref=\"A1:J1001\">ROW(L1:U1001)*100+COLUMN(L1:U1001)</f><v>0</v></c>");
+            } else {
+                rows.push_str(&format!("<c r=\"{c}{r}\"><v>0</v></c>"));
+            }
+        }
+        rows.push_str("</row>");
+    }
+    let out = recalculate_xlsx_bytes(&pack(&parts(&rows)), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    assert!(sheet.contains("ref=\"A1:J1001\">ROW(L1:U1001)*100+COLUMN(L1:U1001)</f><v>112</v>"));
+    assert!(
+        sheet.contains("<c r=\"J1001\"><v>100121</v>"),
+        "{}",
+        &sheet[sheet.len() - 300..]
+    );
+}

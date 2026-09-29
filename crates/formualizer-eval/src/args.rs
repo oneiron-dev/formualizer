@@ -132,9 +132,11 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
         LiteralValue::Text(s) => {
             let s_trim = s.trim();
 
+            // Text criteria keep their spaces: "="&A9 with A9 = "   2E" matches
+            // only "   2E". Numbers are read from the trimmed text.
             let unquote = |t: &str| -> String {
-                let t = t.trim();
-                if let Some(inner) = t.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+                let trimmed = t.trim();
+                if let Some(inner) = trimmed.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
                     inner.replace("\"\"", "\"")
                 } else {
                     t.to_string()
@@ -144,7 +146,7 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
             // Operators: >=, <=, <>, >, <, =
             let ops = [">=", "<=", "<>", ">", "<", "="];
             for op in ops.iter() {
-                if let Some(rhs) = s_trim.strip_prefix(op) {
+                if let Some(rhs) = s.trim_start().strip_prefix(op) {
                     let rhs_trim = rhs.trim();
                     // Try numeric parse for comparisons
                     if let Some(n) = criteria_number(rhs_trim) {
@@ -164,7 +166,7 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
                         Some(kind) if matches!(*op, "=" | "<>") => {
                             LiteralValue::Error(ExcelError::new(kind))
                         }
-                        _ => LiteralValue::Text(unquote(rhs_trim)),
+                        _ => LiteralValue::Text(unquote(rhs)),
                     };
                     return Ok(match *op {
                         "=" => CriteriaPredicate::Eq(lit),
@@ -178,7 +180,7 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
                 }
             }
 
-            let plain = unquote(s_trim);
+            let plain = unquote(s);
 
             // Wildcards * or ? => TextLike
             if plain.contains('*') || plain.contains('?') {
@@ -188,7 +190,7 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
                 });
             }
             // Booleans TRUE/FALSE
-            let lower = plain.to_ascii_lowercase();
+            let lower = plain.trim().to_ascii_lowercase();
             if lower == "true" {
                 return Ok(CriteriaPredicate::Eq(LiteralValue::Boolean(true)));
             } else if lower == "false" {
@@ -196,10 +198,10 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
             }
             // A number written as text ("111111") is a numeric criterion, as
             // if written "=111111".
-            if let Some(n) = criteria_number(&plain) {
+            if let Some(n) = criteria_number(plain.trim()) {
                 return Ok(CriteriaPredicate::Eq(LiteralValue::Number(n)));
             }
-            if let Some(kind) = criteria_error(&plain) {
+            if let Some(kind) = criteria_error(plain.trim()) {
                 return Ok(CriteriaPredicate::Eq(LiteralValue::Error(ExcelError::new(
                     kind,
                 ))));

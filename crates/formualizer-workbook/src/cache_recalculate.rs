@@ -429,6 +429,12 @@ pub fn recalculate_xlsx_bytes(
     }
     let mut config = options.eval_config.clone();
     config.date_system = date_system;
+    // Excel spills any array that fits the grid; the package cell limit is
+    // the only bound here (the default 10,000-cell cap refused SEQUENCE(30000)).
+    config.spill.max_spill_cells = config
+        .spill
+        .max_spill_cells
+        .max(u32::try_from(options.limits.max_cells).unwrap_or(u32::MAX));
     // Excel finds circular references while it calculates: a formula whose
     // references only look circular (INDEX($K$3:K9,...) picking an earlier
     // row) is not one. The file's calcPr decides whether real ones iterate.
