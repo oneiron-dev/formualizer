@@ -1,6 +1,7 @@
 //! Surgical ZIP32 package edits. ZIP7 supplies compression and CRC generation;
 //! original local/central metadata is retained, not normalized by raw_copy_file.
-//! Admission has rejected ZIP64, descriptors and unknown extra metadata.
+//! Admission has rejected ZIP64, descriptors and extra metadata other than the
+//! Office growth-hint padding, which carries no sizes or offsets.
 use super::super::{BoundedOutput, Patch, apply_patches};
 use super::{
     Archive, BTreeMap, IoError, XlsxRecalculateOptions, checkpoint, u16_at, u32_at, unsupported,

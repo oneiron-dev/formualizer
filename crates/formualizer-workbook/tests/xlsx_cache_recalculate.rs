@@ -458,6 +458,75 @@ fn zip_metadata_is_not_normalized_even_for_changed_members() {
         }
     }
 }
+/// Splice one local-header extra record into every member of a packed archive
+/// (ZIP7 refuses to author unreserved IDs), relocating the central directory.
+fn pack_with_local_extra(parts: &BTreeMap<String, String>, id: u16, body: &[u8]) -> Vec<u8> {
+    let input = pack(parts);
+    let (headers, footer) = directory(&input);
+    let central = h32(&input, footer + 16);
+    let mut record = id.to_le_bytes().to_vec();
+    record.extend_from_slice(&(body.len() as u16).to_le_bytes());
+    record.extend_from_slice(body);
+    let mut locals: Vec<usize> = headers.iter().map(|&a| h32(&input, a + 42)).collect();
+    locals.sort_unstable();
+    let mut out = Vec::new();
+    let mut moved = BTreeMap::new();
+    for (i, &local) in locals.iter().enumerate() {
+        let header = out.len();
+        moved.insert(local, header);
+        let fixed = local + 30 + h16(&input, local + 26);
+        assert_eq!(h16(&input, local + 28), 0);
+        out.extend_from_slice(&input[local..fixed]);
+        out[header + 28..header + 30].copy_from_slice(&(record.len() as u16).to_le_bytes());
+        out.extend_from_slice(&record);
+        let next = locals.get(i + 1).copied().unwrap_or(central);
+        out.extend_from_slice(&input[fixed..next]);
+    }
+    let new_central = out.len();
+    out.extend_from_slice(&input[central..]);
+    for &a in &headers {
+        let at = new_central + a - central;
+        let local = moved[&h32(&input, a + 42)] as u32;
+        out[at + 42..at + 46].copy_from_slice(&local.to_le_bytes());
+    }
+    let at = new_central + footer - central;
+    out[at + 16..at + 20].copy_from_slice(&(new_central as u32).to_le_bytes());
+    out
+}
+#[test]
+fn office_growth_hint_padding_is_admitted_and_retained() {
+    // Excel pads every local header with a 0xA220 growth hint (signature
+    // 0xA028, padding length, zero padding); it describes no sizes/offsets.
+    let mut hint = vec![0x28, 0xA0, 0xFC, 0x00];
+    hint.resize(256, 0);
+    let input = pack_with_local_extra(&single("1+1", "<v>99</v>"), 0xA220, &hint);
+    let (headers, _) = directory(&input);
+    let local = h32(&input, headers[0] + 42);
+    assert_eq!(h16(&input, local + 28), 260);
+    let out = recalculate_xlsx_bytes(&input, Default::default()).unwrap();
+    assert_eq!(out.cache_cells_changed, 1);
+    assert_eq!(data(&out.bytes, 0), Data::Float(2.0));
+    let (after, _) = directory(&out.bytes);
+    for (&a, &b) in headers.iter().zip(&after) {
+        let la = h32(&input, a + 42);
+        let lb = h32(&out.bytes, b + 42);
+        let extra = 30 + h16(&input, la + 26);
+        assert_eq!(
+            input[la + extra..la + extra + 260],
+            out.bytes[lb + extra..lb + extra + 260]
+        );
+    }
+    assert_eq!(member(&out.bytes, "custom/opaque.bin"), "do not touch");
+    assert_eq!(
+        recalculate_xlsx_bytes(&out.bytes, Default::default())
+            .unwrap()
+            .bytes,
+        out.bytes
+    );
+    // Other local extras (here an extended timestamp) stay unsupported.
+    let other = pack_with_local_extra(&single("1+1", "<v>99</v>"), 0x5455, &[1, 0, 0, 0, 0]);
+    assert!(recalculate_xlsx_bytes(&other, Default::default()).is_err());
+}
 #[test]
 fn multiple_changed_members_relocate_growing_and_shrinking_payloads() {
     let old = (0..2048u32)

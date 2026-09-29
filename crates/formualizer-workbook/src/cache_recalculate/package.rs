@@ -46,6 +46,26 @@ fn part_name(name: &str) -> Result<(), IoError> {
     }
     Ok(())
 }
+/// Office packages written by Excel pad local headers with the 0xA220 "growth
+/// hint" extra field so parts can be rewritten in place. It carries no size,
+/// CRC or offset information, so a raw-copied local header that keeps it byte
+/// for byte stays valid after the payload changes. Any other local extra (for
+/// example ZIP64 sizes) remains unsupported.
+fn growth_hint_only(extra: &[u8]) -> bool {
+    const GROWTH_HINT: u16 = 0xA220;
+    let mut rest = extra;
+    while !rest.is_empty() {
+        let Some(&[a, b, c, d]) = rest.get(..4) else {
+            return false;
+        };
+        let size = u16::from_le_bytes([c, d]) as usize;
+        if u16::from_le_bytes([a, b]) != GROWTH_HINT || rest.len() < 4 + size {
+            return false;
+        }
+        rest = &rest[4 + size..];
+    }
+    true
+}
 // ZIP7 indexes members by name and can hide duplicate central-directory names.
 // This is a bounded metadata audit, NOT a ZIP writer/decoder. ZIP64, arbitrary
 // entry extras/comments and split archives are explicitly unsupported because
@@ -109,7 +129,7 @@ fn audit_directory(
         let local_name_len = u16_at(bytes, local + 26)?;
         let local_extra = u16_at(bytes, local + 28)?;
         let data = checked_end(local + 30, local_name_len + local_extra, start)?;
-        if local_extra != 0 {
+        if !growth_hint_only(&bytes[local + 30 + local_name_len..data]) {
             return Err(unsupported("ZIP local extra metadata", name));
         }
         if bytes.get(local + 30..local + 30 + local_name_len) != Some(raw_name)
