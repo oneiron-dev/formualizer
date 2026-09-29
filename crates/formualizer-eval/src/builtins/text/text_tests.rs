@@ -271,6 +271,29 @@ mod tests {
     }
 
     #[test]
+    fn trim_removes_only_ascii_spaces() {
+        let wb = TestWorkbook::new().with_function(Arc::new(TrimFn));
+        let ctx = wb.interpreter();
+        let f = ctx.context.get_function("", "TRIM").unwrap();
+        for (input, want) in [
+            ("\tHello", "\tHello"),
+            ("\u{a0}Hello\u{a0}", "\u{a0}Hello\u{a0}"),
+            ("  a \n  b  ", "a \n b"),
+        ] {
+            let text = lit(LiteralValue::Text(input.into()));
+            assert_eq!(
+                f.dispatch(
+                    &[ArgumentHandle::new(&text, &ctx)],
+                    &ctx.function_context(None)
+                )
+                .unwrap(),
+                LiteralValue::Text(want.into()),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_trim_edge_cases() {
         let wb = TestWorkbook::new().with_function(Arc::new(TrimFn));
         let ctx = wb.interpreter();

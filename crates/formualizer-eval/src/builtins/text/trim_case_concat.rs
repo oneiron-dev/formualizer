@@ -127,8 +127,10 @@ pub struct TrimFn;
 /// Removes leading/trailing whitespace and collapses internal runs to single spaces.
 ///
 /// # Remarks
-/// - Leading and trailing whitespace is removed.
-/// - Consecutive whitespace inside the text is collapsed to one ASCII space.
+/// - Leading and trailing spaces are removed.
+/// - Runs of spaces inside the text collapse to one space.
+/// - Only the ASCII space (code 32) counts; tabs, line breaks and
+///   non-breaking spaces are kept.
 /// - Non-text inputs are coerced to text before trimming.
 /// - Errors are propagated unchanged.
 ///
@@ -153,7 +155,7 @@ pub struct TrimFn;
 ///   - SUBSTITUTE
 /// faq:
 ///   - q: "What whitespace does TRIM normalize?"
-///     a: "It trims edges and collapses internal whitespace runs to single spaces."
+///     a: "Only the ASCII space character: it trims edges and collapses internal runs of spaces to one."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: TRIM
@@ -181,23 +183,15 @@ impl Function for TrimFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        // Excel trims only the ASCII space (32); tabs, line breaks and
+        // non-breaking spaces are kept.
         let s = to_text(&args[0])?;
-        let mut out = String::new();
-        let mut prev_space = false;
-        for ch in s.chars() {
-            if ch.is_whitespace() {
-                prev_space = true;
-            } else {
-                if prev_space && !out.is_empty() {
-                    out.push(' ');
-                }
-                out.push(ch);
-                prev_space = false;
-            }
-        }
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(
-            out.trim().into(),
-        )))
+        let out = s
+            .split(' ')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(out)))
     }
 }
 
