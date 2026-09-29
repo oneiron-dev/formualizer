@@ -24,7 +24,7 @@ pub struct RowFn;
 /// `ROW` returns a 1-based row index.
 ///
 /// # Remarks
-/// - With a range argument, `ROW` returns the first row in that reference.
+/// - With a multi-row range argument, `ROW` returns the vertical array of its row numbers.
 /// - Without arguments, it uses the row of the formula cell.
 /// - Full-column references such as `A:A` return `1`.
 /// - Invalid references return an error (`#REF!`/`#VALUE!` depending on context).
@@ -37,8 +37,8 @@ pub struct RowFn;
 /// ```
 ///
 /// ```yaml,sandbox
-/// title: "Row of a multi-cell range"
-/// formula: '=ROW(C3:E9)'
+/// title: "Row of a single-row range"
+/// formula: '=ROW(C3:E3)'
 /// expected: 3
 /// ```
 ///
@@ -49,7 +49,7 @@ pub struct RowFn;
 ///   - ADDRESS
 /// faq:
 ///   - q: "What does ROW return for a multi-cell reference?"
-///     a: "ROW returns the first row index of the reference, not an array of every row number."
+///     a: "ROW returns the array of every row number in the reference (its first row when used as a single value)."
 ///   - q: "What if ROW() is called without arguments?"
 ///     a: "It uses the formula cell position; if no current cell context exists, it returns #VALUE!."
 /// ```
@@ -125,20 +125,21 @@ impl Function for RowFn {
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
 
-        // Extract row number from reference (1-based)
-        let row_1based = match &reference {
-            ReferenceType::Cell { row, .. } => *row as i64,
+        // Row numbers (1-based) spanned by the reference.
+        let (first, last) = match &reference {
+            ReferenceType::Cell { row, .. } => (*row as i64, *row as i64),
             ReferenceType::Range {
                 start_row: Some(sr),
+                end_row,
                 ..
-            } => *sr as i64,
+            } => (*sr as i64, end_row.map_or(*sr as i64, |er| er as i64)),
             // Full-column references like A:A use first row
             ReferenceType::Range {
                 start_row: None,
                 end_row: None,
                 ..
-            } => 1,
-            // Fallback: resolve the reference and use the view origin
+            } => (1, 1),
+            // Fallback: resolve the reference and use the view extent
             _ => match ctx.resolve_range_view(&reference, ctx.current_sheet()) {
                 Ok(view) => {
                     if view.is_empty() {
@@ -146,7 +147,8 @@ impl Function for RowFn {
                             ExcelError::new(ExcelErrorKind::Ref),
                         )));
                     }
-                    view.start_row() as i64 + 1
+                    let first = view.start_row() as i64 + 1;
+                    (first, first + view.dims().0 as i64 - 1)
                 }
                 Err(e) => {
                     return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
@@ -154,9 +156,7 @@ impl Function for RowFn {
             },
         };
 
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Int(
-            row_1based,
-        )))
+        Ok(index_sequence(first, last, true, ctx))
     }
 }
 
@@ -415,20 +415,21 @@ impl Function for ColumnFn {
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
 
-        // Extract column number from reference (1-based)
-        let col_1based = match &reference {
-            ReferenceType::Cell { col, .. } => *col as i64,
+        // Column numbers (1-based) spanned by the reference.
+        let (first, last) = match &reference {
+            ReferenceType::Cell { col, .. } => (*col as i64, *col as i64),
             ReferenceType::Range {
                 start_col: Some(sc),
+                end_col,
                 ..
-            } => *sc as i64,
+            } => (*sc as i64, end_col.map_or(*sc as i64, |ec| ec as i64)),
             // Full-row references like 1:1 use first column
             ReferenceType::Range {
                 start_col: None,
                 end_col: None,
                 ..
-            } => 1,
-            // Fallback: resolve the reference and use the view origin
+            } => (1, 1),
+            // Fallback: resolve the reference and use the view extent
             _ => match ctx.resolve_range_view(&reference, ctx.current_sheet()) {
                 Ok(view) => {
                     if view.is_empty() {
@@ -436,7 +437,8 @@ impl Function for ColumnFn {
                             ExcelError::new(ExcelErrorKind::Ref),
                         )));
                     }
-                    view.start_col() as i64 + 1
+                    let first = view.start_col() as i64 + 1;
+                    (first, first + view.dims().1 as i64 - 1)
                 }
                 Err(e) => {
                     return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
@@ -444,10 +446,31 @@ impl Function for ColumnFn {
             },
         };
 
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Int(
-            col_1based,
-        )))
+        Ok(index_sequence(first, last, false, ctx))
     }
+}
+
+/// ROW/COLUMN result: a single index, or for a multi-row (multi-column)
+/// reference the vertical (horizontal) array of every index, as Excel returns.
+fn index_sequence<'b>(
+    first: i64,
+    last: i64,
+    vertical: bool,
+    ctx: &dyn FunctionContext<'b>,
+) -> crate::traits::CalcValue<'b> {
+    if last <= first {
+        return crate::traits::CalcValue::Scalar(LiteralValue::Int(first));
+    }
+    let values = (first..=last).map(LiteralValue::Int);
+    let rows = if vertical {
+        values.map(|v| vec![v]).collect()
+    } else {
+        vec![values.collect()]
+    };
+    crate::traits::CalcValue::Range(crate::engine::range_view::RangeView::from_owned_rows(
+        rows,
+        ctx.date_system(),
+    ))
 }
 
 #[derive(Debug)]
@@ -626,7 +649,7 @@ mod tests {
             .into_literal();
         assert_eq!(result, LiteralValue::Int(5));
 
-        // ROW(A1:C3) -> 1 (first row)
+        // ROW(A1:C3) -> {1;2;3}
         let range_ref = ASTNode::new(
             ASTNodeType::Reference {
                 original: "A1:C3".into(),
@@ -640,7 +663,14 @@ mod tests {
             .dispatch(&args2, &ctx.function_context(None))
             .unwrap()
             .into_literal();
-        assert_eq!(result2, LiteralValue::Int(1));
+        assert_eq!(
+            result2,
+            LiteralValue::Array(vec![
+                vec![LiteralValue::Number(1.0)],
+                vec![LiteralValue::Number(2.0)],
+                vec![LiteralValue::Number(3.0)],
+            ])
+        );
     }
 
     #[test]
@@ -835,7 +865,7 @@ mod tests {
             .into_literal();
         assert_eq!(result, LiteralValue::Int(3));
 
-        // COLUMN(B2:D4) -> 2 (first column)
+        // COLUMN(B2:D4) -> {2,3,4}
         let range_ref = ASTNode::new(
             ASTNodeType::Reference {
                 original: "B2:D4".into(),
@@ -849,7 +879,14 @@ mod tests {
             .dispatch(&args2, &ctx.function_context(None))
             .unwrap()
             .into_literal();
-        assert_eq!(result2, LiteralValue::Int(2));
+        assert_eq!(
+            result2,
+            LiteralValue::Array(vec![vec![
+                LiteralValue::Number(2.0),
+                LiteralValue::Number(3.0),
+                LiteralValue::Number(4.0),
+            ]])
+        );
     }
 
     #[test]
