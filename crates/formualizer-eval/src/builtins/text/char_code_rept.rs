@@ -20,18 +20,37 @@ fn scalar_like_value(arg: &ArgumentHandle<'_, '_>) -> Result<LiteralValue, Excel
     })
 }
 
-/// CHAR(number) - Returns the character specified by a number
-/// Excel uses Windows-1252 encoding for codes 1-255
+/// Characters 128-255 of the Macintosh character set, which Excel for Mac
+/// uses for CHAR and CODE (Apple's current table: 0xDB is the euro sign).
+const MAC_ROMAN_HIGH: [char; 128] = [
+    '\u{00C4}', '\u{00C5}', '\u{00C7}', '\u{00C9}', '\u{00D1}', '\u{00D6}', '\u{00DC}', '\u{00E1}',
+    '\u{00E0}', '\u{00E2}', '\u{00E4}', '\u{00E3}', '\u{00E5}', '\u{00E7}', '\u{00E9}', '\u{00E8}',
+    '\u{00EA}', '\u{00EB}', '\u{00ED}', '\u{00EC}', '\u{00EE}', '\u{00EF}', '\u{00F1}', '\u{00F3}',
+    '\u{00F2}', '\u{00F4}', '\u{00F6}', '\u{00F5}', '\u{00FA}', '\u{00F9}', '\u{00FB}', '\u{00FC}',
+    '\u{2020}', '\u{00B0}', '\u{00A2}', '\u{00A3}', '\u{00A7}', '\u{2022}', '\u{00B6}', '\u{00DF}',
+    '\u{00AE}', '\u{00A9}', '\u{2122}', '\u{00B4}', '\u{00A8}', '\u{2260}', '\u{00C6}', '\u{00D8}',
+    '\u{221E}', '\u{00B1}', '\u{2264}', '\u{2265}', '\u{00A5}', '\u{00B5}', '\u{2202}', '\u{2211}',
+    '\u{220F}', '\u{03C0}', '\u{222B}', '\u{00AA}', '\u{00BA}', '\u{03A9}', '\u{00E6}', '\u{00F8}',
+    '\u{00BF}', '\u{00A1}', '\u{00AC}', '\u{221A}', '\u{0192}', '\u{2248}', '\u{2206}', '\u{00AB}',
+    '\u{00BB}', '\u{2026}', '\u{00A0}', '\u{00C0}', '\u{00C3}', '\u{00D5}', '\u{0152}', '\u{0153}',
+    '\u{2013}', '\u{2014}', '\u{201C}', '\u{201D}', '\u{2018}', '\u{2019}', '\u{00F7}', '\u{25CA}',
+    '\u{00FF}', '\u{0178}', '\u{2044}', '\u{20AC}', '\u{2039}', '\u{203A}', '\u{FB01}', '\u{FB02}',
+    '\u{2021}', '\u{00B7}', '\u{201A}', '\u{201E}', '\u{2030}', '\u{00C2}', '\u{00CA}', '\u{00C1}',
+    '\u{00CB}', '\u{00C8}', '\u{00CD}', '\u{00CE}', '\u{00CF}', '\u{00CC}', '\u{00D3}', '\u{00D4}',
+    '\u{F8FF}', '\u{00D2}', '\u{00DA}', '\u{00DB}', '\u{00D9}', '\u{0131}', '\u{02C6}', '\u{02DC}',
+    '\u{00AF}', '\u{02D8}', '\u{02D9}', '\u{02DA}', '\u{00B8}', '\u{02DD}', '\u{02DB}', '\u{02C7}',
+];
+
 #[derive(Debug)]
 pub struct CharFn;
 /// Returns the character represented by a numeric code.
 ///
-/// `CHAR` follows Excel-style Windows-1252 behavior for codes `1..255`.
+/// `CHAR` follows Excel for Mac, which reads codes `1..255` in the Macintosh character set.
 ///
 /// # Remarks
 /// - Input is truncated to an integer code.
 /// - Valid code range is `1` through `255`; outside this range returns `#VALUE!`.
-/// - Codes in the Windows-1252 extension range (128-159) are mapped to Unicode equivalents.
+/// - Codes 128-255 map through the Macintosh character set (`CHAR(160)` is a dagger).
 /// - Errors are propagated unchanged.
 ///
 /// # Examples
@@ -54,8 +73,8 @@ pub struct CharFn;
 ///   - UNICHAR
 ///   - UNICODE
 /// faq:
-///   - q: "Which character set does CHAR use for codes 128-159?"
-///     a: "It follows Excel-style Windows-1252 mappings, including extended symbols in that range."
+///   - q: "Which character set does CHAR use for codes 128-255?"
+///     a: "The Macintosh character set, as Excel for Mac does: CHAR(160) is a dagger and CHAR(202) a non-breaking space."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: CHAR
@@ -98,40 +117,11 @@ impl Function for CharFn {
             )));
         }
 
-        // Windows-1252 to Unicode mapping for codes 128-159
-        let unicode_char = match code as u8 {
-            0x80 => '\u{20AC}', // Euro sign
-            0x82 => '\u{201A}', // Single low-9 quotation mark
-            0x83 => '\u{0192}', // Latin small letter f with hook
-            0x84 => '\u{201E}', // Double low-9 quotation mark
-            0x85 => '\u{2026}', // Horizontal ellipsis
-            0x86 => '\u{2020}', // Dagger
-            0x87 => '\u{2021}', // Double dagger
-            0x88 => '\u{02C6}', // Modifier letter circumflex accent
-            0x89 => '\u{2030}', // Per mille sign
-            0x8A => '\u{0160}', // Latin capital letter S with caron
-            0x8B => '\u{2039}', // Single left-pointing angle quotation mark
-            0x8C => '\u{0152}', // Latin capital ligature OE
-            0x8E => '\u{017D}', // Latin capital letter Z with caron
-            0x91 => '\u{2018}', // Left single quotation mark
-            0x92 => '\u{2019}', // Right single quotation mark
-            0x93 => '\u{201C}', // Left double quotation mark
-            0x94 => '\u{201D}', // Right double quotation mark
-            0x95 => '\u{2022}', // Bullet
-            0x96 => '\u{2013}', // En dash
-            0x97 => '\u{2014}', // Em dash
-            0x98 => '\u{02DC}', // Small tilde
-            0x99 => '\u{2122}', // Trade mark sign
-            0x9A => '\u{0161}', // Latin small letter s with caron
-            0x9B => '\u{203A}', // Single right-pointing angle quotation mark
-            0x9C => '\u{0153}', // Latin small ligature oe
-            0x9E => '\u{017E}', // Latin small letter z with caron
-            0x9F => '\u{0178}', // Latin capital letter Y with diaeresis
-            0x81 | 0x8D | 0x8F | 0x90 | 0x9D => {
-                // Undefined in Windows-1252, return placeholder
-                '\u{FFFD}'
-            }
-            c => char::from(c),
+        // Excel for Mac reads codes through the Macintosh character set.
+        let unicode_char = if code < 128 {
+            char::from(code as u8)
+        } else {
+            MAC_ROMAN_HIGH[code as usize - 128]
         };
 
         Ok(CalcValue::Scalar(LiteralValue::Text(
@@ -145,13 +135,14 @@ impl Function for CharFn {
 pub struct CodeFn;
 /// Returns the numeric code of the first character in text.
 ///
-/// `CODE` mirrors Excel behavior with Windows-1252 compatibility mappings.
+/// `CODE` follows Excel for Mac and reports Macintosh character set codes.
 ///
 /// # Remarks
 /// - Only the first character is inspected.
 /// - Empty text returns `#VALUE!`.
 /// - Text-like coercion is applied to non-text scalar inputs.
-/// - Known Unicode characters in the Windows-1252 extension map back to their Excel codes.
+/// - Characters 128-255 of the Macintosh character set map back to their codes; other
+///   characters report 63, the code of the "?" they convert to.
 ///
 /// # Examples
 ///
@@ -222,37 +213,15 @@ impl Function for CodeFn {
 
         let first_char = s.chars().next().unwrap();
 
-        // Map Unicode back to Windows-1252 for Excel compatibility
-        let code = match first_char {
-            '\u{20AC}' => 0x80, // Euro sign
-            '\u{201A}' => 0x82, // Single low-9 quotation mark
-            '\u{0192}' => 0x83, // Latin small letter f with hook
-            '\u{201E}' => 0x84, // Double low-9 quotation mark
-            '\u{2026}' => 0x85, // Horizontal ellipsis
-            '\u{2020}' => 0x86, // Dagger
-            '\u{2021}' => 0x87, // Double dagger
-            '\u{02C6}' => 0x88, // Modifier letter circumflex accent
-            '\u{2030}' => 0x89, // Per mille sign
-            '\u{0160}' => 0x8A, // Latin capital letter S with caron
-            '\u{2039}' => 0x8B, // Single left-pointing angle quotation mark
-            '\u{0152}' => 0x8C, // Latin capital ligature OE
-            '\u{017D}' => 0x8E, // Latin capital letter Z with caron
-            '\u{2018}' => 0x91, // Left single quotation mark
-            '\u{2019}' => 0x92, // Right single quotation mark
-            '\u{201C}' => 0x93, // Left double quotation mark
-            '\u{201D}' => 0x94, // Right double quotation mark
-            '\u{2022}' => 0x95, // Bullet
-            '\u{2013}' => 0x96, // En dash
-            '\u{2014}' => 0x97, // Em dash
-            '\u{02DC}' => 0x98, // Small tilde
-            '\u{2122}' => 0x99, // Trade mark sign
-            '\u{0161}' => 0x9A, // Latin small letter s with caron
-            '\u{203A}' => 0x9B, // Single right-pointing angle quotation mark
-            '\u{0153}' => 0x9C, // Latin small ligature oe
-            '\u{017E}' => 0x9E, // Latin small letter z with caron
-            '\u{0178}' => 0x9F, // Latin capital letter Y with diaeresis
-            c if (c as u32) < 256 => c as i64,
-            c => c as i64, // For characters outside Windows-1252, return Unicode code point
+        // The Macintosh character set code; characters outside it read as
+        // the "?" they convert to.
+        let code = if (first_char as u32) < 128 {
+            first_char as i64
+        } else {
+            MAC_ROMAN_HIGH
+                .iter()
+                .position(|&c| c == first_char)
+                .map_or(63, |i| i as i64 + 128)
         };
 
         Ok(CalcValue::Scalar(LiteralValue::Int(code)))
@@ -478,6 +447,30 @@ mod tests {
             .into_literal(),
             LiteralValue::Text("A".to_string())
         );
+    }
+
+    #[test]
+    fn char_and_code_use_the_macintosh_character_set() {
+        use formualizer_parse::parser::parse;
+        let wb = TestWorkbook::new()
+            .with_function(std::sync::Arc::new(CharFn))
+            .with_function(std::sync::Arc::new(CodeFn));
+        let ctx = interp(&wb);
+        let eval = |f: &str| ctx.evaluate_ast(&parse(f).unwrap()).unwrap().into_literal();
+        assert_eq!(eval("=CHAR(160)"), LiteralValue::Text("\u{2020}".into()));
+        assert_eq!(eval("=CHAR(202)"), LiteralValue::Text("\u{a0}".into()));
+        assert_eq!(eval("=CHAR(142)"), LiteralValue::Text("\u{e9}".into()));
+        assert_eq!(eval("=CHAR(219)"), LiteralValue::Text("\u{20ac}".into()));
+        assert_eq!(eval("=CODE(\"\u{e9}\")"), LiteralValue::Int(142));
+        assert_eq!(eval("=CODE(\"\u{2020}\")"), LiteralValue::Int(160));
+        assert_eq!(eval("=CODE(\"\u{3042}\")"), LiteralValue::Int(63));
+        for code in 1..=255 {
+            assert_eq!(
+                eval(&format!("=CODE(CHAR({code}))")),
+                LiteralValue::Int(code),
+                "CHAR({code}) round trip"
+            );
+        }
     }
 
     #[test]
