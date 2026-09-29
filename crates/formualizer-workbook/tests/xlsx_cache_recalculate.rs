@@ -350,8 +350,12 @@ fn nonportable_literal_errors_and_tables_are_explicitly_rejected() {
 }
 #[test]
 fn engine_specific_errors_are_unsupported_results_not_invented_excel_tokens() {
-    let error = recalculate_xlsx_bytes(&fixture("AGGREGATE(12,0,1)", "99"), Default::default())
-        .unwrap_err();
+    // An intersection operand still evaluates to the engine-only #N/IMPL!.
+    let error = recalculate_xlsx_bytes(
+        &fixture("ERROR.TYPE(B1:B2 C1:C2)", "99"),
+        Default::default(),
+    )
+    .unwrap_err();
     assert!(
         matches!(&error,formualizer_workbook::IoError::Unsupported{feature,context}
             if feature=="formula result is not current"
