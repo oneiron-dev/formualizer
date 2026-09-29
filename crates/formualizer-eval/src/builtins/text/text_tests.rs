@@ -271,6 +271,30 @@ mod tests {
     }
 
     #[test]
+    fn proper_starts_words_after_any_non_letter() {
+        let wb = TestWorkbook::new().with_function(Arc::new(ProperFn));
+        let ctx = wb.interpreter();
+        let f = ctx.context.get_function("", "PROPER").unwrap();
+        for (input, want) in [
+            ("76BudGet", "76Budget"),
+            ("2nd place", "2Nd Place"),
+            ("it's o'neil", "It'S O'Neil"),
+            ("hello-WORLD", "Hello-World"),
+        ] {
+            let text = lit(LiteralValue::Text(input.into()));
+            assert_eq!(
+                f.dispatch(
+                    &[ArgumentHandle::new(&text, &ctx)],
+                    &ctx.function_context(None)
+                )
+                .unwrap(),
+                LiteralValue::Text(want.into()),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
     fn trim_removes_only_ascii_spaces() {
         let wb = TestWorkbook::new().with_function(Arc::new(TrimFn));
         let ctx = wb.interpreter();
