@@ -221,10 +221,7 @@ pub(super) fn admit<'a>(
         if file.name().starts_with("_xmlsignatures/") || file.name().ends_with("origin.sigs") {
             return Err(unsupported("package digital signature", "XLSX package"));
         }
-        if file.name().starts_with("xl/externalLinks/")
-            || file.name() == "xl/metadata.xml"
-            || file.name().starts_with("xl/richData/")
-        {
+        if file.name().starts_with("xl/externalLinks/") || file.name().starts_with("xl/richData/") {
             return Err(unsupported(
                 "external links or rich/dynamic cell metadata",
                 "XLSX package",
@@ -249,7 +246,48 @@ pub(super) fn admit<'a>(
             return Err(unsupported("ZIP expanded-size mismatch", file.name()));
         }
     }
+    if archive.index_for_name("xl/metadata.xml").is_some() {
+        dynamic_array_metadata_only(&mut archive, options)?;
+    }
     Ok(archive)
+}
+/// Excel marks dynamic-array formulas with `cm` indexes into `xl/metadata.xml`
+/// cell metadata of type XLDAPR. That metadata only records that the formula
+/// is a dynamic array; it does not change the formula or its cached value.
+/// Value metadata (rich values, linked data types) remains unsupported.
+fn dynamic_array_metadata_only(
+    archive: &mut Archive<'_>,
+    options: &XlsxRecalculateOptions,
+) -> Result<(), IoError> {
+    const PART: &str = "xl/metadata.xml";
+    let data = read_part(archive, PART, options.limits.max_worksheet_bytes)?;
+    xml::walk(&data, options, |path, node| {
+        if !matches!(node.kind, xml::Kind::Open { .. }) {
+            return Ok(());
+        }
+        let e = path.last().expect("open XML element");
+        if path.len() == 1 && !xml::path_is(path, xml::MAIN, &["metadata"]) {
+            return Err(unsupported("metadata XML root/namespace", PART));
+        }
+        let dynamic_array_type = xml::path_is(
+            path,
+            xml::MAIN,
+            &["metadata", "metadataTypes", "metadataType"],
+        ) && node.value("name") == Some("XLDAPR");
+        let blocked = match e.local.as_str() {
+            "metadataType" => !dynamic_array_type,
+            "futureMetadata" => node.value("name") != Some("XLDAPR"),
+            "valueMetadata" | "mdxMetadata" | "metadataStrings" => true,
+            _ => false,
+        };
+        if blocked && e.ns == xml::MAIN {
+            return Err(unsupported(
+                "external links or rich/dynamic cell metadata",
+                PART,
+            ));
+        }
+        Ok(())
+    })
 }
 pub(super) fn read_part(
     archive: &mut Archive<'_>,

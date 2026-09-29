@@ -527,6 +527,55 @@ fn office_growth_hint_padding_is_admitted_and_retained() {
     let other = pack_with_local_extra(&single("1+1", "<v>99</v>"), 0x5455, &[1, 0, 0, 0, 0]);
     assert!(recalculate_xlsx_bytes(&other, Default::default()).is_err());
 }
+fn with_metadata(mut p: BTreeMap<String, String>, metadata: &str) -> BTreeMap<String, String> {
+    let ct = p.get_mut("[Content_Types].xml").unwrap();
+    *ct = ct.replace("</Types>","<Override PartName=\"/xl/metadata.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml\"/></Types>");
+    let rel = p.get_mut("xl/_rels/workbook.xml.rels").unwrap();
+    *rel = rel.replace("</Relationships>",&format!("<Relationship Id=\"rId9\" Type=\"{OFFICE}/sheetMetadata\" Target=\"metadata.xml\"/></Relationships>"));
+    p.insert("xl/metadata.xml".into(), format!("<metadata xmlns=\"{MAIN}\" xmlns:xda=\"http://schemas.microsoft.com/office/spreadsheetml/2017/dynamicarray\">{metadata}</metadata>"));
+    p
+}
+const XLDAPR: &str = "<metadataTypes count=\"1\"><metadataType name=\"XLDAPR\" minSupportedVersion=\"120000\" copy=\"1\" pasteAll=\"1\" pasteValues=\"1\" merge=\"1\" splitFirst=\"1\" rowColShift=\"1\" clearFormats=\"1\" clearComments=\"1\" assign=\"1\" coerce=\"1\" cellMeta=\"1\"/></metadataTypes><futureMetadata name=\"XLDAPR\" count=\"1\"><bk><extLst><ext uri=\"{bdbb8cdc-fa1e-496e-a857-3c3f30c029c3}\"><xda:dynamicArrayProperties fDynamic=\"1\" fCollapsed=\"0\"/></ext></extLst></bk></futureMetadata><cellMetadata count=\"1\"><bk><rc t=\"1\" v=\"0\"/></bk></cellMetadata>";
+#[test]
+fn single_cell_array_formulas_evaluate_with_array_semantics() {
+    let rows = "<row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"B1\"><f t=\"array\" ref=\"B1\">SUM(A1:A3*A1:A3)</f><v>0</v></c></row>\
+        <row r=\"2\"><c r=\"A2\"><v>2</v></c><c r=\"B2\" cm=\"1\"><f t=\"array\" ref=\"B2\">SUM((A1:A3&gt;1)*A1:A3)</f><v>0</v></c></row>\
+        <row r=\"3\"><c r=\"A3\"><v>3</v></c></row>";
+    // Legacy CSE (no metadata) and a dynamic-array formula flagged by XLDAPR.
+    let input = pack(&with_metadata(parts(rows), XLDAPR));
+    let out = recalculate_xlsx_bytes(&input, Default::default()).unwrap();
+    assert_eq!(out.cache_cells_changed, 2);
+    let sheet = member(&out.bytes, SHEET);
+    assert!(sheet.contains("ref=\"B1\">SUM(A1:A3*A1:A3)</f><v>14</v>"));
+    assert!(sheet.contains("<c r=\"B2\" cm=\"1\"><f t=\"array\" ref=\"B2\">"));
+    assert!(sheet.contains("*A1:A3)</f><v>5</v>"), "{sheet}");
+    assert_eq!(
+        member(&out.bytes, "xl/metadata.xml"),
+        member(&input, "xl/metadata.xml")
+    );
+    assert_eq!(
+        recalculate_xlsx_bytes(&out.bytes, Default::default())
+            .unwrap()
+            .bytes,
+        out.bytes
+    );
+}
+#[test]
+fn multi_cell_arrays_and_rich_value_metadata_stay_unsupported() {
+    let multi = "<row r=\"1\"><c r=\"A1\"><f t=\"array\" ref=\"A1:A2\">{1;2}</f><v>1</v></c></row><row r=\"2\"><c r=\"A2\"><v>2</v></c></row>";
+    reject(&parts(multi));
+    // `cm` outside an array formula is not dynamic-array metadata.
+    let flagged = "<row r=\"1\"><c r=\"A1\" cm=\"1\"><f>1+1</f><v>2</v></c></row>";
+    reject(&with_metadata(parts(flagged), XLDAPR));
+    let array =
+        "<row r=\"1\"><c r=\"A1\" cm=\"1\"><f t=\"array\" ref=\"A1\">1+1</f><v>2</v></c></row>";
+    let rich = format!(
+        "{XLDAPR}<valueMetadata count=\"1\"><bk><rc t=\"1\" v=\"0\"/></bk></valueMetadata>"
+    );
+    reject(&with_metadata(parts(array), &rich));
+    let other = XLDAPR.replace("name=\"XLDAPR\" min", "name=\"XLRICHVALUE\" min");
+    reject(&with_metadata(parts(array), &other));
+}
 #[test]
 fn multiple_changed_members_relocate_growing_and_shrinking_payloads() {
     let old = (0..2048u32)

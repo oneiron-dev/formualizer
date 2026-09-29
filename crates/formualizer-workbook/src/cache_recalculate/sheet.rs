@@ -30,6 +30,7 @@ pub(super) struct Cell {
     shared_id: Option<u32>,
     shared_range: Option<(u32, u32, u32, u32)>,
     has_formula: bool,
+    dynamic_array: bool,
 }
 /// Calamine's fast scalar reader consumes just one raw ASCII text event.
 /// Literal cells must satisfy that assumption; formula caches may instead be
@@ -204,9 +205,12 @@ pub(super) fn scan(
                     if *observed > options.limits.max_cells {
                         return Err(unsupported("serialized cell count limit", "worksheet"));
                     }
-                    if node.value("cm").is_some() || node.value("vm").is_some() {
+                    // `cm` (dynamic-array cell metadata) is admitted only on
+                    // single-cell array formulas, checked when the cell closes.
+                    if node.value("vm").is_some() {
                         return Err(unsupported("dynamic/rich cell metadata", "worksheet"));
                     }
+                    let dynamic_array = node.value("cm").is_some();
                     let kind = node.value("t").map(str::to_owned);
                     if !matches!(
                         kind.as_deref(),
@@ -232,6 +236,7 @@ pub(super) fn scan(
                             shared_id: None,
                             shared_range: None,
                             has_formula: false,
+                            dynamic_array,
                         });
                     }
                 }
@@ -249,13 +254,29 @@ pub(super) fn scan(
                             }
                             cell.has_formula = true;
                             cell.formula_kind = node.value("t").unwrap_or("normal").to_owned();
-                            if !matches!(cell.formula_kind.as_str(), "normal" | "shared") {
+                            if !matches!(cell.formula_kind.as_str(), "normal" | "shared" | "array")
+                            {
                                 return Err(unsupported(
                                     "array/data-table/unknown formula kind",
                                     "worksheet",
                                 ));
                             }
-                            if node.value("ref").is_some() && cell.formula_kind != "shared" {
+                            // A single-cell array formula (legacy CSE or a
+                            // dynamic array whose result is one value) is an
+                            // ordinary formula evaluated with array semantics.
+                            // Multi-cell array extents need geometry writeback.
+                            if cell.formula_kind == "array"
+                                && node.value("ref").map(rect).transpose()?
+                                    != Some((cell.row, cell.col, cell.row, cell.col))
+                            {
+                                return Err(unsupported(
+                                    "multi-cell array formula extent",
+                                    "worksheet",
+                                ));
+                            }
+                            if node.value("ref").is_some()
+                                && !matches!(cell.formula_kind.as_str(), "shared" | "array")
+                            {
                                 return Err(unsupported("non-shared formula extent", "worksheet"));
                             }
                             if cell.formula_kind == "shared" {
@@ -347,8 +368,11 @@ pub(super) fn scan(
                             "worksheet",
                         ));
                     }
+                    if cell.dynamic_array && cell.formula_kind != "array" {
+                        return Err(unsupported("dynamic/rich cell metadata", "worksheet"));
+                    }
                     if cell.has_formula {
-                        if cell.formula_kind == "normal" && cell.formula_text.trim().is_empty() {
+                        if cell.formula_kind != "shared" && cell.formula_text.trim().is_empty() {
                             return Err(unsupported("empty ordinary formula", "worksheet"));
                         }
                         if cell.formula_end == 0 {
