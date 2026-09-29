@@ -11,7 +11,14 @@ use crate::tokenizer::Associativity;
 /// - References printed via .normalise()
 /// - Array literals: {1, 2; 3, 4}
 pub fn pretty_print(ast: &ASTNode) -> String {
-    pretty_print_node(ast)
+    pretty_print_node(ast, false)
+}
+
+/// Formula text as Excel shows it for a formula entered without extra
+/// whitespace: `=SUM(A1,2)+1`, with no spaces around operators or after
+/// argument separators.
+pub fn excel_formula_text(ast: &ASTNode) -> String {
+    format!("={}", pretty_print_node(ast, true))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,8 +124,9 @@ fn pretty_child(
     parent_prec: u8,
     parent_assoc: Associativity,
     side: Side,
+    compact: bool,
 ) -> String {
-    let s = pretty_print_node(child);
+    let s = pretty_print_node(child, compact);
     if child_needs_parens(child, parent_op, parent_prec, parent_assoc, side) {
         format!("({s})")
     } else {
@@ -126,21 +134,21 @@ fn pretty_child(
     }
 }
 
-fn pretty_print_arguments(args: &[ASTNode]) -> String {
+fn pretty_print_arguments(args: &[ASTNode], compact: bool) -> String {
     let mut rendered = String::new();
     for (index, arg) in args.iter().enumerate() {
         if index > 0 {
             rendered.push(',');
-            if !matches!(arg.node_type, ASTNodeType::Omitted) {
+            if !compact && !matches!(arg.node_type, ASTNodeType::Omitted) {
                 rendered.push(' ');
             }
         }
-        rendered.push_str(&pretty_print_node(arg));
+        rendered.push_str(&pretty_print_node(arg, compact));
     }
     rendered
 }
 
-fn pretty_print_node(ast: &ASTNode) -> String {
+fn pretty_print_node(ast: &ASTNode, compact: bool) -> String {
     match &ast.node_type {
         ASTNodeType::Literal(value) => match value {
             // Quote and escape text literals to preserve Excel semantics
@@ -153,7 +161,7 @@ fn pretty_print_node(ast: &ASTNode) -> String {
         ASTNodeType::Omitted => String::new(),
         ASTNodeType::Reference { reference, .. } => reference.normalise(),
         ASTNodeType::UnaryOp { op, expr } => {
-            let inner = pretty_print_node(expr);
+            let inner = pretty_print_node(expr, compact);
             let inner = if unary_operand_needs_parens(op, expr) {
                 format!("({inner})")
             } else {
@@ -168,24 +176,26 @@ fn pretty_print_node(ast: &ASTNode) -> String {
         }
         ASTNodeType::BinaryOp { op, left, right } => {
             let (prec, assoc) = infix_info(op);
-            let left_s = pretty_child(left, op, prec, assoc, Side::Left);
-            let right_s = pretty_child(right, op, prec, assoc, Side::Right);
+            let left_s = pretty_child(left, op, prec, assoc, Side::Left, compact);
+            let right_s = pretty_child(right, op, prec, assoc, Side::Right, compact);
 
             match op.as_str() {
                 // Reference range operator prints tight; intersection is a
                 // single space rather than the generic three-space infix form.
                 ":" => format!("{left_s}:{right_s}"),
                 " " => format!("{left_s} {right_s}"),
+                "," if compact => format!("{left_s},{right_s}"),
                 "," => format!("{left_s}, {right_s}"),
+                _ if compact => format!("{left_s}{op}{right_s}"),
                 _ => format!("{left_s} {op} {right_s}"),
             }
         }
         ASTNodeType::Function { name, args } => {
-            let args_str = pretty_print_arguments(args);
+            let args_str = pretty_print_arguments(args, compact);
             format!("{}({})", name.to_uppercase(), args_str)
         }
         ASTNodeType::Call { callee, args } => {
-            let callee_str = pretty_print_node(callee);
+            let callee_str = pretty_print_node(callee, compact);
             // Wrap the callee in parentheses if it isn't already a callable-looking
             // primary (function call or another call expression). This keeps things
             // like `(1 + 2)(3)` unambiguous when round-tripping unusual ASTs.
@@ -193,7 +203,7 @@ fn pretty_print_node(ast: &ASTNode) -> String {
                 ASTNodeType::Function { .. } | ASTNodeType::Call { .. } => callee_str,
                 _ => format!("({callee_str})"),
             };
-            let args_str = pretty_print_arguments(args);
+            let args_str = pretty_print_arguments(args, compact);
             format!("{callee_rendered}({args_str})")
         }
         ASTNodeType::Array(rows) => {
@@ -201,12 +211,12 @@ fn pretty_print_node(ast: &ASTNode) -> String {
                 .iter()
                 .map(|row| {
                     row.iter()
-                        .map(pretty_print_node)
+                        .map(|cell| pretty_print_node(cell, compact))
                         .collect::<Vec<String>>()
-                        .join(", ")
+                        .join(if compact { "," } else { ", " })
                 })
                 .collect::<Vec<String>>()
-                .join("; ");
+                .join(if compact { ";" } else { "; " });
 
             format!("{{{rows_str}}}")
         }
@@ -353,5 +363,31 @@ mod tests {
         let formula = "={\"A\", \"B\"; \"C\", \"D\"}";
         let pretty = pretty_parse_render(formula).unwrap();
         assert_eq!(pretty, "={\"A\", \"B\"; \"C\", \"D\"}");
+    }
+}
+
+#[cfg(test)]
+mod excel_text_tests {
+    use super::*;
+
+    fn excel_text(formula: &str) -> String {
+        excel_formula_text(&parse(formula).unwrap())
+    }
+
+    #[test]
+    fn excel_formula_text_has_no_padding_spaces() {
+        assert_eq!(excel_text("=1+2"), "=1+2");
+        assert_eq!(excel_text("= 1 + 2 * 3"), "=1+2*3");
+        assert_eq!(
+            excel_text("=CONCATENATE(\"a\", \"b\")"),
+            "=CONCATENATE(\"a\",\"b\")"
+        );
+        assert_eq!(
+            excel_text("=sum(A1:B2, {1,2;3,4})"),
+            "=SUM(A1:B2,{1,2;3,4})"
+        );
+        assert_eq!(excel_text("=(1+2)*3"), "=(1+2)*3");
+        assert_eq!(excel_text("=IF(A1>=1,,-A1%)"), "=IF(A1>=1,,-A1%)");
+        assert_eq!(excel_text("=A1:A3 B1:B3"), "=A1:A3 B1:B3");
     }
 }

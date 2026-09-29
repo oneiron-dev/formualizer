@@ -26961,7 +26961,7 @@ where
         let Some((Some(ast), _)) = self.get_cell(sheet_name, row, col) else {
             return Ok(None);
         };
-        Ok(Some(formualizer_parse::pretty::canonical_formula(&ast)))
+        Ok(Some(formualizer_parse::pretty::excel_formula_text(&ast)))
     }
 
     fn used_rows_for_columns(

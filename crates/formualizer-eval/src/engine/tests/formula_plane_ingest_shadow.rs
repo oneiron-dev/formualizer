@@ -447,9 +447,9 @@ fn formula_text_resolves_authoritative_source_family_placements() {
 
     let source_sheet = engine.graph.sheet_id("Sheet1").unwrap();
     for (inspect_row, source_row, expected) in [
-        (1, 1, "=A1 + 1"),
-        (2, 50, "=A50 + 1"),
-        (3, 100, "=A100 + 1"),
+        (1, 1, "=A1+1"),
+        (2, 50, "=A50+1"),
+        (3, 100, "=A100+1"),
     ] {
         let source = abs_cell_ref(source_sheet, source_row, 2);
         assert_eq!(
@@ -467,7 +467,7 @@ fn formula_text_resolves_authoritative_source_family_placements() {
     }
 
     engine.evaluate_all().unwrap();
-    for (row, expected) in [(1, "=A1 + 1"), (2, "=A50 + 1"), (3, "=A100 + 1")] {
+    for (row, expected) in [(1, "=A1+1"), (2, "=A50+1"), (3, "=A100+1")] {
         assert_eq!(
             engine.get_cell_value("Inspect", row, 1),
             Some(LiteralValue::Text(expected.into()))
