@@ -14,7 +14,7 @@
 //!   * If width > height  → search the first *row*, return from the last *row*.
 //!   * Otherwise          → search the first *column*, return from the last *column*.
 
-use super::lookup_utils::cmp_for_lookup;
+use super::lookup_utils::{SearchedVector, cmp_for_lookup};
 use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
 use crate::engine::DateSystem;
 use crate::function::Function;
@@ -23,27 +23,31 @@ use formualizer_common::{ArgKind, ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
 
 /// Binary-search style approximate match (largest value <= needle) for
-/// ascending-sorted data.  Mirrors the helper in `core.rs` but is kept local
-/// to avoid coupling the legacy path to core internals.
+/// ascending-sorted data. Like the other approximate lookups, the search visits
+/// only entries comparable with the needle: errors, blanks and entries of
+/// another type are skipped, so `LOOKUP(2,1/(cond),result)` finds the last
+/// position where `cond` holds.
 fn approx_match_ascending(
     slice: &[LiteralValue],
     needle: &LiteralValue,
     date_system: DateSystem,
 ) -> Option<usize> {
-    if slice.is_empty() {
-        return None;
-    }
+    let searched = SearchedVector::new(slice, needle, date_system).ok()?;
     let mut lo: usize = 0;
-    let mut hi: usize = slice.len();
+    let mut hi: usize = searched.len();
     while lo < hi {
         let mid = (lo + hi) / 2;
-        match cmp_for_lookup(&slice[mid], needle, date_system) {
+        match cmp_for_lookup(searched.get(mid), needle, date_system) {
             Some(c) if c > 0 => hi = mid,
             Some(_) => lo = mid + 1,
             None => hi = mid,
         }
     }
-    if lo == 0 { None } else { Some(lo - 1) }
+    if lo == 0 {
+        None
+    } else {
+        Some(searched.original_position(lo - 1))
+    }
 }
 
 /// Searches for a value and returns a corresponding value from another range.
@@ -400,6 +404,61 @@ mod tests {
         assert_eq!(
             approx_match_ascending(&vals, &LiteralValue::Int(100), DateSystem::Excel1900),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn approx_skips_errors_blanks_and_other_types() {
+        let na = || LiteralValue::Error(ExcelError::new(ExcelErrorKind::Na));
+        let value = || LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
+        let d = DateSystem::Excel1900;
+        // SEARCH(list, text) with a single hit in the middle.
+        let hits = vec![
+            value(),
+            value(),
+            LiteralValue::Int(8),
+            value(),
+            value(),
+            value(),
+        ];
+        assert_eq!(
+            approx_match_ascending(&hits, &LiteralValue::Int(99999), d),
+            Some(2)
+        );
+        // 1/(cond): the last position where cond holds.
+        let last = vec![
+            na(),
+            LiteralValue::Int(1),
+            na(),
+            LiteralValue::Int(1),
+            na(),
+            na(),
+            na(),
+            na(),
+        ];
+        assert_eq!(
+            approx_match_ascending(&last, &LiteralValue::Int(2), d),
+            Some(3)
+        );
+        let tail = vec![na(), na(), na(), na(), LiteralValue::Int(1)];
+        assert_eq!(
+            approx_match_ascending(&tail, &LiteralValue::Int(2), d),
+            Some(4)
+        );
+        let mixed = vec![
+            LiteralValue::Int(1),
+            LiteralValue::Empty,
+            LiteralValue::Text("x".into()),
+            LiteralValue::Int(3),
+            na(),
+        ];
+        assert_eq!(
+            approx_match_ascending(&mixed, &LiteralValue::Int(5), d),
+            Some(3)
+        );
+        assert_eq!(
+            approx_match_ascending(&[na(), na()], &LiteralValue::Int(2), d),
+            None
         );
     }
 
