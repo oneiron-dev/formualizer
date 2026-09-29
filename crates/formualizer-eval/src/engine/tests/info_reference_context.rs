@@ -139,7 +139,7 @@ fn inspect_reference_covers_cells_ranges_names_tables_and_3d_without_materializi
 }
 
 #[test]
-fn formula_text_context_uses_staged_text_then_canonical_ast_and_tracks_edits() {
+fn formula_text_context_uses_staged_text_then_excel_text_of_the_ast_and_tracks_edits() {
     let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
     let data = engine.add_sheet("Data").unwrap();
     let a1 = abs_cell_ref(data, 1, 1);
@@ -151,7 +151,7 @@ fn formula_text_context_uses_staged_text_then_canonical_ast_and_tracks_edits() {
         .unwrap();
     assert_eq!(
         engine.formula_text_at_cell(a1).unwrap(),
-        Some("=1 + 2".into())
+        Some("=1+2".into())
     );
 
     engine
@@ -159,7 +159,7 @@ fn formula_text_context_uses_staged_text_then_canonical_ast_and_tracks_edits() {
         .unwrap();
     assert_eq!(
         engine.formula_text_at_cell(a1).unwrap(),
-        Some("=SUM(1, 2, 3)".into())
+        Some("=SUM(1,2,3)".into())
     );
 
     engine
@@ -249,7 +249,7 @@ fn formula_text_sheet_sheets_and_isref_functions_evaluate_directly() {
 
     assert_eq!(
         engine.get_cell_value("Sheet1", 1, 1),
-        Some(LiteralValue::Text("=1 + 2".into()))
+        Some(LiteralValue::Text("=1+2".into()))
     );
     assert_eq!(
         err_kind(engine.get_cell_value("Sheet1", 1, 2)),
@@ -287,6 +287,44 @@ fn formula_text_sheet_sheets_and_isref_functions_evaluate_directly() {
     engine.evaluate_all().unwrap();
     assert_eq!(
         engine.get_cell_value("Sheet1", 1, 1),
-        Some(LiteralValue::Text("=3 + 4".into()))
+        Some(LiteralValue::Text("=3+4".into()))
+    );
+}
+
+#[test]
+fn isformula_reports_formula_cells() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("=1+2").unwrap())
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 2, 1, LiteralValue::Number(3.0))
+        .unwrap();
+    for (row, formula) in [
+        (1, "=ISFORMULA(A1)"),
+        (2, "=ISFORMULA(A2)"),
+        (3, "=ISFORMULA(A9)"),
+        (4, "=ISFORMULA(10)"),
+    ] {
+        engine
+            .set_cell_formula("Sheet1", row, 3, parse(formula).unwrap())
+            .unwrap();
+    }
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 3),
+        Some(LiteralValue::Boolean(true))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 2, 3),
+        Some(LiteralValue::Boolean(false))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 3, 3),
+        Some(LiteralValue::Boolean(false))
+    );
+    assert_eq!(
+        err_kind(engine.get_cell_value("Sheet1", 4, 3)),
+        Some(ExcelErrorKind::Value)
     );
 }

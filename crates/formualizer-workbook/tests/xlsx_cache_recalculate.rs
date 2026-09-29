@@ -354,9 +354,9 @@ fn nonportable_literal_errors_are_explicitly_rejected() {
 }
 #[test]
 fn engine_specific_errors_are_unsupported_results_not_invented_excel_tokens() {
-    // An intersection operand still evaluates to the engine-only #N/IMPL!.
+    // R1C1-style INDIRECT still evaluates to the engine-only #N/IMPL!.
     let error = recalculate_xlsx_bytes(
-        &fixture("ERROR.TYPE(B1:B2 C1:C2)", "99"),
+        &fixture("INDIRECT(&quot;R2C2:R3C3&quot;,FALSE)", "99"),
         Default::default(),
     )
     .unwrap_err();

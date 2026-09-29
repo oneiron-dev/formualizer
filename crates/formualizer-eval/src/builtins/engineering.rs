@@ -5069,174 +5069,330 @@ impl Function for ImCotFn {
 /// Unit categories for CONVERT function
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum UnitCategory {
-    Length,
     Mass,
+    Distance,
+    Time,
+    Pressure,
+    Force,
+    Energy,
+    Power,
+    Magnetism,
     Temperature,
+    Volume,
+    Area,
+    Information,
+    Speed,
 }
 
-/// Information about a unit
-struct UnitInfo {
+/// Which prefixes a unit accepts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Prefixes {
+    None,
+    Metric,
+    /// Metric and binary (ki, Mi, ...): bit and byte.
+    Binary,
+}
+
+/// One row of Excel's CONVERT table: the names it is written as, its size
+/// in the category's base unit, and the power a prefix applies with
+/// (2 for areas such as `cm2`, 3 for volumes).
+struct UnitDef {
+    names: &'static [&'static str],
     category: UnitCategory,
-    /// Conversion factor to base unit (meters for length, grams for mass)
-    /// For temperature, this is special-cased
-    to_base: f64,
+    factor: f64,
+    prefixes: Prefixes,
+    power: i32,
 }
 
-/// Get unit info for a given unit string
-fn get_unit_info(unit: &str) -> Option<UnitInfo> {
-    // Length units (base: meter)
-    match unit {
-        // Metric length
-        "m" => Some(UnitInfo {
-            category: UnitCategory::Length,
-            to_base: 1.0,
-        }),
-        "km" => Some(UnitInfo {
-            category: UnitCategory::Length,
-            to_base: 1000.0,
-        }),
-        "cm" => Some(UnitInfo {
-            category: UnitCategory::Length,
-            to_base: 0.01,
-        }),
-        "mm" => Some(UnitInfo {
-            category: UnitCategory::Length,
-            to_base: 0.001,
-        }),
-        // Imperial length
-        "mi" => Some(UnitInfo {
-            category: UnitCategory::Length,
-            to_base: 1609.344,
-        }),
-        "ft" => Some(UnitInfo {
-            category: UnitCategory::Length,
-            to_base: 0.3048,
-        }),
-        "in" => Some(UnitInfo {
-            category: UnitCategory::Length,
-            to_base: 0.0254,
-        }),
-        "yd" => Some(UnitInfo {
-            category: UnitCategory::Length,
-            to_base: 0.9144,
-        }),
-        "Nmi" => Some(UnitInfo {
-            category: UnitCategory::Length,
-            to_base: 1852.0,
-        }),
-
-        // Mass units (base: gram)
-        "g" => Some(UnitInfo {
-            category: UnitCategory::Mass,
-            to_base: 1.0,
-        }),
-        "kg" => Some(UnitInfo {
-            category: UnitCategory::Mass,
-            to_base: 1000.0,
-        }),
-        "mg" => Some(UnitInfo {
-            category: UnitCategory::Mass,
-            to_base: 0.001,
-        }),
-        "lbm" => Some(UnitInfo {
-            category: UnitCategory::Mass,
-            to_base: 453.59237,
-        }),
-        "oz" => Some(UnitInfo {
-            category: UnitCategory::Mass,
-            to_base: 28.349523125,
-        }),
-        "ozm" => Some(UnitInfo {
-            category: UnitCategory::Mass,
-            to_base: 28.349523125,
-        }),
-        "ton" => Some(UnitInfo {
-            category: UnitCategory::Mass,
-            to_base: 907184.74,
-        }),
-
-        // Temperature units (special handling)
-        "C" | "cel" => Some(UnitInfo {
-            category: UnitCategory::Temperature,
-            to_base: 0.0, // Special-cased
-        }),
-        "F" | "fah" => Some(UnitInfo {
-            category: UnitCategory::Temperature,
-            to_base: 0.0, // Special-cased
-        }),
-        "K" | "kel" => Some(UnitInfo {
-            category: UnitCategory::Temperature,
-            to_base: 0.0, // Special-cased
-        }),
-
-        _ => None,
+const fn unit(
+    names: &'static [&'static str],
+    category: UnitCategory,
+    factor: f64,
+    prefixes: Prefixes,
+) -> UnitDef {
+    UnitDef {
+        names,
+        category,
+        factor,
+        prefixes,
+        power: 1,
     }
 }
 
-/// Normalize temperature unit name
-fn normalize_temp_unit(unit: &str) -> &str {
-    match unit {
-        "C" | "cel" => "C",
-        "F" | "fah" => "F",
-        "K" | "kel" => "K",
-        _ => unit,
+const fn powered(
+    names: &'static [&'static str],
+    category: UnitCategory,
+    factor: f64,
+    power: i32,
+) -> UnitDef {
+    UnitDef {
+        names,
+        category,
+        factor,
+        prefixes: Prefixes::Metric,
+        power,
     }
 }
 
-/// Convert temperature between units
-fn convert_temperature(value: f64, from: &str, to: &str) -> f64 {
-    let from = normalize_temp_unit(from);
-    let to = normalize_temp_unit(to);
+/// Excel's CONVERT units. Bases: gram, meter, second, pascal, newton,
+/// joule, watt, tesla, kelvin, cubic meter, square meter, bit and meter per
+/// second. Temperatures other than kelvin are converted separately.
+static UNITS: &[UnitDef] = {
+    use Prefixes::{Binary, Metric, None as No};
+    use UnitCategory::*;
+    const IN: f64 = 0.0254;
+    const FT: f64 = 0.3048;
+    const YD: f64 = 0.9144;
+    const MI: f64 = 1609.344;
+    const NMI: f64 = 1852.0;
+    const LY: f64 = 9_460_730_472_580_800.0;
+    const PICA: f64 = IN / 72.0;
+    &[
+        // Mass
+        unit(&["g"], Mass, 1.0, Metric),
+        unit(&["sg"], Mass, 14_593.902_937_206_4, No),
+        unit(&["lbm"], Mass, 453.592_37, No),
+        unit(&["u"], Mass, 1.660_538_782e-24, Metric),
+        unit(&["ozm"], Mass, 28.349_523_125, No),
+        unit(&["grain"], Mass, 0.064_798_91, No),
+        unit(&["cwt", "shweight"], Mass, 45_359.237, No),
+        unit(&["uk_cwt", "lcwt", "hweight"], Mass, 50_802.345_44, No),
+        unit(&["stone"], Mass, 6_350.293_18, No),
+        unit(&["ton"], Mass, 907_184.74, No),
+        unit(&["uk_ton", "LTON", "brton"], Mass, 1_016_046.908_8, No),
+        // Distance
+        unit(&["m"], Distance, 1.0, Metric),
+        unit(&["mi"], Distance, MI, No),
+        unit(&["Nmi"], Distance, NMI, No),
+        unit(&["in"], Distance, IN, No),
+        unit(&["ft"], Distance, FT, No),
+        unit(&["yd"], Distance, YD, No),
+        unit(&["ang"], Distance, 1e-10, Metric),
+        unit(&["ell"], Distance, 1.143, No),
+        unit(&["ly"], Distance, LY, Metric),
+        unit(
+            &["parsec", "pc"],
+            Distance,
+            30_856_775_812_815_500.0,
+            Metric,
+        ),
+        unit(&["Picapt", "Pica"], Distance, PICA, No),
+        unit(&["pica"], Distance, IN / 6.0, No),
+        unit(&["survey_mi"], Distance, 5280.0 * 1200.0 / 3937.0, No),
+        // Time
+        unit(&["yr"], Time, 365.25 * 86_400.0, No),
+        unit(&["day", "d"], Time, 86_400.0, No),
+        unit(&["hr"], Time, 3_600.0, No),
+        unit(&["mn", "min"], Time, 60.0, No),
+        unit(&["sec", "s"], Time, 1.0, Metric),
+        // Pressure
+        unit(&["Pa", "p"], Pressure, 1.0, Metric),
+        unit(&["atm", "at"], Pressure, 101_325.0, Metric),
+        unit(&["mmHg"], Pressure, 133.322, Metric),
+        unit(&["psi"], Pressure, 6_894.757_293_168_36, No),
+        unit(&["Torr"], Pressure, 101_325.0 / 760.0, No),
+        // Force
+        unit(&["N"], Force, 1.0, Metric),
+        unit(&["dyn", "dy"], Force, 1e-5, Metric),
+        unit(&["lbf"], Force, 4.448_221_615_260_5, No),
+        unit(&["pond"], Force, 0.009_806_65, Metric),
+        // Energy
+        unit(&["J"], Energy, 1.0, Metric),
+        unit(&["e"], Energy, 1e-7, Metric),
+        unit(&["c"], Energy, 4.184, Metric),
+        unit(&["cal"], Energy, 4.1868, Metric),
+        unit(&["eV", "ev"], Energy, 1.602_176_487e-19, Metric),
+        unit(&["HPh", "hh"], Energy, 2_684_519.537_696_17, No),
+        unit(&["Wh", "wh"], Energy, 3_600.0, Metric),
+        unit(&["flb"], Energy, 4.448_221_615_260_5 * FT, No),
+        unit(&["BTU", "btu"], Energy, 1_055.055_852_62, No),
+        // Power
+        unit(&["HP", "h"], Power, 745.699_871_582_27, No),
+        unit(&["PS"], Power, 735.498_75, No),
+        unit(&["W", "w"], Power, 1.0, Metric),
+        // Magnetism
+        unit(&["T"], Magnetism, 1.0, Metric),
+        unit(&["ga"], Magnetism, 1e-4, Metric),
+        // Temperature (kelvin; the others convert through Celsius)
+        unit(&["K", "kel"], Temperature, 1.0, Metric),
+        // Volume
+        unit(&["tsp"], Volume, 4.928_921_593_75e-6, No),
+        unit(&["tspm"], Volume, 5e-6, No),
+        unit(&["tbs"], Volume, 1.478_676_478_125e-5, No),
+        unit(&["oz"], Volume, 2.957_352_956_25e-5, No),
+        unit(&["cup"], Volume, 2.365_882_365e-4, No),
+        unit(&["pt", "us_pt"], Volume, 4.731_764_73e-4, No),
+        unit(&["uk_pt"], Volume, 5.682_612_5e-4, No),
+        unit(&["qt"], Volume, 9.463_529_46e-4, No),
+        unit(&["uk_qt"], Volume, 1.136_522_5e-3, No),
+        unit(&["gal"], Volume, 3.785_411_784e-3, No),
+        unit(&["uk_gal"], Volume, 4.546_09e-3, No),
+        unit(&["l", "L", "lt"], Volume, 1e-3, Metric),
+        powered(&["ang3", "ang^3"], Volume, 1e-30, 3),
+        unit(&["barrel"], Volume, 0.158_987_294_928, No),
+        unit(&["bushel"], Volume, 0.035_239_070_166_88, No),
+        unit(&["ft3", "ft^3"], Volume, FT * FT * FT, No),
+        unit(&["in3", "in^3"], Volume, IN * IN * IN, No),
+        unit(&["ly3", "ly^3"], Volume, LY * LY * LY, No),
+        powered(&["m3", "m^3"], Volume, 1.0, 3),
+        unit(&["mi3", "mi^3"], Volume, MI * MI * MI, No),
+        unit(&["yd3", "yd^3"], Volume, YD * YD * YD, No),
+        unit(&["Nmi3", "Nmi^3"], Volume, NMI * NMI * NMI, No),
+        unit(
+            &["Picapt3", "Picapt^3", "Pica3", "Pica^3"],
+            Volume,
+            PICA * PICA * PICA,
+            No,
+        ),
+        unit(&["GRT", "regton"], Volume, 2.831_684_659_2, No),
+        unit(&["MTON"], Volume, 1.132_673_863_68, No),
+        // Area
+        unit(&["uk_acre"], Area, 4_046.856_422_4, No),
+        unit(&["us_acre"], Area, 4_046.872_609_874_25, No),
+        powered(&["ang2", "ang^2"], Area, 1e-20, 2),
+        unit(&["ar"], Area, 100.0, Metric),
+        unit(&["ft2", "ft^2"], Area, FT * FT, No),
+        unit(&["ha"], Area, 10_000.0, No),
+        unit(&["in2", "in^2"], Area, IN * IN, No),
+        unit(&["ly2", "ly^2"], Area, LY * LY, No),
+        powered(&["m2", "m^2"], Area, 1.0, 2),
+        unit(&["Morgen"], Area, 2_500.0, No),
+        unit(&["mi2", "mi^2"], Area, MI * MI, No),
+        unit(&["Nmi2", "Nmi^2"], Area, NMI * NMI, No),
+        unit(
+            &["Picapt2", "Pica2", "Pica^2", "Picapt^2"],
+            Area,
+            PICA * PICA,
+            No,
+        ),
+        unit(&["yd2", "yd^2"], Area, YD * YD, No),
+        // Information
+        unit(&["bit"], Information, 1.0, Binary),
+        unit(&["byte"], Information, 8.0, Binary),
+        // Speed
+        unit(&["admkn"], Speed, 6_080.0 * FT / 3_600.0, No),
+        unit(&["kn"], Speed, NMI / 3_600.0, No),
+        unit(&["m/h", "m/hr"], Speed, 1.0 / 3_600.0, Metric),
+        unit(&["m/s", "m/sec"], Speed, 1.0, Metric),
+        unit(&["mph"], Speed, MI / 3_600.0, No),
+    ]
+};
 
-    if from == to {
-        return value;
+const METRIC_PREFIXES: &[(&str, f64)] = &[
+    ("Y", 1e24),
+    ("Z", 1e21),
+    ("E", 1e18),
+    ("P", 1e15),
+    ("T", 1e12),
+    ("G", 1e9),
+    ("M", 1e6),
+    ("k", 1e3),
+    ("h", 1e2),
+    ("da", 1e1),
+    ("e", 1e1),
+    ("d", 1e-1),
+    ("c", 1e-2),
+    ("m", 1e-3),
+    ("u", 1e-6),
+    ("n", 1e-9),
+    ("p", 1e-12),
+    ("f", 1e-15),
+    ("a", 1e-18),
+    ("z", 1e-21),
+    ("y", 1e-24),
+];
+
+const BINARY_PREFIXES: &[(&str, f64)] = &[
+    ("Yi", 1_208_925_819_614_629_174_706_176.0),
+    ("Zi", 1_180_591_620_717_411_303_424.0),
+    ("Ei", 1_152_921_504_606_846_976.0),
+    ("Pi", 1_125_899_906_842_624.0),
+    ("Ti", 1_099_511_627_776.0),
+    ("Gi", 1_073_741_824.0),
+    ("Mi", 1_048_576.0),
+    ("ki", 1_024.0),
+];
+
+/// Temperatures that are not multiples of kelvin.
+fn temperature_to_kelvin(unit: &str, value: f64) -> Option<f64> {
+    Some(match unit {
+        "C" | "cel" => value + 273.15,
+        "F" | "fah" => (value - 32.0) * 5.0 / 9.0 + 273.15,
+        "Rank" => value * 5.0 / 9.0,
+        "Reau" => value * 5.0 / 4.0 + 273.15,
+        _ => return None,
+    })
+}
+
+fn kelvin_to_temperature(unit: &str, kelvin: f64) -> Option<f64> {
+    Some(match unit {
+        "C" | "cel" => kelvin - 273.15,
+        "F" | "fah" => (kelvin - 273.15) * 9.0 / 5.0 + 32.0,
+        "Rank" => kelvin * 9.0 / 5.0,
+        "Reau" => (kelvin - 273.15) * 4.0 / 5.0,
+        _ => return None,
+    })
+}
+
+/// A unit name, optionally with a prefix, as its category and size in the
+/// category's base unit. Unit names are case-sensitive and an exact name
+/// wins over a prefix reading (`mi` is a mile, not a milli-inch).
+fn get_unit_info(name: &str) -> Option<(UnitCategory, f64)> {
+    if matches!(name, "C" | "cel" | "F" | "fah" | "Rank" | "Reau") {
+        return Some((UnitCategory::Temperature, f64::NAN));
     }
-
-    // First convert to Celsius
-    let celsius = match from {
-        "C" => value,
-        "F" => (value - 32.0) * 5.0 / 9.0,
-        "K" => value - 273.15,
-        _ => value,
-    };
-
-    // Then convert from Celsius to target
-    match to {
-        "C" => celsius,
-        "F" => celsius * 9.0 / 5.0 + 32.0,
-        "K" => celsius + 273.15,
-        _ => celsius,
+    if let Some(def) = UNITS.iter().find(|u| u.names.contains(&name)) {
+        return Some((def.category, def.factor));
     }
+    for def in UNITS {
+        if def.prefixes == Prefixes::None {
+            continue;
+        }
+        for base in def.names {
+            let Some(prefix) = name.strip_suffix(base) else {
+                continue;
+            };
+            let binary = if def.prefixes == Prefixes::Binary {
+                BINARY_PREFIXES
+            } else {
+                &[]
+            };
+            if let Some((_, scale)) = METRIC_PREFIXES
+                .iter()
+                .chain(binary)
+                .find(|(p, _)| *p == prefix)
+            {
+                return Some((def.category, def.factor * scale.powi(def.power)));
+            }
+        }
+    }
+    None
 }
 
 /// Convert a value between units
 fn convert_units(value: f64, from: &str, to: &str) -> Result<f64, ExcelError> {
-    let from_info = get_unit_info(from).ok_or_else(ExcelError::new_na)?;
-    let to_info = get_unit_info(to).ok_or_else(ExcelError::new_na)?;
-
-    // Check category compatibility
-    if from_info.category != to_info.category {
+    let (from_category, from_factor) = get_unit_info(from).ok_or_else(ExcelError::new_na)?;
+    let (to_category, to_factor) = get_unit_info(to).ok_or_else(ExcelError::new_na)?;
+    if from_category != to_category {
         return Err(ExcelError::new_na());
     }
-
-    // Handle temperature specially
-    if from_info.category == UnitCategory::Temperature {
-        return Ok(convert_temperature(value, from, to));
+    if from_category == UnitCategory::Temperature {
+        let kelvin = temperature_to_kelvin(from, value).unwrap_or(value * from_factor);
+        return Ok(kelvin_to_temperature(to, kelvin).unwrap_or(kelvin / to_factor));
     }
-
-    // For other units: convert to base, then to target
-    let base_value = value * from_info.to_base;
-    Ok(base_value / to_info.to_base)
+    Ok(value * from_factor / to_factor)
 }
 
 /// Converts a numeric value from one supported unit to another.
 ///
-/// Supports a focused set of length, mass, and temperature units.
+/// Supports Excel's unit table: mass, distance, time, pressure, force,
+/// energy, power, magnetism, temperature, volume, area, information and
+/// speed, with metric prefixes and binary prefixes for bits and bytes.
 ///
 /// # Remarks
 /// - `number` is numerically coerced; unit arguments must be text.
 /// - Returns `#N/A` for unknown units or incompatible unit categories.
-/// - Temperature conversions support `C/cel`, `F/fah`, and `K/kel`.
+/// - Temperature conversions support `C/cel`, `F/fah`, `K/kel`, `Rank` and `Reau`.
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -5416,6 +5572,7 @@ mod tests {
             .with_function(Arc::new(ImSechFn))
             .with_function(Arc::new(ImSinhFn))
             .with_function(Arc::new(ImTanFn))
+            .with_function(Arc::new(ConvertFn))
             .with_function(Arc::new(ValueFn));
         let interp = wb.interpreter();
         let ast = parse(formula).expect("parse");
@@ -5436,6 +5593,53 @@ mod tests {
                 assert!((n - expected).abs() / denom < tol, "{n} != {expected}");
             }
             other => panic!("expected number, got {other:?}"),
+        }
+    }
+
+    fn rel(value: LiteralValue, expected: f64) {
+        assert_number_rel_close(value, expected, 1e-12)
+    }
+
+    #[test]
+    fn convert_time_units() {
+        rel(eval("=CONVERT(1,\"day\",\"hr\")"), 24.0);
+        rel(eval("=CONVERT(1,\"hr\",\"mn\")"), 60.0);
+        rel(eval("=CONVERT(1,\"d\",\"min\")"), 1440.0);
+        rel(eval("=CONVERT(1,\"yr\",\"day\")"), 365.25);
+        rel(eval("=CONVERT(1500,\"ms\",\"sec\")"), 1.5);
+    }
+
+    #[test]
+    fn convert_other_categories() {
+        rel(eval("=CONVERT(1,\"atm\",\"Pa\")"), 101_325.0);
+        rel(eval("=CONVERT(1,\"kPa\",\"Pa\")"), 1000.0);
+        rel(eval("=CONVERT(1,\"kWh\",\"J\")"), 3.6e6);
+        rel(eval("=CONVERT(1,\"gal\",\"l\")"), 3.785_411_784);
+        rel(eval("=CONVERT(1,\"oz\",\"tbs\")"), 2.0);
+        rel(eval("=CONVERT(1,\"m2\",\"cm2\")"), 10_000.0);
+        rel(eval("=CONVERT(1,\"m^3\",\"l\")"), 1000.0);
+        rel(eval("=CONVERT(1,\"ha\",\"m2\")"), 10_000.0);
+        rel(eval("=CONVERT(1,\"kibyte\",\"bit\")"), 8192.0);
+        rel(eval("=CONVERT(1,\"kn\",\"m/h\")"), 1852.0);
+        rel(eval("=CONVERT(1,\"mi\",\"km\")"), 1.609_344);
+        rel(eval("=CONVERT(1,\"lbm\",\"ozm\")"), 16.0);
+        rel(eval("=CONVERT(0,\"C\",\"Rank\")"), 491.67);
+        rel(eval("=CONVERT(100,\"C\",\"F\")"), 212.0);
+        rel(eval("=CONVERT(80,\"Reau\",\"C\")"), 100.0);
+    }
+
+    #[test]
+    fn convert_rejects_unknown_and_mismatched_units() {
+        for formula in [
+            "=CONVERT(1,\"kmi\",\"m\")",
+            "=CONVERT(1,\"hr\",\"m\")",
+            "=CONVERT(1,\"M\",\"m\")",
+            "=CONVERT(1,\"kibit\",\"kim\")",
+        ] {
+            match eval(formula) {
+                LiteralValue::Error(e) => assert_eq!(e.kind, ExcelErrorKind::Na, "{formula}"),
+                other => panic!("{formula}: expected #N/A, got {other:?}"),
+            }
         }
     }
 

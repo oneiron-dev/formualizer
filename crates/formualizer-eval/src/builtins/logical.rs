@@ -141,6 +141,84 @@ impl Function for FalseFn {
 
 /* ─────────────────────────── AND() ──────────────────────────────── */
 
+/// Counts the TRUE and FALSE values AND, OR and XOR read, Excel's way.
+/// Every argument is evaluated and the first error wins. In references and
+/// arrays only logicals and numbers count (text and blanks are skipped); a
+/// direct argument may also be the text "TRUE" or "FALSE", and other direct
+/// text is skipped. With nothing to count the result is `#VALUE!`.
+pub(crate) fn count_logicals(
+    args: &[ArgumentHandle<'_, '_>],
+) -> Result<(usize, usize), ExcelError> {
+    let (mut trues, mut falses) = (0usize, 0usize);
+    let mut first_error: Option<ExcelError> = None;
+    let mut count = |v: &LiteralValue, direct: bool, first_error: &mut Option<ExcelError>| {
+        let logical = match v {
+            LiteralValue::Boolean(b) => Some(*b),
+            LiteralValue::Number(n) => Some(*n != 0.0),
+            LiteralValue::Int(i) => Some(*i != 0),
+            LiteralValue::Text(t) if direct && t.eq_ignore_ascii_case("TRUE") => Some(true),
+            LiteralValue::Text(t) if direct && t.eq_ignore_ascii_case("FALSE") => Some(false),
+            LiteralValue::Error(e) => {
+                first_error.get_or_insert_with(|| e.clone());
+                None
+            }
+            _ => None,
+        };
+        match logical {
+            Some(true) => trues += 1,
+            Some(false) => falses += 1,
+            None => {}
+        }
+    };
+    for arg in args {
+        if arg.is_omitted() {
+            // An empty argument slot reads as FALSE.
+            count(&LiteralValue::Boolean(false), true, &mut first_error);
+            continue;
+        }
+        let value = match arg.value() {
+            Ok(value) => value,
+            Err(e) => {
+                first_error.get_or_insert(e);
+                continue;
+            }
+        };
+        match value {
+            crate::traits::CalcValue::Range(view) => {
+                view.for_each_cell(&mut |v| {
+                    count(v, false, &mut first_error);
+                    Ok(())
+                })?;
+            }
+            other => match other.into_literal() {
+                LiteralValue::Array(rows) => {
+                    for v in rows.iter().flatten() {
+                        count(v, false, &mut first_error);
+                    }
+                }
+                v => count(&v, !arg.may_return_reference(), &mut first_error),
+            },
+        }
+    }
+    if let Some(e) = first_error {
+        return Err(e);
+    }
+    if trues + falses == 0 {
+        return Err(ExcelError::new_value().with_message("No logical values to evaluate"));
+    }
+    Ok((trues, falses))
+}
+
+fn logical_result<'b>(
+    counts: Result<(usize, usize), ExcelError>,
+    decide: impl Fn(usize, usize) -> bool,
+) -> crate::traits::CalcValue<'b> {
+    crate::traits::CalcValue::Scalar(match counts {
+        Ok((trues, falses)) => LiteralValue::Boolean(decide(trues, falses)),
+        Err(e) => LiteralValue::Error(e),
+    })
+}
+
 #[derive(Debug)]
 pub struct AndFn;
 /// Returns TRUE only when all supplied values evaluate to TRUE.
@@ -150,7 +228,7 @@ pub struct AndFn;
 /// # Remarks
 /// - Booleans and numbers are accepted (`0` is FALSE, non-zero is TRUE).
 /// - Text and blank cells inside references and arrays are skipped.
-/// - Text given directly counts when it reads "TRUE"/"FALSE"; other text is `#VALUE!`.
+/// - Text given directly counts when it reads "TRUE"/"FALSE"; other text is skipped.
 /// - The first error in argument order is returned, even after a FALSE.
 /// - `#VALUE!` when no logical value is found.
 ///
@@ -175,7 +253,7 @@ pub struct AndFn;
 ///   - XOR
 /// faq:
 ///   - q: "What happens with blanks and text in AND?"
-///     a: "Blank cells and text in references are skipped; direct text other than TRUE/FALSE yields #VALUE!."
+///     a: "Blank cells and text are skipped unless direct text reads TRUE/FALSE; #VALUE! when nothing logical remains."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: AND
@@ -208,7 +286,9 @@ impl Function for AndFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        logical_reduce(args, true, "AND")
+        Ok(logical_result(count_logicals(args), |_, falses| {
+            falses == 0
+        }))
     }
 }
 
@@ -223,7 +303,7 @@ pub struct OrFn;
 /// # Remarks
 /// - Booleans and numbers are accepted (`0` is FALSE, non-zero is TRUE).
 /// - Text and blank cells inside references and arrays are skipped.
-/// - Text given directly counts when it reads "TRUE"/"FALSE"; other text is `#VALUE!`.
+/// - Text given directly counts when it reads "TRUE"/"FALSE"; other text is skipped.
 /// - The first error in argument order is returned, even after a TRUE.
 /// - `#VALUE!` when no logical value is found.
 ///
@@ -281,67 +361,8 @@ impl Function for OrFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        logical_reduce(args, false, "OR")
+        Ok(logical_result(count_logicals(args), |trues, _| trues > 0))
     }
-}
-
-/// AND (`all == true`) / OR over Excel's logical arguments:
-/// - every argument is evaluated; the first error, in argument order, is the
-///   result even when another argument already decides it;
-/// - logicals and numbers count (non-zero is TRUE); text and blanks inside a
-///   reference or array are skipped;
-/// - a text argument given directly counts when it reads "TRUE" or "FALSE"
-///   and is otherwise #VALUE!;
-/// - #VALUE! when nothing counted.
-fn logical_reduce<'b>(
-    args: &[ArgumentHandle<'_, 'b>],
-    all: bool,
-    name: &str,
-) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-    let scalar = |v: LiteralValue| Ok(crate::traits::CalcValue::Scalar(v));
-    let mut counted = false;
-    let mut result = all;
-    for h in args {
-        let direct = !h.may_return_reference()
-            && !matches!(h.value()?.into_literal(), LiteralValue::Array(_));
-        for v in h.lazy_values_owned()? {
-            let truth = match v {
-                LiteralValue::Error(_) => return scalar(v),
-                LiteralValue::Boolean(b) => b,
-                LiteralValue::Number(n) => n != 0.0,
-                LiteralValue::Int(i) => i != 0,
-                LiteralValue::Empty => continue,
-                LiteralValue::Text(t) if direct => {
-                    if t.eq_ignore_ascii_case("TRUE") {
-                        true
-                    } else if t.eq_ignore_ascii_case("FALSE") {
-                        false
-                    } else {
-                        return scalar(LiteralValue::Error(ExcelError::new_value().with_message(
-                            format!("{name} expects logical values; text is not logical"),
-                        )));
-                    }
-                }
-                LiteralValue::Text(_) => continue,
-                other => match other.as_serial_number() {
-                    Some(n) => n != 0.0,
-                    None => continue,
-                },
-            };
-            counted = true;
-            if all {
-                result &= truth;
-            } else {
-                result |= truth;
-            }
-        }
-    }
-    if !counted {
-        return scalar(LiteralValue::Error(
-            ExcelError::new_value().with_message(format!("{name} found no logical values")),
-        ));
-    }
-    scalar(LiteralValue::Boolean(result))
 }
 
 /* ─────────────────────────── IF() ───────────────────────────────── */
@@ -714,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn and_evaluates_every_argument() {
+    fn and_evaluates_every_argument_like_excel() {
         let counter = Arc::new(AtomicUsize::new(0));
         let wb = TestWorkbook::new()
             .with_function(Arc::new(AndFn))
@@ -741,12 +762,15 @@ mod tests {
         ];
         let out = and.eval(&hs, &fctx).unwrap().into_literal();
         assert_eq!(out, LiteralValue::Boolean(false));
-        // Excel evaluates every argument: an error there would be the result.
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "COUNTING is evaluated");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "Excel evaluates every argument of AND and OR"
+        );
     }
 
     #[test]
-    fn or_evaluates_every_argument() {
+    fn or_evaluates_every_argument_like_excel() {
         let counter = Arc::new(AtomicUsize::new(0));
         let wb = TestWorkbook::new()
             .with_function(Arc::new(OrFn))
@@ -773,12 +797,15 @@ mod tests {
         ];
         let out = or.eval(&hs, &fctx).unwrap().into_literal();
         assert_eq!(out, LiteralValue::Boolean(true));
-        // Excel evaluates every argument: an error there would be the result.
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "COUNTING is evaluated");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "Excel evaluates every argument of AND and OR"
+        );
     }
 
     #[test]
-    fn or_evaluates_arguments_after_a_true_range() {
+    fn or_evaluates_arguments_after_a_true_array() {
         let counter = Arc::new(AtomicUsize::new(0));
         let wb = TestWorkbook::new()
             .with_function(Arc::new(OrFn))
@@ -814,8 +841,11 @@ mod tests {
         ];
         let out = or.eval(&hs, &fctx).unwrap().into_literal();
         assert_eq!(out, LiteralValue::Boolean(true));
-        // Excel evaluates every argument: an error there would be the result.
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "COUNTING is evaluated");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "Excel evaluates every argument of AND and OR"
+        );
     }
 
     #[test]
@@ -858,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn or_returns_error_after_true() {
+    fn or_returns_an_error_even_after_true() {
         let err_counter = Arc::new(AtomicUsize::new(0));
         let wb = TestWorkbook::new()
             .with_function(Arc::new(OrFn))
@@ -867,7 +897,7 @@ mod tests {
         let fctx = ctx.function_context(None);
         let or = ctx.context.get_function("", "OR").unwrap();
 
-        // OR(TRUE, ERRORFN()) => TRUE and ERRORFN not evaluated
+        // OR(TRUE, ERRORFN()) => #VALUE!: an error in any argument wins
         let a_true = formualizer_parse::parser::ASTNode::new(
             formualizer_parse::parser::ASTNodeType::Literal(LiteralValue::Boolean(true)),
             None,
@@ -885,12 +915,47 @@ mod tests {
         ];
         // Excel: OR(TRUE, error) is the error.
         let out = or.eval(&hs, &fctx).unwrap().into_literal();
-        assert!(matches!(out, LiteralValue::Error(_)), "{out:?}");
+        match out {
+            LiteralValue::Error(e) => assert_eq!(e.to_string(), "#VALUE!"),
+            other => panic!("Expected error, got {other:?}"),
+        }
         assert_eq!(
             err_counter.load(Ordering::SeqCst),
             1,
-            "ERRORFN is evaluated"
+            "ERRORFN should be evaluated once"
         );
+    }
+
+    #[test]
+    fn and_or_xor_follow_excel_argument_rules() {
+        use formualizer_parse::parser::parse;
+        let wb = TestWorkbook::new()
+            .with_function(Arc::new(AndFn))
+            .with_function(Arc::new(OrFn))
+            .with_function(Arc::new(crate::builtins::logical_ext::XorFn))
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Text("text".into()))
+            .with_cell_a1("Sheet1", "A2", LiteralValue::Boolean(false))
+            .with_cell_a1("Sheet1", "A3", LiteralValue::Boolean(false))
+            .with_cell_a1("Sheet1", "B1", LiteralValue::Text("TRUE".into()));
+        let ctx = interp(&wb);
+        let eval = |f: &str| ctx.evaluate_ast(&parse(f).unwrap()).unwrap().into_literal();
+        let kind = |f: &str| match eval(f) {
+            LiteralValue::Error(e) => e.kind,
+            other => panic!("{f}: expected an error, got {other:?}"),
+        };
+        // Text in references is skipped; blanks too.
+        assert_eq!(eval("=OR(A1:A3)"), LiteralValue::Boolean(false));
+        assert_eq!(eval("=AND(A1:A4)"), LiteralValue::Boolean(false));
+        assert_eq!(eval("=AND(TRUE,C1:C3)"), LiteralValue::Boolean(true));
+        // Direct text converts when it spells a logical, and is skipped otherwise.
+        assert_eq!(eval("=AND(TRUE,\"abc\")"), LiteralValue::Boolean(true));
+        assert_eq!(eval("=OR(\"true\")"), LiteralValue::Boolean(true));
+        assert_eq!(kind("=AND(B1)"), ExcelErrorKind::Value);
+        // Nothing logical to read is #VALUE!; errors win over a decisive value.
+        assert_eq!(kind("=AND(\"abc\")"), ExcelErrorKind::Value);
+        assert_eq!(kind("=OR(C1:C3)"), ExcelErrorKind::Value);
+        assert_eq!(kind("=AND(FALSE,1/0)"), ExcelErrorKind::Div);
+        assert_eq!(eval("=XOR(TRUE,A1:A3,1)"), LiteralValue::Boolean(false));
     }
 
     #[test]
@@ -1029,9 +1094,7 @@ mod excel_logical_tests {
             LiteralValue::Error(e) => assert_eq!(e.kind, ExcelErrorKind::Value),
             other => panic!("expected #VALUE!, got {other:?}"),
         }
-        match eval("=OR(\"x\",TRUE)") {
-            LiteralValue::Error(e) => assert_eq!(e.kind, ExcelErrorKind::Value),
-            other => panic!("expected #VALUE!, got {other:?}"),
-        }
+        // Direct text that is not TRUE/FALSE is skipped too.
+        assert_eq!(eval("=OR(\"x\",TRUE)"), LiteralValue::Boolean(true));
     }
 }

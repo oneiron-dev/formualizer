@@ -193,6 +193,30 @@ pub fn to_text_invariant(value: &LiteralValue) -> String {
 }
 
 /// Numeric sanitization: NaN/Inf → #NUM!
+/// Excel's `^` and POWER. `0^0` is `#NUM!` and `0` to a negative power is
+/// `#DIV/0!`. A negative base with a fractional exponent is `#NUM!` unless
+/// the exponent is the reciprocal of an odd integer, which takes the real
+/// odd root (`(-8)^(1/3)` is -2). Overflow is `#NUM!`.
+pub fn excel_power(base: f64, exponent: f64) -> Result<f64, ExcelError> {
+    if base == 0.0 {
+        if exponent == 0.0 {
+            return Err(ExcelError::new_num());
+        }
+        if exponent < 0.0 {
+            return Err(ExcelError::new_div());
+        }
+    }
+    if base < 0.0 && exponent.fract() != 0.0 {
+        let root = 1.0 / exponent;
+        let whole = root.round();
+        if (root - whole).abs() <= 1e-10 * whole.abs().max(1.0) && whole.rem_euclid(2.0) == 1.0 {
+            return sanitize_numeric(-(-base).powf(exponent));
+        }
+        return Err(ExcelError::new_num());
+    }
+    sanitize_numeric(base.powf(exponent))
+}
+
 pub fn sanitize_numeric(n: f64) -> Result<f64, ExcelError> {
     if n.is_nan() || n.is_infinite() {
         return Err(ExcelError::new_num());

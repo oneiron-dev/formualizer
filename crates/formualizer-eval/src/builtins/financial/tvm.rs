@@ -1620,11 +1620,11 @@ impl Function for MirrFn {
 /// # Examples
 /// ```yaml,sandbox
 /// formula: =CUMIPMT(0.06/12, 360, 300000, 1, 12, 0)
-/// result: 16929.385083045923
+/// result: -17899.783768668927
 /// ```
 /// ```yaml,sandbox
 /// formula: =CUMIPMT(0.06/12, 360, 300000, 13, 24, 0)
-/// result: 14681.09233746059
+/// result: -17672.560542597304
 /// ```
 /// ```yaml,docs
 /// related:
@@ -1695,33 +1695,47 @@ impl Function for CumipmtFn {
             ));
         }
 
-        // Calculate PMT
-        let pmt = if rate == 0.0 {
-            -pv / nper as f64
-        } else {
-            -pv * rate * (1.0 + rate).powi(nper) / ((1.0 + rate).powi(nper) - 1.0)
-        };
-
-        // Sum interest payments from start to end
-        let mut cum_int = 0.0;
-        let mut balance = pv;
-
-        for period in 1..=end {
-            let interest = if pay_type == 1 && period == 1 {
-                0.0
-            } else {
-                balance * rate
-            };
-
-            if period >= start {
-                cum_int += interest;
-            }
-
-            let principal = pmt - interest;
-            balance += principal;
-        }
+        // Interest carries the payment's sign: negative for a positive loan.
+        let pmt = cum_pmt(rate, nper as f64, pv, pay_type);
+        let cum_int: f64 = (start..=end)
+            .map(|per| cum_ipmt(rate, per, pmt, pv, pay_type))
+            .sum();
 
         Ok(CalcValue::Scalar(LiteralValue::Number(cum_int)))
+    }
+}
+
+/// Excel's PMT for a whole number of periods (payment sign opposite to `pv`).
+fn cum_pmt(rate: f64, nper: f64, pv: f64, pay_type: i32) -> f64 {
+    let term = (1.0 + rate).powf(nper);
+    let pmt = pv * rate / (1.0 - 1.0 / term);
+    -if pay_type == 1 {
+        pmt / (1.0 + rate)
+    } else {
+        pmt
+    }
+}
+
+/// Excel's FV after `nper` periods of payment `pmt` on `pv`.
+fn cum_fv(rate: f64, nper: f64, pmt: f64, pv: f64, pay_type: i32) -> f64 {
+    let term = (1.0 + rate).powf(nper);
+    let annuity = if pay_type == 1 {
+        pmt * (1.0 + rate) * (term - 1.0) / rate
+    } else {
+        pmt * (term - 1.0) / rate
+    };
+    -(pv * term + annuity)
+}
+
+/// Interest paid in period `per` (1-based), as IPMT computes it.
+fn cum_ipmt(rate: f64, per: i32, pmt: f64, pv: f64, pay_type: i32) -> f64 {
+    if per == 1 {
+        return if pay_type == 1 { 0.0 } else { -pv * rate };
+    }
+    if pay_type == 1 {
+        (cum_fv(rate, (per - 2) as f64, pmt, pv, 1) - pmt) * rate
+    } else {
+        cum_fv(rate, (per - 1) as f64, pmt, pv, 0) * rate
     }
 }
 
@@ -1739,11 +1753,11 @@ impl Function for CumipmtFn {
 /// # Examples
 /// ```yaml,sandbox
 /// formula: =CUMPRINC(0.06/12, 360, 300000, 1, 12, 0)
-/// result: -38513.20398854517
+/// result: -3684.0351368303236
 /// ```
 /// ```yaml,sandbox
 /// formula: =CUMPRINC(0.06/12, 360, 300000, 13, 24, 0)
-/// result: -36264.91124295984
+/// result: -3911.2583629019473
 /// ```
 /// ```yaml,docs
 /// related:
@@ -1814,33 +1828,11 @@ impl Function for CumprincFn {
             ));
         }
 
-        // Calculate PMT
-        let pmt = if rate == 0.0 {
-            -pv / nper as f64
-        } else {
-            -pv * rate * (1.0 + rate).powi(nper) / ((1.0 + rate).powi(nper) - 1.0)
-        };
-
-        // Sum principal payments from start to end
-        let mut cum_princ = 0.0;
-        let mut balance = pv;
-
-        for period in 1..=end {
-            let interest = if pay_type == 1 && period == 1 {
-                0.0
-            } else {
-                balance * rate
-            };
-
-            let principal = pmt - interest;
-
-            if period >= start {
-                cum_princ += principal;
-            }
-
-            balance += principal;
-        }
-
+        // Principal is the payment less that period's interest.
+        let pmt = cum_pmt(rate, nper as f64, pv, pay_type);
+        let cum_princ: f64 = (start..=end)
+            .map(|per| pmt - cum_ipmt(rate, per, pmt, pv, pay_type))
+            .sum();
         Ok(CalcValue::Scalar(LiteralValue::Number(cum_princ)))
     }
 }
@@ -2682,4 +2674,54 @@ pub fn register_builtins() {
     crate::function_registry::register_builtin(Arc::new(RriFn));
     crate::function_registry::register_builtin(Arc::new(IspmtFn));
     crate::function_registry::register_builtin(Arc::new(PdurationFn));
+}
+
+#[cfg(test)]
+mod cumulative_tests {
+    use crate::test_workbook::TestWorkbook;
+    use formualizer_common::LiteralValue;
+    use formualizer_parse::parser::parse;
+    use std::sync::Arc;
+
+    fn eval(formula: &str) -> f64 {
+        let wb = TestWorkbook::new()
+            .with_function(Arc::new(super::CumipmtFn))
+            .with_function(Arc::new(super::CumprincFn));
+        match wb
+            .interpreter()
+            .evaluate_ast(&parse(formula).unwrap())
+            .unwrap()
+            .into_literal()
+        {
+            LiteralValue::Number(n) => n,
+            other => panic!("{formula}: {other:?}"),
+        }
+    }
+
+    fn close(formula: &str, want: f64) {
+        let got = eval(formula);
+        assert!((got - want).abs() < 1e-6, "{formula}: {got} != {want}");
+    }
+
+    /// Microsoft's documented examples: interest and principal carry the
+    /// payment's (negative) sign.
+    #[test]
+    fn cumulative_interest_and_principal_match_excel() {
+        close("=CUMIPMT(0.09/12,360,125000,13,24,0)", -11135.232130750846);
+        close("=CUMIPMT(0.09/12,360,125000,1,1,0)", -937.5);
+        close("=CUMPRINC(0.09/12,360,125000,13,24,0)", -934.1071234208758);
+        close("=CUMPRINC(0.09/12,360,125000,1,1,0)", -68.27827118097684);
+        close("=CUMIPMT(0.005,360,300000,1,1,0)", -1500.0);
+        close("=CUMPRINC(0.005,360,300000,1,1,0)", -298.6515754582708);
+    }
+
+    #[test]
+    fn payments_in_advance_accrue_no_first_period_interest() {
+        close("=CUMIPMT(0.01,12,1000,1,1,1)", 0.0);
+        // Interest and principal together make up every payment.
+        let pmt_total =
+            eval("=CUMIPMT(0.01,12,1000,1,12,1)") + eval("=CUMPRINC(0.01,12,1000,1,12,1)");
+        close("=CUMPRINC(0.01,12,1000,1,12,1)", -1000.0);
+        assert!(pmt_total < -1000.0);
+    }
 }

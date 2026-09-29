@@ -343,9 +343,476 @@ impl Function for LambdaFn {
     }
 }
 
+/* ───────────────────── LAMBDA helper functions ───────────────────── */
+
+type Grid = Vec<Vec<LiteralValue>>;
+
+fn error_value(kind: ExcelErrorKind, msg: &str) -> LiteralValue {
+    LiteralValue::Error(ExcelError::new(kind).with_message(msg.to_string()))
+}
+
+fn scalar<'b>(value: LiteralValue) -> CalcValue<'b> {
+    CalcValue::Scalar(value)
+}
+
+/// A built-in function named as a value, such as `SUM` in
+/// `BYROW(A1:B2,SUM)`: Excel's eta-reduced lambda, equivalent to
+/// `LAMBDA(a,b,...,SUM(a,b,...))` for any argument count SUM accepts.
+struct EtaCallable {
+    name: String,
+    min_args: usize,
+    max_args: Option<usize>,
+}
+
+impl CustomCallable for EtaCallable {
+    fn arity(&self) -> usize {
+        self.min_args.max(1)
+    }
+
+    fn accepts(&self, count: usize) -> bool {
+        count >= self.min_args.max(1) && self.max_args.is_none_or(|max| count <= max)
+    }
+
+    fn invoke<'ctx>(
+        &self,
+        interp: &crate::interpreter::Interpreter<'ctx>,
+        args: &[LiteralValue],
+    ) -> Result<CalcValue<'ctx>, ExcelError> {
+        if !self.accepts(args.len()) {
+            return Ok(CalcValue::Scalar(LiteralValue::Error(value_error(
+                format!("{} cannot take {} argument(s)", self.name, args.len()),
+            ))));
+        }
+        // Bind each argument to a name no formula can spell and call the
+        // function on those names, the same path a written LAMBDA takes.
+        let mut env = LocalEnv::default();
+        let mut params = Vec::with_capacity(args.len());
+        for (i, value) in args.iter().enumerate() {
+            let name = format!("\u{1}ETA{i}");
+            env = env.with_binding(&name, LocalBinding::Value(value.clone()));
+            params.push(ASTNode::new(
+                ASTNodeType::Reference {
+                    original: name.clone(),
+                    reference: ReferenceType::NamedRange(name),
+                },
+                None,
+            ));
+        }
+        let body = ASTNode::new(
+            ASTNodeType::Function {
+                name: self.name.clone(),
+                args: params,
+            },
+            None,
+        );
+        interp.with_local_env(env).evaluate_ast(&body)
+    }
+}
+
+/// The eta-reduced lambda for an argument written as a bare function name
+/// (`SUM`, or `_xleta.SUM` as stored in a file).
+fn eta_callable(arg: &ArgumentHandle<'_, '_>) -> Option<Arc<dyn CustomCallable>> {
+    let ASTNodeType::Reference {
+        reference: ReferenceType::NamedRange(name),
+        ..
+    } = &arg.ast().node_type
+    else {
+        return None;
+    };
+    let bare = ["_xleta.", "_xlfn."]
+        .iter()
+        .find_map(|prefix| {
+            name.get(..prefix.len())
+                .filter(|head| head.eq_ignore_ascii_case(prefix))
+                .map(|_| &name[prefix.len()..])
+        })
+        .unwrap_or(name);
+    let fun = arg.interpreter().context.get_function("", bare)?;
+    let max_args = (!fun.variadic()).then(|| fun.arg_schema().len().max(fun.min_args()));
+    Some(Arc::new(EtaCallable {
+        name: fun.name().to_string(),
+        min_args: fun.min_args(),
+        max_args,
+    }))
+}
+
+/// A function-valued argument: a LAMBDA, or a built-in function named as a
+/// value. `Err` carries the value to return instead: an error argument
+/// propagates and anything else is `#VALUE!`.
+pub(crate) fn function_arg(
+    arg: &ArgumentHandle<'_, '_>,
+) -> Result<Result<Arc<dyn CustomCallable>, LiteralValue>, ExcelError> {
+    let value = match arg.value() {
+        Ok(value) => value,
+        Err(error) => match eta_callable(arg) {
+            Some(callable) => return Ok(Ok(callable)),
+            None => return Err(error),
+        },
+    };
+    Ok(match value {
+        CalcValue::Callable(callable) => Ok(callable),
+        other => match other.into_literal() {
+            LiteralValue::Error(error) => match eta_callable(arg) {
+                Some(callable) if error.kind == ExcelErrorKind::Name => Ok(callable),
+                _ => Err(LiteralValue::Error(error)),
+            },
+            _ => Err(error_value(ExcelErrorKind::Value, "Expected a LAMBDA")),
+        },
+    })
+}
+
+/// The LAMBDA a helper receives as its last argument, which must take
+/// `arity` parameters; otherwise `Err` carries the value to return.
+fn lambda_arg(
+    arg: &ArgumentHandle<'_, '_>,
+    arity: usize,
+) -> Result<Result<Arc<dyn CustomCallable>, LiteralValue>, ExcelError> {
+    Ok(match function_arg(arg)? {
+        Ok(callable) if callable.accepts(arity) => Ok(callable),
+        Ok(_) => Err(error_value(
+            ExcelErrorKind::Value,
+            "LAMBDA has the wrong number of parameters",
+        )),
+        Err(value) => Err(value),
+    })
+}
+
+/// An array argument as rows of values; a single value is a 1x1 array.
+fn grid_arg(arg: &ArgumentHandle<'_, '_>) -> Result<Grid, ExcelError> {
+    Ok(match arg.value()?.into_literal() {
+        LiteralValue::Array(rows) => rows,
+        other => vec![vec![other]],
+    })
+}
+
+/// A 1x1 array passes to a LAMBDA as its single value.
+fn array_value(rows: Grid) -> LiteralValue {
+    if rows.len() == 1 && rows[0].len() == 1 {
+        rows.into_iter().next().unwrap().into_iter().next().unwrap()
+    } else {
+        LiteralValue::Array(rows)
+    }
+}
+
+pub(crate) fn invoke(
+    arg: &ArgumentHandle<'_, '_>,
+    callable: &Arc<dyn CustomCallable>,
+    values: &[LiteralValue],
+) -> LiteralValue {
+    match callable.invoke(arg.interpreter(), values) {
+        Ok(result) => result.into_literal(),
+        Err(error) => LiteralValue::Error(error),
+    }
+}
+
+/// One element of a helper's result array. A LAMBDA result that is itself a
+/// multi-cell array cannot nest, so the whole helper returns `#CALC!`; a blank
+/// result reads as 0, like a formula that refers to an empty cell.
+pub(crate) fn element_value(value: LiteralValue) -> Option<LiteralValue> {
+    match value {
+        LiteralValue::Array(rows) => {
+            if rows.len() == 1 && rows[0].len() == 1 {
+                element_value(rows.into_iter().next().unwrap().into_iter().next().unwrap())
+            } else {
+                None
+            }
+        }
+        LiteralValue::Empty => Some(LiteralValue::Number(0.0)),
+        other => Some(other),
+    }
+}
+
+fn nested_array_error() -> LiteralValue {
+    error_value(ExcelErrorKind::Calc, "Nested arrays are not supported")
+}
+
+fn array_result<'b>(rows: Grid, ctx: &dyn FunctionContext<'b>) -> CalcValue<'b> {
+    if rows.len() == 1 && rows[0].len() == 1 {
+        scalar(rows.into_iter().next().unwrap().into_iter().next().unwrap())
+    } else {
+        CalcValue::Range(crate::engine::range_view::RangeView::from_owned_rows(
+            rows,
+            ctx.date_system(),
+        ))
+    }
+}
+
+/// Element `(r, c)` of an array broadcast to a larger result: a single row or
+/// column repeats, and positions past the array's edge are `#N/A`.
+fn broadcast_get(rows: &Grid, r: usize, c: usize) -> LiteralValue {
+    let height = rows.len();
+    let width = rows.first().map_or(0, Vec::len);
+    let r = if height == 1 { 0 } else { r };
+    let c = if width == 1 { 0 } else { c };
+    rows.get(r)
+        .and_then(|row| row.get(c))
+        .cloned()
+        .unwrap_or_else(|| error_value(ExcelErrorKind::Na, "Array too small"))
+}
+
+macro_rules! lambda_helper {
+    ($ty:ident, $name:literal, $min:expr, $variadic:expr, $eval:ident) => {
+        #[derive(Debug)]
+        pub struct $ty;
+
+        impl Function for $ty {
+            fn caps(&self) -> FnCaps {
+                FnCaps::PURE | FnCaps::MAY_SPILL
+            }
+
+            fn name(&self) -> &'static str {
+                $name
+            }
+
+            fn min_args(&self) -> usize {
+                $min
+            }
+
+            fn variadic(&self) -> bool {
+                $variadic
+            }
+
+            fn arg_schema(&self) -> &'static [crate::args::ArgSchema] {
+                static SCHEMA: std::sync::LazyLock<Vec<crate::args::ArgSchema>> =
+                    std::sync::LazyLock::new(|| vec![crate::args::ArgSchema::any()]);
+                &SCHEMA
+            }
+
+            fn dispatch<'a, 'b, 'c>(
+                &self,
+                args: &'c [ArgumentHandle<'a, 'b>],
+                ctx: &dyn FunctionContext<'b>,
+            ) -> Result<CalcValue<'b>, ExcelError> {
+                self.eval(args, ctx)
+            }
+
+            fn eval<'a, 'b, 'c>(
+                &self,
+                args: &'c [ArgumentHandle<'a, 'b>],
+                ctx: &dyn FunctionContext<'b>,
+            ) -> Result<CalcValue<'b>, ExcelError> {
+                if args.len() < $min || (!$variadic && args.len() > $min) {
+                    return Ok(scalar(error_value(
+                        ExcelErrorKind::Value,
+                        concat!("Wrong number of arguments to ", $name),
+                    )));
+                }
+                $eval(args, ctx)
+            }
+        }
+    };
+}
+
+/// `MAP(array1, [array2, ...], lambda)`: applies the LAMBDA to each element,
+/// taking one parameter per array.
+fn eval_map<'a, 'b>(
+    args: &[ArgumentHandle<'a, 'b>],
+    ctx: &dyn FunctionContext<'b>,
+) -> Result<CalcValue<'b>, ExcelError> {
+    let (lambda, arrays) = args.split_last().unwrap();
+    let callable = match lambda_arg(lambda, arrays.len())? {
+        Ok(callable) => callable,
+        Err(value) => return Ok(scalar(value)),
+    };
+    let grids = arrays.iter().map(grid_arg).collect::<Result<Vec<_>, _>>()?;
+    let height = grids.iter().map(Vec::len).max().unwrap_or(0);
+    let width = grids
+        .iter()
+        .map(|g| g.first().map_or(0, Vec::len))
+        .max()
+        .unwrap_or(0);
+    let mut out = Vec::with_capacity(height);
+    for r in 0..height {
+        let mut row = Vec::with_capacity(width);
+        for c in 0..width {
+            let values: Vec<LiteralValue> = grids.iter().map(|g| broadcast_get(g, r, c)).collect();
+            match element_value(invoke(lambda, &callable, &values)) {
+                Some(value) => row.push(value),
+                None => return Ok(scalar(nested_array_error())),
+            }
+        }
+        out.push(row);
+    }
+    Ok(array_result(out, ctx))
+}
+
+/// The starting accumulator of REDUCE/SCAN; an omitted one is blank.
+fn initial_value(arg: &ArgumentHandle<'_, '_>) -> Result<LiteralValue, ExcelError> {
+    if arg.is_omitted() {
+        Ok(LiteralValue::Empty)
+    } else {
+        Ok(arg.value()?.into_literal())
+    }
+}
+
+/// `REDUCE([initial_value], array, lambda(accumulator, value))`: folds the
+/// array in row-major order and returns the final accumulator, which may be
+/// an array.
+fn eval_reduce<'a, 'b>(
+    args: &[ArgumentHandle<'a, 'b>],
+    ctx: &dyn FunctionContext<'b>,
+) -> Result<CalcValue<'b>, ExcelError> {
+    let (array_arg, lambda) = (&args[1], &args[2]);
+    let callable = match lambda_arg(lambda, 2)? {
+        Ok(callable) => callable,
+        Err(value) => return Ok(scalar(value)),
+    };
+    let mut acc = initial_value(&args[0])?;
+    for row in grid_arg(array_arg)? {
+        for value in row {
+            acc = invoke(lambda, &callable, &[acc, value]);
+        }
+    }
+    Ok(match acc {
+        LiteralValue::Array(rows) => array_result(rows, ctx),
+        LiteralValue::Empty => scalar(LiteralValue::Number(0.0)),
+        other => scalar(other),
+    })
+}
+
+/// `SCAN([initial_value], array, lambda(accumulator, value))`: like REDUCE,
+/// returning every intermediate accumulator in the shape of the array.
+fn eval_scan<'a, 'b>(
+    args: &[ArgumentHandle<'a, 'b>],
+    ctx: &dyn FunctionContext<'b>,
+) -> Result<CalcValue<'b>, ExcelError> {
+    let (array_arg, lambda) = (&args[1], &args[2]);
+    let callable = match lambda_arg(lambda, 2)? {
+        Ok(callable) => callable,
+        Err(value) => return Ok(scalar(value)),
+    };
+    let mut acc = initial_value(&args[0])?;
+    let grid = grid_arg(array_arg)?;
+    let mut out = Vec::with_capacity(grid.len());
+    for row in grid {
+        let mut out_row = Vec::with_capacity(row.len());
+        for value in row {
+            acc = invoke(lambda, &callable, &[acc, value]);
+            match element_value(acc.clone()) {
+                Some(value) => out_row.push(value),
+                None => return Ok(scalar(nested_array_error())),
+            }
+        }
+        out.push(out_row);
+    }
+    Ok(array_result(out, ctx))
+}
+
+/// `BYROW(array, lambda(row))`: one result per row, as a column.
+fn eval_byrow<'a, 'b>(
+    args: &[ArgumentHandle<'a, 'b>],
+    ctx: &dyn FunctionContext<'b>,
+) -> Result<CalcValue<'b>, ExcelError> {
+    let callable = match lambda_arg(&args[1], 1)? {
+        Ok(callable) => callable,
+        Err(value) => return Ok(scalar(value)),
+    };
+    let mut out = Vec::new();
+    for row in grid_arg(&args[0])? {
+        match element_value(invoke(&args[1], &callable, &[array_value(vec![row])])) {
+            Some(value) => out.push(vec![value]),
+            None => return Ok(scalar(nested_array_error())),
+        }
+    }
+    Ok(array_result(out, ctx))
+}
+
+/// `BYCOL(array, lambda(column))`: one result per column, as a row.
+fn eval_bycol<'a, 'b>(
+    args: &[ArgumentHandle<'a, 'b>],
+    ctx: &dyn FunctionContext<'b>,
+) -> Result<CalcValue<'b>, ExcelError> {
+    let callable = match lambda_arg(&args[1], 1)? {
+        Ok(callable) => callable,
+        Err(value) => return Ok(scalar(value)),
+    };
+    let grid = grid_arg(&args[0])?;
+    let width = grid.first().map_or(0, Vec::len);
+    let mut out = Vec::with_capacity(width);
+    for c in 0..width {
+        let column: Grid = grid
+            .iter()
+            .map(|row| vec![row.get(c).cloned().unwrap_or(LiteralValue::Empty)])
+            .collect();
+        match element_value(invoke(&args[1], &callable, &[array_value(column)])) {
+            Some(value) => out.push(value),
+            None => return Ok(scalar(nested_array_error())),
+        }
+    }
+    Ok(array_result(vec![out], ctx))
+}
+
+/// A MAKEARRAY dimension: a number truncated to an integer from 1 up to the
+/// sheet's size; anything else is `#VALUE!`.
+fn dimension_arg(
+    arg: &ArgumentHandle<'_, '_>,
+    max: f64,
+) -> Result<Result<usize, LiteralValue>, ExcelError> {
+    let value = arg.value()?.into_literal();
+    if let LiteralValue::Error(_) = value {
+        return Ok(Err(value));
+    }
+    Ok(match crate::coercion::to_number_lenient(&value) {
+        Ok(n) if n.trunc() >= 1.0 && n.trunc() <= max => Ok(n.trunc() as usize),
+        _ => Err(error_value(
+            ExcelErrorKind::Value,
+            "Invalid MAKEARRAY dimension",
+        )),
+    })
+}
+
+/// `MAKEARRAY(rows, columns, lambda(row, column))`: builds an array from the
+/// LAMBDA applied to each 1-based row and column index.
+fn eval_makearray<'a, 'b>(
+    args: &[ArgumentHandle<'a, 'b>],
+    ctx: &dyn FunctionContext<'b>,
+) -> Result<CalcValue<'b>, ExcelError> {
+    let height = match dimension_arg(&args[0], 1_048_576.0)? {
+        Ok(n) => n,
+        Err(value) => return Ok(scalar(value)),
+    };
+    let width = match dimension_arg(&args[1], 16_384.0)? {
+        Ok(n) => n,
+        Err(value) => return Ok(scalar(value)),
+    };
+    let callable = match lambda_arg(&args[2], 2)? {
+        Ok(callable) => callable,
+        Err(value) => return Ok(scalar(value)),
+    };
+    let mut out = Vec::with_capacity(height);
+    for r in 1..=height {
+        let mut row = Vec::with_capacity(width);
+        for c in 1..=width {
+            let values = [
+                LiteralValue::Number(r as f64),
+                LiteralValue::Number(c as f64),
+            ];
+            match element_value(invoke(&args[2], &callable, &values)) {
+                Some(value) => row.push(value),
+                None => return Ok(scalar(nested_array_error())),
+            }
+        }
+        out.push(row);
+    }
+    Ok(array_result(out, ctx))
+}
+
+lambda_helper!(MapFn, "MAP", 2, true, eval_map);
+lambda_helper!(ReduceFn, "REDUCE", 3, false, eval_reduce);
+lambda_helper!(ScanFn, "SCAN", 3, false, eval_scan);
+lambda_helper!(ByRowFn, "BYROW", 2, false, eval_byrow);
+lambda_helper!(ByColFn, "BYCOL", 2, false, eval_bycol);
+lambda_helper!(MakeArrayFn, "MAKEARRAY", 3, false, eval_makearray);
+
 pub fn register_builtins() {
     crate::function_registry::register_builtin(Arc::new(LetFn));
     crate::function_registry::register_builtin(Arc::new(LambdaFn));
+    crate::function_registry::register_builtin(Arc::new(MapFn));
+    crate::function_registry::register_builtin(Arc::new(ReduceFn));
+    crate::function_registry::register_builtin(Arc::new(ScanFn));
+    crate::function_registry::register_builtin(Arc::new(ByRowFn));
+    crate::function_registry::register_builtin(Arc::new(ByColFn));
+    crate::function_registry::register_builtin(Arc::new(MakeArrayFn));
 }
 
 #[cfg(test)]

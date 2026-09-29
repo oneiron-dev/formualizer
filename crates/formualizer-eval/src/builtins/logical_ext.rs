@@ -104,9 +104,9 @@ pub struct XorFn;
 ///
 /// # Remarks
 /// - Booleans and numbers are accepted (`0` is FALSE, non-zero is TRUE).
-/// - Blank values are ignored.
-/// - Text and other non-coercible values produce `#VALUE!`.
-/// - If no coercion error occurs first, encountered formula errors are propagated.
+/// - Text and blanks in references and arrays are skipped; direct text counts only
+///   when it spells TRUE or FALSE.
+/// - Any error in the arguments is returned; with no logical values, `#VALUE!`.
 ///
 /// # Examples
 ///
@@ -117,8 +117,8 @@ pub struct XorFn;
 /// ```
 ///
 /// ```yaml,sandbox
-/// title: "Text input triggers VALUE error"
-/// formula: '=XOR(1, "x")'
+/// title: "Text with nothing logical is a VALUE error"
+/// formula: '=XOR("x")'
 /// expected: "#VALUE!"
 /// ```
 ///
@@ -160,87 +160,12 @@ impl Function for XorFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let mut true_count = 0usize;
-        let mut first_error: Option<LiteralValue> = None;
-        for a in args {
-            if let Ok(view) = a.range_view() {
-                let mut err: Option<LiteralValue> = None;
-                view.for_each_cell(&mut |val| {
-                    match val {
-                        LiteralValue::Boolean(b) => {
-                            if *b {
-                                true_count += 1;
-                            }
-                        }
-                        LiteralValue::Number(n) => {
-                            if *n != 0.0 {
-                                true_count += 1;
-                            }
-                        }
-                        LiteralValue::Int(i) => {
-                            if *i != 0 {
-                                true_count += 1;
-                            }
-                        }
-                        LiteralValue::Empty => {}
-                        LiteralValue::Error(_) => {
-                            if first_error.is_none() {
-                                err = Some(val.clone());
-                            }
-                        }
-                        _ => {
-                            if first_error.is_none() {
-                                err = Some(LiteralValue::Error(ExcelError::from_error_string(
-                                    "#VALUE!",
-                                )));
-                            }
-                        }
-                    }
-                    Ok(())
-                })?;
-                if first_error.is_none() {
-                    first_error = err;
-                }
-            } else {
-                let v = a.value()?.into_literal();
-                match v {
-                    LiteralValue::Boolean(b) => {
-                        if b {
-                            true_count += 1;
-                        }
-                    }
-                    LiteralValue::Number(n) => {
-                        if n != 0.0 {
-                            true_count += 1;
-                        }
-                    }
-                    LiteralValue::Int(i) => {
-                        if i != 0 {
-                            true_count += 1;
-                        }
-                    }
-                    LiteralValue::Empty => {}
-                    LiteralValue::Error(e) => {
-                        if first_error.is_none() {
-                            first_error = Some(LiteralValue::Error(e));
-                        }
-                    }
-                    _ => {
-                        if first_error.is_none() {
-                            first_error = Some(LiteralValue::Error(ExcelError::from_error_string(
-                                "#VALUE!",
-                            )));
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(err) = first_error {
-            return Ok(crate::traits::CalcValue::Scalar(err));
-        }
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Boolean(
-            true_count % 2 == 1,
-        )))
+        Ok(crate::traits::CalcValue::Scalar(
+            match crate::builtins::logical::count_logicals(args) {
+                Ok((trues, _)) => LiteralValue::Boolean(trues % 2 == 1),
+                Err(e) => LiteralValue::Error(e),
+            },
+        ))
     }
 }
 

@@ -97,6 +97,11 @@ pub type CowValue<'a> = Cow<'a, LiteralValue>;
 pub trait CustomCallable: Send + Sync {
     fn arity(&self) -> usize;
 
+    /// Whether the callable can be invoked with `count` arguments.
+    fn accepts(&self, count: usize) -> bool {
+        self.arity() == count
+    }
+
     fn invoke<'ctx>(
         &self,
         interp: &Interpreter<'ctx>,
@@ -558,6 +563,12 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
 
     pub fn current_env(&self) -> crate::interpreter::LocalEnv {
         self.interp.local_env().clone()
+    }
+
+    /// The interpreter evaluating this argument; helpers such as MAP invoke
+    /// a LAMBDA argument through it.
+    pub(crate) fn interpreter(&self) -> &'a Interpreter<'b> {
+        self.interp
     }
 
     pub fn inline_array_literal(&self) -> Result<Option<Vec<Vec<LiteralValue>>>, ExcelError> {
