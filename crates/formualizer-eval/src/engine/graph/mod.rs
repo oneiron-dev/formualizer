@@ -283,6 +283,9 @@ pub struct DependencyGraph {
     source_tables: FxHashMap<String, sources::SourceTableEntry>,
     source_vertex_lookup: FxHashMap<VertexId, String>,
 
+    /// Saved values of linked workbooks, keyed by normalized book token (`[1]`).
+    external_books: FxHashMap<String, std::sync::Arc<crate::engine::external_book::ExternalBook>>,
+
     /// Monotonic allocator for the symbol address space.
     ///
     /// Names, tables and external sources are identified by name and have no position, so
@@ -1239,6 +1242,7 @@ impl DependencyGraph {
             table_vertex_lookup: FxHashMap::default(),
             source_scalars: FxHashMap::default(),
             source_tables: FxHashMap::default(),
+            external_books: FxHashMap::default(),
             source_vertex_lookup: FxHashMap::default(),
             symbol_vertex_seq: 0,
             cell_to_name_dependents: FxHashMap::default(),
@@ -1390,6 +1394,7 @@ impl DependencyGraph {
             tables_lookup,
             source_scalars,
             source_tables,
+            external_books,
             config,
             ..
         } = self;
@@ -1492,7 +1497,11 @@ impl DependencyGraph {
                     vertex: entry.vertex,
                 })
             },
-        );
+        )
+        .with_external_books(move |token| {
+            !external_books.is_empty()
+                && external_books.contains_key(&crate::engine::external_book::book_key(token))
+        });
 
         crate::engine::ingest_pipeline::IngestPipeline::new(
             data_store,

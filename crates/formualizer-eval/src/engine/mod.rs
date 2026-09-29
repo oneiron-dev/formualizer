@@ -9,6 +9,7 @@ pub(crate) mod convergence;
 pub mod effects;
 pub mod eval;
 pub mod eval_delta;
+pub mod external_book;
 pub mod formula_ingest;
 mod formula_source;
 pub(crate) mod fragmented_transaction;

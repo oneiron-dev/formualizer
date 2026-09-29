@@ -1919,6 +1919,21 @@ mod tests {
         }
 
         #[test]
+        fn external_range_is_one_operand() {
+            for formula in ["=[1]Sheet1!A1:B4", "='[1]My Sheet'!$A$1:$B$4"] {
+                let classic = classic_non_ws(formula);
+                assert_eq!(classic.len(), 1, "{formula}: {classic:?}");
+                assert_eq!(classic[0].1, TokenSubType::Range);
+                assert_eq!(classic[0].2, &formula[1..]);
+                assert_eq!(span_non_ws(formula), classic);
+            }
+            // Structured references still join with the range operator.
+            let joined = classic_non_ws("=Table1[a]:Table1[b]");
+            assert_eq!(joined.len(), 3, "{joined:?}");
+            assert_eq!(joined[1].0, TokenType::OpInfix);
+        }
+
+        #[test]
         fn spill_after_paren_close() {
             let expected = vec![
                 (TokenType::Paren, TokenSubType::Open, "(".to_string()),

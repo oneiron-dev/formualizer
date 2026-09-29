@@ -817,7 +817,18 @@ impl ReferenceType {
             if Self::is_r1c1_shape(&ref_part) {
                 return Ok(ReferenceType::NamedRange(reference.to_string()));
             }
-            return Self::parse_table_reference(&ref_part);
+            let table = Self::parse_table_reference(&ref_part)?;
+            // `[1]!Table1[Col]` names a table in a linked workbook; keep the
+            // book qualifier so it never binds to a local table.
+            return match (table, sheet.as_deref()) {
+                (ReferenceType::Table(mut tref), Some(book))
+                    if book.starts_with('[') && book.ends_with(']') =>
+                {
+                    tref.name = format!("{book}!{}", tref.name);
+                    Ok(ReferenceType::Table(tref))
+                }
+                (table, _) => Ok(table),
+            };
         }
 
         let external_sheet = sheet.as_deref().and_then(|s| {

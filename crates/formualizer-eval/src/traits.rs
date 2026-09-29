@@ -405,6 +405,27 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         self.reference_attempt().is_some()
     }
 
+    /// Whether this argument is written as a reference into a linked workbook,
+    /// which evaluates from the values saved with the link while it is closed.
+    pub fn is_external_reference(&self) -> bool {
+        match &self.expr {
+            ArgumentExpr::Ast(node) => matches!(
+                &node.node_type,
+                ASTNodeType::Reference {
+                    reference: ReferenceType::External(_),
+                    ..
+                }
+            ),
+            ArgumentExpr::Arena { id, data_store, .. } => matches!(
+                data_store.get_node(*id),
+                Some(crate::engine::arena::AstNodeData::Reference {
+                    ref_type: crate::engine::arena::CompactRefType::External { .. },
+                    ..
+                })
+            ),
+        }
+    }
+
     /// Return whether this argument's syntax may produce a spreadsheet reference.
     ///
     /// Unlike [`Self::has_reference_semantics`], this does not evaluate a
@@ -710,6 +731,10 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                     {
                         return None;
                     }
+                    // A closed linked workbook yields values, not a reference.
+                    if matches!(reference, ReferenceType::External(_)) {
+                        return None;
+                    }
                     Some(self.interp.reference_for_current_offset(reference))
                 }
                 ASTNodeType::BinaryOp { op, .. } if op == ":" => {
@@ -750,6 +775,12 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                                 .resolve_local_name(data_store.resolve_ast_string(*name_id))
                                 .is_some()
                         {
+                            return None;
+                        }
+                        if matches!(
+                            ref_type,
+                            crate::engine::arena::CompactRefType::External { .. }
+                        ) {
                             return None;
                         }
                         let reference = data_store

@@ -216,12 +216,36 @@ impl CriteriaMaskMemo {
     }
 }
 
+/// Excel's range-only parameters (SUMIF's range, COUNTIFS's criteria ranges,
+/// COUNTBLANK's range, ...) cannot read a closed linked workbook: a reference
+/// into one makes the function return #VALUE!.
+pub(crate) fn closed_workbook_range(
+    args: &[ArgumentHandle<'_, '_>],
+    mut is_range_position: impl FnMut(usize) -> bool,
+) -> bool {
+    args.iter()
+        .enumerate()
+        .any(|(i, arg)| is_range_position(i) && arg.is_external_reference())
+}
+
 fn eval_if_family<'a, 'b>(
     args: &[ArgumentHandle<'a, 'b>],
     ctx: &dyn FunctionContext<'b>,
     agg_type: AggregationType,
     multi: bool,
 ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+    // COUNTIFS pairs start at 0; SUMIFS/AVERAGEIFS lead with the value range.
+    let counts = matches!(agg_type, AggregationType::Count);
+    let range_position = |i: usize| match (multi, counts) {
+        (false, _) => i != 1,
+        (true, true) => i % 2 == 0,
+        (true, false) => i == 0 || i % 2 == 1,
+    };
+    if closed_workbook_range(args, range_position) {
+        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+            ExcelError::new_value(),
+        )));
+    }
     let mut sum_view: Option<crate::engine::range_view::RangeView<'_>> = None;
     let mut sum_scalar: Option<LiteralValue> = None;
     let mut crit_specs = Vec::new();
@@ -1656,6 +1680,11 @@ impl Function for CountBlankFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        if closed_workbook_range(args, |_| true) {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                ExcelError::new_value(),
+            )));
+        }
         let mut cnt = 0i64;
         for a in args {
             let (argument, logical_cells) = resolve_count_argument(a, ctx)?;

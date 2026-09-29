@@ -30,6 +30,7 @@ use quick_xml::name::QName;
 use zip::ZipArchive;
 
 mod compressed_evidence;
+mod external_links;
 mod formula_replay;
 
 use compressed_evidence::{EvidenceRecord, MonotonicFormulaEvidence};
@@ -1932,6 +1933,10 @@ where
             .map_err(|e| calamine::Error::Io(std::io::Error::other(e.to_string())))?;
         #[cfg(feature = "tracing")]
         drop(_span_sheets);
+        // References into linked workbooks evaluate from their saved values.
+        for (token, book) in external_links::scan_external_books(self.cancellable_reader()) {
+            engine.set_external_book(&token, book);
+        }
 
         let prev_index_mode = engine.config.sheet_index_mode;
         engine.set_sheet_index_mode(formualizer_eval::engine::SheetIndexMode::Lazy);

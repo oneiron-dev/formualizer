@@ -232,7 +232,9 @@ pub(super) fn admit<'a>(
         if file.name().starts_with("_xmlsignatures/") || file.name().ends_with("origin.sigs") {
             return Err(unsupported("package digital signature", "XLSX package"));
         }
-        if file.name().starts_with("xl/externalLinks/") || file.name().starts_with("xl/richData/") {
+        // Linked-workbook parts stay as saved; references into them evaluate
+        // from their saved values.
+        if file.name().starts_with("xl/richData/") {
             return Err(unsupported(
                 "external links or rich/dynamic cell metadata",
                 "XLSX package",
@@ -394,7 +396,7 @@ pub(super) fn discover(
     }
     let relations = relationships(archive, "xl/workbook.xml", options)?;
     for rel in relations.values() {
-        if rel.kind.ends_with("/externalLink") || rel.kind.contains("digital-signature") {
+        if rel.kind.contains("digital-signature") {
             return Err(unsupported(
                 "external workbook link/signature",
                 "workbook relationships",
@@ -499,9 +501,6 @@ pub(super) fn discover(
                 Some("1" | "true") => formualizer_common::DateSystem::Excel1904,
                 _ => return Err(unsupported("invalid workbook date system", "workbook XML")),
             };
-        }
-        if e.local == "externalReferences" {
-            return Err(unsupported("external workbook references", "workbook XML"));
         }
         if e.local == "sheet" {
             if !xml::path_is(path, xml::MAIN, &["workbook", "sheets", "sheet"]) {

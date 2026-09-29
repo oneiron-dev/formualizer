@@ -5052,6 +5052,20 @@ where
         Ok(())
     }
 
+    /// Register the saved values of a linked workbook under its book token
+    /// (`[1]` in `[1]Sheet1!A1`). Formulas loaded afterwards evaluate references
+    /// into that workbook from these values, as Excel does while the linked
+    /// workbook is closed.
+    pub fn set_external_book(
+        &mut self,
+        token: &str,
+        book: crate::engine::external_book::ExternalBook,
+    ) {
+        self.graph.set_external_book(token, book);
+        self.record_formula_plane_structural_change(StructuralScope::OpaqueGlobal);
+        self.mark_topology_edited();
+    }
+
     pub fn set_source_scalar_version(
         &mut self,
         name: &str,
@@ -27008,6 +27022,16 @@ where
         current_sheet: &str,
     ) -> Result<RangeView<'c>, ExcelError> {
         match reference {
+            ReferenceType::External(ext) if self.graph.is_linked_book_ref(ext) => {
+                let book = self
+                    .graph
+                    .external_book(ext.book.token())
+                    .ok_or_else(|| ExcelError::new(ExcelErrorKind::Ref))?;
+                Ok(RangeView::from_owned_rows(
+                    external_book_rows(book, ext)?,
+                    self.config.date_system,
+                ))
+            }
             ReferenceType::External(ext) => {
                 let name = ext.raw.as_str();
                 match ext.kind {
@@ -27297,6 +27321,11 @@ where
 
                 let data = self.resolver.resolve_named_range_reference(name)?;
                 Ok(RangeView::from_owned_rows(data, self.config.date_system))
+            }
+            ReferenceType::Table(tref)
+                if crate::engine::external_book::is_linked_table_name(&tref.name) =>
+            {
+                Err(ExcelError::new(ExcelErrorKind::Ref))
             }
             ReferenceType::Table(tref) => {
                 if let Some(table) = self.graph.resolve_table_entry(&tref.name) {
@@ -30049,4 +30078,57 @@ where
         self.flush_computed_write_buffer(&mut computed_writes)?;
         Ok(layer.vertices.len())
     }
+}
+
+/// Values of a reference into a linked workbook, from its saved values.
+/// A sheet the link does not name is #REF!; open-ended bounds stop at the
+/// last saved cell.
+fn external_book_rows(
+    book: &crate::engine::external_book::ExternalBook,
+    ext: &formualizer_parse::parser::ExternalReference,
+) -> Result<Vec<Vec<LiteralValue>>, ExcelError> {
+    use formualizer_parse::parser::ExternalRefKind;
+    const MAX_CELLS: u64 = 4_000_000;
+    let sheet = book
+        .sheet(&ext.sheet)
+        .ok_or_else(|| ExcelError::new(ExcelErrorKind::Ref))?;
+    let (max_row, max_col) = sheet.extent();
+    let (mut sr, mut sc, mut er, mut ec) = match ext.kind {
+        ExternalRefKind::Cell { row, col, .. } => (row, col, row, col),
+        ExternalRefKind::Range {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            ..
+        } => {
+            let sr = start_row.unwrap_or(1);
+            let sc = start_col.unwrap_or(1);
+            (
+                sr,
+                sc,
+                end_row.unwrap_or(max_row.max(sr)),
+                end_col.unwrap_or(max_col.max(sc)),
+            )
+        }
+    };
+    if sr > er {
+        std::mem::swap(&mut sr, &mut er);
+    }
+    if sc > ec {
+        std::mem::swap(&mut sc, &mut ec);
+    }
+    if sr == 0 || sc == 0 {
+        return Err(ExcelError::new(ExcelErrorKind::Ref));
+    }
+    if u64::from(er - sr + 1) * u64::from(ec - sc + 1) > MAX_CELLS {
+        // Beyond the last saved cell every value is blank.
+        er = er.min(max_row.max(sr));
+        ec = ec.min(max_col.max(sc));
+        if u64::from(er - sr + 1) * u64::from(ec - sc + 1) > MAX_CELLS {
+            return Err(ExcelError::new(ExcelErrorKind::NImpl)
+                .with_message("External reference too large".to_string()));
+        }
+    }
+    Ok(sheet.rows(sr, sc, er, ec))
 }

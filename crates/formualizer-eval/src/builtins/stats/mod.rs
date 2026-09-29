@@ -2288,6 +2288,13 @@ fn eval_maxminifs<'a, 'b>(
     args: &[ArgumentHandle<'a, 'b>],
     is_max: bool,
 ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+    if crate::builtins::math::criteria_aggregates::closed_workbook_range(args, |i| {
+        i == 0 || i % 2 == 1
+    }) {
+        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+            ExcelError::new_value(),
+        )));
+    }
     // Validate argument count: must be target_range + N pairs
     if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
         return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(

@@ -26,6 +26,43 @@ impl DependencyGraph {
         self.allocate_symbol_vertex(VertexKind::External, scope_sheet_id)
     }
 
+    /// Register the saved values of a linked workbook under its book token
+    /// (`[1]` in `[1]Sheet1!A1`). References into it evaluate from these values
+    /// and need no dependency edges, since they cannot change during a recalc.
+    pub fn set_external_book(
+        &mut self,
+        token: &str,
+        book: crate::engine::external_book::ExternalBook,
+    ) {
+        self.external_books.insert(
+            crate::engine::external_book::book_key(token),
+            std::sync::Arc::new(book),
+        );
+        self.bump_symbol_revision();
+    }
+
+    pub fn external_book(
+        &self,
+        token: &str,
+    ) -> Option<&std::sync::Arc<crate::engine::external_book::ExternalBook>> {
+        if self.external_books.is_empty() {
+            return None;
+        }
+        self.external_books
+            .get(&crate::engine::external_book::book_key(token))
+    }
+
+    /// A reference into a linked workbook that is read from saved values
+    /// (registered book) or, with nothing saved and no source defined for it,
+    /// cannot be read at all (#REF!). Either way it has no dependency.
+    pub fn is_linked_book_ref(&self, ext: &formualizer_parse::parser::ExternalReference) -> bool {
+        let token = ext.book.token();
+        self.external_book(token).is_some()
+            || (crate::engine::external_book::is_link_index(token)
+                && !self.source_scalars.contains_key(&ext.raw)
+                && !self.source_tables.contains_key(&ext.raw))
+    }
+
     pub fn resolve_source_scalar_entry(&self, name: &str) -> Option<&SourceScalarEntry> {
         self.source_scalars.get(name)
     }

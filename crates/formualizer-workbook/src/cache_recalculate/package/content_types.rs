@@ -42,7 +42,6 @@ pub(super) fn validate(
             if content.is_empty()
                 || content.contains("digital-signature")
                 || (content.contains("sheetMetadata") && !metadata_part)
-                || content.contains("externalLink")
             {
                 return Err(unsupported("unsupported content type", "XLSX package"));
             }

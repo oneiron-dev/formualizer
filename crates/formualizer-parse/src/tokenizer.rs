@@ -716,6 +716,13 @@ fn next_starts_reference_expression(formula: &str, mut offset: usize) -> bool {
     matches!(bytes[offset], b'(' | b'[' | b'\'' | b'$') || bytes[offset].is_ascii_alphabetic()
 }
 
+/// `[1]Sheet1!A1` / `'[1]Sheet 1'!A1`: a sheet qualifier after an external
+/// book token, so a following `:` continues the range (`[1]Sheet1!A1:B4`)
+/// rather than joining two structured references.
+fn is_external_book_prefixed(value: &str) -> bool {
+    value.rfind(']').is_some_and(|rb| value[rb..].contains('!'))
+}
+
 fn next_reference_has_sheet_qualifier(formula: &str, mut offset: usize) -> bool {
     let bytes = formula.as_bytes();
     while offset < bytes.len() && matches!(bytes[offset], b' ' | b'\t' | b'\r' | b'\n') {
@@ -1336,7 +1343,7 @@ impl<'a> SpanTokenizer<'a> {
                 return false;
             }
             return reference_value_contains_range_colon(value)
-                || value.contains('[')
+                || (value.contains('[') && !is_external_book_prefixed(value))
                 || (value.contains('!')
                     && next_reference_has_sheet_qualifier(self.formula, self.offset + 1));
         }
@@ -2130,7 +2137,7 @@ impl Tokenizer {
                 return false;
             }
             return reference_value_contains_range_colon(value)
-                || value.contains('[')
+                || (value.contains('[') && !is_external_book_prefixed(value))
                 || (value.contains('!')
                     && next_reference_has_sheet_qualifier(&self.formula, self.offset + 1));
         }

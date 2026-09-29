@@ -129,6 +129,7 @@ impl<'a> TableRegistryView<'a> {
 pub(crate) struct SourceRegistryView<'a> {
     resolve_scalar: Box<SourceResolveFn<'a>>,
     resolve_table: Box<SourceResolveFn<'a>>,
+    has_external_book: Box<dyn Fn(&str) -> bool + 'a>,
 }
 
 impl<'a> SourceRegistryView<'a> {
@@ -139,7 +140,27 @@ impl<'a> SourceRegistryView<'a> {
         Self {
             resolve_scalar: Box::new(resolve_scalar),
             resolve_table: Box::new(resolve_table),
+            has_external_book: Box::new(|_| false),
         }
+    }
+
+    pub(crate) fn with_external_books(mut self, has: impl Fn(&str) -> bool + 'a) -> Self {
+        self.has_external_book = Box::new(has);
+        self
+    }
+
+    /// Saved linked-workbook values are constant during a recalc: references
+    /// into a registered book, or into a linked book with nothing saved and no
+    /// source standing in for it, need no dependency.
+    pub(crate) fn is_linked_book_ref(
+        &self,
+        ext: &formualizer_parse::parser::ExternalReference,
+    ) -> bool {
+        let token = ext.book.token();
+        (self.has_external_book)(token)
+            || (crate::engine::external_book::is_link_index(token)
+                && self.resolve_scalar(&ext.raw).is_none()
+                && self.resolve_table(&ext.raw).is_none())
     }
 
     pub(crate) fn resolve_scalar(&self, name: &str) -> Option<SourceEntryRef> {
@@ -394,6 +415,9 @@ impl<'a> IngestPipeline<'a> {
         use crate::engine::refs::SemanticReference;
 
         match reference {
+            SemanticReference::ExternalSource(ext) if self.sources.is_linked_book_ref(ext) => {
+                Ok(())
+            }
             SemanticReference::ExternalSource(ext) => match ext.kind {
                 ExternalRefKind::Cell { .. } => {
                     let name = ext.raw.as_str();
@@ -491,6 +515,8 @@ impl<'a> IngestPipeline<'a> {
                     Ok(())
                 } else if self.sources.resolve_table(&tref.name).is_some() {
                     plan.source_refs.push(tref.name.clone());
+                    Ok(())
+                } else if crate::engine::external_book::is_linked_table_name(&tref.name) {
                     Ok(())
                 } else {
                     Err(ExcelError::new(ExcelErrorKind::Name)
@@ -2135,6 +2161,7 @@ mod tests {
             local_scopes: &[FxHashSet<String>],
         ) -> Result<(), ExcelError> {
             match reference {
+                ReferenceType::External(ext) if self.sources.is_linked_book_ref(ext) => Ok(()),
                 ReferenceType::External(ext) => match ext.kind {
                     ExternalRefKind::Cell { .. } => {
                         let name = ext.raw.as_str();
@@ -2253,6 +2280,8 @@ mod tests {
                         Ok(())
                     } else if self.sources.resolve_table(&tref.name).is_some() {
                         plan.source_refs.push(tref.name.clone());
+                        Ok(())
+                    } else if crate::engine::external_book::is_linked_table_name(&tref.name) {
                         Ok(())
                     } else {
                         Err(ExcelError::new(ExcelErrorKind::Name)

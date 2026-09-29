@@ -67,6 +67,11 @@ fn collect_graph_reference(
     use crate::engine::refs::SemanticReference;
 
     match reference {
+        SemanticReference::ExternalSource(external)
+            if context.graph.is_linked_book_ref(external) =>
+        {
+            Ok(())
+        }
         SemanticReference::ExternalSource(external) => match external.kind {
             formualizer_parse::parser::ExternalRefKind::Cell { .. } => {
                 let name = external.raw.as_str();
@@ -192,7 +197,7 @@ fn collect_graph_reference(
                 .resolve_source_table_entry(&table_reference.name)
             {
                 context.dependencies.insert(source.vertex);
-            } else {
+            } else if !crate::engine::external_book::is_linked_table_name(&table_reference.name) {
                 return Err(ExcelError::new(ExcelErrorKind::Name)
                     .with_message(format!("Undefined table: {}", table_reference.name)));
             }

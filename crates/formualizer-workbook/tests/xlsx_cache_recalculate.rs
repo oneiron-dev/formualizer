@@ -816,3 +816,45 @@ fn atomic_native_output_and_permissions() {
     recalculate_xlsx_file(&input, None, Default::default()).unwrap();
     assert_eq!(data(&std::fs::read(&input).unwrap(), 0), Data::Float(2.0));
 }
+#[test]
+fn linked_workbook_references_read_saved_values() {
+    let mut p = parts(
+        "<row r=\"1\"><c r=\"A1\"><f>[1]Rates!$B$2*2</f><v>0</v></c></row>\
+         <row r=\"2\"><c r=\"A2\"><f>VLOOKUP(\"pear\",[1]Rates!A1:B3,2,FALSE)</f><v>0</v></c></row>\
+         <row r=\"3\"><c r=\"A3\"><f>SUMIF([1]Rates!A1:A3,\"pear\",[1]Rates!B1:B3)</f><v>0</v></c></row>\
+         <row r=\"4\"><c r=\"A4\"><f>IFERROR([1]Gone!A1,\"missing\")</f><v>0</v></c></row>",
+    );
+    let wb = p.get_mut("xl/workbook.xml").unwrap();
+    *wb = wb.replace(
+        "</sheets>",
+        "</sheets><externalReferences><externalReference r:id=\"rId9\"/></externalReferences>",
+    );
+    let rels = p.get_mut("xl/_rels/workbook.xml.rels").unwrap();
+    *rels = rels.replace(
+        "</Relationships>",
+        &format!("<Relationship Id=\"rId9\" Type=\"{OFFICE}/externalLink\" Target=\"externalLinks/externalLink1.xml\"/></Relationships>"),
+    );
+    let types = p.get_mut("[Content_Types].xml").unwrap();
+    *types = types.replace(
+        "</Types>",
+        "<Override PartName=\"/xl/externalLinks/externalLink1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.externalLink+xml\"/></Types>",
+    );
+    let link = format!(
+        "<externalLink xmlns=\"{MAIN}\" xmlns:r=\"{OFFICE}\"><externalBook r:id=\"rId1\"><sheetNames><sheetName val=\"Rates\"/></sheetNames><sheetDataSet><sheetData sheetId=\"0\" refreshError=\"1\"><row r=\"1\"><cell r=\"A1\" t=\"str\"><v>apple</v></cell><cell r=\"B1\"><v>3</v></cell></row><row r=\"2\"><cell r=\"A2\" t=\"str\"><v>pear</v></cell><cell r=\"B2\"><v>5</v></cell></row></sheetData></sheetDataSet></externalBook></externalLink>"
+    );
+    p.insert("xl/externalLinks/externalLink1.xml".into(), link.clone());
+    p.insert(
+        "xl/externalLinks/_rels/externalLink1.xml.rels".into(),
+        format!("<Relationships xmlns=\"{RELS}\"><Relationship Id=\"rId1\" Type=\"{OFFICE}/externalLinkPath\" Target=\"Rates.xlsx\" TargetMode=\"External\"/></Relationships>"),
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    assert_eq!(data(&out.bytes, 0), Data::Float(10.0));
+    assert_eq!(data(&out.bytes, 1), Data::Float(5.0));
+    // Range-only parameters cannot read a closed linked workbook.
+    assert!(matches!(data(&out.bytes, 2), Data::Error(_)));
+    assert_eq!(data(&out.bytes, 3), Data::String("missing".into()));
+    assert_eq!(
+        member(&out.bytes, "xl/externalLinks/externalLink1.xml"),
+        link
+    );
+}
