@@ -6,7 +6,9 @@ use crate::function::Function;
 use crate::function_contract::FunctionDependencyContract;
 use crate::traits::{ArgumentHandle, FunctionContext};
 use arrow_array::Array;
-use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
+#[cfg(test)]
+use formualizer_common::ExcelErrorKind;
+use formualizer_common::{ExcelError, LiteralValue};
 use formualizer_macros::func_caps;
 
 /* ─────────────────────────── SUM() ──────────────────────────── */
@@ -1779,40 +1781,31 @@ impl Function for AggregateFn {
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
 
-        let op = if (1..=11).contains(&function_num) {
-            aggregate_op_from_function_num(function_num)
-                .expect("validated AGGREGATE function_num maps to operation")
-        } else if (12..=19).contains(&function_num) {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new(ExcelErrorKind::NImpl),
-            )));
-        } else {
+        if !(1..=19).contains(&function_num) {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_value(),
             )));
-        };
+        }
 
         let options = match parse_strict_int_arg(&args[1]) {
             Ok(v) => v,
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
 
+        // Options 0-3 also skip nested SUBTOTAL/AGGREGATE results (not yet
+        // distinguished here); 4-7 are the same hidden-row/error choices
+        // without that exclusion.
         let (visibility, error_policy) = match options {
-            0 => (VisibilityPolicy::IncludeAll, ErrorPolicy::Propagate),
-            1 => (
+            0 | 4 => (VisibilityPolicy::IncludeAll, ErrorPolicy::Propagate),
+            1 | 5 => (
                 VisibilityPolicy::ExcludeManualOrFilterHidden,
                 ErrorPolicy::Propagate,
             ),
-            2 => (VisibilityPolicy::IncludeAll, ErrorPolicy::Ignore),
-            3 => (
+            2 | 6 => (VisibilityPolicy::IncludeAll, ErrorPolicy::Ignore),
+            3 | 7 => (
                 VisibilityPolicy::ExcludeManualOrFilterHidden,
                 ErrorPolicy::Ignore,
             ),
-            4..=7 => {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                    ExcelError::new(ExcelErrorKind::NImpl),
-                )));
-            }
             _ => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new_value(),
@@ -1820,13 +1813,130 @@ impl Function for AggregateFn {
             }
         };
 
-        let collected =
-            match AggregateCollector::collect_args(args, 2, ctx, op, visibility, error_policy) {
+        if let Some(op) = aggregate_op_from_function_num(function_num) {
+            let collected = match AggregateCollector::collect_args(
+                args,
+                2,
+                ctx,
+                op,
+                visibility,
+                error_policy,
+            ) {
                 Ok(c) => c,
-                Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+                Err(e) => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+                }
             };
+            return Ok(crate::traits::CalcValue::Scalar(collected.finalize(op)));
+        }
 
-        Ok(crate::traits::CalcValue::Scalar(collected.finalize(op)))
+        // 12 MEDIAN and 13 MODE.SNGL take references; 14-19 are the array
+        // form AGGREGATE(function_num, options, array, k).
+        let (data_args, k) = if function_num <= 13 {
+            (args, None)
+        } else {
+            if args.len() != 4 {
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                    ExcelError::new_value(),
+                )));
+            }
+            let k = match args[3].value()?.into_literal() {
+                LiteralValue::Error(e) => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+                }
+                other => match coerce_num(&other) {
+                    Ok(k) => k,
+                    Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+                },
+            };
+            (&args[..3], Some(k))
+        };
+        let collected = match AggregateCollector::collect_args(
+            data_args,
+            2,
+            ctx,
+            AggregateOp::Sum,
+            visibility,
+            error_policy,
+        ) {
+            Ok(c) => c,
+            Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+        };
+        let result = aggregate_order_statistic(function_num, collected.numeric_values, k);
+        Ok(crate::traits::CalcValue::Scalar(match result {
+            Ok(n) => LiteralValue::Number(n),
+            Err(e) => LiteralValue::Error(e),
+        }))
+    }
+}
+
+/// AGGREGATE functions 12-19 over the collected numbers.
+fn aggregate_order_statistic(
+    function_num: i32,
+    mut nums: Vec<f64>,
+    k: Option<f64>,
+) -> Result<f64, ExcelError> {
+    use crate::builtins::stats::{nth_smallest, percentile_exc, percentile_inc};
+    let k = k.unwrap_or(0.0);
+    match function_num {
+        12 => {
+            if nums.is_empty() {
+                return Err(ExcelError::new_num());
+            }
+            nums.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let n = nums.len();
+            Ok(if n % 2 == 1 {
+                nums[n / 2]
+            } else {
+                (nums[n / 2 - 1] + nums[n / 2]) / 2.0
+            })
+        }
+        13 => {
+            // Most frequent value; ties go to the value seen first.
+            let mut best: Option<(f64, usize)> = None;
+            for (i, &v) in nums.iter().enumerate() {
+                if nums[..i].contains(&v) {
+                    continue;
+                }
+                let count = nums[i..].iter().filter(|&&x| x == v).count();
+                if count > 1 && best.is_none_or(|(_, c)| count > c) {
+                    best = Some((v, count));
+                }
+            }
+            best.map(|(v, _)| v).ok_or_else(ExcelError::new_na)
+        }
+        14 | 15 => {
+            let k = k.trunc();
+            if k < 1.0 || k as usize > nums.len() {
+                return Err(ExcelError::new_num());
+            }
+            let k = k as usize;
+            let index = if function_num == 14 {
+                nums.len() - k
+            } else {
+                k - 1
+            };
+            Ok(nth_smallest(&mut nums, index))
+        }
+        16 => percentile_inc(&mut nums, k),
+        18 => percentile_exc(&mut nums, k),
+        17 | 19 => {
+            let quart = k.trunc();
+            let valid = if function_num == 17 {
+                0.0..=4.0
+            } else {
+                1.0..=3.0
+            };
+            if !valid.contains(&quart) {
+                return Err(ExcelError::new_num());
+            }
+            if function_num == 17 {
+                percentile_inc(&mut nums, quart / 4.0)
+            } else {
+                percentile_exc(&mut nums, quart / 4.0)
+            }
+        }
+        _ => Err(ExcelError::new_value()),
     }
 }
 
@@ -2033,38 +2143,71 @@ mod tests_subtotal_aggregate {
         assert_num_close(out, 2.0);
     }
 
-    #[test]
-    fn aggregate_unsupported_option_returns_nimpl() {
-        let wb = TestWorkbook::new().with_function(std::sync::Arc::new(AggregateFn));
-        let ctx = interp(&wb);
+    fn aggregate(
+        ctx: &crate::interpreter::Interpreter<'_>,
+        args: Vec<LiteralValue>,
+    ) -> LiteralValue {
+        let nodes: Vec<ASTNode> = args.into_iter().map(lit).collect();
+        dispatch(ctx, "AGGREGATE", &nodes)
+    }
 
-        let out = dispatch(
-            &ctx,
-            "AGGREGATE",
-            &[
-                lit(LiteralValue::Int(9)),
-                lit(LiteralValue::Int(4)),
-                lit(LiteralValue::Array(vec![vec![LiteralValue::Int(1)]])),
-            ],
-        );
-        assert_error_kind(out, ExcelErrorKind::NImpl);
+    fn data() -> LiteralValue {
+        // {5, #N/A, 3, 8, 3}
+        LiteralValue::Array(vec![vec![
+            LiteralValue::Int(5),
+            LiteralValue::Error(ExcelError::new_na()),
+            LiteralValue::Int(3),
+            LiteralValue::Int(8),
+            LiteralValue::Int(3),
+        ]])
     }
 
     #[test]
-    fn aggregate_unsupported_function_num_returns_nimpl() {
+    fn aggregate_options_four_to_seven_choose_error_handling() {
         let wb = TestWorkbook::new().with_function(std::sync::Arc::new(AggregateFn));
         let ctx = interp(&wb);
+        let sum = |option| {
+            aggregate(
+                &ctx,
+                vec![LiteralValue::Int(9), LiteralValue::Int(option), data()],
+            )
+        };
+        assert_error_kind(sum(4), ExcelErrorKind::Na);
+        assert_error_kind(sum(5), ExcelErrorKind::Na);
+        assert_num_close(sum(6), 19.0);
+        assert_num_close(sum(7), 19.0);
+    }
 
-        let out = dispatch(
+    #[test]
+    fn aggregate_order_statistics_array_form() {
+        let wb = TestWorkbook::new().with_function(std::sync::Arc::new(AggregateFn));
+        let ctx = interp(&wb);
+        let call = |f: i64, k: Option<f64>| {
+            let mut args = vec![LiteralValue::Int(f), LiteralValue::Int(6), data()];
+            args.extend(k.map(LiteralValue::Number));
+            aggregate(&ctx, args)
+        };
+        assert_num_close(call(12, None), 4.0); // MEDIAN {3,3,5,8}
+        assert_num_close(call(13, None), 3.0); // MODE.SNGL
+        assert_num_close(call(14, Some(1.0)), 8.0); // LARGE
+        assert_num_close(call(15, Some(2.0)), 3.0); // SMALL
+        assert_num_close(call(16, Some(0.5)), 4.0); // PERCENTILE.INC
+        assert_num_close(call(17, Some(3.0)), 5.75); // QUARTILE.INC
+        assert_num_close(call(18, Some(0.5)), 4.0); // PERCENTILE.EXC
+        assert_num_close(call(19, Some(1.0)), 3.0); // QUARTILE.EXC
+        assert_error_kind(call(15, Some(5.0)), ExcelErrorKind::Num);
+        assert_error_kind(call(14, None), ExcelErrorKind::Value);
+        // Without ignoring errors the #N/A propagates.
+        let strict = aggregate(
             &ctx,
-            "AGGREGATE",
-            &[
-                lit(LiteralValue::Int(12)),
-                lit(LiteralValue::Int(0)),
-                lit(LiteralValue::Array(vec![vec![LiteralValue::Int(1)]])),
+            vec![
+                LiteralValue::Int(15),
+                LiteralValue::Int(4),
+                data(),
+                LiteralValue::Int(1),
             ],
         );
-        assert_error_kind(out, ExcelErrorKind::NImpl);
+        assert_error_kind(strict, ExcelErrorKind::Na);
     }
 }
 

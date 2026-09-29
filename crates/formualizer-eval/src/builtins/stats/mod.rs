@@ -119,7 +119,7 @@ fn collect_numeric_stats(args: &[ArgumentHandle]) -> Result<Vec<f64>, ExcelError
  */
 
 /// k-th order statistic (0-based, ascending). Reorders `nums` in place.
-fn nth_smallest(nums: &mut [f64], k: usize) -> f64 {
+pub(crate) fn nth_smallest(nums: &mut [f64], k: usize) -> f64 {
     let (_, kth, _) = nums.select_nth_unstable_by(k, |a, b| a.partial_cmp(b).unwrap());
     *kth
 }
@@ -143,7 +143,7 @@ fn adjacent_smallest(nums: &mut [f64], k: usize) -> (f64, f64) {
 /// the ascending order needs at most the two adjacent order statistics
 /// around the rank. The interpolation formula is unchanged from the old
 /// full-sort implementation.
-fn percentile_inc(nums: &mut [f64], p: f64) -> Result<f64, ExcelError> {
+pub(crate) fn percentile_inc(nums: &mut [f64], p: f64) -> Result<f64, ExcelError> {
     if nums.is_empty() {
         return Err(ExcelError::new_num());
     }
@@ -169,7 +169,7 @@ fn percentile_inc(nums: &mut [f64], p: f64) -> Result<f64, ExcelError> {
 /// PERCENTILE.EXC over unsorted data (reorders `nums`); (n+1) rank basis,
 /// invalid when rank < 1 or > n. Same selection strategy as
 /// [`percentile_inc`]; interpolation formula unchanged.
-fn percentile_exc(nums: &mut [f64], p: f64) -> Result<f64, ExcelError> {
+pub(crate) fn percentile_exc(nums: &mut [f64], p: f64) -> Result<f64, ExcelError> {
     if nums.is_empty() {
         return Err(ExcelError::new_num());
     }
