@@ -118,3 +118,20 @@ fn concatenation_is_element_wise_over_arrays() {
     // An error element stays an error in its own position only.
     assert_number("=SUM(--ISERROR({1,\"x\"}&IF({TRUE,FALSE},NA(),1)))", 1.0);
 }
+
+#[test]
+fn operators_pad_the_shorter_array_with_na() {
+    // {1,2,3}+{1,2} = {2,4,#N/A}
+    assert_number("=SUM(IFERROR({1,2,3}+{1,2},0))", 6.0);
+    // ROW(B1:B3)/(A1:A2="a") = {1,#DIV/0!,#N/A}; AGGREGATE option 6 skips errors.
+    assert_number("=_xlfn.AGGREGATE(15,6,ROW(B1:B3)/(A1:A2=\"a\"),1)", 1.0);
+    assert_number("=ROWS(B1:B3*{1;2})", 3.0);
+    assert_number("=SUM(IFERROR(B1:B3*{1;2},0))", 5.0);
+    // A single row or column still repeats.
+    assert_number("=SUM({1;2;3}*{1,2})", 18.0);
+    let mut engine = engine();
+    match eval(&mut engine, "=INDEX(B1:B3+{1;2},3)") {
+        LiteralValue::Error(e) => assert_eq!(e.kind, ExcelErrorKind::Na),
+        other => panic!("expected #N/A, got {other:?}"),
+    }
+}

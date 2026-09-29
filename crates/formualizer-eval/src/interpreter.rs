@@ -1446,30 +1446,16 @@ impl<'a> Interpreter<'a> {
     where
         F: Fn(LiteralValue, LiteralValue) -> Result<LiteralValue, ExcelError> + Copy,
     {
-        // Use strict broadcasting across dimensions
-        let l_shape = (l.len(), l.first().map(|r| r.len()).unwrap_or(0));
-        let r_shape = (r.len(), r.first().map(|r| r.len()).unwrap_or(0));
-        let target = match broadcast_shape(&[l_shape, r_shape]) {
-            Ok(s) => s,
-            Err(e) => return Ok(LiteralValue::Error(e)),
-        };
-
-        let mut out = Vec::with_capacity(target.0);
-        for i in 0..target.0 {
-            let mut row = Vec::with_capacity(target.1);
-            for j in 0..target.1 {
-                let (li, lj) = project_index((i, j), l_shape);
-                let (ri, rj) = project_index((i, j), r_shape);
-                let lv = l
-                    .get(li)
-                    .and_then(|r| r.get(lj))
-                    .cloned()
-                    .unwrap_or(LiteralValue::Empty);
-                let rv = r
-                    .get(ri)
-                    .and_then(|r| r.get(rj))
-                    .cloned()
-                    .unwrap_or(LiteralValue::Empty);
+        // Excel's array expansion: the result takes the larger size in each
+        // dimension; a single row or column repeats, and positions past the
+        // end of a longer-but-not-single dimension are #N/A.
+        let (rows, cols) = crate::lift::broadcast_dims([&l, &r]);
+        let mut out = Vec::with_capacity(rows);
+        for i in 0..rows {
+            let mut row = Vec::with_capacity(cols);
+            for j in 0..cols {
+                let lv = crate::lift::broadcast_get(&l, i, j);
+                let rv = crate::lift::broadcast_get(&r, i, j);
                 row.push(match f(lv, rv) {
                     Ok(v) => v,
                     Err(e) => LiteralValue::Error(e),
