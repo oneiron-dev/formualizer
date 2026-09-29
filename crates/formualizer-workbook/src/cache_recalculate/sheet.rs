@@ -140,12 +140,6 @@ pub(super) fn scan(
                 if matches!(element.local.as_str(), "f" | "v" | "is") && !direct {
                     return Err(unsupported("misplaced cell payload", "worksheet"));
                 }
-                if matches!(element.local.as_str(), "tableParts" | "tablePart") {
-                    return Err(unsupported(
-                        "table metadata ingestion is not supported",
-                        "cache-only recalculation",
-                    ));
-                }
                 if element.local == "dimension" {
                     if !xml::path_is(path, xml::MAIN, &["worksheet", "dimension"])
                         || dimension.is_some()

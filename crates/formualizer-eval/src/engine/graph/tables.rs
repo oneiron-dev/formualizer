@@ -203,3 +203,151 @@ impl DependencyGraph {
         }
     }
 }
+
+/// A table's placement for resolving structured references (0-based bounds).
+pub(crate) struct TableGeometry<'a> {
+    pub(crate) start_row: u32,
+    pub(crate) start_col: u32,
+    pub(crate) end_row: u32,
+    pub(crate) end_col: u32,
+    pub(crate) header_row: bool,
+    pub(crate) totals_row: bool,
+    pub(crate) headers: &'a [String],
+}
+
+/// The 1-based area `(r1, c1, r2, c2)` of a structured reference that the
+/// symbolic table path does not evaluate: row/area combinations such as
+/// `[[#Headers],[Col]]` or `[[#This Row],[A]:[C]]`, `[#This Row]`, row
+/// selectors and the bare table name. `None` keeps the symbolic forms
+/// (a column, a column range or a single area item) unchanged. `row0` is the
+/// formula cell's 0-based row, used by `#This Row`.
+pub(crate) fn static_structured_area(
+    table: &TableGeometry<'_>,
+    specifier: Option<&formualizer_parse::parser::TableSpecifier>,
+    row0: u32,
+) -> Result<Option<(u32, u32, u32, u32)>, ExcelError> {
+    use formualizer_parse::parser::{SpecialItem, TableRowSpecifier, TableSpecifier};
+
+    match specifier {
+        Some(
+            TableSpecifier::Column(_)
+            | TableSpecifier::ColumnRange(..)
+            | TableSpecifier::All
+            | TableSpecifier::Data
+            | TableSpecifier::Headers
+            | TableSpecifier::Totals
+            | TableSpecifier::SpecialItem(
+                SpecialItem::Headers | SpecialItem::Data | SpecialItem::Totals | SpecialItem::All,
+            ),
+        ) => return Ok(None),
+        _ => {}
+    }
+
+    let data_start = table.start_row + u32::from(table.header_row);
+    let data_end = table.end_row - u32::from(table.totals_row);
+    let reference_error = || ExcelError::new(ExcelErrorKind::Ref);
+    let mut rows: Option<(u32, u32)> = None;
+    let mut cols: Option<(u32, u32)> = None;
+    let union = |span: &mut Option<(u32, u32)>, lo: u32, hi: u32| {
+        *span = Some(match *span {
+            Some((a, b)) => (a.min(lo), b.max(hi)),
+            None => (lo, hi),
+        });
+    };
+    let column = |name: &str| {
+        table
+            .headers
+            .iter()
+            .position(|h| h.eq_ignore_ascii_case(name.trim()))
+            .map(|i| table.start_col + i as u32)
+            .ok_or_else(reference_error)
+    };
+    let mut pending = specifier.map_or_else(Vec::new, |s| vec![s]);
+    while let Some(part) = pending.pop() {
+        match part {
+            TableSpecifier::Combination(parts) => pending.extend(parts.iter().map(Box::as_ref)),
+            TableSpecifier::Column(name) => {
+                let c = column(name)?;
+                union(&mut cols, c, c);
+            }
+            TableSpecifier::ColumnRange(a, b) => {
+                let (a, b) = (column(a)?, column(b)?);
+                union(&mut cols, a.min(b), a.max(b));
+            }
+            TableSpecifier::All
+            | TableSpecifier::SpecialItem(SpecialItem::All)
+            | TableSpecifier::Row(TableRowSpecifier::All) => {
+                union(&mut rows, table.start_row, table.end_row);
+            }
+            TableSpecifier::Data
+            | TableSpecifier::SpecialItem(SpecialItem::Data)
+            | TableSpecifier::Row(TableRowSpecifier::Data) => {
+                union(&mut rows, data_start, data_end);
+            }
+            TableSpecifier::Headers
+            | TableSpecifier::SpecialItem(SpecialItem::Headers)
+            | TableSpecifier::Row(TableRowSpecifier::Headers) => {
+                if !table.header_row {
+                    return Err(reference_error());
+                }
+                union(&mut rows, table.start_row, table.start_row);
+            }
+            TableSpecifier::Totals
+            | TableSpecifier::SpecialItem(SpecialItem::Totals)
+            | TableSpecifier::Row(TableRowSpecifier::Totals) => {
+                if !table.totals_row {
+                    return Err(reference_error());
+                }
+                union(&mut rows, table.end_row, table.end_row);
+            }
+            TableSpecifier::SpecialItem(SpecialItem::ThisRow)
+            | TableSpecifier::Row(TableRowSpecifier::Current) => {
+                // Outside the table body the implicit intersection fails.
+                if row0 < data_start || row0 > table.end_row {
+                    return Err(ExcelError::new(ExcelErrorKind::Value));
+                }
+                union(&mut rows, row0, row0);
+            }
+            TableSpecifier::Row(TableRowSpecifier::Index(_)) => {
+                return Err(ExcelError::new(ExcelErrorKind::NImpl)
+                    .with_message("Indexed table row selectors are not supported".to_string()));
+            }
+        }
+    }
+    let (r1, r2) = rows.unwrap_or((data_start, data_end));
+    let (c1, c2) = cols.unwrap_or((table.start_col, table.end_col));
+    if r1 > r2 {
+        return Err(reference_error());
+    }
+    Ok(Some((r1 + 1, c1 + 1, r2 + 1, c2 + 1)))
+}
+
+/// An A1 reference for a resolved structured-reference area.
+pub(crate) fn area_reference(
+    sheet: Option<String>,
+    area: (u32, u32, u32, u32),
+) -> formualizer_parse::parser::ReferenceType {
+    use formualizer_parse::parser::ReferenceType;
+    let (r1, c1, r2, c2) = area;
+    if r1 == r2 && c1 == c2 {
+        ReferenceType::Cell {
+            sheet,
+            row: r1,
+            col: c1,
+            row_abs: true,
+            col_abs: true,
+        }
+    } else {
+        ReferenceType::Range {
+            sheet,
+            start_row: Some(r1),
+            start_col: Some(c1),
+            end_row: Some(r2),
+            end_col: Some(c2),
+            start_row_abs: true,
+            start_col_abs: true,
+            end_row_abs: true,
+            end_col_abs: true,
+        }
+    }
+}

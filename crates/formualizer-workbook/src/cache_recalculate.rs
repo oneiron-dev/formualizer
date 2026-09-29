@@ -433,6 +433,7 @@ pub fn recalculate_xlsx_bytes(
         .max_formula_spool_bytes_per_workbook
         .min(options.limits.max_expanded_bytes as u64);
     engine.set_workbook_load_limits(load_limits);
+    define_tables(&mut engine, &sheets)?;
     let ingested = adapter.stream_into_engine(&mut engine);
     checkpoint(&options.cancel)?;
     ingested?;
@@ -561,6 +562,43 @@ pub fn recalculate_xlsx_bytes(
         cache_cells_changed: changed,
         worksheet_parts_changed: replacements.len(),
     })
+}
+
+/// Register worksheet tables before formula ingestion so structured
+/// references resolve (sheet registration is idempotent for the adapter).
+fn define_tables(
+    engine: &mut Engine<WBResolver>,
+    sheets: &[package::Sheet],
+) -> Result<(), IoError> {
+    use formualizer_eval::reference::{CellRef, Coord, RangeRef};
+    if sheets.iter().all(|sheet| sheet.tables.is_empty()) {
+        return Ok(());
+    }
+    engine
+        .adopt_file_sheets(sheets.iter().map(|sheet| sheet.name.as_str()))
+        .map_err(IoError::Engine)?;
+    for sheet in sheets {
+        let sheet_id = engine
+            .sheet_id(&sheet.name)
+            .ok_or_else(|| unsupported("table sheet was not registered", &sheet.name))?;
+        for table in &sheet.tables {
+            let (r1, c1, r2, c2) = table.area;
+            let range = RangeRef::new(
+                CellRef::new(sheet_id, Coord::from_excel(r1, c1, true, true)),
+                CellRef::new(sheet_id, Coord::from_excel(r2, c2, true, true)),
+            );
+            engine
+                .define_table(
+                    &table.name,
+                    range,
+                    table.header_row,
+                    table.columns.clone(),
+                    table.totals_row,
+                )
+                .map_err(IoError::Engine)?;
+        }
+    }
+    Ok(())
 }
 
 /// Native bounded snapshot + same-directory temporary + atomic replace. This

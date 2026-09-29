@@ -17,6 +17,17 @@ pub(super) struct Relationship {
 pub(super) struct Sheet {
     pub name: String,
     pub part: String,
+    pub tables: Vec<Table>,
+}
+/// A worksheet table (ListObject): its display name, full area (1-based
+/// r1, c1, r2, c2, header and totals rows included) and column names.
+#[derive(Debug)]
+pub(super) struct Table {
+    pub name: String,
+    pub area: (u32, u32, u32, u32),
+    pub header_row: bool,
+    pub totals_row: bool,
+    pub columns: Vec<String>,
 }
 fn u16_at(bytes: &[u8], offset: usize) -> Result<usize, IoError> {
     let b = bytes
@@ -532,6 +543,7 @@ pub(super) fn discover(
             sheets.push(Sheet {
                 name: name.to_owned(),
                 part,
+                tables: Vec::new(),
             });
         }
         Ok(())
@@ -566,25 +578,84 @@ pub(super) fn discover(
             validate_aux(archive, name, root, options)?;
         }
     }
-    for sheet in &sheets {
+    for sheet in &mut sheets {
         let (parent, name) = sheet.part.rsplit_once('/').unwrap_or(("", &sheet.part));
         let rel_part = format!("{parent}/_rels/{name}.rels");
         if archive.file_names().any(|n| n == rel_part) {
             for rel in relationships(archive, &sheet.part, options)?.values() {
                 if rel.kind == format!("{}/table", xml::OFFICE) {
-                    // The existing CalamineAdapter does not hydrate the engine
-                    // table registry. Preserving XML alone would silently make
-                    // valid structured references evaluate against missing data.
-                    return Err(unsupported(
-                        "table metadata ingestion is not supported",
-                        "cache-only recalculation",
-                    ));
+                    // Tables are registered with the engine before formulas
+                    // are ingested so structured references resolve.
+                    let part = rel
+                        .target
+                        .as_deref()
+                        .ok_or_else(|| unsupported("external table part", &sheet.part))?;
+                    sheet.tables.push(table(archive, part, options)?);
                 }
             }
         }
     }
     content_types::validate(archive, &sheets, options)?;
     Ok((sheets, epoch))
+}
+fn cell_coordinate(value: &str, part: &str) -> Result<(u32, u32), IoError> {
+    let (row, col, _, _) = formualizer_common::coord::parse_a1_1based(value)
+        .map_err(|_| unsupported("invalid table reference", part))?;
+    Ok((row, col))
+}
+/// Parse a table part: `displayName`, `ref`, header/totals row counts and the
+/// `tableColumn` names, which must match the area width.
+fn table(
+    archive: &mut Archive<'_>,
+    part: &str,
+    options: &XlsxRecalculateOptions,
+) -> Result<Table, IoError> {
+    let data = read_part(archive, part, options.limits.max_worksheet_bytes)?;
+    let mut table = None;
+    let mut columns = Vec::new();
+    xml::walk(&data, options, |path, node| {
+        if !matches!(node.kind, xml::Kind::Open { .. }) {
+            return Ok(());
+        }
+        if path.len() == 1 {
+            if !xml::path_is(path, xml::MAIN, &["table"]) {
+                return Err(unsupported("table XML root/namespace", part));
+            }
+            let name = node
+                .value("displayName")
+                .or_else(|| node.value("name"))
+                .ok_or_else(|| unsupported("unnamed table", part))?;
+            let reference = node.required("ref")?;
+            let (start, end) = reference.split_once(':').unwrap_or((reference, reference));
+            let (r1, c1) = cell_coordinate(start, part)?;
+            let (r2, c2) = cell_coordinate(end, part)?;
+            let count = |attr: &str, default: u32| {
+                node.value(attr)
+                    .map_or(Ok(default), str::parse::<u32>)
+                    .map_err(|_| unsupported("invalid table row count", part))
+            };
+            let (header, totals) = (count("headerRowCount", 1)?, count("totalsRowCount", 0)?);
+            if r1 > r2 || c1 > c2 || header > 1 || totals > 1 {
+                return Err(unsupported("unsupported table geometry", part));
+            }
+            table = Some(Table {
+                name: name.to_owned(),
+                area: (r1, c1, r2, c2),
+                header_row: header == 1,
+                totals_row: totals == 1,
+                columns: Vec::new(),
+            });
+        } else if xml::path_is(path, xml::MAIN, &["table", "tableColumns", "tableColumn"]) {
+            columns.push(node.required("name")?.to_owned());
+        }
+        Ok(())
+    })?;
+    let mut table = table.ok_or_else(|| unsupported("empty table part", part))?;
+    if columns.len() as u32 != table.area.3 - table.area.1 + 1 {
+        return Err(unsupported("table column count mismatch", part));
+    }
+    table.columns = columns;
+    Ok(table)
 }
 fn validate_aux(
     archive: &mut Archive<'_>,

@@ -593,11 +593,21 @@ fn names_and_structured_tables_retain_symbolic_resolution() {
             resolution: NameResolution::Formula { formula, .. },
         } if name == "Twice" && formula == "=2 * 3"
     ));
+    // A this-row reference is resolved to its cell when the formula is placed.
     assert!(matches!(
         &report.precedents[2].reference,
+        SemanticReference::Cell(cell)
+            if cell.sheet == "Model" && cell.row == 2 && cell.column == 2
+    ));
+    set_formula(&mut engine, 5, 4, "=SUM(Sales[Amount])");
+    let report = engine
+        .precedents(&address("Model", 5, 4), &PrecedentOptions::default())
+        .unwrap();
+    assert!(matches!(
+        &report.precedents[0].reference,
         SemanticReference::Table { name, specifier, resolved }
             if name == "Sales" && specifier.contains("Amount")
-                && resolved.start_row == 2 && resolved.end_row == 2
+                && resolved.start_row == 2 && resolved.end_row == 3
                 && resolved.start_col == 2 && resolved.end_col == 2
     ));
 }

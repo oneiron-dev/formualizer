@@ -332,7 +332,7 @@ fn defined_names_are_evaluated_without_metadata_rewrite() {
     reject(&p);
 }
 #[test]
-fn nonportable_literal_errors_and_tables_are_explicitly_rejected() {
+fn nonportable_literal_errors_are_explicitly_rejected() {
     let p = parts(
         "<row r=\"1\"><c r=\"A1\" t=\"e\"><v>#SPILL!</v></c><c r=\"B1\"><f>IFERROR(A1,0)</f><v>99</v></c></row>",
     );
@@ -340,13 +340,13 @@ fn nonportable_literal_errors_and_tables_are_explicitly_rejected() {
     assert!(
         matches!(error,formualizer_workbook::IoError::Unsupported{feature,..} if feature.contains("literal error"))
     );
+    // Table parts are supported (see worksheet_tables_answer_structured_references);
+    // an empty tableParts list is just metadata.
     let mut p = single("1+1", "<v>99</v>");
     let s = p.get_mut(SHEET).unwrap();
     *s = s.replace("</worksheet>", "<tableParts count=\"0\"/></worksheet>");
-    let error = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap_err();
-    assert!(
-        matches!(error,formualizer_workbook::IoError::Unsupported{feature,..} if feature.contains("table metadata"))
-    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    assert_eq!(data(&out.bytes, 0), Data::Float(2.0));
 }
 #[test]
 fn engine_specific_errors_are_unsupported_results_not_invented_excel_tokens() {
@@ -610,6 +610,33 @@ fn volatile_formulas_are_recalculated_not_refused() {
     let out = recalculate_xlsx_bytes(&pack(&parts(rows)), Default::default()).unwrap();
     assert!(matches!(data(&out.bytes, 0), Data::Float(n) if n > 45_000.0));
     assert_eq!(data(&out.bytes, 1), Data::Float(2.0));
+}
+#[test]
+fn worksheet_tables_answer_structured_references() {
+    let rows = "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>Item</t></is></c><c r=\"B1\" t=\"inlineStr\"><is><t>Qty</t></is></c><c r=\"D1\"><f>SUM(Sales[Qty])</f><v>0</v></c></row>\
+        <row r=\"2\"><c r=\"A2\" t=\"inlineStr\"><is><t>a</t></is></c><c r=\"B2\"><v>4</v></c><c r=\"D2\"><f>COUNTA(Sales[[#Headers],[Item]])</f><v>0</v></c></row>\
+        <row r=\"3\"><c r=\"A3\" t=\"inlineStr\"><is><t>b</t></is></c><c r=\"B3\"><v>6</v></c></row>";
+    let mut p = parts(rows);
+    let sheet = p.get_mut(SHEET).unwrap();
+    *sheet = sheet.replace(
+        "</sheetData>",
+        &format!("</sheetData><tableParts count=\"1\"><tablePart xmlns:r=\"{OFFICE}\" r:id=\"rId1\"/></tableParts>"),
+    );
+    p.insert(
+        "xl/worksheets/_rels/sheet1.xml.rels".into(),
+        format!("<Relationships xmlns=\"{RELS}\"><Relationship Id=\"rId1\" Type=\"{OFFICE}/table\" Target=\"../tables/table1.xml\"/></Relationships>"),
+    );
+    p.insert(
+        "xl/tables/table1.xml".into(),
+        format!("<table xmlns=\"{MAIN}\" id=\"1\" name=\"Table1\" displayName=\"Sales\" ref=\"A1:B3\" totalsRowShown=\"0\"><tableColumns count=\"2\"><tableColumn id=\"1\" name=\"Item\"/><tableColumn id=\"2\" name=\"Qty\"/></tableColumns></table>"),
+    );
+    let ct = p.get_mut("[Content_Types].xml").unwrap();
+    *ct = ct.replace("</Types>", "<Override PartName=\"/xl/tables/table1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml\"/></Types>");
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    assert!(sheet.contains("SUM(Sales[Qty])</f><v>10</v>"), "{sheet}");
+    assert!(sheet.contains("[Item]])</f><v>1</v>"), "{sheet}");
+    assert!(sheet.contains("<tablePart"));
 }
 #[test]
 fn multiple_changed_members_relocate_growing_and_shrinking_payloads() {

@@ -348,10 +348,10 @@ impl DataStore {
                 continue;
             };
             match node {
+                // Unnamed this-row references, named-table row/area
+                // combinations and bare table names are rewritten per placement.
                 super::ast::AstNodeData::Reference { ref_type, .. } => {
-                    if let CompactRefType::Table { name_id, .. } = ref_type
-                        && self.resolve_ast_string(*name_id).is_empty()
-                    {
+                    if let CompactRefType::Table { .. } | CompactRefType::NamedRange(_) = ref_type {
                         return true;
                     }
                 }

@@ -36,7 +36,7 @@ pub(crate) use range_deps::{StructuralEdit, StructuralOccupancy};
 mod sheets;
 pub mod snapshot;
 mod sources;
-mod tables;
+pub(crate) mod tables;
 pub(crate) use tables::TableEntry;
 
 use super::addr::{GridAddr, SymbolAddr, VertexAddr};
@@ -1435,6 +1435,7 @@ impl DependencyGraph {
             name: entry.name.clone(),
             range: entry.range,
             header_row: entry.header_row,
+            totals_row: entry.totals_row,
             headers: entry.headers.clone(),
             vertex: entry.vertex,
         };
@@ -2386,14 +2387,51 @@ impl DependencyGraph {
     ) -> Result<bool, ExcelError> {
         use formualizer_parse::parser::{SpecialItem, TableSpecifier};
 
+        // A bare table name (not a defined name) is the table's data body.
+        if let ReferenceType::NamedRange(name) = reference {
+            if self.resolve_name_entry(name, cell.sheet_id).is_none()
+                && self.resolve_table_entry(name).is_some()
+            {
+                *reference = ReferenceType::Table(formualizer_parse::parser::TableReference {
+                    name: name.clone(),
+                    specifier: Some(TableSpecifier::Data),
+                });
+                return Ok(true);
+            }
+            return Ok(false);
+        }
         let ReferenceType::Table(tref) = reference else {
             return Ok(false);
         };
 
-        // This-row shorthand: parsed as an unnamed table reference with a Combination specifier.
         if !tref.name.is_empty() {
-            return Ok(false);
+            let Some(table) = self.resolve_table_entry(&tref.name) else {
+                return Ok(false);
+            };
+            let geometry = tables::TableGeometry {
+                start_row: table.range.start.coord.row(),
+                start_col: table.range.start.coord.col(),
+                end_row: table.range.end.coord.row(),
+                end_col: table.range.end.coord.col(),
+                header_row: table.header_row,
+                totals_row: table.totals_row,
+                headers: &table.headers,
+            };
+            let Some(area) = tables::static_structured_area(
+                &geometry,
+                tref.specifier.as_ref(),
+                cell.coord.row(),
+            )?
+            else {
+                return Ok(false);
+            };
+            let sheet = (table.sheet_id() != cell.sheet_id)
+                .then(|| self.sheet_name(table.sheet_id()).to_string());
+            *reference = tables::area_reference(sheet, area);
+            return Ok(true);
         }
+
+        // This-row shorthand: parsed as an unnamed table reference with a Combination specifier.
 
         let col_name = match &tref.specifier {
             Some(TableSpecifier::Combination(parts)) => {
