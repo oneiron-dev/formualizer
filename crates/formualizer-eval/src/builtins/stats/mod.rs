@@ -6880,11 +6880,32 @@ impl Function for TrendFn {
             .map(|&x| LiteralValue::Number(slope * x + intercept))
             .collect();
 
-        // Return as 1xN array (row vector)
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Array(vec![
-            predicted,
-        ])))
+        fitted_values_result(args, predicted, is_arg_empty)
     }
+}
+
+/// TREND and GROWTH return their fitted values in the shape of `new_x`,
+/// or of `known_x` (then `known_y`) when it is omitted; a single value is a
+/// scalar.
+fn fitted_values_result<'b>(
+    args: &[ArgumentHandle<'_, 'b>],
+    values: Vec<LiteralValue>,
+    is_arg_empty: fn(&ArgumentHandle) -> bool,
+) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+    let shape_arg = [2usize, 1, 0]
+        .into_iter()
+        .find(|&i| i < args.len() && (i == 0 || !is_arg_empty(&args[i])))
+        .unwrap_or(0);
+    let (rows, cols) = args[shape_arg].range_view_or_scalar()?.dims();
+    let grid: Vec<Vec<LiteralValue>> = if rows * cols == values.len() && cols > 0 {
+        values.chunks(cols).map(<[LiteralValue]>::to_vec).collect()
+    } else {
+        values.into_iter().map(|v| vec![v]).collect()
+    };
+    Ok(super::utils::collapse_if_scalar(
+        grid,
+        args[0].date_system(),
+    ))
 }
 
 /* ─────────────────────────── GROWTH ──────────────────────────── */
@@ -7078,10 +7099,7 @@ impl Function for GrowthFn {
             .map(|&x| LiteralValue::Number(b * m.powf(x)))
             .collect();
 
-        // Return as 1xN array (row vector)
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Array(vec![
-            predicted,
-        ])))
+        fitted_values_result(args, predicted, is_arg_empty)
     }
 }
 
@@ -10173,6 +10191,35 @@ mod tests_basic_stats {
             None,
         )
     }
+    #[test]
+    fn trend_and_growth_return_values_in_the_shape_of_new_x() {
+        let wb = TestWorkbook::new()
+            .with_function(std::sync::Arc::new(TrendFn))
+            .with_function(std::sync::Arc::new(GrowthFn))
+            .with_function(std::sync::Arc::new(crate::builtins::math::numeric::RoundFn));
+        let ctx = interp(&wb);
+        let eval = |f: &str| {
+            ctx.evaluate_ast(&formualizer_parse::parser::parse(f).unwrap())
+                .unwrap()
+                .into_literal()
+        };
+        let n = LiteralValue::Number;
+        assert_eq!(eval("=ROUND(GROWTH({2;4;8},{1;2;3},4),6)"), n(16.0));
+        assert_eq!(eval("=ROUND(TREND({1;2;3},{1;2;3},4),6)"), n(4.0));
+        assert_eq!(
+            eval("=ROUND(GROWTH({2;4;8},{1;2;3},{4;5}),6)"),
+            LiteralValue::Array(vec![vec![n(16.0)], vec![n(32.0)]])
+        );
+        assert_eq!(
+            eval("=ROUND(TREND({1,2,3}),6)"),
+            LiteralValue::Array(vec![vec![n(1.0), n(2.0), n(3.0)]])
+        );
+        assert_eq!(
+            eval("=ROUND(TREND({1;2;3}),6)"),
+            LiteralValue::Array(vec![vec![n(1.0)], vec![n(2.0)], vec![n(3.0)]])
+        );
+    }
+
     #[test]
     fn std_norm_cdf_is_double_precision() {
         // Regression for #458: the A&S 7.1.26 approximation was only good to ~7e-8.
