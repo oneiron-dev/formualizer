@@ -1,4 +1,4 @@
-use super::{super::utils::ARG_ANY_ONE, scalar_text_value};
+use super::{super::utils::ARG_ANY_ONE, number_format, scalar_text_value};
 use crate::args::ArgSchema;
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, FunctionContext};
@@ -228,16 +228,17 @@ impl Function for NumberValueFn {
 pub struct TextFn;
 /// Formats a value as text using a format pattern.
 ///
-/// This implementation supports common numeric, percent, grouping, and basic date tokens.
+/// Formats with Excel's number-format language: sections, conditions, digit
+/// placeholders, grouping/scaling, percent, scientific, fractions, text `@`,
+/// and date/time tokens (see `number_format`).
 ///
 /// # Remarks
 /// - Requires exactly two arguments: value and format text.
-/// - Numeric text is parsed before formatting. Text that is *clearly* non-numeric (no
-///   digits) is returned unchanged (e.g. `=TEXT("abc","00")` -> `"abc"`), matching Excel.
-///   Digit-bearing text that is not a plain number (dates, currency, fractions, or
-///   locale-ambiguous values like `"1.234,56"`) still returns `#VALUE!` for now.
+/// - Numeric and date/time text is converted to its number before formatting.
+///   Other text (and TRUE/FALSE) only passes through the format's text section;
+///   without one it is returned unchanged (e.g. `=TEXT("abc","00")` -> `"abc"`).
 /// - Error inputs are propagated unchanged.
-/// - Supported patterns are intentionally limited compared with full Excel formatting.
+/// - Numbers show at most 15 significant digits and round half away from zero.
 ///
 /// # Examples
 ///
@@ -260,7 +261,7 @@ pub struct TextFn;
 ///   - DOLLAR
 /// faq:
 ///   - q: "How complete is format_text support?"
-///     a: "Only a limited subset of Excel-style numeric/date tokens is supported in this implementation."
+///     a: "Excel format codes are supported, including sections, conditions, fractions, scientific and date/time tokens; locale-specific codes render in en-US."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: TEXT
@@ -306,169 +307,47 @@ impl Function for TextFn {
         let num = match val {
             LiteralValue::Number(f) => f,
             LiteralValue::Int(i) => i as f64,
-            LiteralValue::Text(t) => match ctx.locale().parse_number_invariant(&t) {
-                Some(n) => n,
-                None => {
-                    // Excel returns the text argument unchanged only when it is
-                    // *clearly* non-numeric (e.g. =TEXT("abc","00") -> "abc"). Text
-                    // that contains digits may be a number, date, currency or
-                    // fraction that Excel would coerce and format (e.g. "3-1",
-                    // "$5", "1/2", or locale-ambiguous "1.234,56"); handling those
-                    // requires a shared TEXT/VALUE coercion that does not exist yet,
-                    // so we conservatively keep returning #VALUE! for them rather
-                    // than passing them through unformatted.
-                    if t.chars().any(|c| c.is_ascii_digit()) {
-                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                            ExcelError::new_value(),
-                        )));
-                    }
-                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(t)));
+            // Numeric and date/time text is formatted as its number; other
+            // text only passes through the format's text section.
+            LiteralValue::Text(t) => match crate::coercion::to_arithmetic_number_with_locale(
+                &LiteralValue::Text(t.clone()),
+                &ctx.locale(),
+                ctx.date_system(),
+            ) {
+                Ok(n) => n,
+                Err(_) => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(
+                        number_format::format_text(&t, &fmt),
+                    )));
                 }
             },
+            // Logical values are not numbers to TEXT.
             LiteralValue::Boolean(b) => {
-                if b {
-                    1.0
-                } else {
-                    0.0
-                }
+                let text = if b { "TRUE" } else { "FALSE" };
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(
+                    number_format::format_text(text, &fmt),
+                )));
             }
             LiteralValue::Empty => 0.0,
             LiteralValue::Error(e) => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
             }
-            _ => 0.0,
-        };
-        let out = if fmt.contains('%') {
-            format_percent(num)
-        } else if fmt.contains('#') && fmt.contains(',') {
-            // Handle formats like #,##0 or #,##0.00
-            format_with_thousands(num, &fmt)
-        } else if fmt.contains("0.00") {
-            format!("{num:.2}")
-        } else if fmt.contains("0") {
-            if fmt.contains(".00") {
-                format!("{num:.2}")
-            } else {
-                format_number_basic(num)
-            }
-        } else {
-            // Date-token parsing is intentionally limited here; conversion still
-            // follows the workbook's shared Excel serial semantics.
-            if fmt.contains("yyyy") || fmt.contains("dd") || fmt.contains("mm") {
-                match format_serial_date(ctx.date_system(), num, &fmt) {
-                    Ok(text) => text,
-                    Err(_) => {
-                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                            ExcelError::new_value(),
-                        )));
-                    }
+            other => match other.as_serial_number_for(ctx.date_system()) {
+                Some(n) => n,
+                None => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                        ExcelError::new_value(),
+                    )));
                 }
-            } else {
-                num.to_string()
-            }
+            },
         };
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(out)))
+        Ok(crate::traits::CalcValue::Scalar(
+            match number_format::format_number(num, &fmt, ctx.date_system()) {
+                Ok(text) => LiteralValue::Text(text),
+                Err(error) => LiteralValue::Error(error),
+            },
+        ))
     }
-}
-
-fn format_percent(n: f64) -> String {
-    format!("{:.0}%", n * 100.0)
-}
-fn format_number_basic(n: f64) -> String {
-    if n.fract() == 0.0 {
-        format!("{n:.0}")
-    } else {
-        n.to_string()
-    }
-}
-
-fn format_with_thousands(n: f64, fmt: &str) -> String {
-    // Determine decimal places from format
-    let decimal_places = if fmt.contains(".00") {
-        2
-    } else if fmt.contains(".0") {
-        1
-    } else {
-        0
-    };
-
-    let abs_n = n.abs();
-    let formatted = if decimal_places > 0 {
-        format!("{:.prec$}", abs_n, prec = decimal_places)
-    } else {
-        format!("{:.0}", abs_n)
-    };
-
-    // Split into integer and decimal parts
-    let parts: Vec<&str> = formatted.split('.').collect();
-    let int_part = parts[0];
-    let dec_part = parts.get(1);
-
-    // Add thousands separators to integer part
-    let int_with_commas: String = int_part
-        .chars()
-        .rev()
-        .enumerate()
-        .flat_map(|(i, c)| {
-            if i > 0 && i % 3 == 0 {
-                vec![',', c]
-            } else {
-                vec![c]
-            }
-        })
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
-
-    // Combine with decimal part
-    let result = if let Some(dec) = dec_part {
-        format!("{}.{}", int_with_commas, dec)
-    } else {
-        int_with_commas
-    };
-
-    // Handle negative numbers
-    if n < 0.0 {
-        format!("-{}", result)
-    } else {
-        result
-    }
-}
-
-fn format_serial_date(
-    system: crate::engine::DateSystem,
-    n: f64,
-    fmt: &str,
-) -> Result<String, ExcelError> {
-    use formualizer_common::try_serial_to_display_date_parts_for;
-
-    let mut out = fmt.to_string();
-
-    // Resolve the already-supported time token before `mm` is interpreted as
-    // the month token. Minute rounding can advance the displayed calendar day.
-    let (display_serial, rounded_minutes) = if out.contains("hh:mm") {
-        let total_minutes = (n.fract() * 1_440.0).round() as i64;
-        if total_minutes == 1_440 {
-            (n.trunc() + 1.0, Some(0))
-        } else {
-            (n, Some(total_minutes))
-        }
-    } else {
-        (n, None)
-    };
-    let parts = try_serial_to_display_date_parts_for(system, display_serial)?;
-
-    if let Some(total_minutes) = rounded_minutes {
-        let hours = total_minutes / 60;
-        let minutes = total_minutes % 60;
-        out = out.replace("hh:mm", &format!("{hours:02}:{minutes:02}"));
-    }
-
-    out = out.replace("yyyy", &format!("{:04}", parts.year));
-    out = out.replace("mm", &format!("{:02}", parts.month));
-    out = out.replace("dd", &format!("{:02}", parts.day));
-    Ok(out)
 }
 
 pub fn register_builtins() {
@@ -622,17 +501,19 @@ mod tests {
     }
 
     #[test]
-    fn text_digit_bearing_text_still_errors() {
-        // Text that contains digits may be a number/date/currency/fraction that
-        // Excel would coerce and format. Until a shared TEXT/VALUE coercion exists
-        // we keep returning #VALUE! rather than passing it through unformatted,
-        // and we must not change the locale-ambiguous "1.234,56" case.
+    fn text_coerces_number_and_date_text_and_passes_other_text() {
         let wb = TestWorkbook::new().with_function(std::sync::Arc::new(TextFn));
         let ctx = wb.interpreter();
         let f = ctx.context.get_function("", "TEXT").unwrap();
-        for input in ["3-1", "10-", "1.234,56", "$5", "1/2"] {
+        for (input, format, expected) in [
+            ("12.5", "0.00", "12.50"),
+            ("2024-03-05", "dddd", "Tuesday"),
+            ("abc", "00", "abc"),
+            ("1.234,56", "00", "1.234,56"),
+            ("abc", "\"<\"@\">\"", "<abc>"),
+        ] {
             let v = lit(LiteralValue::Text(input.into()));
-            let fmt = lit(LiteralValue::Text("00".into()));
+            let fmt = lit(LiteralValue::Text(format.into()));
             let out = f
                 .dispatch(
                     &[
@@ -643,12 +524,11 @@ mod tests {
                 )
                 .unwrap()
                 .into_literal();
-            match out {
-                LiteralValue::Error(e) => {
-                    assert_eq!(e.to_string(), "#VALUE!", "TEXT({input:?},\"00\")")
-                }
-                other => panic!("expected #VALUE! for TEXT({input:?},\"00\"), got {other:?}"),
-            }
+            assert_eq!(
+                out,
+                LiteralValue::Text(expected.into()),
+                "TEXT({input:?},{format:?})"
+            );
         }
     }
 }

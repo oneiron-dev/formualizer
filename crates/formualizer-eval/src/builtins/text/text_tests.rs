@@ -544,13 +544,15 @@ mod tests {
     }
 
     #[test]
-    fn test_text_hh_mm_rounding_carries_the_displayed_day() {
+    fn test_text_hh_mm_truncates_to_the_displayed_minute() {
         use crate::engine::DateSystem;
 
+        // Hidden seconds do not round the minute up (23:59:34 shows 23:59).
         let cases_1900 = [
-            (59.9997, "1900-02-29 00:00"),
-            (60.9997, "1900-03-01 00:00"),
-            (61.9997, "1900-03-02 00:00"),
+            (59.9997, "1900-02-28 23:59"),
+            (60.9997, "1900-02-29 23:59"),
+            (61.9997, "1900-03-01 23:59"),
+            (2958465.9997, "9999-12-31 23:59"),
         ];
         for (serial, expected) in cases_1900 {
             assert_eq!(
@@ -564,9 +566,9 @@ mod tests {
         }
 
         let cases_1904 = [
-            (59.9997, "1904-03-01 00:00"),
-            (60.9997, "1904-03-02 00:00"),
-            (61.9997, "1904-03-03 00:00"),
+            (59.9997, "1904-02-29 23:59"),
+            (60.9997, "1904-03-01 23:59"),
+            (61.9997, "1904-03-02 23:59"),
         ];
         for (serial, expected) in cases_1904 {
             assert_eq!(
@@ -579,13 +581,10 @@ mod tests {
             );
         }
 
+        // A time that rounds to the next second past the calendar end.
         assert_value_error(eval_text_formula(
             DateSystem::Excel1900,
-            "=TEXT(2958465.9997,\"yyyy-mm-dd hh:mm\")",
-        ));
-        assert_value_error(eval_text_formula(
-            DateSystem::Excel1904,
-            "=TEXT(2957003.9997,\"yyyy-mm-dd hh:mm\")",
+            "=TEXT(2958465.999999999,\"yyyy-mm-dd hh:mm:ss\")",
         ));
     }
 
@@ -597,7 +596,7 @@ mod tests {
 
         // Percent format
         let num = lit(LiteralValue::Number(0.125));
-        let fmt = lit(LiteralValue::Text("%".into()));
+        let fmt = lit(LiteralValue::Text("0%".into()));
         assert_eq!(
             f.dispatch(
                 &[
@@ -607,7 +606,7 @@ mod tests {
                 &ctx.function_context(None)
             )
             .unwrap(),
-            LiteralValue::Text("12%".into()) // 0.125 * 100 = 12.5, rounds to 12
+            LiteralValue::Text("13%".into()) // 12.5 rounds half away from zero
         );
 
         // Two decimal places
@@ -625,10 +624,11 @@ mod tests {
             LiteralValue::Text("3.14".into())
         );
 
-        // Locale-dependent numeric text should error (not silently become 0.00)
+        // Text that is not a number in en-US passes through unformatted
+        // (it must not silently become 0.00).
         let comma_decimal = lit(LiteralValue::Text("1.234,56".into()));
-        match f
-            .dispatch(
+        assert_eq!(
+            f.dispatch(
                 &[
                     ArgumentHandle::new(&comma_decimal, &ctx),
                     ArgumentHandle::new(&dec_fmt, &ctx),
@@ -636,11 +636,9 @@ mod tests {
                 &ctx.function_context(None),
             )
             .unwrap()
-            .into_literal()
-        {
-            LiteralValue::Error(e) => assert_eq!(e.to_string(), "#VALUE!"),
-            other => panic!("Expected #VALUE! error, got {other:?}"),
-        }
+            .into_literal(),
+            LiteralValue::Text("1.234,56".into())
+        );
     }
 
     #[test]
