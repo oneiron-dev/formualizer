@@ -302,6 +302,26 @@ impl EKind {
 }
 
 /// Oracle value: a fully-evaluated scalar, or an error verdict.
+/// Excel comparison: numbers sort below logicals, a blank takes the other
+/// operand's type (0 or FALSE), and values of one type compare by value.
+fn excel_compare(op: &str, l: &OVal, r: &OVal) -> bool {
+    let key = |v: &OVal, other: &OVal| match v {
+        OVal::Num(n) => (0u8, *n),
+        OVal::Bool(b) => (1u8, f64::from(u8::from(*b))),
+        OVal::Empty => match other {
+            OVal::Bool(_) => (1u8, 0.0),
+            _ => (0u8, 0.0),
+        },
+        OVal::Err(_) => unreachable!("errors propagate before comparison"),
+    };
+    let (a, b) = (key(l, r), key(r, l));
+    match op {
+        ">" => a > b,
+        "<" => a < b,
+        _ => a == b,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum OVal {
     Num(f64),
@@ -576,9 +596,7 @@ impl Oracle {
                     "+" => OVal::Num(a + b),
                     "-" => OVal::Num(a - b),
                     "*" => OVal::Num(a * b),
-                    ">" => OVal::Bool(a > b),
-                    "<" => OVal::Bool(a < b),
-                    "=" => OVal::Bool(a == b),
+                    ">" | "<" | "=" => OVal::Bool(excel_compare(op, &l, &r)),
                     other => panic!("oracle: unsupported binary op {other}"),
                 }
             }
@@ -756,9 +774,7 @@ impl GuardEval<'_> {
                     "+" => OVal::Num(a + b),
                     "-" => OVal::Num(a - b),
                     "*" => OVal::Num(a * b),
-                    ">" => OVal::Bool(a > b),
-                    "<" => OVal::Bool(a < b),
-                    "=" => OVal::Bool(a == b),
+                    ">" | "<" | "=" => OVal::Bool(excel_compare(op, &l, &r)),
                     other => panic!("guard: unsupported binary op {other}"),
                 }
             }

@@ -483,13 +483,30 @@ mod tests {
             LiteralValue::Boolean(true)
         );
 
-        // Mixed type comparisons
+        // Mixed type comparisons: Excel orders numbers < text < logicals and
+        // never coerces between them.
         assert_eq!(
             evaluate_formula("=\"5\"=5", &wb).unwrap(),
-            LiteralValue::Boolean(true)
+            LiteralValue::Boolean(false)
         );
         assert_eq!(
             evaluate_formula("=TRUE=1", &wb).unwrap(),
+            LiteralValue::Boolean(false)
+        );
+        assert_eq!(
+            evaluate_formula("=5<\"4\"", &wb).unwrap(),
+            LiteralValue::Boolean(true)
+        );
+        assert_eq!(
+            evaluate_formula("=5<\"\"", &wb).unwrap(),
+            LiteralValue::Boolean(true)
+        );
+        assert_eq!(
+            evaluate_formula("=TRUE>99", &wb).unwrap(),
+            LiteralValue::Boolean(true)
+        );
+        assert_eq!(
+            evaluate_formula("=(0.1+0.2)=0.3", &wb).unwrap(),
             LiteralValue::Boolean(true)
         );
     }

@@ -1582,36 +1582,56 @@ impl<'a> Interpreter<'a> {
             (Array(arr), v) => self.broadcast_apply(Array(arr), v, |a, b| self.compare(op, a, b)),
             (v, Array(arr)) => self.broadcast_apply(v, Array(arr), |a, b| self.compare(op, a, b)),
             (l, r) => {
-                let res = match (l, r) {
-                    (Number(a), Number(b)) => self.cmp_f64(a, b, op),
-                    (Int(a), Number(b)) => self.cmp_f64(a as f64, b, op),
-                    (Number(a), Int(b)) => self.cmp_f64(a, b as f64, op),
-                    (Boolean(a), Boolean(b)) => {
-                        self.cmp_f64(if a { 1.0 } else { 0.0 }, if b { 1.0 } else { 0.0 }, op)
-                    }
-                    (Text(a), Text(b)) => self.cmp_text(&a, &b, op),
-                    (a, b) => {
-                        // fallback to numeric coercion or text compare
-                        let an = crate::coercion::to_number_lenient_with_locale(
-                            &a,
-                            &self.context.locale(),
-                        )
-                        .ok();
-                        let bn = crate::coercion::to_number_lenient_with_locale(
-                            &b,
-                            &self.context.locale(),
-                        )
-                        .ok();
-                        if let (Some(a), Some(b)) = (an, bn) {
-                            self.cmp_f64(a, b, op)
+                // Excel orders values by type first: numbers < text < logicals,
+                // with no text-to-number coercion ("4" > 5). A blank operand
+                // takes the other operand's type: 0, "" or FALSE.
+                enum Key {
+                    Number(f64),
+                    Text(String),
+                    Logical(bool),
+                    Blank,
+                }
+                let system = self.context.date_system();
+                let key = |v: &LiteralValue| match v {
+                    Number(n) => Key::Number(*n),
+                    Int(i) => Key::Number(*i as f64),
+                    Boolean(b) => Key::Logical(*b),
+                    Text(t) => Key::Text(t.clone()),
+                    Empty => Key::Blank,
+                    other => other
+                        .as_serial_number_for(system)
+                        .map(Key::Number)
+                        .unwrap_or_else(|| Key::Text(crate::coercion::to_text_invariant(other))),
+                };
+                let rank = |k: &Key| match k {
+                    Key::Number(_) => 0,
+                    Key::Text(_) => 1,
+                    Key::Logical(_) => 2,
+                    Key::Blank => 3,
+                };
+                let (a, b) = match (key(&l), key(&r)) {
+                    (Key::Blank, Key::Blank) => (Key::Number(0.0), Key::Number(0.0)),
+                    (Key::Blank, other) | (other, Key::Blank) => {
+                        let blank = match other {
+                            Key::Number(_) => Key::Number(0.0),
+                            Key::Text(_) => Key::Text(String::new()),
+                            _ => Key::Logical(false),
+                        };
+                        if matches!(l, Empty) {
+                            (blank, other)
                         } else {
-                            self.cmp_text(
-                                &crate::coercion::to_text_invariant(&a),
-                                &crate::coercion::to_text_invariant(&b),
-                                op,
-                            )
+                            (other, blank)
                         }
                     }
+                    pair => pair,
+                };
+                let res = match (&a, &b) {
+                    (Key::Number(x), Key::Number(y)) => self.cmp_f64(*x, *y, op),
+                    (Key::Text(x), Key::Text(y)) => self.cmp_text(x, y, op),
+                    (Key::Logical(x), Key::Logical(y)) => {
+                        self.cmp_f64(f64::from(u8::from(*x)), f64::from(u8::from(*y)), op)
+                    }
+                    _ => self.cmp_f64(f64::from(rank(&a)), f64::from(rank(&b)), op),
                 };
                 Ok(LiteralValue::Boolean(res))
             }
@@ -1619,6 +1639,12 @@ impl<'a> Interpreter<'a> {
     }
 
     fn cmp_f64(&self, a: f64, b: f64, op: &str) -> bool {
+        // Excel compares numbers to 15 significant digits: 0.1+0.2=0.3.
+        let (a, b) = if a != b && same_to_15_digits(a, b) {
+            (a, a)
+        } else {
+            (a, b)
+        };
         match op {
             "=" => a == b,
             "<>" => a != b,
@@ -1646,6 +1672,18 @@ impl<'a> Interpreter<'a> {
             },
         )
     }
+}
+
+/// Whether two numbers agree when rounded to 15 significant digits.
+fn same_to_15_digits(a: f64, b: f64) -> bool {
+    if !a.is_finite() || !b.is_finite() {
+        return false;
+    }
+    let scale = a.abs().max(b.abs());
+    if (a - b).abs() > scale * 1e-14 {
+        return false;
+    }
+    format!("{a:.14e}") == format!("{b:.14e}")
 }
 
 fn relocate_reference_for_offset(
