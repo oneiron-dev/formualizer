@@ -1849,68 +1849,76 @@ impl Function for UniqueFn {
             ));
         }
 
-        let by_col = if args.len() >= 2 {
-            matches!(args[1].value()?.into_literal(), LiteralValue::Boolean(true))
-        } else {
-            false
+        let flag = |i: usize| -> Result<bool, ExcelError> {
+            match args.get(i) {
+                Some(arg) if !arg.is_omitted() => {
+                    crate::coercion::to_logical(&arg.value()?.into_literal())
+                }
+                _ => Ok(false),
+            }
         };
-        let exactly_once = if args.len() >= 3 {
-            matches!(args[2].value()?.into_literal(), LiteralValue::Boolean(true))
-        } else {
-            false
+        let (by_col, exactly_once) = match (flag(1), flag(2)) {
+            (Ok(b), Ok(e)) => (b, e),
+            (Err(e), _) | (_, Err(e)) => {
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+            }
         };
 
-        if by_col {
-            #[derive(Hash, Eq, PartialEq, Clone)]
-            struct ColKey(Vec<LiteralValue>);
-
-            let mut order: Vec<ColKey> = Vec::new();
-            let mut counts: HashMap<ColKey, usize> = HashMap::new();
-
-            for c in 0..cols {
-                let mut col_vals: Vec<LiteralValue> = Vec::with_capacity(rows);
-                for r in 0..rows {
-                    col_vals.push(view.get_cell(r, c));
-                }
-                let key = ColKey(col_vals);
-                if !counts.contains_key(&key) {
-                    order.push(key.clone());
-                }
-                *counts.entry(key).or_insert(0) += 1;
+        // Rows (or columns) compare the way Excel's UNIQUE does: text
+        // ignores case and a number equals the same number of any type.
+        let key_of = |v: &LiteralValue| -> String {
+            match v {
+                LiteralValue::Text(t) if t.is_empty() => "E".to_string(),
+                LiteralValue::Text(t) => format!("T{}", t.to_lowercase()),
+                LiteralValue::Empty => "E".to_string(),
+                LiteralValue::Boolean(b) => format!("B{b}"),
+                LiteralValue::Error(e) => format!("X{}", e.kind),
+                other => match other.as_serial_number() {
+                    Some(n) => format!("N{}", (n + 0.0).to_bits()),
+                    None => format!("O{other:?}"),
+                },
             }
-
-            let mut out: Vec<Vec<LiteralValue>> = Vec::new();
-            for k in order {
-                if !exactly_once || counts.get(&k) == Some(&1) {
-                    out.push(k.0);
-                }
+        };
+        let (lines, width) = if by_col { (cols, rows) } else { (rows, cols) };
+        let line = |i: usize| -> Vec<LiteralValue> {
+            (0..width)
+                .map(|j| {
+                    if by_col {
+                        view.get_cell(j, i)
+                    } else {
+                        view.get_cell(i, j)
+                    }
+                })
+                .collect()
+        };
+        let mut order: Vec<(Vec<String>, Vec<LiteralValue>)> = Vec::new();
+        let mut counts: HashMap<Vec<String>, usize> = HashMap::new();
+        for i in 0..lines {
+            let values = line(i);
+            let key: Vec<String> = values.iter().map(key_of).collect();
+            let count = counts.entry(key.clone()).or_insert(0);
+            if *count == 0 {
+                order.push((key, values));
             }
-            return Ok(collapse_if_scalar(out, _ctx.date_system()));
+            *count += 1;
         }
-
-        #[derive(Hash, Eq, PartialEq, Clone)]
-        struct RowKey(Vec<LiteralValue>);
-
-        let mut order: Vec<RowKey> = Vec::new();
-        let mut counts: HashMap<RowKey, usize> = HashMap::new();
-        for r in 0..rows {
-            let mut row_vals: Vec<LiteralValue> = Vec::with_capacity(cols);
-            for c in 0..cols {
-                row_vals.push(view.get_cell(r, c));
-            }
-            let key = RowKey(row_vals);
-            if !counts.contains_key(&key) {
-                order.push(key.clone());
-            }
-            *counts.entry(key).or_insert(0) += 1;
+        let kept: Vec<Vec<LiteralValue>> = order
+            .into_iter()
+            .filter(|(key, _)| !exactly_once || counts[key] == 1)
+            .map(|(_, values)| values)
+            .collect();
+        if kept.is_empty() {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                ExcelError::new(ExcelErrorKind::Calc),
+            )));
         }
-
-        let mut out: Vec<Vec<LiteralValue>> = Vec::new();
-        for k in order {
-            if !exactly_once || counts.get(&k) == Some(&1) {
-                out.push(k.0);
-            }
-        }
+        let out = if by_col {
+            (0..rows)
+                .map(|r| kept.iter().map(|col| col[r].clone()).collect())
+                .collect()
+        } else {
+            kept
+        };
         Ok(collapse_if_scalar(out, _ctx.date_system()))
     }
 }
@@ -3282,6 +3290,45 @@ mod tests {
                 assert_eq!(a[0][0], LiteralValue::Number(1.0));
             }
             _ => panic!("expected array"),
+        }
+    }
+
+    #[test]
+    fn unique_by_column_and_ignoring_case() {
+        let n = |v: f64| LiteralValue::Number(v);
+        let t = |v: &str| LiteralValue::Text(v.into());
+        let wb = TestWorkbook::new()
+            .with_function(Arc::new(UniqueFn))
+            .with_cell_a1("Sheet1", "A1", n(1.0))
+            .with_cell_a1("Sheet1", "B1", n(2.0))
+            .with_cell_a1("Sheet1", "C1", n(1.0))
+            .with_cell_a1("Sheet1", "A2", n(1.0))
+            .with_cell_a1("Sheet1", "B2", n(2.0))
+            .with_cell_a1("Sheet1", "C2", n(1.0))
+            .with_cell_a1("Sheet1", "E1", t("a"))
+            .with_cell_a1("Sheet1", "E2", t("A"))
+            .with_cell_a1("Sheet1", "E3", t("b"));
+        let ctx = wb.interpreter();
+        let eval = |f: &str| {
+            ctx.evaluate_ast(&formualizer_parse::parser::parse(f).unwrap())
+                .unwrap()
+                .into_literal()
+        };
+        let by_col = LiteralValue::Array(vec![vec![n(1.0), n(2.0)], vec![n(1.0), n(2.0)]]);
+        assert_eq!(eval("=UNIQUE(A1:C2,TRUE)"), by_col);
+        assert_eq!(eval("=UNIQUE(A1:C2,1)"), by_col);
+        assert_eq!(
+            eval("=UNIQUE(A1:C2,TRUE,TRUE)"),
+            LiteralValue::Array(vec![vec![n(2.0)], vec![n(2.0)]])
+        );
+        assert_eq!(
+            eval("=UNIQUE(E1:E3)"),
+            LiteralValue::Array(vec![vec![t("a")], vec![t("b")]])
+        );
+        assert_eq!(eval("=UNIQUE(E1:E3,FALSE,TRUE)"), t("b"));
+        match eval("=UNIQUE(E1:E2,FALSE,TRUE)") {
+            LiteralValue::Error(e) => assert_eq!(e.kind, ExcelErrorKind::Calc),
+            other => panic!("expected #CALC!, got {other:?}"),
         }
     }
 

@@ -380,11 +380,13 @@ impl Function for ProperFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        // Excel capitalizes every letter that follows a non-letter, digits
+        // included ("2nd" becomes "2Nd"), and lowercases the rest.
         let s = to_text(&args[0])?;
         let mut out = String::new();
         let mut new_word = true;
         for ch in s.chars() {
-            if ch.is_alphanumeric() {
+            if ch.is_alphabetic() {
                 if new_word {
                     for c in ch.to_uppercase() {
                         out.push(c);
