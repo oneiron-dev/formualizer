@@ -607,10 +607,14 @@ fn extension_markup_outside_cells_is_not_workbook_or_cell_metadata() {
 }
 #[test]
 fn volatile_formulas_are_recalculated_not_refused() {
-    let rows = "<row r=\"1\"><c r=\"A1\"><f>TODAY()</f><v>1</v></c></row><row r=\"2\"><c r=\"A2\"><f>1+1</f><v>9</v></c></row>";
+    let rows = "<row r=\"1\"><c r=\"A1\"><f>TODAY()</f><v>1</v></c></row><row r=\"2\"><c r=\"A2\"><f>1+1</f><v>9</v></c></row>\
+        <row r=\"3\"><c r=\"A3\"><f>A1-A1+7</f><v>9</v></c></row><row r=\"4\"><c r=\"A4\"><f>SUBTOTAL(9,A2:A3)</f><v>0</v></c></row>";
     let out = recalculate_xlsx_bytes(&pack(&parts(rows)), Default::default()).unwrap();
     assert!(matches!(data(&out.bytes, 0), Data::Float(n) if n > 45_000.0));
     assert_eq!(data(&out.bytes, 1), Data::Float(2.0));
+    // Readers of volatile results are computed in the same pass.
+    assert_eq!(data(&out.bytes, 2), Data::Float(7.0));
+    assert_eq!(data(&out.bytes, 3), Data::Float(9.0));
 }
 #[test]
 fn worksheet_tables_answer_structured_references() {

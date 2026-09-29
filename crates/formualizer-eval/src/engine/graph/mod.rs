@@ -2877,9 +2877,10 @@ impl DependencyGraph {
     /// One multi-source propagation: many volatiles feeding one dependent
     /// component used to pay O(volatiles × component) (a full `mark_dirty`
     /// BFS per volatile); `mark_dirty_many` visits the component once.
-    pub(crate) fn redirty_volatiles(&mut self) {
+    /// Re-marks volatile vertices and their dependents dirty; returns them.
+    pub(crate) fn redirty_volatiles(&mut self) -> Vec<VertexId> {
         let volatile_ids: Vec<VertexId> = self.volatile_vertices.iter().copied().collect();
-        let _ = self.mark_dirty_many(&volatile_ids);
+        self.mark_dirty_many(&volatile_ids)
     }
 
     /// Re-marks members of iterating SCCs (and, via propagation, their

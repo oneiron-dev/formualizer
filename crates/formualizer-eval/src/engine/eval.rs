@@ -1246,6 +1246,10 @@ pub struct Engine<R> {
     /// [`Self::retained_scc_members`] instead and stay clean until the dirty
     /// graph (or a config change) reaches them (#368).
     pending_iterative_redirty: Vec<VertexId>,
+    /// Vertices re-marked dirty at the end of the last recalc because they
+    /// are volatile or read a volatile result. Their values were computed by
+    /// that recalc; the dirty flag only schedules the next one.
+    volatile_redirtied: rustc_hash::FxHashSet<VertexId>,
     /// Members of iterating SCCs retained across recalcs (#368), keyed to the
     /// id of the retained SCC they belong to (ids come from
     /// `next_retained_scc_id`; grouping is only used for telemetry).
@@ -3089,6 +3093,7 @@ where
             source_cache_footprints: Vec::new(),
             source_cache_accounted: 0,
             pending_iterative_redirty: Vec::new(),
+            volatile_redirtied: Default::default(),
             retained_scc_members: FxHashMap::default(),
             next_retained_scc_id: 0,
             retained_scc_config_fingerprint: 0,
@@ -3257,6 +3262,7 @@ where
             source_cache_footprints: Vec::new(),
             source_cache_accounted: 0,
             pending_iterative_redirty: Vec::new(),
+            volatile_redirtied: Default::default(),
             retained_scc_members: FxHashMap::default(),
             next_retained_scc_id: 0,
             retained_scc_config_fingerprint: 0,
@@ -4057,7 +4063,7 @@ where
     /// `graph.redirty_volatiles()` call at every evaluation-flow exit; must
     /// run AFTER the flow's `clear_dirty_flags`.
     fn redirty_for_next_recalc(&mut self) {
-        self.graph.redirty_volatiles();
+        self.volatile_redirtied = self.graph.redirty_volatiles().into_iter().collect();
         let pending = std::mem::take(&mut self.pending_iterative_redirty);
         let dirty_at_begin = std::mem::take(&mut self.retained_scc_dirty_at_begin);
         for (vertex, scc) in dirty_at_begin {
@@ -5050,6 +5056,25 @@ where
         self.record_formula_plane_structural_change(StructuralScope::OpaqueGlobal);
         self.mark_topology_edited();
         Ok(())
+    }
+
+    /// Whether the formula at `address` is dirty only because it is volatile
+    /// or reads a volatile result: the last recalc computed its value and
+    /// re-marked it for the next one.
+    pub fn recomputes_each_recalc(&self, address: &formualizer_common::CellAddress) -> bool {
+        if self.volatile_redirtied.is_empty() || address.row == 0 || address.column == 0 {
+            return false;
+        }
+        let Some(sheet_id) = self.graph.sheet_id(&address.sheet) else {
+            return false;
+        };
+        let cell = crate::reference::CellRef::new(
+            sheet_id,
+            crate::reference::Coord::new(address.row - 1, address.column - 1, true, true),
+        );
+        self.graph
+            .get_vertex_for_cell(&cell)
+            .is_some_and(|vertex| self.volatile_redirtied.contains(&vertex))
     }
 
     /// Register the saved values of a linked workbook under its book token

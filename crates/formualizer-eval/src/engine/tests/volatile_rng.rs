@@ -3,7 +3,7 @@ use crate::builtins::random::register_builtins;
 use crate::engine::{Engine, EvalConfig};
 use crate::test_workbook::TestWorkbook;
 use formualizer_common::LiteralValue;
-use formualizer_parse::parser::{ASTNode, ASTNodeType};
+use formualizer_parse::parser::{ASTNode, ASTNodeType, parse};
 
 #[test]
 fn rand_reproducible_given_seed_and_cell_address() {
@@ -208,4 +208,37 @@ fn context_scoped_volatility_detection() {
     // Value is constant 0, but volatile status causes re-eval; just assert evaluation path doesn't error
     assert_eq!(v1, LiteralValue::Number(0.0));
     assert_eq!(v2, LiteralValue::Number(0.0));
+}
+
+#[test]
+fn volatile_readers_are_recomputed_each_recalc() {
+    use formualizer_common::CellAddress;
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("=RAND()").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 1, 2, parse("=A1*2").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 1, 3, parse("=B1+1").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 1, 4, parse("=1+1").unwrap())
+        .unwrap();
+    let at = |col| CellAddress::new("Sheet1", 1, col).unwrap();
+    assert!(!engine.recomputes_each_recalc(&at(2)));
+    engine.evaluate_all().unwrap();
+    assert!(engine.recomputes_each_recalc(&at(1)));
+    assert!(engine.recomputes_each_recalc(&at(2)));
+    assert!(engine.recomputes_each_recalc(&at(3)));
+    assert!(!engine.recomputes_each_recalc(&at(4)));
+    let a = match engine.get_cell_value("Sheet1", 1, 1) {
+        Some(LiteralValue::Number(n)) => n,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 3),
+        Some(LiteralValue::Number(a * 2.0 + 1.0))
+    );
 }
