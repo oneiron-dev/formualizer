@@ -1245,14 +1245,12 @@ impl Function for PowerFn {
             }
             other => coerce_num(&other)?,
         };
-        if base < 0.0 && (expv.fract().abs() > 1e-12) {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            base.powf(expv),
-        )))
+        Ok(crate::traits::CalcValue::Scalar(
+            match crate::coercion::excel_power(base, expv) {
+                Ok(n) => LiteralValue::Number(n),
+                Err(e) => LiteralValue::Error(e),
+            },
+        ))
     }
 }
 
@@ -3783,6 +3781,39 @@ mod tests_numeric {
             )
             .unwrap();
         assert!(matches!(out.into_literal(), LiteralValue::Error(_))); // complex -> #NUM!
+    }
+
+    #[test]
+    fn power_follows_excel_edge_cases() {
+        let wb = TestWorkbook::new().with_function(std::sync::Arc::new(PowerFn));
+        let ctx = interp(&wb);
+        let eval = |f: &str| {
+            ctx.evaluate_ast(&formualizer_parse::parser::parse(f).unwrap())
+                .unwrap()
+                .into_literal()
+        };
+        let kind = |f: &str| match eval(f) {
+            LiteralValue::Error(e) => e.kind,
+            other => panic!("{f}: expected an error, got {other:?}"),
+        };
+        use formualizer_common::ExcelErrorKind::{Div, Num};
+        assert_eq!(kind("=POWER(0,0)"), Num);
+        assert_eq!(kind("=0^0"), Num);
+        assert_eq!(kind("=POWER(0,-1)"), Div);
+        assert_eq!(kind("=POWER(-8,2/3)"), Num);
+        assert_eq!(
+            eval("=POWER(-8,1/3)"),
+            LiteralValue::Number(-(8f64.powf(1.0 / 3.0)))
+        );
+        assert_eq!(
+            eval("=(-8)^(1/3)"),
+            LiteralValue::Number(-(8f64.powf(1.0 / 3.0)))
+        );
+        assert_eq!(
+            eval("=POWER(-32,-1/5)"),
+            LiteralValue::Number(-(32f64.powf(-0.2)))
+        );
+        assert_eq!(eval("=POWER(-2,3)"), LiteralValue::Number(-8.0));
     }
 
     #[test]

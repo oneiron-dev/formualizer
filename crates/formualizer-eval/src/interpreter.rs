@@ -1511,11 +1511,7 @@ impl<'a> Interpreter<'a> {
                 (Ok(a), Ok(b)) => (a, b),
                 (Err(e), _) | (_, Err(e)) => return Ok(LiteralValue::Error(e)),
             };
-            // Excel domain: negative base with non-integer exponent -> #NUM!
-            if a < 0.0 && b.fract() != 0.0 {
-                return Ok(LiteralValue::Error(ExcelError::new_num()));
-            }
-            match crate::coercion::sanitize_numeric(a.powf(b)) {
+            match crate::coercion::excel_power(a, b) {
                 Ok(n) => Ok(LiteralValue::Number(n)),
                 Err(e) => Ok(LiteralValue::Error(e)),
             }

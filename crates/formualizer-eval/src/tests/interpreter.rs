@@ -673,11 +673,11 @@ mod tests {
             LiteralValue::Array(rows) => {
                 assert_eq!(rows.len(), 2);
                 assert_eq!(rows[0].len(), 2);
-                // 1^-1 = 1; 0^-1 is treated as #NUM! by current semantics
+                // 1^-1 = 1; 0^-1 divides by zero
                 assert_eq!(rows[0][0], LiteralValue::Number(1.0));
                 match &rows[0][1] {
-                    LiteralValue::Error(e) => assert_eq!(e, "#NUM!"),
-                    v => panic!("expected num error, got {v:?}"),
+                    LiteralValue::Error(e) => assert_eq!(e, "#DIV/0!"),
+                    v => panic!("expected div error, got {v:?}"),
                 }
                 // 1^0.5 = 1; 0^0.5 = 0
                 assert_eq!(rows[1][0], LiteralValue::Number(1.0));
@@ -723,9 +723,12 @@ mod tests {
 
     #[test]
     fn test_zero_power_zero() {
+        // Excel leaves 0^0 undefined: #NUM!.
         let wb = create_workbook();
-        let result = evaluate_formula("=0^0", &wb).unwrap();
-        assert_eq!(result, LiteralValue::Number(1.0));
+        match evaluate_formula("=0^0", &wb).unwrap() {
+            LiteralValue::Error(e) => assert_eq!(e, "#NUM!"),
+            other => panic!("Expected #NUM!, got {other:?}"),
+        }
     }
 
     #[test]
