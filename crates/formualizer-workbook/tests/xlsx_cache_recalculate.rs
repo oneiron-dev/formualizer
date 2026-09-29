@@ -565,8 +565,9 @@ fn single_cell_array_formulas_evaluate_with_array_semantics() {
     );
 }
 #[test]
-fn multi_cell_arrays_and_rich_value_metadata_stay_unsupported() {
-    let multi = "<row r=\"1\"><c r=\"A1\"><f t=\"array\" ref=\"A1:A2\">{1;2}</f><v>1</v></c></row><row r=\"2\"><c r=\"A2\"><v>2</v></c></row>";
+fn misplaced_arrays_and_rich_value_metadata_stay_unsupported() {
+    // A multi-cell array anchored away from its extent's top-left.
+    let multi = "<row r=\"2\"><c r=\"B2\"><f t=\"array\" ref=\"A1:B2\">{1;2}</f><v>1</v></c></row>";
     reject(&parts(multi));
     // `cm` outside an array formula is not dynamic-array metadata.
     let flagged = "<row r=\"1\"><c r=\"A1\" cm=\"1\"><f>1+1</f><v>2</v></c></row>";
@@ -658,6 +659,41 @@ fn shared_formula_master_below_its_range_start_is_the_expansion_origin() {
     // A member above or left of the master cannot be expanded from it.
     let rows = "<row r=\"2\"><c r=\"B2\"><f t=\"shared\" ref=\"A2:B3\" si=\"0\">1</f><v>0</v></c></row>\
         <row r=\"3\"><c r=\"A3\"><f t=\"shared\" si=\"0\"/><v>0</v></c></row>";
+    reject(&parts(rows));
+}
+#[test]
+fn multi_cell_array_formulas_write_results_into_their_extent() {
+    // A1:A3 = 1,2,3. B1:B3 is a spilled dynamic array; C1:D2 a legacy CSE
+    // array whose one-column result repeats across and pads with #N/A.
+    let rows = "<row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"B1\" cm=\"1\"><f t=\"array\" ref=\"B1:B3\">A1:A3*10</f><v>0</v></c><c r=\"C1\"><f t=\"array\" ref=\"C1:D3\">A1:A2+1</f><v>0</v></c><c r=\"D1\"><v>0</v></c></row>\
+        <row r=\"2\"><c r=\"A2\"><v>2</v></c><c r=\"B2\"><v>0</v></c><c r=\"C2\"><v>0</v></c><c r=\"D2\"><v>0</v></c></row>\
+        <row r=\"3\"><c r=\"A3\"><v>3</v></c><c r=\"B3\" t=\"str\"><v>old</v></c><c r=\"C3\"><v>0</v></c><c r=\"D3\"><v>0</v></c><c r=\"E3\"><f>SUM(B1:B3)</f><v>0</v></c></row>";
+    let input = pack(&with_metadata(parts(rows), XLDAPR));
+    let out = recalculate_xlsx_bytes(&input, Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "A1:A3*10</f><v>10</v>",
+        "<c r=\"B2\"><v>20</v>",
+        // The removed type attribute leaves its separating space.
+        "<c r=\"B3\" ><v>30</v>",
+        "A1:A2+1</f><v>2</v>",
+        "<c r=\"D1\"><v>2</v>",
+        "<c r=\"C2\"><v>3</v>",
+        "<c r=\"D2\"><v>3</v>",
+        "<c r=\"C3\" t=\"e\"><v>#N/A</v>",
+        "<c r=\"D3\" t=\"e\"><v>#N/A</v>",
+        "SUM(B1:B3)</f><v>60</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected} in {sheet}");
+    }
+    assert_eq!(
+        recalculate_xlsx_bytes(&out.bytes, Default::default())
+            .unwrap()
+            .bytes,
+        out.bytes
+    );
+    // A formula inside another array formula's extent is not a member.
+    let rows = "<row r=\"1\"><c r=\"A1\"><f t=\"array\" ref=\"A1:A2\">{1;2}</f><v>1</v></c></row><row r=\"2\"><c r=\"A2\"><f>1</f><v>2</v></c></row>";
     reject(&parts(rows));
 }
 #[test]

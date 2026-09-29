@@ -33,8 +33,22 @@ pub(super) struct Cell {
     /// A replacement `ref="..."` attribute for the transient ingestion view
     /// when a shared-formula master is not the top-left cell of its range.
     pub reanchored_ref: Option<(Range<usize>, String)>,
+    /// The recorded `ref` of a multi-cell array formula anchored here.
+    pub array_extent: Option<(u32, u32, u32, u32)>,
     has_formula: bool,
-    dynamic_array: bool,
+    pub dynamic_array: bool,
+}
+/// A value cell inside a multi-cell array formula's extent; `anchor` indexes
+/// the formula cell in [`Scan::cells`].
+#[derive(Debug)]
+pub(super) struct Member {
+    pub anchor: usize,
+    pub cell: Cell,
+}
+#[derive(Debug, Default)]
+pub(super) struct Scan {
+    pub cells: Vec<Cell>,
+    pub members: Vec<Member>,
 }
 /// Calamine's fast scalar reader consumes just one raw ASCII text event.
 /// Literal cells must satisfy that assumption; formula caches may instead be
@@ -90,8 +104,10 @@ pub(super) fn scan(
     options: &XlsxRecalculateOptions,
     observed: &mut usize,
     logical_cells: &mut u64,
-) -> Result<Vec<Cell>, IoError> {
+) -> Result<Scan, IoError> {
     let mut cells = Vec::new();
+    let mut members = Vec::new();
+    let mut extents: Vec<(u32, u32, u32, u32, usize)> = Vec::new();
     let mut current: Option<Cell> = None;
     let mut row = 0;
     let mut column = 0;
@@ -245,6 +261,7 @@ pub(super) fn scan(
                             shared_range: None,
                             shared_ref_span: None,
                             reanchored_ref: None,
+                            array_extent: None,
                             has_formula: false,
                             dynamic_array,
                         });
@@ -271,18 +288,32 @@ pub(super) fn scan(
                                     "worksheet",
                                 ));
                             }
-                            // A single-cell array formula (legacy CSE or a
-                            // dynamic array whose result is one value) is an
-                            // ordinary formula evaluated with array semantics.
-                            // Multi-cell array extents need geometry writeback.
-                            if cell.formula_kind == "array"
-                                && node.value("ref").map(rect).transpose()?
-                                    != Some((cell.row, cell.col, cell.row, cell.col))
-                            {
-                                return Err(unsupported(
-                                    "multi-cell array formula extent",
-                                    "worksheet",
-                                ));
+                            // An array formula (legacy CSE or dynamic array)
+                            // is an ordinary formula evaluated with array
+                            // semantics. A multi-cell extent anchored at its
+                            // top-left keeps its members for result writeback.
+                            if cell.formula_kind == "array" {
+                                let extent =
+                                    node.value("ref").map(rect).transpose()?.ok_or_else(|| {
+                                        unsupported("array formula without extent", "worksheet")
+                                    })?;
+                                if (extent.0, extent.1) != (cell.row, cell.col) {
+                                    return Err(unsupported(
+                                        "multi-cell array formula extent",
+                                        "worksheet",
+                                    ));
+                                }
+                                let area = u64::from(extent.2 - extent.0 + 1)
+                                    * u64::from(extent.3 - extent.1 + 1);
+                                if area > options.limits.max_cells as u64 {
+                                    return Err(unsupported(
+                                        "array extent cell limit",
+                                        "worksheet",
+                                    ));
+                                }
+                                if area > 1 {
+                                    cell.array_extent = Some(extent);
+                                }
                             }
                             if node.value("ref").is_some()
                                 && !matches!(cell.formula_kind.as_str(), "shared" | "array")
@@ -362,6 +393,25 @@ pub(super) fn scan(
                         .take()
                         .ok_or_else(|| unsupported("unbalanced cell", "worksheet"))?;
                     cell.span.end = node.span.end;
+                    let array_anchor = extents
+                        .iter()
+                        .find(|&&(r1, c1, r2, c2, _)| {
+                            (r1..=r2).contains(&cell.row) && (c1..=c2).contains(&cell.col)
+                        })
+                        .map(|extent| extent.4);
+                    if let Some(anchor) = array_anchor {
+                        if cell.has_formula {
+                            return Err(unsupported(
+                                "formula inside an array formula extent",
+                                "worksheet",
+                            ));
+                        }
+                        // Its cache is written after the anchor is evaluated;
+                        // a missing <v> goes right after the opening tag.
+                        cell.formula_end = cell.open_end;
+                        members.push(Member { anchor, cell });
+                        return Ok(());
+                    }
                     if !cell.has_formula
                         && cell.kind.as_deref() == Some("e")
                         && cell
@@ -389,6 +439,9 @@ pub(super) fn scan(
                         }
                         if cell.formula_end == 0 {
                             return Err(unsupported("missing formula boundary", "worksheet"));
+                        }
+                        if let Some((r1, c1, r2, c2)) = cell.array_extent {
+                            extents.push((r1, c1, r2, c2, cells.len()));
                         }
                         cells.push(cell);
                         if cells.len() > options.limits.max_formula_cells {
@@ -475,5 +528,5 @@ pub(super) fn scan(
             }
         }
     }
-    Ok(cells)
+    Ok(Scan { cells, members })
 }

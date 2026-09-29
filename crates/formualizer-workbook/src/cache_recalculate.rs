@@ -351,14 +351,14 @@ pub fn recalculate_xlsx_bytes(
             &sheet.part,
             options.limits.max_worksheet_bytes,
         )?;
-        let cells = sheet::scan(&data, &options, &mut observed, &mut logical_cells)?;
+        let scan = sheet::scan(&data, &options, &mut observed, &mut logical_cells)?;
         formula_count = formula_count
-            .checked_add(cells.len())
+            .checked_add(scan.cells.len())
             .ok_or_else(|| unsupported("formula count overflow", "workbook"))?;
         if formula_count > options.limits.max_formula_cells {
             return Err(unsupported("formula cell count limit", "workbook"));
         }
-        plans.push((data, cells));
+        plans.push((data, scan));
     }
     let empty_result = |summary| XlsxRecalculateResult {
         bytes: bytes.to_vec(),
@@ -379,9 +379,15 @@ pub fn recalculate_xlsx_bytes(
     // although formula ingestion ignores cached results. Clear those caches in a
     // bounded, transient ingestion view; the authoritative package stays intact.
     let mut view_parts = BTreeMap::new();
-    for (sheet, (data, cells)) in sheets.iter().zip(&plans) {
+    for (sheet, (data, scan)) in sheets.iter().zip(&plans) {
         let mut patches = Vec::new();
-        for cell in cells {
+        // Array members are blanked so the anchor's result can spill.
+        for member in &scan.members {
+            if member.cell.value.is_some() || member.cell.inline.is_some() {
+                cache_patches(data, &member.cell, &Cache::Empty, &mut patches);
+            }
+        }
+        for cell in &scan.cells {
             if !sheet::readable_scalar_cache(cell, data)
                 || matches!(cell.kind.as_deref(), Some("s" | "inlineStr" | "d"))
             {
@@ -466,9 +472,11 @@ pub fn recalculate_xlsx_bytes(
             .ok_or_else(|| unsupported("ZIP expanded-size overflow", "workbook"))?,
     )
     .map_err(|_| unsupported("ZIP expanded-size overflow", "workbook"))?;
-    for (sheet, (data, cells)) in sheets.iter().zip(plans) {
+    for (sheet, (data, scan)) in sheets.iter().zip(plans) {
         let mut patches = Vec::new();
-        for cell in cells {
+        // Evaluated array extent (rows, cols) per anchor index.
+        let mut array_results: BTreeMap<usize, (u32, u32)> = BTreeMap::new();
+        for (index, cell) in scan.cells.iter().enumerate() {
             checkpoint(&options.cancel)?;
             let address = CellAddress::new(&sheet.name, cell.row, cell.col)
                 .map_err(|e| IoError::from_backend("xlsx-coordinate", e))?;
@@ -477,17 +485,28 @@ pub fn recalculate_xlsx_bytes(
                 .map_err(|e| IoError::from_backend("xlsx-inspect", e))?
                 .cell;
             use formualizer_eval::engine::inspect::SpillRole;
-            if snapshot.spill.as_ref().is_some_and(|spill| match spill {
-                SpillRole::Anchor { extent } => {
-                    extent.start_row != extent.end_row || extent.start_col != extent.end_col
-                }
-                SpillRole::Member { .. } => true,
-                _ => true,
-            }) {
+            let spilled = match &snapshot.spill {
+                None => (1, 1),
+                Some(SpillRole::Anchor { extent }) => (
+                    extent.end_row - extent.start_row + 1,
+                    extent.end_col - extent.start_col + 1,
+                ),
+                Some(_) => (u32::MAX, u32::MAX),
+            };
+            // A spilled result must stay inside the array extent recorded
+            // in the file, whose member cells receive the values.
+            let fits = match cell.array_extent {
+                Some((r1, c1, r2, c2)) => spilled.0 <= r2 - r1 + 1 && spilled.1 <= c2 - c1 + 1,
+                None => spilled == (1, 1),
+            };
+            if !fits {
                 return Err(unsupported(
                     "materialized multi-cell dynamic spill",
                     &sheet.name,
                 ));
+            }
+            if cell.array_extent.is_some() {
+                array_results.insert(index, spilled);
             }
             let mut value = snapshot
                 .value
@@ -530,11 +549,13 @@ pub fn recalculate_xlsx_bytes(
                 }
             }
             let cache = Cache::from_value(value, engine.config.date_system)?;
-            if !cache.matches(&cell) {
+            if !cache.matches(cell) {
                 changed += 1;
-                cache_patches(&data, &cell, &cache, &mut patches);
+                cache_patches(&data, cell, &cache, &mut patches);
             }
         }
+        changed +=
+            array_member_patches(&engine, sheet, &data, &scan, &array_results, &mut patches)?;
         if !patches.is_empty() {
             let patched = apply_patches(&data, patches, options.limits.max_worksheet_bytes)?;
             expanded = expanded
@@ -568,6 +589,75 @@ pub fn recalculate_xlsx_bytes(
         cache_cells_changed: changed,
         worksheet_parts_changed: replacements.len(),
     })
+}
+
+/// Write evaluated array results into the member caches of each multi-cell
+/// array formula. A dynamic array's members outside its current spill are
+/// blank. A legacy (CSE) array fills its whole extent: a one-row or
+/// one-column result repeats and positions beyond the result are #N/A.
+fn array_member_patches(
+    engine: &Engine<WBResolver>,
+    sheet: &package::Sheet,
+    data: &[u8],
+    scan: &sheet::Scan,
+    results: &BTreeMap<usize, (u32, u32)>,
+    patches: &mut Vec<Patch>,
+) -> Result<usize, IoError> {
+    let mut changed = 0;
+    let mut seen: HashSet<(u32, u32)> = HashSet::new();
+    let value_at = |index: usize, row: u32, col: u32| -> LiteralValue {
+        let anchor = &scan.cells[index];
+        let (r1, c1, _, _) = anchor.array_extent.expect("array anchor");
+        let (height, width) = results[&index];
+        let (i, j) = (row - r1, col - c1);
+        let (i, j) = if anchor.dynamic_array {
+            (i, j)
+        } else {
+            (
+                if height == 1 { 0 } else { i },
+                if width == 1 { 0 } else { j },
+            )
+        };
+        if i >= height || j >= width {
+            return if anchor.dynamic_array {
+                LiteralValue::Empty
+            } else {
+                LiteralValue::Error(formualizer_common::ExcelError::new(
+                    formualizer_common::ExcelErrorKind::Na,
+                ))
+            };
+        }
+        match engine.get_cell_value(&sheet.name, r1 + i, c1 + j) {
+            Some(LiteralValue::Array(rows)) if rows.len() == 1 && rows[0].len() == 1 => {
+                rows[0][0].clone()
+            }
+            value => value.unwrap_or(LiteralValue::Empty),
+        }
+    };
+    for member in &scan.members {
+        seen.insert((member.cell.row, member.cell.col));
+        let value = value_at(member.anchor, member.cell.row, member.cell.col);
+        let cache = Cache::from_value(value, engine.config.date_system)?;
+        if !cache.matches(&member.cell) {
+            changed += 1;
+            cache_patches(data, &member.cell, &cache, patches);
+        }
+    }
+    // Positions without a cell element cannot receive a value.
+    for &index in results.keys() {
+        let (r1, c1, r2, c2) = scan.cells[index].array_extent.expect("array anchor");
+        for row in r1..=r2 {
+            for col in c1..=c2 {
+                if (row, col) == (r1, c1) || seen.contains(&(row, col)) {
+                    continue;
+                }
+                if !matches!(value_at(index, row, col), LiteralValue::Empty) {
+                    return Err(unsupported("array result cell is absent", &sheet.name));
+                }
+            }
+        }
+    }
+    Ok(changed)
 }
 
 /// Register worksheet tables before formula ingestion so structured
