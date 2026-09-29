@@ -862,3 +862,16 @@ fn linked_workbook_references_read_saved_values() {
         link
     );
 }
+#[test]
+fn excel_width_worksheets_recalculate() {
+    // Excel's grid is 16,384 columns wide (A..XFD).
+    let rows = "<row r=\"1\"><c r=\"A1\"><v>2</v></c><c r=\"XFC1\"><f>A1*3</f><v>0</v></c><c r=\"XFD1\"><f>XFC1+1</f><v>0</v></c></row>";
+    let mut p = parts(rows);
+    let sheet = p.get_mut(SHEET).unwrap();
+    *sheet = sheet.replace("<sheetData>", "<dimension ref=\"A1:XFD1\"/><sheetData>");
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let mut x = Xlsx::new(Cursor::new(&out.bytes)).unwrap();
+    let range = x.worksheet_range("Sheet1").unwrap();
+    assert_eq!(range.get_value((0, 16_382)), Some(&Data::Float(6.0)));
+    assert_eq!(range.get_value((0, 16_383)), Some(&Data::Float(7.0)));
+}

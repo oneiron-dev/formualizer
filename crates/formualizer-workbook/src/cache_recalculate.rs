@@ -43,7 +43,7 @@ impl Default for XlsxRecalculateLimits {
             max_output_bytes: 64 << 20,
             max_xml_depth: 128,
             max_cells: 8_000_000,
-            max_columns: 256,
+            max_columns: 16_384,
         }
     }
 }
