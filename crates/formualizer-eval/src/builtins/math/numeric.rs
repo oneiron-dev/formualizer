@@ -387,14 +387,60 @@ impl Function for RoundFn {
             }
             other => coerce_num(&other)? as i32,
         };
-        let f = 10f64.powi(digits.abs());
-        let out = if digits >= 0 {
-            (n * f).round() / f
-        } else {
-            (n / f).round() * f
-        };
+        let out = round_decimal(n, digits, RoundMode::Nearest);
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(out)))
     }
+}
+
+/// Direction for [`round_decimal`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoundMode {
+    /// Half away from zero (ROUND).
+    Nearest,
+    /// Away from zero (ROUNDUP).
+    Up,
+    /// Toward zero (ROUNDDOWN).
+    Down,
+}
+
+/// Rounds to `digits` decimal places the way Excel does: on the number's
+/// 15-significant-digit decimal form, so 1.005 (stored as 1.00499999...)
+/// rounds to 1.01 and 0.1+0.2 rounds up to 0.3, not 0.4.
+fn round_decimal(n: f64, digits: i32, mode: RoundMode) -> f64 {
+    if n == 0.0 || !n.is_finite() {
+        return n;
+    }
+    let formatted = format!("{:.14e}", n.abs());
+    let (mantissa, exponent) = formatted.split_once('e').unwrap();
+    let exponent: i64 = exponent.parse().unwrap();
+    let decimal: Vec<u8> = mantissa
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .map(|b| b - b'0')
+        .collect();
+    // decimal[i] has place value 10^(exponent - i); keep places >= 10^-digits.
+    let keep = exponent + digits as i64 + 1;
+    if keep >= decimal.len() as i64 {
+        return n;
+    }
+    let (kept, rest): (&[u8], &[u8]) = if keep <= 0 {
+        (&[], if keep == 0 { &decimal[..] } else { &[] })
+    } else {
+        decimal.split_at(keep as usize)
+    };
+    let mut value = kept.iter().fold(0u64, |acc, &d| acc * 10 + d as u64);
+    let bump = match mode {
+        RoundMode::Nearest => rest.first().is_some_and(|&d| d >= 5),
+        RoundMode::Up => keep < 0 || rest.iter().any(|&d| d != 0),
+        RoundMode::Down => false,
+    };
+    if bump {
+        value += 1;
+    }
+    let magnitude: f64 = format!("{value}e{}", -(digits as i64))
+        .parse()
+        .unwrap_or(0.0);
+    if n < 0.0 { -magnitude } else { magnitude }
 }
 
 #[derive(Debug)]
@@ -466,12 +512,7 @@ impl Function for RoundDownFn {
             }
             other => coerce_num(&other)? as i32,
         };
-        let f = 10f64.powi(digits.abs());
-        let out = if digits >= 0 {
-            (n * f).trunc() / f
-        } else {
-            (n / f).trunc() * f
-        };
+        let out = round_decimal(n, digits, RoundMode::Down);
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(out)))
     }
 }
@@ -545,14 +586,7 @@ impl Function for RoundUpFn {
             }
             other => coerce_num(&other)? as i32,
         };
-        let f = 10f64.powi(digits.abs());
-        let mut scaled = if digits >= 0 { n * f } else { n / f };
-        if scaled > 0.0 {
-            scaled = scaled.ceil();
-        } else {
-            scaled = scaled.floor();
-        }
-        let out = if digits >= 0 { scaled / f } else { scaled * f };
+        let out = round_decimal(n, digits, RoundMode::Up);
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(out)))
     }
 }
@@ -3566,6 +3600,38 @@ mod tests_numeric {
     }
 
     // ROUND
+    #[test]
+    fn rounding_works_on_the_fifteen_digit_decimal_value() {
+        let wb = TestWorkbook::new()
+            .with_function(std::sync::Arc::new(RoundFn))
+            .with_function(std::sync::Arc::new(RoundUpFn))
+            .with_function(std::sync::Arc::new(RoundDownFn));
+        let ctx = interp(&wb);
+        let eval = |f: &str| match ctx
+            .evaluate_ast(&formualizer_parse::parser::parse(f).unwrap())
+            .unwrap()
+            .into_literal()
+        {
+            LiteralValue::Number(n) => n,
+            other => panic!("{f}: {other:?}"),
+        };
+        assert_eq!(eval("=ROUND(1.005,2)"), 1.01);
+        assert_eq!(eval("=ROUND(-1.005,2)"), -1.01);
+        assert_eq!(eval("=ROUND(2.675,2)"), 2.68);
+        assert_eq!(eval("=ROUND(1234.5678,-2)"), 1200.0);
+        assert_eq!(eval("=ROUND(49,-2)"), 0.0);
+        assert_eq!(eval("=ROUND(50,-2)"), 100.0);
+        assert_eq!(eval("=ROUND(0.5,0)"), 1.0);
+        assert_eq!(eval("=ROUND(1.23456789012345678,20)"), 1.23456789012345678);
+        assert_eq!(eval("=ROUNDUP(0.1+0.2,1)"), 0.3);
+        assert_eq!(eval("=ROUNDUP(3.2,0)"), 4.0);
+        assert_eq!(eval("=ROUNDUP(-3.2,0)"), -4.0);
+        assert_eq!(eval("=ROUNDUP(0.001,-2)"), 100.0);
+        assert_eq!(eval("=ROUNDDOWN(4.35*100,0)"), 435.0);
+        assert_eq!(eval("=ROUNDDOWN(-987.65,-2)"), -900.0);
+        assert_eq!(eval("=ROUNDDOWN(3.14159,3)"), 3.141);
+    }
+
     #[test]
     fn round_half_away_positive_and_negative() {
         let wb = TestWorkbook::new().with_function(std::sync::Arc::new(RoundFn));
