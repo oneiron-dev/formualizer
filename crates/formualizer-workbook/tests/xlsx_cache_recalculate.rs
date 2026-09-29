@@ -268,13 +268,14 @@ fn limits_and_precancellation() {
 }
 #[test]
 fn unsupported_spill_does_not_return_a_partial_package() {
-    assert!(
-        recalculate_xlsx_bytes(
-            &fixture("SEQUENCE(2)", "99"),
-            XlsxRecalculateOptions::default()
-        )
-        .is_err()
+    // A dynamic array that now spills past the extent recorded in the file.
+    let p = parts(
+        "<row r=\"1\"><c r=\"A1\" cm=\"1\"><f t=\"array\" ref=\"A1\">SEQUENCE(2)</f><v>99</v></c></row>",
     );
+    assert!(recalculate_xlsx_bytes(&pack(&p), XlsxRecalculateOptions::default()).is_err());
+    // Without the array flag the formula is a legacy one: its top-left value.
+    let out = recalculate_xlsx_bytes(&fixture("SEQUENCE(2)", "99"), Default::default()).unwrap();
+    assert_eq!(data(&out.bytes, 0), Data::Float(1.0));
 }
 #[test]
 fn error_locations_are_bounded() {
@@ -300,11 +301,14 @@ fn typed_text_controls_fail_instead_of_silent_corruption() {
 #[test]
 fn modern_scalar_errors_are_cached_and_can_be_recalculated_again() {
     for (formula, token) in [
-        ("SEQUENCE(2)", "#SPILL!"),
-        ("FILTER(A2:A2,FALSE)", "#CALC!"),
+        (
+            " cm=\"1\"><f t=\"array\" ref=\"A1\">SEQUENCE(2)</f>",
+            "#SPILL!",
+        ),
+        ("><f>FILTER(A2:A2,FALSE)</f>", "#CALC!"),
     ] {
         let p = parts(&format!(
-            "<row r=\"1\"><c r=\"A1\"><f>{formula}</f><v>99</v></c></row><row r=\"2\"><c r=\"A2\"><v>7</v></c></row>"
+            "<row r=\"1\"><c r=\"A1\"{formula}<v>99</v></c></row><row r=\"2\"><c r=\"A2\"><v>7</v></c></row>"
         ));
         let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
         assert_eq!(out.summary.errors, 1);
@@ -1015,6 +1019,50 @@ fn range_names_are_references() {
         "INDEX(Years,B2,1)</f><v>2023</v></c><c r=\"C6\"><f>INDEX(Years,B2,1)</f><v>2023</v>",
         "<f>OFFSET(Years,1,0,1,1)</f><v>2023</v>",
         "<f>ROWS(Years)</f><v>3</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected}: {sheet}");
+    }
+}
+#[test]
+fn formulas_without_the_array_flag_take_the_implicit_intersection() {
+    // A formula stored without t="array" is a legacy formula: an array result
+    // shows its top-left value and a range result the cell in the formula's
+    // row or column. A legacy array formula fills exactly its extent.
+    let p = parts(
+        "<row r=\"1\"><c r=\"A1\"><v>10</v></c><c r=\"C1\"><f>{1,2,3}</f><v>0</v></c></row>\
+         <row r=\"2\"><c r=\"A2\"><v>20</v></c><c r=\"B2\"><f>A1:A3</f><v>0</v></c></row>\
+         <row r=\"3\"><c r=\"A3\"><v>30</v></c></row>\
+         <row r=\"5\"><c r=\"B5\"><f t=\"array\" ref=\"B5:C6\">{1,2,3;4,5,6;7,8,9}</f><v>0</v></c><c r=\"C5\"><v>0</v></c><c r=\"E5\"><f t=\"array\" ref=\"E5:E7\">{1;2}</f><v>0</v></c></row>\
+         <row r=\"6\"><c r=\"B6\"><v>0</v></c><c r=\"C6\"><v>0</v></c><c r=\"E6\"><v>0</v></c></row>\
+         <row r=\"7\"><c r=\"E7\"><v>0</v></c></row>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<f>{1,2,3}</f><v>1</v>",
+        "<f>A1:A3</f><v>20</v>",
+        "<f t=\"array\" ref=\"B5:C6\">{1,2,3;4,5,6;7,8,9}</f><v>1</v></c><c r=\"C5\"><v>2</v>",
+        "<c r=\"B6\"><v>4</v></c><c r=\"C6\"><v>5</v>",
+        "<c r=\"E6\"><v>2</v>",
+        "<c r=\"E7\" t=\"e\"><v>#N/A</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected}: {sheet}");
+    }
+}
+#[test]
+fn formulas_reading_array_members_see_the_array_result() {
+    let p = parts(
+        "<row r=\"1\"><c r=\"A1\"><f>C3*10</f><v>0</v></c><c r=\"B1\"><f>D3+1</f><v>0</v></c></row>\
+         <row r=\"3\"><c r=\"B3\"><f t=\"array\" ref=\"B3:D3\">{1,2,3}+A5</f><v>1</v></c><c r=\"C3\"><v>2</v></c><c r=\"D3\"><v>3</v></c></row>\
+         <row r=\"5\"><c r=\"A5\"><v>100</v></c><c r=\"B5\"><f>C7*10</f><v>0</v></c></row>\
+         <row r=\"7\"><c r=\"B7\" cm=\"1\"><f t=\"array\" ref=\"B7:D7\">{1,2,3}+A5</f><v>1</v></c><c r=\"C7\"><v>2</v></c><c r=\"D7\"><v>3</v></c></row>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<f>C3*10</f><v>1020</v>",
+        "<f>D3+1</f><v>104</v>",
+        "<f>C7*10</f><v>1020</v>",
     ] {
         assert!(sheet.contains(expected), "{expected}: {sheet}");
     }

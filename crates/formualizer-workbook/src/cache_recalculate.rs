@@ -451,6 +451,29 @@ pub fn recalculate_xlsx_bytes(
     ingested?;
     drop(adapter);
     checkpoint(&options.cancel)?;
+    // Only array formulas produce arrays; a formula stored without the array
+    // flag takes the implicit intersection of an array or range result.
+    engine.use_legacy_array_semantics();
+    for (sheet, (_, scan)) in sheets.iter().zip(&plans) {
+        for cell in &scan.cells {
+            if cell.formula_kind != "array" {
+                continue;
+            }
+            let (r1, c1, r2, c2) = cell
+                .array_extent
+                .unwrap_or((cell.row, cell.col, cell.row, cell.col));
+            {
+                engine.declare_array_formula(
+                    &sheet.name,
+                    cell.row,
+                    cell.col,
+                    r2 - r1 + 1,
+                    c2 - c1 + 1,
+                    cell.dynamic_array,
+                );
+            }
+        }
+    }
     if let Some(cancel) = options.cancel.clone() {
         engine.evaluate_all_cancellable(cancel)?;
     } else {

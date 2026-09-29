@@ -1034,7 +1034,10 @@ impl<'a> Interpreter<'a> {
         }
     }
 
-    fn eval_implicit_intersection_calc(&self, cv: crate::traits::CalcValue<'a>) -> LiteralValue {
+    pub(crate) fn eval_implicit_intersection_calc(
+        &self,
+        cv: crate::traits::CalcValue<'a>,
+    ) -> LiteralValue {
         let (cur_r0, cur_c0) = match self.current_cell {
             Some(cell) => (cell.coord.row() as usize, cell.coord.col() as usize),
             None => (0usize, 0usize),
