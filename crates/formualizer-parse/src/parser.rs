@@ -2790,6 +2790,23 @@ impl Parser {
         let args_volatile = args.iter().any(|a| a.contains_volatile);
 
         let func_token = self.span_to_token(&func_span);
+        // Files store the implicit-intersection operator `@x` as
+        // `_xlfn.SINGLE(x)`; parse it as that operator.
+        let bare = name
+            .strip_prefix("_xlfn.")
+            .or_else(|| name.strip_prefix("_XLFN."))
+            .unwrap_or(&name);
+        if bare.eq_ignore_ascii_case("SINGLE") && args.len() == 1 {
+            let expr = args.into_iter().next().expect("one argument");
+            return Ok(ASTNode::new_with_volatile(
+                ASTNodeType::UnaryOp {
+                    op: "@".to_string(),
+                    expr: Box::new(expr),
+                },
+                Some(func_token),
+                args_volatile,
+            ));
+        }
         Ok(ASTNode::new_with_volatile(
             ASTNodeType::Function { name, args },
             Some(func_token),

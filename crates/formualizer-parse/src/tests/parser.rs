@@ -1760,6 +1760,21 @@ mod tests {
         }
 
         #[test]
+        fn xlfn_single_is_the_implicit_intersection_operator() {
+            use crate::parser::{ASTNodeType, parse};
+            for formula in ["=_xlfn.SINGLE(A1:A3)*2", "=single(A1:A3)*2"] {
+                let ast = parse(formula).unwrap();
+                let ASTNodeType::BinaryOp { left, .. } = &ast.node_type else {
+                    panic!("{formula}: {ast:?}");
+                };
+                assert!(
+                    matches!(&left.node_type, ASTNodeType::UnaryOp { op, .. } if op == "@"),
+                    "{formula}: {left:?}"
+                );
+            }
+        }
+
+        #[test]
         fn pretty_print_intersection_and_colon() {
             // Intersection space prints with single-space gap; colon prints tight.
             let pretty = pretty_parse_render("=A1:A3 B1:B3").unwrap();

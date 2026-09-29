@@ -1,6 +1,7 @@
 pub mod aggregate;
 pub mod combinatorics;
 pub mod criteria_aggregates;
+pub mod matrix;
 pub mod numeric;
 pub mod reduction;
 pub mod trig;
@@ -36,6 +37,7 @@ pub fn register_builtins() {
     aggregate::register_builtins();
     combinatorics::register_builtins();
     criteria_aggregates::register_builtins();
+    matrix::register_builtins();
     reduction::register_builtins();
     numeric::register_builtins();
     trig::register_builtins();
