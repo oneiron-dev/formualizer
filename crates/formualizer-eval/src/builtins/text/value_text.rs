@@ -586,5 +586,24 @@ mod tests {
             eval(LiteralValue::Text("abc".into()), "\"n\"@"),
             LiteralValue::Text("nabc".into())
         );
+        // Code letters ignore case and accents, `b` is the Buddhist year next
+        // to digits, and `!` shows the next letter as written.
+        for (value, format, text) in [
+            (45356.0, "EEEE", "2024"),
+            (45356.0, "\u{e9}\u{e9}\u{e9}\u{e9}", "2024"),
+            (45356.0, "dd/mm/bbbb", "05/03/2567"),
+            (5.0, "0!n", "5n"),
+        ] {
+            assert_eq!(
+                eval(LiteralValue::Number(value), format),
+                LiteralValue::Text(text.into()),
+                "TEXT({value},{format:?})"
+            );
+        }
+        let out = eval(LiteralValue::Number(5.0), "0.0b");
+        assert!(
+            matches!(&out, LiteralValue::Error(e) if e.kind == ExcelErrorKind::Value),
+            "{out:?}"
+        );
     }
 }

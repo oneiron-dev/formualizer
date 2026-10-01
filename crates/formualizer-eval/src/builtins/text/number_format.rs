@@ -5,12 +5,13 @@
 //! fill (dropped), `[$sym-lcid]` currency, `[color]` (ignored), `General`,
 //! digit placeholders `0 # ?`, grouping and scaling commas, `%`, scientific
 //! `E+`/`E-`, fractions (`# ?/?`, `?/8`), `@`, and the date/time tokens
-//! `y m d h s AM/PM A/P [h] [m] [s]` with fractional seconds. Output is the
-//! Excel for Mac en-US rendering; values keep at most 15 significant digits.
-//! Codes Excel cannot read are `#VALUE!`: a bare `n`, `N`, unsigned `E` or
-//! accented E/N, a trailing `B`, unterminated quotes or brackets, a dangling
-//! `\` `_` `*`, more than four sections, or date codes mixed with digit
-//! placeholders, `%` or `@`.
+//! `y e b m d h s AM/PM A/P [h] [m] [s]` with fractional seconds. Code
+//! letters match without regard to case or accents, and `\` and `!` show the
+//! next character as it is. Output is the Excel for Mac en-US rendering;
+//! values keep at most 15 significant digits. Codes Excel cannot read are
+//! `#VALUE!`: an unquoted `n` (any case or accent), unterminated quotes or
+//! brackets, a dangling `\` `!` `_` `*`, more than four sections, or date
+//! codes mixed with digit placeholders, `%` or `@`.
 
 use crate::engine::DateSystem;
 use formualizer_common::{ExcelError, try_serial_to_display_date_parts_for};
@@ -55,6 +56,8 @@ enum Tok {
     At,
     General,
     Year(usize),
+    /// `b`/`bb` (two digits) or `bbb`+ (four): the Buddhist-era year.
+    BuddhistYear(usize),
     /// Month or minute, resolved from neighbouring hour/second tokens.
     MonthOrMinute(usize),
     Minute(usize),
@@ -86,6 +89,7 @@ fn is_date_tok(t: &Tok) -> bool {
     matches!(
         t,
         Tok::Year(_)
+            | Tok::BuddhistYear(_)
             | Tok::MonthOrMinute(_)
             | Tok::Minute(_)
             | Tok::Day(_)
@@ -115,8 +119,8 @@ fn split_sections(code: &str) -> Vec<&str> {
         }
         match c {
             '"' if !bracket => quoted = !quoted,
-            // `\x`, `_x` and `*x` take the next character literally.
-            '\\' | '_' | '*' if !quoted && !bracket => escaped = true,
+            // `\x`, `!x`, `_x` and `*x` take the next character literally.
+            '\\' | '!' | '_' | '*' if !quoted && !bracket => escaped = true,
             '[' if !quoted => bracket = true,
             ']' if !quoted => bracket = false,
             ';' if !quoted && !bracket => {
@@ -157,14 +161,24 @@ fn push_lit(toks: &mut Vec<Tok>, text: &str) {
     }
 }
 
-/// Letters Excel rejects outside quotes, escapes and brackets: `E` without an
-/// exponent sign, `N`/`n`, and their accented forms.
-fn is_illegal_letter(c: char) -> bool {
-    "ENnÈÉÊËèéêëĒēĔĕĖėĘęĚěȄȅȆȇȨȩÑñŃńŅņŇňǸǹ".contains(c)
+/// The format-code letter `c` stands for. Excel matches code letters without
+/// regard to case or accents (Excel for Mac reads `ÅÅÅÅ` as `aaaa` and `É` as
+/// `e`), so a Latin letter with a diacritic folds to its base letter.
+fn code_letter(c: char) -> char {
+    match c {
+        'À'..='Å' | 'à'..='å' | 'Ā'..='ą' | 'Ǎ' | 'ǎ' | 'Ȁ'..='ȃ' | 'Ȧ' | 'ȧ' => 'a',
+        'È'..='Ë' | 'è'..='ë' | 'Ē'..='ě' | 'Ȅ'..='ȇ' | 'Ȩ' | 'ȩ' => 'e',
+        'Ñ' | 'ñ' | 'Ń'..='ň' | 'Ǹ' | 'ǹ' => 'n',
+        'Ý' | 'ý' | 'ÿ' | 'Ŷ'..='Ÿ' | 'Ȳ' | 'ȳ' => 'y',
+        'Ď' | 'ď' => 'd',
+        'Ĥ' | 'ĥ' | 'Ȟ' | 'ȟ' => 'h',
+        'Ś'..='š' | 'Ș' | 'ș' => 's',
+        _ => c.to_ascii_lowercase(),
+    }
 }
 
-/// Parse one section; `last` marks the end of the whole code.
-fn parse_section(text: &str, last: bool) -> Result<Section, ExcelError> {
+/// Parse one section, rejecting codes Excel cannot read.
+fn parse_section(text: &str) -> Result<Section, ExcelError> {
     let chars: Vec<char> = text.chars().collect();
     let mut section = Section::default();
     let toks = &mut section.toks;
@@ -172,7 +186,7 @@ fn parse_section(text: &str, last: bool) -> Result<Section, ExcelError> {
     let run = |i: usize, lower: char| {
         chars[i..]
             .iter()
-            .take_while(|c| c.to_ascii_lowercase() == lower)
+            .take_while(|&&c| code_letter(c) == lower)
             .count()
     };
     let closing = |i: usize, close: char| {
@@ -184,7 +198,7 @@ fn parse_section(text: &str, last: bool) -> Result<Section, ExcelError> {
     };
     while i < chars.len() {
         let c = chars[i];
-        let lower = c.to_ascii_lowercase();
+        let lower = code_letter(c);
         match c {
             '"' => {
                 let end = closing(i, '"')?;
@@ -192,9 +206,12 @@ fn parse_section(text: &str, last: bool) -> Result<Section, ExcelError> {
                 i = end + 1;
                 continue;
             }
-            // `\`, `_` and `*` need a character to act on.
-            '\\' | '_' | '*' if i + 1 == chars.len() => return Err(ExcelError::new_value()),
-            '\\' => {
+            // `\`, `!`, `_` and `*` need a character to act on.
+            '\\' | '!' | '_' | '*' if i + 1 == chars.len() => {
+                return Err(ExcelError::new_value());
+            }
+            // `!` shows the next character as it is, like `\`.
+            '\\' | '!' => {
                 push_lit(toks, &chars[i + 1].to_string());
                 i += 2;
                 continue;
@@ -237,10 +254,10 @@ fn parse_section(text: &str, last: bool) -> Result<Section, ExcelError> {
             '%' => toks.push(Tok::Percent),
             '/' => toks.push(Tok::Slash),
             '@' => toks.push(Tok::At),
-            'E' | 'e' if matches!(chars.get(i + 1), Some('+' | '-')) => {
+            _ if lower == 'e' && matches!(chars.get(i + 1), Some('+' | '-')) => {
                 toks.push(Tok::Exp {
                     plus: chars[i + 1] == '+',
-                    upper: c == 'E',
+                    upper: c.is_uppercase(),
                 });
                 i += 2;
                 continue;
@@ -275,8 +292,15 @@ fn parse_section(text: &str, last: bool) -> Result<Section, ExcelError> {
                 i += 3;
                 continue;
             }
-            _ if is_illegal_letter(c) || (c == 'B' && last && i + 1 == chars.len()) => {
-                return Err(ExcelError::new_value());
+            // `n` is no code letter, and Excel will not show it unquoted.
+            _ if lower == 'n' => return Err(ExcelError::new_value()),
+            // `b` is the Buddhist-era year; `B1`/`B2` (calendar prefixes) stay
+            // as written.
+            _ if lower == 'b' && !matches!(chars.get(i + 1), Some('1' | '2')) => {
+                let n = run(i, 'b');
+                toks.push(Tok::BuddhistYear(n));
+                i += n;
+                continue;
             }
             _ if matches!(lower, 'y' | 'e') => {
                 let n = run(i, lower);
@@ -335,12 +359,7 @@ fn parse_sections(code: &str) -> Result<Vec<Section>, ExcelError> {
     if parts.len() > 4 {
         return Err(ExcelError::new_value());
     }
-    let last = parts.len() - 1;
-    parts
-        .into_iter()
-        .enumerate()
-        .map(|(k, text)| parse_section(text, k == last))
-        .collect()
+    parts.into_iter().map(parse_section).collect()
 }
 
 /// `m`/`mm` directly after an hour or before a second is a minute.
@@ -970,9 +989,12 @@ fn format_date(section: &Section, value: f64, system: DateSystem) -> Result<Stri
     let whole_secs = secs.floor() as i64;
     let fraction = secs - whole_secs as f64;
     let (hour, minute, second) = (whole_secs / 3600, (whole_secs / 60) % 60, whole_secs % 60);
-    let needs_date = toks
-        .iter()
-        .any(|t| matches!(t, Tok::Year(_) | Tok::MonthOrMinute(_) | Tok::Day(_)));
+    let needs_date = toks.iter().any(|t| {
+        matches!(
+            t,
+            Tok::Year(_) | Tok::BuddhistYear(_) | Tok::MonthOrMinute(_) | Tok::Day(_)
+        )
+    });
     let parts = if needs_date {
         // Serials outside Excel's calendar cannot be shown as dates.
         Some(
@@ -991,8 +1013,14 @@ fn format_date(section: &Section, value: f64, system: DateSystem) -> Result<Stri
     while i < toks.len() {
         match &toks[i] {
             Tok::Lit(s) => out.push_str(s),
-            Tok::Year(n) => {
+            Tok::Year(n) | Tok::BuddhistYear(n) => {
                 let year = parts.as_ref().map_or(1900, |p| p.year);
+                // The Buddhist era starts 543 years before the common era.
+                let year = if matches!(toks[i], Tok::BuddhistYear(_)) {
+                    year + 543
+                } else {
+                    year
+                };
                 if *n <= 2 {
                     out.push_str(&format!("{:02}", year.rem_euclid(100)));
                 } else {
@@ -1181,21 +1209,18 @@ mod tests {
     #[test]
     fn codes_excel_cannot_read_are_rejected() {
         for code in [
-            // `n`/`N`, unsigned `E` and accented E/N are not format codes.
+            // `n` is not a format code, in any case or with any accent.
             "eeee.hh.nn ",
             "nn",
             "0 N",
-            "E",
-            "0E0",
-            "EEEE",
-            "\u{e9}",
+            "\u{f1}",
             "0 \u{d1}",
-            // A code may not end in `B`.
-            "0.0B",
-            // Unterminated quotes and brackets, dangling `\` `_` `*`.
+            "\u{144}\u{148}",
+            // Unterminated quotes and brackets, dangling `\` `!` `_` `*`.
             "\"abc",
             "[Red",
             "0\\",
+            "0!",
             "0_",
             "0*",
             // At most four sections.
@@ -1211,6 +1236,15 @@ mod tests {
             "AM/PM ?",
             "ss.0000",
             "General 0",
+            // `e`/`E` without a sign and `b`/`B` are year codes, so they cannot
+            // stand beside digit placeholders either, in any section.
+            "0E0",
+            "0.0\u{c9}",
+            "0.0B",
+            "0.0b",
+            "0.0B ",
+            "0.0B;0",
+            "0;0.0B",
         ] {
             assert!(
                 format_number(1.0, code, DateSystem::Excel1900).is_err(),
@@ -1236,12 +1270,60 @@ mod tests {
         );
         assert_eq!(fmt(5.0, "[Green]0;[Red]-0"), "5");
         assert_eq!(fmt(5.0, "[$-409]0"), "5");
-        assert_eq!(fmt(5.0, "B;0"), "B");
         assert_eq!(fmt(5.0, "0;0;0;@"), "5");
         assert_eq!(fmt(1234.5, "GENERAL"), "1234.5");
         assert_eq!(fmt(45356.0, "mmmm d, yyyy"), "March 5, 2024");
         assert_eq!(fmt(45356.5, "hh:mm:ss.000"), "12:00:00.000");
         assert_eq!(fmt(45356.0, "eeee"), "2024");
         assert_eq!(format_text("abc", "\"n\"@").unwrap(), "nabc");
+    }
+
+    #[test]
+    fn code_letters_match_without_case_or_accents() {
+        // 2024-03-05. `E`/`e` without a sign is the year, whatever its case.
+        assert_eq!(fmt(45356.0, "EEEE"), "2024");
+        assert_eq!(fmt(45356.0, "E"), "2024");
+        assert_eq!(fmt(45356.0, "dd/mm/EE"), "05/03/2024");
+        assert_eq!(fmt(45356.0, "eeee"), "2024");
+        // Accented letters fold to their base letter: E-like ones are the
+        // year, and so on for the other date letters.
+        assert_eq!(fmt(45356.0, "\u{e9}\u{e9}\u{e9}\u{e9}"), "2024");
+        assert_eq!(fmt(45356.0, "\u{c9}"), "2024");
+        assert_eq!(fmt(45356.0, "\u{e8}\u{ea}\u{cb}\u{113}"), "2024");
+        assert_eq!(fmt(45356.0, "\u{ff}\u{ff}/mm/dd"), "24/03/05");
+        assert_eq!(fmt(45356.0, "D\u{10e}.\u{160}S"), "05.00");
+        assert_eq!(fmt(12200000.0, "0.00\u{c9}+00"), "1.22E+07");
+        // Letters that are not codes stay as written.
+        assert_eq!(fmt(0.400544, "\u{f3}\u{f3}:pp:mm"), "\u{f3}\u{f3}:pp:01");
+        assert_eq!(fmt(45356.0, "d \"\u{e9}\u{f1}\""), "5 \u{e9}\u{f1}");
+    }
+
+    #[test]
+    fn b_is_the_buddhist_year_code() {
+        // 2024 is 2567 in the Buddhist era; serial 5 is in 1900 (2443).
+        assert_eq!(fmt(45356.0, "bbbb"), "2567");
+        assert_eq!(fmt(45356.0, "BBBB"), "2567");
+        assert_eq!(fmt(45356.0, "bb"), "67");
+        assert_eq!(fmt(45356.0, "B"), "67");
+        assert_eq!(fmt(45356.0, "dd/mm/bbbb"), "05/03/2567");
+        assert_eq!(fmt(5.0, "B;0"), "43");
+        // Escaped or quoted, `b` is text.
+        assert_eq!(fmt(5.0, "0\\B"), "5B");
+        assert_eq!(fmt(5.0, "0.0\"b\""), "5.0b");
+    }
+
+    #[test]
+    fn bang_shows_the_next_character_as_written() {
+        assert_eq!(fmt(5.0, "0!n"), "5n");
+        assert_eq!(fmt(5.0, "0!E"), "5E");
+        assert_eq!(fmt(5.0, "0!B"), "5B");
+        assert_eq!(fmt(5.0, "0!b"), "5b");
+        assert_eq!(fmt(5.0, "0\\n"), "5n");
+        assert_eq!(fmt(203.0, "!r0c00"), "r2c03");
+        assert_eq!(fmt(123456.0, "0!.0,"), "12.3");
+        assert_eq!(fmt(3.0, "0!!"), "3!");
+        // An escaped `;` does not start a section.
+        assert_eq!(fmt(-5.0, "0;0!;"), "5;");
+        assert_eq!(format_text("abc", "!n@").unwrap(), "nabc");
     }
 }
