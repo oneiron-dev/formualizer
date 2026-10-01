@@ -1428,10 +1428,25 @@ enum VisibilityPolicy {
     ExcludeManualOrFilterHidden,
 }
 
+/// Whether error values in the data are skipped. This applies to the cells
+/// of a referenced range and the items of an array, not to an argument that
+/// is itself an error (see [`ArgumentForm`]).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum ErrorPolicy {
     Propagate,
     Ignore,
+}
+
+/// How SUBTOTAL/AGGREGATE read their data arguments.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ArgumentForm {
+    /// SUBTOTAL and AGGREGATE 1-13 take references. An argument that is an
+    /// error value or a failed reference is not a range whose error cells
+    /// an option can skip, so that error is the result under every option.
+    Reference,
+    /// AGGREGATE 14-19 take an array; an error argument is one more data
+    /// value, which the options ignore or propagate like any other.
+    Array,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1520,11 +1535,13 @@ struct AggregateCollector {
 }
 
 impl AggregateCollector {
+    #[allow(clippy::too_many_arguments)]
     fn collect_args<'a, 'b>(
         args: &[ArgumentHandle<'a, 'b>],
         start_idx: usize,
         ctx: &dyn FunctionContext<'b>,
         op: AggregateOp,
+        form: ArgumentForm,
         visibility_policy: VisibilityPolicy,
         error_policy: ErrorPolicy,
         skip_nested: bool,
@@ -1544,7 +1561,15 @@ impl AggregateCollector {
                     )?;
                 }
                 AggregateArgument::ReferenceError(error) => {
+                    if form == ArgumentForm::Reference {
+                        return Err(error);
+                    }
                     out.consume_scalar_value(LiteralValue::Error(error), op, error_policy)?;
+                }
+                AggregateArgument::Scalar(LiteralValue::Error(error))
+                    if form == ArgumentForm::Reference =>
+                {
+                    return Err(error);
                 }
                 AggregateArgument::Scalar(value) => {
                     out.consume_scalar_value(value, op, error_policy)?;
@@ -1846,6 +1871,7 @@ impl Function for SubtotalFn {
             1,
             ctx,
             op,
+            ArgumentForm::Reference,
             visibility,
             ErrorPolicy::Propagate,
             true,
@@ -1944,6 +1970,7 @@ impl Function for AggregateFn {
                 2,
                 ctx,
                 op,
+                ArgumentForm::Reference,
                 visibility,
                 error_policy,
                 skip_nested,
@@ -1958,8 +1985,8 @@ impl Function for AggregateFn {
 
         // 12 MEDIAN and 13 MODE.SNGL take references; 14-19 are the array
         // form AGGREGATE(function_num, options, array, k).
-        let (data_args, k) = if function_num <= 13 {
-            (args, None)
+        let (data_args, form, k) = if function_num <= 13 {
+            (args, ArgumentForm::Reference, None)
         } else {
             if args.len() != 4 {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -1975,13 +2002,14 @@ impl Function for AggregateFn {
                     Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
                 },
             };
-            (&args[..3], Some(k))
+            (&args[..3], ArgumentForm::Array, Some(k))
         };
         let collected = match AggregateCollector::collect_args(
             data_args,
             2,
             ctx,
             AggregateOp::Sum,
+            form,
             visibility,
             error_policy,
             skip_nested,

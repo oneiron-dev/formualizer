@@ -13,6 +13,7 @@ description: "FORECAST.LINEAR: Returns a predicted y-value at `x` from simple li
  - Requires `known_y` and `known_x` arrays with the same numeric length.
  - Returns `#N/A` when arrays are empty or lengths do not match.
  - Returns `#DIV/0!` when `known_x` has zero variance.
+ - An error passed as `x` is the result; a non-numeric `x` returns `#VALUE!`.
  - Alias `FORECAST` is supported.
 
 ## Examples

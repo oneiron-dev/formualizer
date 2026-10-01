@@ -6066,6 +6066,7 @@ impl Function for FisherInvFn {
 /// - Requires `known_y` and `known_x` arrays with the same numeric length.
 /// - Returns `#N/A` when arrays are empty or lengths do not match.
 /// - Returns `#DIV/0!` when `known_x` has zero variance.
+/// - An error passed as `x` is the result; a non-numeric `x` returns `#VALUE!`.
 /// - Alias `FORECAST` is supported.
 ///
 /// # Examples
@@ -6115,13 +6116,11 @@ impl Function for ForecastLinearFn {
         // args[0] = x value to forecast
         // args[1] = known_y's
         // args[2] = known_x's
+        // An error in `x` is the result, as in Excel; a non-numeric `x` is #VALUE!
+        // (coerce_num keeps an error's kind and gives #VALUE! for text).
         let x = match coerce_num(&scalar_like_value(&args[0])?) {
             Ok(n) => n,
-            Err(_) => {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                    ExcelError::new_value(),
-                )));
-            }
+            Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
 
         let y_vals = collect_numeric_stats(&args[1..2])?;

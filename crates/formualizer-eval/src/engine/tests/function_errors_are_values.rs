@@ -267,6 +267,16 @@ fn error_in_scalar_argument_keeps_its_kind() {
         ("=INDIRECT(NA())", ExcelErrorKind::Na),
         ("=INDIRECT(\"B2\",NA())", ExcelErrorKind::Na),
         ("=SUM(INDIRECT(FOOBARFN()))", ExcelErrorKind::Name),
+        ("=FORECAST(FOOBARFN(),B1:B3,B1:B3)", ExcelErrorKind::Name),
+        (
+            "=FORECAST.LINEAR(FOOBARFN(),B1:B3,B1:B3)",
+            ExcelErrorKind::Name,
+        ),
+        ("=FORECAST(NA(),B1:B3,B1:B3)", ExcelErrorKind::Na),
+        ("=FORECAST.LINEAR(1/0,B1:B3,B1:B3)", ExcelErrorKind::Div),
+        ("=FORECAST(A3,B1:B3,B1:B3)", ExcelErrorKind::Name),
+        // A non-numeric `x` is #VALUE!, as documented.
+        ("=FORECAST(\"x\",B1:B3,B1:B3)", ExcelErrorKind::Value),
         // A numeric argument out of range keeps the function's own code.
         ("=LARGE(B1:B3,4)", ExcelErrorKind::Num),
         ("=SMALL(B1:B3,0)", ExcelErrorKind::Num),
@@ -291,7 +301,60 @@ fn error_in_scalar_argument_keeps_its_kind() {
         ),
         ("=LARGE(B1:B3,2)", LiteralValue::Number(2.0)),
         ("=RANK.EQ(4,B1:B3)", LiteralValue::Number(1.0)),
+        ("=FORECAST(3,B1:B3,B1:B3)", LiteralValue::Number(3.0)),
+        (
+            "=IFNA(FORECAST(NA(),B1:B3,B1:B3),\"x\")",
+            LiteralValue::Text("x".into()),
+        ),
         ("=INDIRECT(\"B2\")", LiteralValue::Number(2.0)),
+    ] {
+        assert_eq!(eval_with_unknown_fn_data(formula), expected, "{formula}");
+    }
+}
+
+/// SUBTOTAL and AGGREGATE 1-13 take references. The "ignore error values"
+/// options skip error cells inside the referenced ranges; an argument that is
+/// itself an error (a value or a failed reference) is the result under every
+/// option, and COUNTA does not count it.
+#[test]
+fn error_argument_to_subtotal_or_aggregate_reference_form_is_the_result() {
+    for (formula, kind) in [
+        ("=AGGREGATE(9,6,FOOBARFN())", ExcelErrorKind::Name),
+        ("=AGGREGATE(4,6,FOOBARFN())", ExcelErrorKind::Name),
+        ("=AGGREGATE(1,6,FOOBARFN())", ExcelErrorKind::Name),
+        ("=AGGREGATE(9,6,NA())", ExcelErrorKind::Na),
+        ("=AGGREGATE(9,2,1/0)", ExcelErrorKind::Div),
+        ("=AGGREGATE(5,3,NA())", ExcelErrorKind::Na),
+        ("=AGGREGATE(2,7,FOOBARFN())", ExcelErrorKind::Name),
+        ("=AGGREGATE(3,6,NA())", ExcelErrorKind::Na),
+        ("=AGGREGATE(3,0,NA())", ExcelErrorKind::Na),
+        ("=AGGREGATE(12,6,FOOBARFN())", ExcelErrorKind::Name),
+        ("=AGGREGATE(13,7,1/0)", ExcelErrorKind::Div),
+        ("=AGGREGATE(9,6,B1:B3,FOOBARFN())", ExcelErrorKind::Name),
+        ("=AGGREGATE(9,6,INDIRECT(\"zz\"))", ExcelErrorKind::Ref),
+        ("=AGGREGATE(9,0,A1:A3)", ExcelErrorKind::Name),
+        ("=SUBTOTAL(9,FOOBARFN())", ExcelErrorKind::Name),
+        ("=SUBTOTAL(3,FOOBARFN())", ExcelErrorKind::Name),
+        ("=SUBTOTAL(103,NA())", ExcelErrorKind::Na),
+        ("=SUBTOTAL(3,INDIRECT(\"zz\"))", ExcelErrorKind::Ref),
+    ] {
+        assert_error_kind(formula, kind);
+    }
+    for (formula, expected) in [
+        (
+            "=IFNA(AGGREGATE(9,6,NA()),\"x\")",
+            LiteralValue::Text("x".into()),
+        ),
+        // Error cells inside a referenced range are still skipped.
+        ("=AGGREGATE(9,6,A1:A3)", LiteralValue::Number(200.0)),
+        ("=AGGREGATE(9,6,A3)", LiteralValue::Number(0.0)),
+        ("=AGGREGATE(3,6,A1:A3)", LiteralValue::Number(2.0)),
+        ("=AGGREGATE(4,6,A1:A3,B1:B3)", LiteralValue::Number(100.0)),
+        ("=AGGREGATE(9,6,B1:B3)", LiteralValue::Number(7.0)),
+        ("=SUBTOTAL(3,A1:A3)", LiteralValue::Number(3.0)),
+        // The array form (14-19) reads its argument as data, so an error
+        // there is an item the option skips.
+        ("=AGGREGATE(14,6,A1:A3,1)", LiteralValue::Number(100.0)),
     ] {
         assert_eq!(eval_with_unknown_fn_data(formula), expected, "{formula}");
     }
