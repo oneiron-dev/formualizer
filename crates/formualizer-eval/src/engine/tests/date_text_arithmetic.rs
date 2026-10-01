@@ -333,3 +333,29 @@ fn date_functions_and_value_read_date_text() {
         Expected::Error(ExcelErrorKind::Value),
     );
 }
+
+#[test]
+fn month_name_with_a_number_that_is_no_day_reads_as_a_year() {
+    // Excel reads `Mon n` as month/year on the 1st when n is no day of the
+    // month, so MONTH(name&0) is the month number.
+    for (formula, expected) in [
+        ("=MONTH(\"March\"&0)", 3.0),
+        ("=YEAR(\"January0\")", 2000.0),
+        ("=DATEVALUE(\"Jan 0\")", 36526.0),
+        ("=DATEVALUE(\"Apr 31\")", 11414.0),
+        ("=YEAR(\"Feb 30\")", 1930.0),
+        ("=\"Jan 45\"+0", 16438.0),
+        ("=VALUE(\"Mar-00\")", 36586.0),
+        ("=DAY(\"Jan 31\")", 31.0),
+    ] {
+        match eval_formula(DateSystem::Excel1900, formula) {
+            LiteralValue::Number(n) => assert_eq!(n, expected, "{formula}"),
+            LiteralValue::Int(n) => assert_eq!(n as f64, expected, "{formula}"),
+            other => assert_eq!(
+                other.as_serial_number_for(DateSystem::Excel1900),
+                Some(expected),
+                "{formula}"
+            ),
+        }
+    }
+}

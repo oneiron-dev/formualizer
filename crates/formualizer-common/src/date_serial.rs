@@ -98,9 +98,11 @@ enum DateToken {
 
 /// Excel's en-US date shapes over numbers and English month names separated
 /// by spaces, `-`, `/` or `,` (a month name may touch its number: `July1`,
-/// `1June2021`): `d Mon y`, `Mon d y`, `Mon y` (4-digit or > 31: first of the
-/// month), `m-d-y` / `y-m-d`, `m/y` with a 4-digit year, and year-less
-/// `Mon d`, `d Mon`, `m/d` in `current_year`.
+/// `1June2021`): `d Mon y`, `Mon d y`, `m-d-y` / `y-m-d`, `m/y` with a 4-digit
+/// year, year-less `d Mon`, `m/d` in `current_year`, and `Mon n`, which Excel
+/// reads as month/day in `current_year` and, when `n` is no day of that month
+/// in that year (`Jan 0`, `Apr 31`, `Jan 45`) or has 4 digits, as month/year on
+/// the 1st.
 fn parse_general_date(text: &str, current_year: Option<i32>) -> Option<NaiveDate> {
     let mut tokens = Vec::new();
     let mut separators = String::new();
@@ -171,8 +173,11 @@ fn parse_general_date(text: &str, current_year: Option<i32>) -> Option<NaiveDate
         [Month(m), Number { value, digits }] => {
             if *digits == 4 {
                 day_in(*value as i32, *m, 1)
-            } else if *value <= 31 {
-                day_in(current_year?, *m, *value)
+            } else if let Some(date) = current_year.and_then(|year| day_in(year, *m, *value)) {
+                Some(date)
+            } else if current_year.is_none() && day_in(2000, *m, *value).is_some() {
+                // A possible day of the month needs the current year to resolve.
+                None
             } else {
                 day_in(year_of(*value, *digits)?, *m, 1)
             }
@@ -923,6 +928,61 @@ mod tests {
         }
         for text in ["2023", "Foo 3 2023", "13/45/2020", "1 2 3", "Jan Feb 2020"] {
             assert_eq!(parse_excel_date_text(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn month_led_number_that_is_no_day_of_the_month_is_a_year() {
+        // Excel resolves `Mon n` as month/day in the current year, else as
+        // month/year on the 1st with the 2029 window.
+        for (text, expected) in [
+            ("January0", date(2000, 1, 1)),
+            ("March0", date(2000, 3, 1)),
+            ("Jan 0", date(2000, 1, 1)),
+            ("Jan-00", date(2000, 1, 1)),
+            ("Feb 30", date(1930, 2, 1)),
+            ("Apr 31", date(1931, 4, 1)),
+            ("Jan 32", date(1932, 1, 1)),
+            ("Jan/45", date(1945, 1, 1)),
+            ("Dec 99", date(1999, 12, 1)),
+        ] {
+            assert_eq!(parse_excel_date_text(text), Some(expected), "{text}");
+            assert_eq!(
+                parse_excel_date_text_in_year(text, Some(2026)),
+                Some(expected),
+                "{text}"
+            );
+        }
+        // Feb 29 is a day only when the current year is a leap year.
+        assert_eq!(
+            parse_excel_date_text_in_year("Feb 29", Some(2024)),
+            Some(date(2024, 2, 29))
+        );
+        assert_eq!(
+            parse_excel_date_text_in_year("Feb 29", Some(2026)),
+            Some(date(2029, 2, 1))
+        );
+        assert_eq!(parse_excel_date_text("Feb 29"), None);
+        // A day of the month stays a day; a three-digit number and a
+        // number-led month are unchanged.
+        for (text, expected) in [
+            ("Jan 31", date(2026, 1, 31)),
+            ("Apr 30", date(2026, 4, 30)),
+            ("March1", date(2026, 3, 1)),
+        ] {
+            assert_eq!(parse_excel_date_text(text), None, "{text} without a year");
+            assert_eq!(
+                parse_excel_date_text_in_year(text, Some(2026)),
+                Some(expected),
+                "{text}"
+            );
+        }
+        for text in ["Jan 100", "Jan 999", "0 Jan", "45-Jan"] {
+            assert_eq!(
+                parse_excel_date_text_in_year(text, Some(2026)),
+                None,
+                "{text}"
+            );
         }
     }
 
