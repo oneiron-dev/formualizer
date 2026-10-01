@@ -56,7 +56,7 @@ fn workbook_computed_array_aggregates_preserve_reference_errors_and_mode_parity(
         off.get_value("S", 8, 2),
         Some(LiteralValue::Error(error)) if error.kind == ExcelErrorKind::Value
     ));
-    for (row, kind) in [(9, ExcelErrorKind::Ref), (10, ExcelErrorKind::Name)] {
+    for (row, kind) in [(9, ExcelErrorKind::Ref), (10, ExcelErrorKind::Ref)] {
         let Some(LiteralValue::Error(error)) = off.get_value("S", row, 2) else {
             panic!("expected an error value at B{row}");
         };
