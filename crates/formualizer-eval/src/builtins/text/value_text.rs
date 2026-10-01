@@ -529,6 +529,10 @@ mod tests {
         for (input, format, expected) in [
             ("12.5", "0.00", "12.50"),
             ("2024-03-05", "dddd", "Tuesday"),
+            // `aaa`/`aaaa` are weekday codes, matched without case or accents.
+            ("2024-03-05", "aaaa", "Tuesday"),
+            ("45356", "\u{c5}\u{c5}\u{c5} d", "Tue 5"),
+            ("abc", "aaaa", "abc"),
             ("abc", "00", "abc"),
             ("1.234,56", "00", "1.234,56"),
             ("abc", "\"<\"@\">\"", "<abc>"),

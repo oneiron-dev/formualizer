@@ -5,7 +5,7 @@
 //! fill (dropped), `[$sym-lcid]` currency, `[color]` (ignored), `General`,
 //! digit placeholders `0 # ?`, grouping and scaling commas, `%`, scientific
 //! `E+`/`E-`, fractions (`# ?/?`, `?/8`), `@`, and the date/time tokens
-//! `y e b m d h s AM/PM A/P [h] [m] [s]` with fractional seconds. Code
+//! `y e b m d aaa h s AM/PM A/P [h] [m] [s]` with fractional seconds. Code
 //! letters match without regard to case or accents, and `\` and `!` show the
 //! next character as it is. Output is the Excel for Mac en-US rendering;
 //! values keep at most 15 significant digits. Codes Excel cannot read are
@@ -162,8 +162,9 @@ fn push_lit(toks: &mut Vec<Tok>, text: &str) {
 }
 
 /// The format-code letter `c` stands for. Excel matches code letters without
-/// regard to case or accents (Excel for Mac reads `ÅÅÅÅ` as `aaaa` and `É` as
-/// `e`), so a Latin letter with a diacritic folds to its base letter.
+/// regard to case or accents (en-US Excel for Windows and Mac read `ÅÅÅÅ` as
+/// `aaaa` and `É` as `e`), so a Latin letter with a diacritic folds to its base
+/// letter.
 fn code_letter(c: char) -> char {
     match c {
         'À'..='Å' | 'à'..='å' | 'Ā'..='ą' | 'Ǎ' | 'ǎ' | 'Ȁ'..='ȃ' | 'Ȧ' | 'ȧ' => 'a',
@@ -290,6 +291,14 @@ fn parse_section(text: &str) -> Result<Section, ExcelError> {
             {
                 toks.push(Tok::AmPm(false, c.is_ascii_lowercase()));
                 i += 3;
+                continue;
+            }
+            // `aaa` names the weekday short and `aaaa` (or longer) in full, like
+            // `ddd`/`dddd`; `a` and `aa` stay as written.
+            _ if lower == 'a' && run(i, 'a') >= 3 => {
+                let n = run(i, 'a');
+                toks.push(Tok::Day(n));
+                i += n;
                 continue;
             }
             // `n` is no code letter, and Excel will not show it unquoted.
@@ -1325,5 +1334,22 @@ mod tests {
         // An escaped `;` does not start a section.
         assert_eq!(fmt(-5.0, "0;0!;"), "5;");
         assert_eq!(format_text("abc", "!n@").unwrap(), "nabc");
+    }
+
+    #[test]
+    fn aaa_weekday_codes_and_accented_code_letters() {
+        assert_eq!(fmt(45356.0, "aaaa"), "Tuesday");
+        assert_eq!(fmt(45356.0, "AAA d"), "Tue 5");
+        // 44926 is Saturday 2022-12-31.
+        assert_eq!(fmt(44926.0, "ÅÅÅÅ-MM-DD"), "Saturday-12-31");
+        assert_eq!(fmt(44926.0, "àaa"), "Sat");
+        assert_eq!(fmt(45356.0, "ÿÿ/mm/dd"), "24/03/05");
+        assert_eq!(fmt(45356.0, "É"), "2024");
+        assert_eq!(fmt(45356.0, "DĎ.ŠS"), "05.00");
+        // Unchanged: shorter runs, other letters and quoted text are literal.
+        assert_eq!(fmt(45356.0, "d a aa"), "5 a aa");
+        assert_eq!(fmt(45356.0, "d ö"), "5 ö");
+        assert_eq!(fmt(45356.0, "d \"Åå\""), "5 Åå");
+        assert_eq!(fmt(45356.5, "h AM/PM"), "12 PM");
     }
 }
