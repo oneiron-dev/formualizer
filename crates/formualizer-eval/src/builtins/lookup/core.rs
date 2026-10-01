@@ -11,10 +11,10 @@
 //! - Binary search used for approximate modes for efficiency; linear scan for exact or when data has fewer than 8 searchable elements to avoid overhead.
 //! - VLOOKUP/HLOOKUP wrap MATCH logic; VLOOKUP: vertical first column; HLOOKUP: horizontal first row.
 //! - Error handling: lookup-value errors propagate; error cells in approximate lookup vectors are skipped.
-//! - Type coercion: current simple: numbers vs numeric text coerced; text comparison case-insensitive? Excel is case-insensitive for MATCH (without wildcards). We implement case-insensitive for now.
-//!   TODO(excel-nuance): refine boolean/text/number coercion differences.
+//! - Type coercion: text comparison is case-insensitive. Approximate modes compare the lookup
+//!   value only with entries of its own type (number, text or logical); the others are skipped.
 
-use super::lookup_utils::{SearchedVector, cmp_for_lookup, find_exact_index};
+use super::lookup_utils::{SearchedVector, cmp_for_approximate, find_exact_index};
 use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
 use crate::engine::{DateSystem, lookup_index_cache::LookupAxis};
 use crate::function::Function;
@@ -79,7 +79,7 @@ fn binary_search_searched(
         let mut hi = searched.len();
         while lo < hi {
             let mid = (lo + hi) / 2;
-            match cmp_for_lookup(searched.get(mid), needle, date_system) {
+            match cmp_for_approximate(searched.get(mid), needle, date_system) {
                 Some(c) => {
                     if c > 0 {
                         hi = mid;
@@ -97,7 +97,7 @@ fn binary_search_searched(
         // -1 mode handled via linear fallback since semantics differ (smallest >=)
         let mut best: Option<usize> = None;
         for i in 0..searched.len() {
-            if let Some(c) = cmp_for_lookup(searched.get(i), needle, date_system) {
+            if let Some(c) = cmp_for_approximate(searched.get(i), needle, date_system) {
                 if c == 0 {
                     return Some(i);
                 }
@@ -343,9 +343,11 @@ impl Function for MatchFn {
                         // linear small
                         let mut best: Option<usize> = None;
                         for i in 0..searched.len() {
-                            if let Some(c) =
-                                cmp_for_lookup(searched.get(i), &lookup_value, ctx.date_system())
-                            {
+                            if let Some(c) = cmp_for_approximate(
+                                searched.get(i),
+                                &lookup_value,
+                                ctx.date_system(),
+                            ) {
                                 // compare candidate to needle
                                 if mt == 1 {
                                     // v <= needle

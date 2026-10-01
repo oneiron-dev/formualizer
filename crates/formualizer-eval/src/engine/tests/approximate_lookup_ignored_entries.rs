@@ -563,3 +563,68 @@ fn searchable_count_not_range_extent_controls_descending_tie_break() {
         "MATCH threshold uses projected length, not range extent",
     );
 }
+
+/// An omitted IF false branch leaves FALSE in a numeric lookup vector. To an
+/// approximate search a logical is not the number 0: Excel skips it like a
+/// blank, and the answer is still counted in the full vector.
+/// Excel: `=MATCH(35,IF(B1:B4="x",A1:A4),1)` => 3 with A = 10, 20, 30, 40 and
+/// B = x, y, x, y.
+#[test]
+fn logical_entries_are_not_numeric_candidates() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    for (row, (value, group)) in [(10, "x"), (20, "y"), (30, "x"), (40, "y")]
+        .into_iter()
+        .enumerate()
+    {
+        let row = row as u32 + 1;
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Int(value))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", row, 2, LiteralValue::Text(group.into()))
+            .unwrap();
+    }
+    for (formula, expected) in [
+        ("=MATCH(35,IF(B1:B4=\"x\",A1:A4),1)", 3.0),
+        ("=MATCH(35,IF(B1:B4=\"y\",A1:A4),1)", 2.0),
+        ("=MATCH(25,{10;20;FALSE;30},1)", 2.0),
+        ("=MATCH(25,{FALSE;10;20;30},1)", 3.0),
+        ("=LOOKUP(25,{10;TRUE;20},{1;2;3})", 3.0),
+        // Control: a vector with no logicals is unchanged.
+        ("=MATCH(25,{10;20;30},1)", 2.0),
+    ] {
+        assert_number(eval(&mut engine, formula), expected, formula);
+    }
+    assert_eq!(
+        eval(
+            &mut engine,
+            "=VLOOKUP(25,{10,\"a\";TRUE,\"b\";20,\"c\"},2,TRUE)"
+        ),
+        Some(LiteralValue::Text("c".into()))
+    );
+    // FALSE is not a 0 below the needle, so nothing qualifies.
+    assert_na(
+        eval(&mut engine, "=MATCH(5,{FALSE;10;20},1)"),
+        "MATCH(5,{FALSE;10;20},1)",
+    );
+}
+
+/// The same type rule from the other sides: numeric-looking text is text, so a
+/// numeric needle skips it and a text needle orders it as text ("10" < "9"),
+/// and a logical needle searches only the logicals.
+#[test]
+fn numeric_text_and_logical_needles_search_their_own_type() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    assert_na(
+        eval(&mut engine, "=MATCH(15,{\"10\";20;30},1)"),
+        "MATCH(15,{\"10\";20;30},1)",
+    );
+    for (formula, expected) in [
+        ("=MATCH(25,{\"10\";20;30},1)", 2.0),
+        ("=MATCH(\"9\",{\"10\";\"20\";\"30\"},1)", 3.0),
+        ("=MATCH(TRUE,{1;FALSE;TRUE},1)", 3.0),
+        ("=MATCH(FALSE,{0;FALSE;TRUE},1)", 2.0),
+    ] {
+        assert_number(eval(&mut engine, formula), expected, formula);
+    }
+}

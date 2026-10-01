@@ -154,19 +154,48 @@ pub fn equals_maybe_wildcard(
     PreparedLookupMatcher::new(pattern, wildcard, date_system).matches(candidate)
 }
 
+/// Compare a lookup-vector entry with the lookup value in an approximate
+/// lookup, or `None` when Excel's search skips the entry.
+///
+/// Excel compares a lookup value only with entries of its own type: numbers
+/// (dates and times are serial numbers), text, or logicals. A logical is not
+/// the number 0 or 1 here and numeric-looking text is not a number, so a
+/// numeric search skips both, as it skips blanks and errors. A blank lookup
+/// value searches as the number 0.
+pub fn cmp_for_approximate(
+    value: &LiteralValue,
+    needle: &LiteralValue,
+    date_system: DateSystem,
+) -> Option<i32> {
+    match (value, needle) {
+        (LiteralValue::Text(a), LiteralValue::Text(b)) => {
+            Some(a.to_lowercase().cmp(&b.to_lowercase()) as i32)
+        }
+        (LiteralValue::Boolean(a), LiteralValue::Boolean(b)) => Some(a.cmp(b) as i32),
+        (v, n)
+            if is_numeric_exact_value(v)
+                && (is_numeric_exact_value(n) || matches!(n, LiteralValue::Empty)) =>
+        {
+            cmp_for_lookup(v, n, date_system)
+        }
+        _ => None,
+    }
+}
+
 /// Whether Excel's approximate search visits `value` when looking for `needle`.
 ///
 /// The legacy approximate lookups (`MATCH` with `match_type` 1/-1,
-/// `VLOOKUP`/`HLOOKUP` with `range_lookup` TRUE) consider only entries in the
-/// needle's comparable value set. A blank cell, error cell, or incomparable
-/// entry such as a text header sitting above a column of numbers is skipped: it
-/// is neither out-of-order data nor a matchable position.
+/// `VLOOKUP`/`HLOOKUP` with `range_lookup` TRUE, `LOOKUP`) consider only
+/// entries of the needle's type (see [`cmp_for_approximate`]). A blank cell,
+/// error cell, or entry of another type such as a text header above a column
+/// of numbers or a FALSE left by `IF` is skipped: it is neither out-of-order
+/// data nor a matchable position.
 pub fn is_searchable_for_approximate(
     value: &LiteralValue,
     needle: &LiteralValue,
     date_system: DateSystem,
 ) -> bool {
-    !matches!(value, LiteralValue::Empty) && cmp_for_lookup(value, needle, date_system).is_some()
+    cmp_for_approximate(value, needle, date_system).is_some()
 }
 
 /// A lookup vector projected onto the entries an approximate search visits.
@@ -231,13 +260,15 @@ impl<'a> SearchedVector<'a> {
 
     pub fn is_sorted_ascending(&self) -> bool {
         (1..self.len()).all(|i| {
-            cmp_for_lookup(self.get(i - 1), self.get(i), self.date_system).is_some_and(|c| c <= 0)
+            cmp_for_approximate(self.get(i - 1), self.get(i), self.date_system)
+                .is_some_and(|c| c <= 0)
         })
     }
 
     pub fn is_sorted_descending(&self) -> bool {
         (1..self.len()).all(|i| {
-            cmp_for_lookup(self.get(i - 1), self.get(i), self.date_system).is_some_and(|c| c >= 0)
+            cmp_for_approximate(self.get(i - 1), self.get(i), self.date_system)
+                .is_some_and(|c| c >= 0)
         })
     }
 }

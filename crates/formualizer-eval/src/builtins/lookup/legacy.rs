@@ -14,7 +14,7 @@
 //!   * If width > height  → search the first *row*, return from the last *row*.
 //!   * Otherwise          → search the first *column*, return from the last *column*.
 
-use super::lookup_utils::{SearchedVector, cmp_for_lookup};
+use super::lookup_utils::{SearchedVector, cmp_for_approximate};
 use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
 use crate::engine::DateSystem;
 use crate::function::Function;
@@ -37,7 +37,7 @@ fn approx_match_ascending(
     let mut hi: usize = searched.len();
     while lo < hi {
         let mid = (lo + hi) / 2;
-        match cmp_for_lookup(searched.get(mid), needle, date_system) {
+        match cmp_for_approximate(searched.get(mid), needle, date_system) {
             Some(c) if c > 0 => hi = mid,
             Some(_) => lo = mid + 1,
             None => hi = mid,
