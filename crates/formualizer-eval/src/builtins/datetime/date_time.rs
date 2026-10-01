@@ -13,7 +13,15 @@ fn coerce_to_int(arg: &ArgumentHandle) -> Result<i32, ExcelError> {
     match v {
         LiteralValue::Int(i) => Ok(i as i32),
         LiteralValue::Number(f) => Ok(f.trunc() as i32),
-        LiteralValue::Text(s) => s.parse::<f64>().map(|f| f.trunc() as i32).map_err(|_| {
+        // Text coerces as VALUE() does: numeric text, or date/time text such as
+        // "Oct 21" read as its serial (year-less dates fall in the clock's year).
+        LiteralValue::Text(_) => crate::coercion::to_serial_lenient_in_year(
+            &v,
+            arg.date_system(),
+            Some(arg.current_year()),
+        )
+        .map(|f| f.trunc() as i32)
+        .map_err(|_| {
             ExcelError::new_value().with_message("DATE/TIME argument is not a valid number")
         }),
         LiteralValue::Boolean(b) => Ok(if b { 1 } else { 0 }),
@@ -436,6 +444,76 @@ mod tests {
                 assert!((n - 1.0 / 24.0).abs() < 1e-10);
             }
             _ => panic!("TIME should return a number"),
+        }
+    }
+
+    fn eval_formula(formula: &str) -> LiteralValue {
+        use crate::engine::{Engine, EvalConfig};
+        use crate::interpreter::Interpreter;
+        use formualizer_parse::parser::parse;
+
+        let wb = TestWorkbook::new()
+            .with_function(Arc::new(DateFn))
+            .with_function(Arc::new(TimeFn));
+        let engine = Engine::new(wb, EvalConfig::default());
+        let interpreter = Interpreter::new(&engine, "Sheet1");
+        match interpreter.evaluate_ast(&parse(formula).expect("formula should parse")) {
+            Ok(v) => v.into_literal(),
+            Err(e) => LiteralValue::Error(e),
+        }
+    }
+
+    fn is_num_error(v: &LiteralValue) -> bool {
+        matches!(v, LiteralValue::Error(e) if e.kind == formualizer_common::ExcelErrorKind::Num)
+    }
+
+    /// DATE and TIME coerce text arguments as VALUE() does, so date/time text
+    /// becomes its serial instead of #VALUE!.
+    #[test]
+    fn date_time_text_arguments_coerce_like_value() {
+        // "Oct 21" is 21 October of the clock's year, a serial far above
+        // 9999 in any recent year, so as the year it is #NUM!, not #VALUE!.
+        let v = eval_formula("=DATE(\"Oct 21\",1,1)");
+        assert!(is_num_error(&v), "DATE(\"Oct 21\",1,1) gave {v:?}");
+        // "1/15/1950" is serial 18278: 18277 days after 2000-01-01.
+        assert_eq!(
+            eval_formula("=DATE(2000,1,\"1/15/1950\")"),
+            LiteralValue::Number(36526.0 + 18277.0)
+        );
+        // "12:00" is 0.5, which truncates to day 0: 2020-12-31.
+        assert_eq!(
+            eval_formula("=DATE(2021,1,\"12:00\")"),
+            LiteralValue::Number(44196.0)
+        );
+        // "1/30/1900" is serial 30, read as 30 minutes.
+        match eval_formula("=TIME(0,\"1/30/1900\",0)") {
+            LiteralValue::Number(n) => assert!((n - 30.0 / 1440.0).abs() < 1e-12),
+            other => panic!("TIME with date-text minutes gave {other:?}"),
+        }
+    }
+
+    /// Numeric text keeps working and text that is neither a number nor a
+    /// date stays #VALUE!.
+    #[test]
+    fn date_time_non_date_text_arguments_unchanged() {
+        assert_eq!(
+            eval_formula("=DATE(\"2021\",\"3\",\"15\")"),
+            eval_formula("=DATE(2021,3,15)")
+        );
+        match eval_formula("=TIME(\"12\",\"30\",\"0\")") {
+            LiteralValue::Number(n) => assert!((n - 12.5 / 24.0).abs() < 1e-12),
+            other => panic!("TIME with numeric text gave {other:?}"),
+        }
+        for formula in [
+            "=DATE(2021,\"abc\",1)",
+            "=DATE(2021,\"\",1)",
+            "=TIME(\"noon\",0,0)",
+        ] {
+            let v = eval_formula(formula);
+            assert!(
+                matches!(&v, LiteralValue::Error(e) if e.kind == formualizer_common::ExcelErrorKind::Value),
+                "{formula} gave {v:?}"
+            );
         }
     }
 }
