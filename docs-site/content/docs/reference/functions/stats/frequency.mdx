@@ -15,7 +15,8 @@ description: "Returns a vertical frequency distribution for numeric data across 
  - Counts follow the order of `bins_array`; bins are sorted only to find each value's
    interval, and a repeated bin value takes the count at its first position.
  - If `bins_array` has no numeric values, result is a single count of all data points.
- - Non-numeric values in input ranges are ignored by statistical-collection rules.
+ - Non-numeric values in input ranges are ignored by statistical-collection rules; in
+   `bins_array` that includes error values, which are dropped like text.
 
 ## Examples
 

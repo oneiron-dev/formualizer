@@ -45,6 +45,12 @@ fn scalar_like_value(arg: &ArgumentHandle<'_, '_>) -> Result<LiteralValue, Excel
 ///   coerce_num succeeds). Non-numeric text is ignored (Excel would treat a direct non-numeric text
 ///   argument as #VALUE! in some contexts; covered by TODO for finer parity).
 fn collect_numeric_stats(args: &[ArgumentHandle]) -> Result<Vec<f64>, ExcelError> {
+    collect_numeric(args, false)
+}
+
+/// [`collect_numeric_stats`]; with `skip_errors` an error inside an array or range is
+/// passed over like text instead of returned (a direct error argument still is).
+fn collect_numeric(args: &[ArgumentHandle], skip_errors: bool) -> Result<Vec<f64>, ExcelError> {
     let mut out = Vec::new();
     for a in args {
         // Special-case: inline array literal argument should be treated like a list of direct scalar
@@ -54,6 +60,7 @@ fn collect_numeric_stats(args: &[ArgumentHandle]) -> Result<Vec<f64>, ExcelError
             for row in arr.into_iter() {
                 for cell in row.into_iter() {
                     match cell {
+                        LiteralValue::Error(_) if skip_errors => {}
                         LiteralValue::Error(e) => return Err(e),
                         other => {
                             if let Ok(n) = crate::coercion::to_number_lenient(&other) {
@@ -70,6 +77,7 @@ fn collect_numeric_stats(args: &[ArgumentHandle]) -> Result<Vec<f64>, ExcelError
             let date_system = a.date_system();
             view.for_each_cell(&mut |v| {
                 match v {
+                    LiteralValue::Error(_) if skip_errors => {}
                     LiteralValue::Error(e) => return Err(e.clone()),
                     LiteralValue::Number(n) => out.push(*n),
                     LiteralValue::Int(i) => out.push(*i as f64),
@@ -7733,7 +7741,8 @@ impl Function for PercentRankExcFn {
 /// - Counts follow the order of `bins_array`; bins are sorted only to find each value's
 ///   interval, and a repeated bin value takes the count at its first position.
 /// - If `bins_array` has no numeric values, result is a single count of all data points.
-/// - Non-numeric values in input ranges are ignored by statistical-collection rules.
+/// - Non-numeric values in input ranges are ignored by statistical-collection rules; in
+///   `bins_array` that includes error values, which are dropped like text.
 ///
 /// # Examples
 ///
@@ -7794,8 +7803,8 @@ impl Function for FrequencyFn {
         // Collect data array
         let data = collect_numeric_stats(&args[0..1])?;
 
-        // Collect bins array
-        let bins = collect_numeric_stats(&args[1..2])?;
+        // Collect bins array: like blanks and text, error entries are not bins.
+        let bins = collect_numeric(&args[1..2], true)?;
 
         // Handle empty bins - return single count of all data
         if bins.is_empty() {
@@ -11141,6 +11150,43 @@ mod tests_basic_stats {
         assert_eq!(
             frequency_eval("=FREQUENCY({1,2,3},{\"a\"})"),
             column(&[3.0])
+        );
+    }
+
+    #[test]
+    fn frequency_drops_error_bins_like_text() {
+        // ""-15 is #VALUE!: those bins are skipped, the rest still count.
+        assert_eq!(
+            frequency_eval("=SUM(FREQUENCY(0,ABS({13,15,17,\"\",\"\"}-15)))"),
+            LiteralValue::Number(1.0)
+        );
+        assert_eq!(
+            frequency_eval(
+                "=LOOKUP(1,1/FREQUENCY(0,ABS({13,15,17,\"\",\"\"}-15)),{13,15,17,\"\",\"\"})"
+            ),
+            LiteralValue::Number(15.0)
+        );
+        // An error bin between numeric bins is dropped, not kept as a slot.
+        assert_eq!(
+            frequency_eval("=FREQUENCY({1,2,3,4},IF({1,0,1},{1,9,3},NA()))"),
+            column(&[1.0, 2.0, 1.0])
+        );
+        assert_eq!(
+            frequency_eval("=FREQUENCY({1,2,3},IF({0,0},1,NA()))"),
+            column(&[3.0])
+        );
+        // Errors in data_array, and a direct error as bins_array, still propagate.
+        let err = |f: &str| match frequency_eval(f) {
+            LiteralValue::Error(e) => e.kind,
+            other => panic!("{f}: expected an error, got {other:?}"),
+        };
+        assert_eq!(
+            err("=FREQUENCY(IF({1,0},{1,2},NA()),{2})"),
+            formualizer_common::ExcelErrorKind::Na
+        );
+        assert_eq!(
+            err("=FREQUENCY({1,2},1/0)"),
+            formualizer_common::ExcelErrorKind::Div
         );
     }
 
