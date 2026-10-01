@@ -173,6 +173,7 @@ mod inspect;
 mod intersection_and_error_values;
 mod lambda_helpers;
 mod let_lambda;
+mod negative_zero;
 mod nested_subtotals;
 mod npv_variadic;
 mod offset_dynamic;

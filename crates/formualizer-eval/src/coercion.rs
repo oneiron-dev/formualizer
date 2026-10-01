@@ -442,11 +442,18 @@ pub fn excel_power(base: f64, exponent: f64) -> Result<f64, ExcelError> {
     sanitize_numeric(base.powf(exponent))
 }
 
+/// Operator/function result guard: NaN/Inf → #NUM!, and `-0` → `0`.
 pub fn sanitize_numeric(n: f64) -> Result<f64, ExcelError> {
     if n.is_nan() || n.is_infinite() {
         return Err(ExcelError::new_num());
     }
-    Ok(n)
+    Ok(normalize_zero(n))
+}
+
+/// Excel has no negative zero: `-1*0` or `-A1` with A1 = 0 is plain 0, so it
+/// prints as "0" and equals a 0 criterion. Only an exact zero changes sign.
+pub fn normalize_zero(n: f64) -> f64 {
+    if n == 0.0 { 0.0 } else { n }
 }
 
 /// Coerce to Excel serial (date/time/duration) or error.
@@ -912,5 +919,14 @@ mod tests {
         assert!(sanitize_numeric(f64::NAN).is_err());
         assert!(sanitize_numeric(f64::INFINITY).is_err());
         assert_eq!(sanitize_numeric(1.5).unwrap(), 1.5);
+    }
+
+    #[test]
+    fn negative_zero_becomes_zero_but_tiny_negatives_stay() {
+        assert!(sanitize_numeric(-0.0).unwrap().is_sign_positive());
+        assert_eq!(sanitize_numeric(-1e-300).unwrap(), -1e-300);
+        assert_eq!(normalize_zero(-2.5), -2.5);
+        assert_eq!(to_text_invariant(&LiteralValue::Number(-0.0)), "0");
+        assert_eq!(to_text_invariant(&LiteralValue::Number(-2.0)), "-2");
     }
 }
