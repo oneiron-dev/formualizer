@@ -11,7 +11,9 @@ use formualizer_macros::func_caps;
 fn coerce_to_int(arg: &ArgumentHandle) -> Result<i32, ExcelError> {
     let v = arg.value()?.into_literal();
     match v {
-        LiteralValue::Int(i) => Ok(i as i32),
+        // Saturate rather than wrap, so a value outside i32 stays out of the
+        // 16-bit argument ranges below instead of wrapping back into them.
+        LiteralValue::Int(i) => Ok(i.clamp(i32::MIN.into(), i32::MAX.into()) as i32),
         LiteralValue::Number(f) => Ok(f.trunc() as i32),
         // Text coerces as VALUE() does: numeric text, or date/time text such as
         // "Oct 21" read as its serial (year-less dates fall in the clock's year).
@@ -30,6 +32,23 @@ fn coerce_to_int(arg: &ArgumentHandle) -> Result<i32, ExcelError> {
         _ => Err(ExcelError::new_value()
             .with_message("DATE/TIME expects numeric or text-numeric arguments")),
     }
+}
+
+/// DATE's month argument (after truncation) must lie in this range, or DATE is
+/// #NUM! before any roll-over. Excel reads it as a signed 16-bit integer; the
+/// references that give the edges put the top at 32766, one below `i16::MAX`.
+const DATE_MONTH_RANGE: std::ops::RangeInclusive<i32> = -32768..=32766;
+
+/// TIME's hour, minute and second (after truncation) must each lie in this
+/// range, or TIME is #NUM!. Microsoft documents each as at most 32767; Excel
+/// reads them as signed 16-bit integers, so a negative component that keeps
+/// the total time non-negative (`TIME(1,-1,0)`) still rolls back.
+const TIME_ARG_RANGE: std::ops::RangeInclusive<i32> = i16::MIN as i32..=i16::MAX as i32;
+
+fn num_error<'b>() -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+    Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+        ExcelError::new_num(),
+    )))
 }
 
 /// Returns the serial number for a calendar date from year, month, and day.
@@ -115,6 +134,13 @@ impl Function for DateFn {
         let year = coerce_to_int(&args[0])?;
         let month = coerce_to_int(&args[1])?;
         let day = coerce_to_int(&args[2])?;
+
+        // A month outside Excel's 16-bit range is #NUM!, even when the rolled-over
+        // date would be valid. Date text used as the month (a serial such as
+        // 44211 for "1/15/2021") lands here.
+        if !DATE_MONTH_RANGE.contains(&month) {
+            return num_error();
+        }
 
         // Excel interprets years 0-1899 as 1900-3799
         let adjusted_year = if (0..=1899).contains(&year) {
@@ -226,6 +252,16 @@ impl Function for TimeFn {
         let hour = coerce_to_int(&args[0])?;
         let minute = coerce_to_int(&args[1])?;
         let second = coerce_to_int(&args[2])?;
+
+        // An argument outside the 16-bit range is #NUM! (date text such as
+        // "1/15/2021" is a serial far above 32767). The bound also keeps the
+        // total below inside i32: 32767 * 3661 < 2^31.
+        if [hour, minute, second]
+            .iter()
+            .any(|v| !TIME_ARG_RANGE.contains(v))
+        {
+            return num_error();
+        }
 
         // Excel normalizes time values
         let total_seconds = hour * 3600 + minute * 60 + second;
@@ -454,7 +490,9 @@ mod tests {
 
         let wb = TestWorkbook::new()
             .with_function(Arc::new(DateFn))
-            .with_function(Arc::new(TimeFn));
+            .with_function(Arc::new(TimeFn))
+            .with_function(Arc::new(crate::builtins::info::IsErrorFn))
+            .with_function(Arc::new(crate::builtins::logical_ext::IfErrorFn));
         let engine = Engine::new(wb, EvalConfig::default());
         let interpreter = Interpreter::new(&engine, "Sheet1");
         match interpreter.evaluate_ast(&parse(formula).expect("formula should parse")) {
@@ -514,6 +552,155 @@ mod tests {
                 matches!(&v, LiteralValue::Error(e) if e.kind == formualizer_common::ExcelErrorKind::Value),
                 "{formula} gave {v:?}"
             );
+        }
+    }
+
+    fn serial_1900(y: i32, m: u32, d: u32) -> f64 {
+        date_to_serial_for(
+            formualizer_common::DateSystem::Excel1900,
+            &chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap(),
+        )
+    }
+
+    fn assert_time(formula: &str, seconds: f64) {
+        match eval_formula(formula) {
+            LiteralValue::Number(n) => assert!(
+                (n - seconds / 86400.0).abs() < 1e-12,
+                "{formula} gave {n}, expected {}",
+                seconds / 86400.0
+            ),
+            other => panic!("{formula} gave {other:?}"),
+        }
+    }
+
+    /// Date text read as a DATE month or a TIME component is a serial far above
+    /// the 16-bit argument range, so it is #NUM! (an error, as in Excel) and
+    /// error-agnostic callers such as ISERROR and IFERROR see an error.
+    #[test]
+    fn date_time_date_text_outside_16_bit_range_is_num_error() {
+        for formula in [
+            "=DATE(2021,\"Oct 21\",1)",
+            "=DATE(2021,\"1/15/2021\",1)",
+            "=DATE(2000,\"12/31/9999\",1)",
+            "=TIME(0,\"1/15/2021\",0)",
+            "=TIME(\"1/15/2021\",0,0)",
+            "=TIME(0,0,\"1/15/2021\")",
+            "=TIME(\"12/31/9999\",0,0)",
+        ] {
+            let v = eval_formula(formula);
+            assert!(is_num_error(&v), "{formula} gave {v:?}");
+        }
+        assert_eq!(
+            eval_formula("=ISERROR(DATE(2021,\"Oct 21\",1))"),
+            LiteralValue::Boolean(true)
+        );
+        assert_eq!(
+            eval_formula("=IFERROR(DATE(2021,\"Oct 21\",1),\"bad\")"),
+            LiteralValue::Text("bad".into())
+        );
+        assert_eq!(
+            eval_formula("=IFERROR(TIME(0,\"1/15/2021\",0),\"bad\")"),
+            LiteralValue::Text("bad".into())
+        );
+        assert_eq!(
+            eval_formula("=ISERROR(TIME(\"1/15/2021\",0,0))"),
+            LiteralValue::Boolean(true)
+        );
+        // Date text whose serial is inside the range still rolls over:
+        // "1/30/1900" is 30, so month 30 of 2000 is June 2002.
+        assert_eq!(
+            eval_formula("=DATE(2000,\"1/30/1900\",1)"),
+            LiteralValue::Number(serial_1900(2002, 6, 1))
+        );
+    }
+
+    /// A DATE month outside -32768..=32766 (after truncation) is #NUM!, even
+    /// when the rolled-over date would be a valid serial.
+    #[test]
+    fn date_month_outside_16_bit_range_is_num_error() {
+        for formula in [
+            "=DATE(21,32767,1)",
+            "=DATE(21,46316,0)",
+            "=DATE(2000,32767.5,1)",
+            "=DATE(5000,-32769,1)",
+            "=DATE(2000,1E10,1)",
+            "=DATE(9999,-1E10,1)",
+            "=DATE(21,\"32768\",1)",
+        ] {
+            let v = eval_formula(formula);
+            assert!(is_num_error(&v), "{formula} gave {v:?}");
+        }
+        // Months at the edges still roll over: 2000 + 32765 months is June
+        // 4730, 5000 - 32769 months is April 2269.
+        assert_eq!(
+            eval_formula("=DATE(2000,32766,1)"),
+            LiteralValue::Number(serial_1900(4730, 6, 1))
+        );
+        assert_eq!(
+            eval_formula("=DATE(2000,32766.9,1)"),
+            LiteralValue::Number(serial_1900(4730, 6, 1))
+        );
+        assert_eq!(
+            eval_formula("=DATE(5000,-32768,1)"),
+            LiteralValue::Number(serial_1900(2269, 4, 1))
+        );
+        // An argument error still comes before the range check.
+        let v = eval_formula("=DATE(21,32768,\"x\")");
+        assert!(
+            matches!(&v, LiteralValue::Error(e) if e.kind == formualizer_common::ExcelErrorKind::Value),
+            "DATE(21,32768,\"x\") gave {v:?}"
+        );
+    }
+
+    /// A TIME argument above 32767 or below -32768 (after truncation) is #NUM!,
+    /// and huge values no longer overflow the seconds total.
+    #[test]
+    fn time_argument_outside_16_bit_range_is_num_error() {
+        for formula in [
+            "=TIME(32768,0,0)",
+            "=TIME(0,32768,0)",
+            "=TIME(0,0,32768)",
+            "=TIME(600000,0,0)",
+            "=TIME(1E10,0,0)",
+            "=TIME(0,1E300,0)",
+            "=TIME(-32769,0,0)",
+            "=TIME(\"32768\",0,0)",
+        ] {
+            let v = eval_formula(formula);
+            assert!(is_num_error(&v), "{formula} gave {v:?}");
+        }
+        // Up to 32767 each component still rolls over into the time of day,
+        // and a negative component that keeps the total positive rolls back.
+        assert_time("=TIME(32767,0,0)", 7.0 * 3600.0);
+        assert_time("=TIME(0,32767,0)", (18.0 * 60.0 + 7.0) * 60.0);
+        assert_time("=TIME(0,0,32767)", 32767.0);
+        assert_time("=TIME(32767.9,0,0)", 7.0 * 3600.0);
+        assert_time("=TIME(1,-1,0)", 59.0 * 60.0);
+    }
+
+    /// An integer argument beyond i32 saturates instead of wrapping back into
+    /// the 16-bit range: 2^32 + 1 would otherwise wrap to 1.
+    #[test]
+    fn date_time_huge_integer_arguments_do_not_wrap() {
+        let wb = TestWorkbook::new()
+            .with_function(Arc::new(DateFn))
+            .with_function(Arc::new(TimeFn));
+        let ctx = wb.interpreter();
+        let huge = lit(LiteralValue::Int((1_i64 << 32) + 1));
+        let one = lit(LiteralValue::Int(1));
+        let year = lit(LiteralValue::Int(2000));
+        for (name, args) in [
+            ("DATE", [&year, &huge, &one]),
+            ("TIME", [&huge, &one, &one]),
+            ("TIME", [&one, &one, &huge]),
+        ] {
+            let f = ctx.context.get_function("", name).unwrap();
+            let handles: Vec<_> = args.iter().map(|a| ArgumentHandle::new(a, &ctx)).collect();
+            let v = f
+                .dispatch(&handles, &ctx.function_context(None))
+                .unwrap()
+                .into_literal();
+            assert!(is_num_error(&v), "{name} with 2^32 + 1 gave {v:?}");
         }
     }
 }
