@@ -323,3 +323,34 @@ fn numbers_become_text_with_15_significant_digits() {
         Some(LiteralValue::Number(17.0))
     );
 }
+
+#[test]
+fn numbers_become_text_rounding_ties_away_from_zero() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    set_value(&mut engine, 1, 1, LiteralValue::Number(100000000000000.5));
+    let cases = [
+        ("=1234567890123.125&\"\"", "1234567890123.13"),
+        ("=A1&\"\"", "100000000000001"),
+        ("=-A1&\"\"", "-100000000000001"),
+        ("=(10^15+5)&\"\"", "1000000000000010"),
+        ("=CONCAT(70489670895608.25)", "70489670895608.3"),
+        (
+            "=TEXTJOIN(\",\",TRUE,999999999999999.5,13/2^20)",
+            "1000000000000000,1.23977661132813E-05",
+        ),
+        ("=RIGHT(A1,3)", "001"),
+    ];
+    for (row, (formula, _)) in cases.iter().enumerate() {
+        set_formula(&mut engine, row as u32 + 1, 3, formula);
+    }
+
+    engine.evaluate_all().expect("evaluate formulas");
+
+    for (row, (formula, expected)) in cases.iter().enumerate() {
+        assert_eq!(
+            engine.get_cell_value("Sheet1", row as u32 + 1, 3),
+            Some(LiteralValue::Text((*expected).into())),
+            "{formula}"
+        );
+    }
+}

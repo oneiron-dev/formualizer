@@ -239,7 +239,9 @@ pub fn to_logical(value: &LiteralValue) -> Result<bool, ExcelError> {
 /// number out in full up to 20 integer digits, or below 1 while that takes
 /// at most 20 characters; beyond that it uses E notation
 /// (`0.333333333333333`, `1234567890123460`, `1.23456789012346E-05`,
-/// `1.23456789012346E+20`). Zero has no sign, and subnormal values read as 0.
+/// `1.23456789012346E+20`). Like all of Excel's number formatting it rounds
+/// half away from zero (100000000000000.5 is `100000000000001`). Zero has
+/// no sign, and subnormal values read as 0.
 pub fn number_to_text(n: f64) -> String {
     if !n.is_finite() {
         return n.to_string();
@@ -247,14 +249,9 @@ pub fn number_to_text(n: f64) -> String {
     if n.abs() < f64::MIN_POSITIVE {
         return "0".into();
     }
-    let split = |sci: String| {
-        let (mantissa, exponent) = sci.split_once('e').expect("scientific");
-        let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
-        (digits, exponent.parse::<i32>().expect("exponent"))
-    };
-    let (mut digits, mut exponent) = split(format!("{:.14e}", n.abs()));
+    let (mut digits, mut exponent) = significant_digits(n.abs(), 15);
     if exponent.abs() > 98 {
-        (digits, exponent) = split(format!("{:.13e}", n.abs()));
+        (digits, exponent) = significant_digits(n.abs(), 14);
     }
     let digits = digits.trim_end_matches('0');
     let sign = if n < 0.0 { "-" } else { "" };
@@ -273,6 +270,51 @@ pub fn number_to_text(n: f64) -> String {
         format!("{sign}{}.{}", &digits[..int_len], &digits[int_len..])
     } else {
         format!("{sign}{digits}{}", "0".repeat(int_len - digits.len()))
+    }
+}
+
+/// The positive normal `a` rounded half up to `sig` significant digits: the
+/// digits, and the decimal exponent of the first one.
+fn significant_digits(a: f64, sig: usize) -> (String, i32) {
+    let split = |sci: String| {
+        let (mantissa, exponent) = sci.split_once('e').expect("scientific");
+        let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+        (digits, exponent.parse::<i32>().expect("exponent"))
+    };
+    // Rust's formatting rounds the exact binary value correctly, but an exact
+    // tie goes to even. A tie is a value that takes exactly one more digit,
+    // a final 5; the next double up lies just past it and rounds up.
+    let (longer, exponent) = split(format!("{a:.sig$e}"));
+    let tie = longer.ends_with('5')
+        && longer
+            .parse::<u64>()
+            .is_ok_and(|d| equals_decimal(a, d, exponent - sig as i32));
+    let a = if tie { a.next_up() } else { a };
+    split(format!("{a:.prec$e}", prec = sig - 1))
+}
+
+/// Whether the positive normal `a` is exactly `digits × 10^exponent`, for
+/// odd `digits`.
+fn equals_decimal(a: f64, digits: u64, exponent: i32) -> bool {
+    let bits = a.to_bits();
+    let significand = (bits & ((1 << 52) - 1)) | (1 << 52);
+    let shift = significand.trailing_zeros();
+    // a = odd × 2^power, and digits × 10^exponent is digits × 5^exponent (an
+    // odd number, or a fraction with odd parts) × 2^exponent, so the powers of
+    // two must match and then the odd parts: digits × 5^exponent = odd.
+    let (odd, power) = (
+        u128::from(significand >> shift),
+        ((bits >> 52) & 0x7ff) as i32 - 1075 + shift as i32,
+    );
+    if power != exponent {
+        return false;
+    }
+    let five = 5u128.checked_pow(exponent.unsigned_abs());
+    let digits = u128::from(digits);
+    if exponent >= 0 {
+        five.and_then(|f| f.checked_mul(digits)) == Some(odd)
+    } else {
+        five.and_then(|f| f.checked_mul(odd)) == Some(digits)
     }
 }
 
@@ -455,6 +497,101 @@ mod tests {
             (0.1 + 0.2, "0.3"),
         ] {
             assert_eq!(number_to_text(n), text, "{n:e}");
+        }
+    }
+
+    #[test]
+    fn number_to_text_rounds_ties_away_from_zero() {
+        for (n, text) in [
+            // Exact ties at the 16th significant digit round away from zero.
+            (1234567890123.125, "1234567890123.13"),
+            (100000000000000.5, "100000000000001"),
+            (-100000000000000.5, "-100000000000001"),
+            (1e15 + 5.0, "1000000000000010"),
+            (70489670895608.25, "70489670895608.3"),
+            (999999999999999.5, "1000000000000000"),
+            (13.0 / 1048576.0, "1.23977661132813E-05"),
+            (-13.0 / 1048576.0, "-1.23977661132813E-05"),
+            // Near ties round to the nearer side of the exact value.
+            (0.1234567890123455, "0.123456789012345"),
+            (0.3000000000000005, "0.3"),
+            (1.000000000000005, "1.00000000000001"),
+            (123456789012.3455, "123456789012.346"),
+        ] {
+            assert_eq!(number_to_text(n), text, "{n:e}");
+        }
+    }
+
+    /// `a` rounded half up to `sig` significant digits from its full
+    /// decimal expansion.
+    fn half_up_from_exact_digits(a: f64, sig: usize) -> (String, i32) {
+        // A double's exact decimal expansion has under 800 significant digits.
+        let exact = format!("{a:.1100e}");
+        let (mantissa, exponent) = exact.split_once('e').unwrap();
+        let all: Vec<u8> = mantissa.bytes().filter(u8::is_ascii_digit).collect();
+        let mut kept = all[..sig].to_vec();
+        let mut exponent: i32 = exponent.parse().unwrap();
+        if all[sig] >= b'5' {
+            match kept.iter().rposition(|&d| d != b'9') {
+                Some(i) => {
+                    kept[i] += 1;
+                    kept[i + 1..].fill(b'0');
+                }
+                None => {
+                    kept.fill(b'0');
+                    kept[0] = b'1';
+                    exponent += 1;
+                }
+            }
+        }
+        (String::from_utf8(kept).unwrap(), exponent)
+    }
+
+    #[test]
+    fn significant_digits_round_the_exact_value_half_up() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state
+        };
+        let mut values = Vec::new();
+        for _ in 0..20_000 {
+            let a = f64::from_bits(next() >> 1);
+            if a.is_normal() {
+                values.push(a);
+            }
+        }
+        // Exact ties at the 16th digit: odd × 2^k equal to a 16-digit decimal
+        // ending in 5, so odd × 5^-k (k < 0) or odd / 5^k (k >= 0) is that
+        // decimal, which needs -22 <= k <= 1.
+        let mut ties = 0;
+        for k in -22i32..=1 {
+            let five = 5u64.pow(k.unsigned_abs());
+            for _ in 0..200 {
+                let odd = if k >= 0 {
+                    (1_000_000_000_000_005 + 10 * (next() % 900_000_000_000_000)) * five
+                } else {
+                    let low = 1_000_000_000_000_000u64.div_ceil(five);
+                    let high = 10_000_000_000_000_000 / five;
+                    (low + next() % (high - low)) | 1
+                };
+                if odd < 1 << 53 {
+                    values.push(odd as f64 * 2f64.powi(k));
+                    ties += 1;
+                }
+            }
+        }
+        assert!(ties > 500, "{ties} ties");
+        for a in values {
+            for sig in [15, 14] {
+                assert_eq!(
+                    significant_digits(a, sig),
+                    half_up_from_exact_digits(a, sig),
+                    "{a:e} to {sig} digits"
+                );
+            }
         }
     }
 
