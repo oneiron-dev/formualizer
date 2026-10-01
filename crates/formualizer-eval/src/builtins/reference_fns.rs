@@ -121,13 +121,18 @@ fn resolve_reference_bounds<'b>(
         // A structured reference is the area it selects on the table's own
         // sheet: INDEX(Table1[Qty],2) is the second data cell of that column.
         // Source tables resolve to owned values with no sheet position.
+        // Like the A1 form ingest writes for a structured reference, the area
+        // names its sheet only when that is not the formula's own, so it
+        // combines with plain references there (B2:INDEX(Table1[Qty],3)).
         ReferenceType::Table(_) => {
             let rv = ctx.resolve_range_view(base, ctx.current_sheet())?;
             if rv.is_empty() || !rv.is_sheet_backed() {
                 return Err(ExcelError::new(ExcelErrorKind::Ref));
             }
+            let sheet = rv.sheet_name();
             Ok((
-                Some(rv.sheet_name().to_string()),
+                (!crate::reference::same_sheet_name(sheet, ctx.current_sheet()))
+                    .then(|| sheet.to_string()),
                 rv.start_row() as u32 + 1,
                 rv.start_col() as u32 + 1,
                 rv.end_row() as u32 + 1,
@@ -265,7 +270,15 @@ impl IndexFn {
         };
         if col == 0 {
             if row == 0 {
-                return Some(Ok(base));
+                // The whole reference. A structured reference is its A1 area,
+                // so INDEX(Table1,0,0):B9 combines like any range.
+                return Some(Ok(match base {
+                    ReferenceType::Table(_) if sr == er && sc == ec => {
+                        ReferenceType::cell(sheet, sr, sc)
+                    }
+                    ReferenceType::Table(_) => range_ref(sheet, sr, sc, er, ec),
+                    base => base,
+                }));
             }
             let r = sr + (row as u32) - 1;
             if r > er {

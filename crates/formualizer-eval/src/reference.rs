@@ -120,12 +120,22 @@ impl Coord {
 
 type SheetBounds = (Option<String>, (u32, u32, u32, u32));
 
+/// Whether two sheet names name the same sheet. Sheet names are
+/// case-insensitive, as in the sheet registry.
+pub(crate) fn same_sheet_name(a: &str, b: &str) -> bool {
+    a == b || a.to_lowercase() == b.to_lowercase()
+}
+
 /// Combine two references with the range operator ':'
 /// Supports combining Cell:Cell, Cell:Range (and Range:Cell), and Range:Range on the same sheet.
 /// Returns #REF! for cross-sheet combinations or incompatible shapes.
+///
+/// An unqualified reference is on `current_sheet`, the formula's own sheet, so
+/// `Sheet1!B2:INDEX(B2:B4,3)` on Sheet1 is `Sheet1!B2:B4`.
 pub fn combine_references(
     a: &ReferenceType,
     b: &ReferenceType,
+    current_sheet: &str,
 ) -> Result<ReferenceType, ExcelError> {
     // Extract sheet and bounds as (sheet, (sr, sc, er, ec))
     fn to_bounds(r: &ReferenceType) -> Option<SheetBounds> {
@@ -158,11 +168,15 @@ pub fn combine_references(
         ExcelError::new(ExcelErrorKind::Ref).with_message("Unsupported reference for ':'")
     })?;
 
-    // Sheets must match (both None or equal Some)
-    if sheet_a != sheet_b {
+    // Both ends must be on one sheet; an unqualified end is on the current one.
+    if !same_sheet_name(
+        sheet_a.as_deref().unwrap_or(current_sheet),
+        sheet_b.as_deref().unwrap_or(current_sheet),
+    ) {
         return Err(ExcelError::new(ExcelErrorKind::Ref)
             .with_message("Cannot combine references across sheets"));
     }
+    let sheet_a = sheet_a.or(sheet_b);
 
     let sr = a_sr.min(b_sr);
     let sc = a_sc.min(b_sc);
@@ -436,5 +450,48 @@ mod tests {
         let b2 = CellRef::new(0, Coord::new(1, 1, false, false));
         let r = RangeRef::new(a1, b2);
         assert_eq!(r.to_string(), "Sheet0!A1:B2");
+    }
+
+    #[test]
+    fn range_operator_reads_an_unqualified_end_on_the_current_sheet() {
+        let cell = |sheet: Option<&str>, row, col| ReferenceType::Cell {
+            sheet: sheet.map(str::to_string),
+            row,
+            col,
+            row_abs: false,
+            col_abs: false,
+        };
+        let range = |sheet: Option<&str>| ReferenceType::Range {
+            sheet: sheet.map(str::to_string),
+            start_row: Some(2),
+            start_col: Some(2),
+            end_row: Some(4),
+            end_col: Some(2),
+            start_row_abs: false,
+            start_col_abs: false,
+            end_row_abs: false,
+            end_col_abs: false,
+        };
+        // Sheet1!B2:B4 on Sheet1, whichever end names the sheet and in any case.
+        for (a, b) in [
+            (cell(Some("Sheet1"), 2, 2), cell(None, 4, 2)),
+            (cell(None, 2, 2), cell(Some("Sheet1"), 4, 2)),
+            (cell(Some("sheet1"), 2, 2), cell(Some("SHEET1"), 4, 2)),
+            (cell(None, 2, 2), cell(None, 4, 2)),
+        ] {
+            let combined = combine_references(&a, &b, "Sheet1").unwrap();
+            let expected_sheet = match (&a, &b) {
+                (ReferenceType::Cell { sheet: sa, .. }, ReferenceType::Cell { sheet: sb, .. }) => {
+                    sa.clone().or(sb.clone())
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(combined, range(expected_sheet.as_deref()));
+        }
+        // An end on another sheet still can't combine with one on this sheet.
+        let error = combine_references(&cell(Some("Other"), 2, 2), &cell(None, 4, 2), "Sheet1")
+            .unwrap_err();
+        assert_eq!(error.kind, ExcelErrorKind::Ref);
+        assert!(combine_references(&cell(Some("Other"), 2, 2), &cell(None, 4, 2), "Other").is_ok());
     }
 }

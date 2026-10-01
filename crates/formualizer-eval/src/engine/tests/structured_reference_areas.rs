@@ -128,6 +128,120 @@ fn index_and_offset_read_structured_references() {
 }
 
 #[test]
+fn index_and_offset_over_a_table_combine_with_plain_references() {
+    let mut engine = engine();
+    let n = LiteralValue::Number;
+    // INDEX and OFFSET return the reference into the table's A1 area, so a
+    // plain reference on the same sheet makes a range with it, as with
+    // B2:INDEX(B2:B4,3): B2:INDEX(Sales[Qty],3) is B2:B4.
+    assert_eq!(
+        eval(&mut engine, 1, 7, "=SUM(B2:INDEX(Sales[Qty],3))"),
+        n(6.0)
+    );
+    assert_eq!(
+        eval(
+            &mut engine,
+            2,
+            7,
+            "=SUM($B$2:INDEX(Sales[Qty],MATCH(\"c\",Sales[Item],0)))"
+        ),
+        n(6.0)
+    );
+    assert_eq!(
+        eval(&mut engine, 3, 7, "=ROWS(A2:INDEX(Sales[Item],2))"),
+        n(2.0)
+    );
+    assert_eq!(
+        eval(&mut engine, 4, 7, "=SUM(INDEX(Sales[Qty],1):B4)"),
+        n(6.0)
+    );
+    assert_eq!(
+        eval(&mut engine, 5, 7, "=SUM(B2:OFFSET(Sales[Qty],2,0,1,1))"),
+        n(6.0)
+    );
+    // INDEX(Sales,0,0) is the whole data body, A2:B4; with B5 it is A2:B5.
+    assert_eq!(
+        eval(&mut engine, 6, 7, "=COUNT(INDEX(Sales,0,0):B5)"),
+        n(4.0)
+    );
+    assert_eq!(
+        eval(&mut engine, 7, 7, "=ROWS(INDEX(Sales[Qty],0,0))"),
+        n(3.0)
+    );
+    // A sheet-qualified end on the formula's own sheet is the same sheet.
+    assert_eq!(
+        eval(&mut engine, 8, 7, "=SUM(Sheet1!B2:INDEX(Sales[Qty],3))"),
+        n(6.0)
+    );
+    assert_eq!(
+        eval(&mut engine, 9, 7, "=SUM(Sheet1!B2:INDEX(B2:B4,3))"),
+        n(6.0)
+    );
+
+    // From another sheet the table's area keeps its sheet.
+    engine.add_sheet("Other").unwrap();
+    engine
+        .set_cell_formula(
+            "Other",
+            1,
+            1,
+            parse("=SUM(Sheet1!B2:INDEX(Sales[Qty],3))").unwrap(),
+        )
+        .unwrap();
+    engine.evaluate_cell("Other", 1, 1).unwrap();
+    assert_eq!(engine.get_cell_value("Other", 1, 1).unwrap(), n(6.0));
+}
+
+#[test]
+fn running_total_from_index_to_this_row() {
+    let mut engine = engine();
+    // Run at D1:F4: Item, Qty and a running total of Qty.
+    let text = |s: &str| LiteralValue::Text(s.into());
+    for (row, item, qty) in [
+        (1, text("Item"), text("Qty")),
+        (2, text("a"), LiteralValue::Number(1.0)),
+        (3, text("b"), LiteralValue::Number(2.0)),
+        (4, text("c"), LiteralValue::Number(3.0)),
+    ] {
+        engine.set_cell_value("Sheet1", row, 4, item).unwrap();
+        engine.set_cell_value("Sheet1", row, 5, qty).unwrap();
+    }
+    engine
+        .set_cell_value("Sheet1", 1, 6, text("Total"))
+        .unwrap();
+    let sheet = engine.sheet_id("Sheet1").unwrap();
+    let range = RangeRef::new(
+        CellRef::new(sheet, Coord::from_excel(1, 4, true, true)),
+        CellRef::new(sheet, Coord::from_excel(4, 6, true, true)),
+    );
+    engine
+        .define_table(
+            "Run",
+            range,
+            true,
+            vec!["Item".into(), "Qty".into(), "Total".into()],
+            false,
+        )
+        .unwrap();
+    for row in 2..=4 {
+        engine
+            .set_cell_formula(
+                "Sheet1",
+                row,
+                6,
+                parse("=SUM(INDEX(Run[Qty],1):Run[[#This Row],[Qty]])").unwrap(),
+            )
+            .unwrap();
+    }
+    engine.evaluate_all().unwrap();
+    let totals: Vec<_> = (2..=4)
+        .map(|row| engine.get_cell_value("Sheet1", row, 6).unwrap())
+        .collect();
+    let n = LiteralValue::Number;
+    assert_eq!(totals, vec![n(1.0), n(3.0), n(6.0)]);
+}
+
+#[test]
 fn this_row_outside_the_table_body_is_a_value_error() {
     let mut engine = engine();
     let error = engine

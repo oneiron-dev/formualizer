@@ -358,7 +358,7 @@ fn range_operator_composition_same_sheet() {
     // reference context via helper
     let lref = ctx.evaluate_ast_as_reference(&left).unwrap();
     let rref = ctx.evaluate_ast_as_reference(&right).unwrap();
-    let comb = crate::reference::combine_references(&lref, &rref).unwrap();
+    let comb = crate::reference::combine_references(&lref, &rref, ctx.current_sheet()).unwrap();
     match comb {
         ReferenceType::Range {
             start_row,

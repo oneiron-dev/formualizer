@@ -394,7 +394,7 @@ impl<'a> Interpreter<'a> {
             ASTNodeType::BinaryOp { op, left, right } if op == ":" => {
                 let lref = self.evaluate_ast_as_reference(left)?;
                 let rref = self.evaluate_ast_as_reference(right)?;
-                crate::reference::combine_references(&lref, &rref)
+                crate::reference::combine_references(&lref, &rref, self.current_sheet)
             }
             ASTNodeType::Array(_)
             | ASTNodeType::UnaryOp { .. }
@@ -488,7 +488,7 @@ impl<'a> Interpreter<'a> {
                     return crate::reference::intersect_references(&lref, &rref)?
                         .ok_or_else(|| ExcelError::new(ExcelErrorKind::Null));
                 }
-                crate::reference::combine_references(&lref, &rref)
+                crate::reference::combine_references(&lref, &rref, self.current_sheet)
             }
             _ => Err(ExcelError::new(ExcelErrorKind::Ref)
                 .with_message("Expression cannot be used as a reference")),
@@ -1029,7 +1029,7 @@ impl<'a> Interpreter<'a> {
                                 data_store,
                                 sheet_registry,
                             )?;
-                            crate::reference::combine_references(&lref, &rref)
+                            crate::reference::combine_references(&lref, &rref, self.current_sheet)
                         });
                     return self.range_value(range);
                 }
@@ -1647,7 +1647,7 @@ impl<'a> Interpreter<'a> {
         if op == ":" {
             let range = self.evaluate_ast_as_reference(left_node).and_then(|lref| {
                 let rref = self.evaluate_ast_as_reference(right_node)?;
-                crate::reference::combine_references(&lref, &rref)
+                crate::reference::combine_references(&lref, &rref, self.current_sheet)
             });
             return self.range_value(range);
         }
