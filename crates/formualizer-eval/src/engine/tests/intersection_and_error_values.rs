@@ -146,6 +146,8 @@ fn computed_colon_range_keeps_reference_semantics() {
         "=SUM(ROW(INDEX(A1:A4,2):A4))",
         "=ISERROR(INDEX(A1:A4,5):A4)",
         "=ERROR.TYPE(A1:INDEX(A1:A4,5))",
+        "=ISERROR(INDIRECT(\"Missing!A1\"):INDIRECT(\"Missing!A2\"))",
+        "=IFERROR(INDIRECT(\"Missing!A1\"):INDIRECT(\"Missing!A2\"),-1)",
     ]);
     assert_eq!(got[0], n(27.0));
     assert_eq!(got[1], n(4.0));
@@ -154,6 +156,9 @@ fn computed_colon_range_keeps_reference_semantics() {
     assert_eq!(got[4], n(2.0 + 3.0 + 4.0));
     assert_eq!(got[5], LiteralValue::Boolean(true));
     assert_eq!(got[6], n(4.0));
+    // A range that forms but cannot be read (missing sheet) is an error value.
+    assert_eq!(got[7], LiteralValue::Boolean(true));
+    assert_eq!(got[8], n(-1.0));
 }
 
 /// A `:` range as a whole formula spills like the literal range, and under

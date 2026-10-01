@@ -2852,7 +2852,9 @@ fn round_significant_15(val: f64) -> f64 {
     if val == 0.0 || !val.is_finite() {
         return val;
     }
-    format!("{val:.14e}").parse().unwrap_or(val)
+    // Rounding up near f64::MAX can overflow; a finite part stays finite.
+    let rounded: f64 = format!("{val:.14e}").parse().unwrap_or(val);
+    if rounded.is_finite() { rounded } else { val }
 }
 
 /// Format a complex number as a string
@@ -5760,5 +5762,8 @@ mod tests {
         // Short parts are unchanged.
         assert_eq!(format_complex(3.0, -4.0, 'i'), "3-4i");
         assert_eq!(format_complex(0.5, 0.0, 'j'), "0.5");
+        // Rounding up near f64::MAX must not turn a finite part into infinity.
+        let near_max = format_complex(1.7976931348623155e308, 0.0, 'i');
+        assert!(!near_max.contains("inf"), "{near_max}");
     }
 }

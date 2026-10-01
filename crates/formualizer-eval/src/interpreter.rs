@@ -1052,15 +1052,16 @@ impl<'a> Interpreter<'a> {
     }
 
     /// The value of a `:` range: its cells, read exactly like a literal range
-    /// of the same area, or the error that kept the range from forming.
+    /// of the same area, or the error that kept the range from forming or
+    /// being read (an error value, so ISERROR and IFERROR see it).
     fn range_value(
         &self,
         range: Result<ReferenceType, ExcelError>,
     ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
-        match range {
-            Ok(reference) => self.eval_reference_to_calc(&reference),
+        match range.and_then(|reference| self.eval_reference_to_calc(&reference)) {
             Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
             Err(error) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error))),
+            ok => ok,
         }
     }
 
