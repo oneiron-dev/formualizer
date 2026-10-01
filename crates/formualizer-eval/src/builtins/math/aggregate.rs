@@ -150,6 +150,8 @@ pub struct CountFn;
 /// # Remarks
 /// - Text values inside ranges are ignored and not counted.
 /// - Blank cells and logical values in ranges are ignored.
+/// - Error values are not counted, whether supplied directly (`COUNT(1/0)` is 0)
+///   or found in a range or array.
 ///
 /// # Examples
 ///
@@ -231,10 +233,11 @@ impl Function for CountFn {
                     return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
                 }
                 AggregateArgument::Scalar(v) => {
-                    if let LiteralValue::Error(e) = v {
-                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
-                    }
-                    if !matches!(v, LiteralValue::Empty) && coerce_num(&v).is_ok() {
+                    // Excel: "Arguments that are error values or text that
+                    // cannot be translated into numbers are not counted."
+                    if !matches!(v, LiteralValue::Empty | LiteralValue::Error(_))
+                        && coerce_num(&v).is_ok()
+                    {
                         count += 1;
                     }
                 }
@@ -1211,22 +1214,65 @@ mod tests_count {
         );
     }
 
+    /// Excel: "Arguments that are error values or text that cannot be
+    /// translated into numbers are not counted", so COUNT(1/0) is 0, not
+    /// #DIV/0!.
     #[test]
-    fn count_direct_error_argument_propagates() {
+    fn count_direct_error_arguments_are_not_counted() {
         let wb = TestWorkbook::new().with_function(std::sync::Arc::new(CountFn));
         let ctx = interp(&wb);
-        let err = ASTNode::new(
-            ASTNodeType::Literal(LiteralValue::Error(ExcelError::from_error_string(
-                "#DIV/0!",
-            ))),
-            None,
-        );
-        let args = vec![ArgumentHandle::new(&err, &ctx)];
+        let error = |code: &str| {
+            ASTNode::new(
+                ASTNodeType::Literal(LiteralValue::Error(ExcelError::from_error_string(code))),
+                None,
+            )
+        };
+        let div0 = error("#DIV/0!");
+        let na = error("#N/A");
+        let one = ASTNode::new(ASTNodeType::Literal(LiteralValue::Int(1)), None);
         let f = ctx.context.get_function("", "COUNT").unwrap();
         let fctx = ctx.function_context(None);
-        match f.dispatch(&args, &fctx).unwrap().into_literal() {
-            LiteralValue::Error(e) => assert_eq!(e, "#DIV/0!"),
-            v => panic!("unexpected {v:?}"),
+
+        let args = vec![ArgumentHandle::new(&div0, &ctx)];
+        assert_eq!(
+            f.dispatch(&args, &fctx).unwrap().into_literal(),
+            LiteralValue::Number(0.0)
+        );
+        let args = vec![
+            ArgumentHandle::new(&na, &ctx),
+            ArgumentHandle::new(&one, &ctx),
+            ArgumentHandle::new(&div0, &ctx),
+        ];
+        assert_eq!(
+            f.dispatch(&args, &fctx).unwrap().into_literal(),
+            LiteralValue::Number(1.0)
+        );
+    }
+
+    #[test]
+    fn count_skips_computed_error_values() {
+        use crate::engine::{Engine, EvalConfig};
+        use formualizer_parse::parser::parse;
+
+        let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+        let cases = [
+            ("=COUNT(1/0)", 0.0),
+            ("=COUNT(#N/A)", 0.0),
+            ("=COUNT(1,NA(),\"2\",\"x\",SQRT(-1))", 2.0),
+            ("=COUNT({1,#N/A,2})", 2.0),
+        ];
+        for (row, (formula, _)) in cases.iter().enumerate() {
+            engine
+                .set_cell_formula("Sheet1", row as u32 + 1, 1, parse(formula).unwrap())
+                .unwrap();
+        }
+        engine.evaluate_all().unwrap();
+        for (row, (formula, expected)) in cases.iter().enumerate() {
+            assert_eq!(
+                engine.get_cell_value("Sheet1", row as u32 + 1, 1),
+                Some(LiteralValue::Number(*expected)),
+                "{formula}"
+            );
         }
     }
 }

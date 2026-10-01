@@ -309,3 +309,21 @@ fn lambda_bodies_keep_array_evaluation() {
         number(6.0)
     );
 }
+
+#[test]
+fn count_does_not_count_an_intersected_error() {
+    // COUNT does not count error values, so an operand intersected to one
+    // error counts 0 instead of returning the error; the
+    // IF(COUNT(SEARCH(..)),..) idiom depends on this.
+    assert_eq!(legacy(2, "=COUNT(SEARCH(\"q\",B1:B3))"), number(0.0));
+    assert_eq!(
+        legacy(2, "=IF(COUNT(MATCH(A1:A3,{5},0)),\"hit\",\"miss\")"),
+        Some(LiteralValue::Text("miss".into()))
+    );
+    assert_eq!(legacy(2, "=COUNT(A1:A3/0)"), number(0.0));
+    // No row of A1:A3 at row 5: the operand is #VALUE!, which is not counted.
+    assert_eq!(legacy(5, "=COUNT(A1:A3*1)"), number(0.0));
+    assert_eq!(legacy(2, "=COUNT(A1:A3*1)"), number(1.0));
+    // COUNTA does count the error value.
+    assert_eq!(legacy(5, "=COUNTA(A1:A3*1)"), number(1.0));
+}

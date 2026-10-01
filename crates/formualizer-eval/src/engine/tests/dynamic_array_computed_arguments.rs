@@ -111,10 +111,11 @@ fn genuine_reference_errors_are_still_preserved() {
             ExcelErrorKind::Ref,
         ),
         // INDIRECT of text that is not a reference is #REF!; the point is
-        // that the failure still propagates instead of being masked.
+        // that the failure still propagates instead of being masked. SUM, not
+        // COUNT: COUNT does not count error values, so Excel gives 0 there.
         (
             3,
-            "=COUNT(TRANSPOSE(INDIRECT(\"not a reference\")))",
+            "=SUM(TRANSPOSE(INDIRECT(\"not a reference\")))",
             ExcelErrorKind::Ref,
         ),
     ];
