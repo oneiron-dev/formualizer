@@ -8,19 +8,24 @@ use crate::function::Function;
 use crate::traits::{ArgumentHandle, CalcValue, FunctionContext};
 use formualizer_common::{ExcelError, LiteralValue};
 use formualizer_macros::func_caps;
-use sxd_document::dom::{ChildOfElement, ChildOfRoot, Text};
-use sxd_xpath::{Context, Factory, Value};
+use xml::{Document, is_xml_space};
+
+mod xml;
+mod xpath;
 
 /// The longest XPath FILTERXML accepts.
 const MAX_XPATH_CHARS: usize = 1024;
 
-/// The namespace of the predeclared `xml:` prefix (`xml:space`).
-const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+/// Parsing and evaluating an XPath recurses as deep as its parentheses and
+/// brackets nest. Up to this nesting that takes little stack; a deeper XPath
+/// (up to 512 levels fit in 1024 characters) runs on a thread of its own
+/// with [`DEEP_XPATH_STACK_BYTES`], so it never overflows the caller's stack
+/// (a 2 MiB rayon worker, say).
+const INLINE_NESTING: usize = 32;
 
-/// XML white space: space, tab, carriage return and line feed.
-fn is_xml_space(c: char) -> bool {
-    matches!(c, ' ' | '\t' | '\r' | '\n')
-}
+/// The stack of that thread: room for 512 levels several times over, in
+/// debug builds too. Untouched stack pages cost no memory.
+const DEEP_XPATH_STACK_BYTES: usize = 16 << 20;
 
 fn to_text(arg: &ArgumentHandle<'_, '_>) -> Result<String, ExcelError> {
     Ok(match scalar_text_value(arg)? {
@@ -37,49 +42,6 @@ fn to_text(arg: &ArgumentHandle<'_, '_>) -> Result<String, ExcelError> {
     })
 }
 
-/// Whether `xpath` uses a namespace prefix (`p:name`, `p:*`, `p:f()`) outside
-/// its string literals. FILTERXML declares no prefixes for the XPath, so
-/// MSXML rejects any; a single `:` only ever separates a prefix (`::` is an
-/// axis).
-fn has_prefixed_name(xpath: &str) -> bool {
-    let mut quote = None;
-    let mut chars = xpath.chars().peekable();
-    while let Some(c) = chars.next() {
-        match quote {
-            Some(q) => {
-                if c == q {
-                    quote = None;
-                }
-            }
-            None => match c {
-                '\'' | '"' => quote = Some(c),
-                ':' if chars.peek() == Some(&':') => {
-                    chars.next();
-                }
-                ':' => return true,
-                _ => {}
-            },
-        }
-    }
-    false
-}
-
-/// Make a run of adjacent text nodes one node (the parser splits text at
-/// entity references and CDATA sections), or drop it when it is only white
-/// space and white space is not preserved.
-fn merge_text_run(run: &mut Vec<Text<'_>>, preserve: bool) {
-    let text: String = run.iter().map(|node| node.text()).collect();
-    if !preserve && text.chars().all(is_xml_space) {
-        run.iter().for_each(|node| node.remove_from_parent());
-    } else if let [first, rest @ ..] = run.as_slice()
-        && !rest.is_empty()
-    {
-        first.set_text(&text);
-        rest.iter().for_each(|node| node.remove_from_parent());
-    }
-    run.clear();
-}
-
 /// The text of each node `xpath` selects in `xml`, in document order; `None`
 /// when the XML or the XPath is invalid, the XPath evaluates to something
 /// other than nodes (`count(//a)`) or selects no node.
@@ -88,48 +50,37 @@ fn merge_text_run(run: &mut Vec<Text<'_>>, preserve: bool) {
 /// not preserved unless `xml:space="preserve"`), and a node's text is trimmed
 /// of leading and trailing white space; XPath tests see the untrimmed values.
 fn select_node_texts(xml: &str, xpath: &str) -> Option<Vec<String>> {
-    if xpath.chars().count() > MAX_XPATH_CHARS || has_prefixed_name(xpath) {
+    if xpath.chars().count() > MAX_XPATH_CHARS {
         return None;
     }
-    let package = sxd_document::parser::parse(xml).ok()?;
-    let document = package.as_document();
-    let mut elements: Vec<_> = document
-        .root()
-        .children()
+    let tokens = xpath::tokenize(xpath).ok()?;
+    if tokens.nesting() <= INLINE_NESTING {
+        return evaluate(xml, tokens);
+    }
+    // Where no thread can start (wasm), a deep XPath is #VALUE!.
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(DEEP_XPATH_STACK_BYTES)
+            .spawn_scoped(scope, || evaluate(xml, tokens))
+            .ok()?
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+/// Parses the XPath, loads the XML and returns the text of the selected nodes.
+fn evaluate(xml: &str, tokens: xpath::Tokens) -> Option<Vec<String>> {
+    let xpath = xpath::compile(tokens).ok()?;
+    let document = Document::parse(xml, xpath.uses_namespace_axis)?;
+    let texts: Vec<String> = xpath::select(&document, &xpath)
+        .ok()?
         .into_iter()
-        .filter_map(|child| match child {
-            ChildOfRoot::Element(element) => Some((element, false)),
-            _ => None,
+        .map(|node| {
+            document
+                .string_value(node)
+                .trim_matches(is_xml_space)
+                .to_string()
         })
-        .collect();
-    let mut run = Vec::new();
-    while let Some((element, inherited)) = elements.pop() {
-        let preserve = match element.attribute_value((XML_NAMESPACE, "space")) {
-            Some("preserve") => true,
-            Some("default") => false,
-            _ => inherited,
-        };
-        for child in element.children() {
-            match child {
-                ChildOfElement::Text(text) => run.push(text),
-                other => {
-                    merge_text_run(&mut run, preserve);
-                    if let ChildOfElement::Element(child) = other {
-                        elements.push((child, preserve));
-                    }
-                }
-            }
-        }
-        merge_text_run(&mut run, preserve);
-    }
-    let xpath = Factory::new().build(xpath).ok()??;
-    let Value::Nodeset(nodes) = xpath.evaluate(&Context::new(), document.root()).ok()? else {
-        return None;
-    };
-    let texts: Vec<String> = nodes
-        .document_order()
-        .iter()
-        .map(|node| node.string_value().trim_matches(is_xml_space).to_string())
         .collect();
     (!texts.is_empty()).then_some(texts)
 }
@@ -595,6 +546,465 @@ mod tests {
         // Owner ruling: the web functions stay unknown (#NAME?).
         for name in ["WEBSERVICE", "ENCODEURL"] {
             assert!(crate::function_registry::get("", name).is_none(), "{name}");
+        }
+    }
+
+    /// FILTERXML of literal XML and XPath (neither may hold a double quote).
+    fn filterxml(xml: &str, xpath: &str) -> LiteralValue {
+        eval(&format!("=FILTERXML(\"{xml}\",\"{xpath}\")"))
+    }
+
+    /// The nodes FILTERXML of literal XML and XPath spills.
+    fn filterxml_spill(xml: &str, xpath: &str) -> Vec<LiteralValue> {
+        spill(&format!("=FILTERXML(\"{xml}\",\"{xpath}\")"))
+    }
+
+    fn assert_value_error(xml: &str, xpath: &str) {
+        assert_eq!(
+            error_kind(filterxml(xml, xpath)),
+            ExcelErrorKind::Value,
+            "{xml} {xpath}"
+        );
+    }
+
+    #[test]
+    fn numeric_predicate_selects_only_the_equal_position() {
+        // XPath 1.0 §2.4: a number is true only when it equals the position,
+        // so a fraction selects nothing and FILTERXML is #VALUE!.
+        let four = "<t><s>a</s><s>b</s><s>c</s><s>d</s></t>";
+        for xpath in [
+            "//s[1.5]",
+            "//s[1.9]",
+            "//s[(last()+1) div 2]",
+            "(//s)[2.5]",
+            "//s[0]",
+            "//s[-1]",
+            "//s[0 div 0]",
+            "//s[1 div 0]",
+        ] {
+            assert_value_error(four, xpath);
+        }
+        assert_eq!(filterxml(four, "//s[2.0]"), text("b"));
+        assert_eq!(filterxml(four, "//s[last() div 2]"), text("b"));
+        assert_eq!(filterxml(four, "(//s)[round(2.5)]"), text("c"));
+        assert_eq!(filterxml(four, "//s[position()=1.0]"), text("a"));
+        // With an odd count the middle position is whole.
+        assert_eq!(
+            filterxml("<t><s>a</s><s>b</s><s>c</s></t>", "//s[(last()+1) div 2]"),
+            text("b")
+        );
+    }
+
+    #[test]
+    fn xpath_reads_only_xpath_numbers_from_text() {
+        // XPath 1.0 §4.4: number() reads optional white space, an optional
+        // minus sign and digits with an optional point; anything else is NaN.
+        assert_value_error("<t><s>a</s><s>1e3</s></t>", "//s[.*0=0]");
+        assert_value_error("<t><s>a</s><s>+5</s></t>", "//s[.*0=0]");
+        assert_value_error("<t><s>2</s><s>3e2</s></t>", "//s[.>200]");
+        assert_eq!(
+            filterxml_spill("<t><s>Infinity</s><s>5</s></t>", "//s[.>1]"),
+            vec![number(5.0)]
+        );
+        assert_eq!(
+            error_kind(eval(
+                "=FILTERXML(\"<t><s>\"&UNICHAR(160)&\"5</s></t>\",\"//s[.=5]\")"
+            )),
+            ExcelErrorKind::Value
+        );
+        let not_numbers = "1e3|1E3|1.|0x10|Infinity|-Infinity|NaN|inf|1,000|--1|.|-|1 1|1.2.3|8";
+        assert_eq!(
+            eval(&format!(
+                "=FILTERXML({},\"//s[number(.)=number(.)][.!='1.']\")",
+                split(not_numbers, "|")
+            )),
+            number(8.0)
+        );
+        // XML white space around a number is fine.
+        assert_eq!(
+            eval(&format!(
+                "=ROWS(FILTERXML({},\"//s[.*0=0]\"))",
+                split(" 7 |5.|.5|-.5|-2|x", "|")
+            )),
+            number(5.0)
+        );
+        assert_eq!(
+            eval("=FILTERXML(\"<t><s>\"&CHAR(9)&\"5\"&CHAR(10)&\"</s></t>\",\"//s[.=5]\")"),
+            number(5.0)
+        );
+        // The string of a number: no exponent, 0 for -0, Infinity and NaN.
+        let strings =
+            "<t><s>0</s><s>0.5</s><s>Infinity</s><s>NaN</s><s>100000000000000000000</s></t>";
+        assert_eq!(filterxml(strings, "//s[.=string(-0)]"), number(0.0));
+        assert_eq!(filterxml(strings, "//s[.=concat(1 div 2,'')]"), number(0.5));
+        assert_eq!(
+            filterxml(strings, "//s[.=string(1 div 0)]"),
+            text("Infinity")
+        );
+        assert_eq!(filterxml(strings, "//s[.=string(0 div 0)]"), text("NaN"));
+        assert_eq!(
+            filterxml(strings, "//s[.=string(100000*100000*100000*100000)]"),
+            number(1e20)
+        );
+    }
+
+    #[test]
+    fn xml_line_ends_and_attribute_white_space_are_normalized() {
+        // XML 1.0 §2.11: CR LF and a lone CR are a line feed.
+        assert_eq!(
+            eval("=CODE(MID(FILTERXML(\"<a>p\"&CHAR(13)&\"q</a>\",\"//a\"),2,1))"),
+            number(10.0)
+        );
+        assert_eq!(
+            eval("=LEN(FILTERXML(\"<a>x\"&CHAR(13)&CHAR(10)&\"y</a>\",\"//a\"))"),
+            number(3.0)
+        );
+        assert_eq!(
+            eval("=CODE(MID(FILTERXML(\"<a><![CDATA[p\"&CHAR(13)&\"q]]></a>\",\"//a\"),2,1))"),
+            number(10.0)
+        );
+        // §3.3.3: a tab, CR or LF written in an attribute value is a space.
+        for code in [9, 10, 13] {
+            assert_eq!(
+                eval(&format!(
+                    "=CODE(MID(FILTERXML(\"<a x='p\"&CHAR({code})&\"q'/>\",\"//@x\"),2,1))"
+                )),
+                number(32.0),
+                "CHAR({code})"
+            );
+        }
+        assert_eq!(
+            eval("=LEN(FILTERXML(\"<a x='p\"&CHAR(13)&CHAR(10)&\"q'/>\",\"//@x\"))"),
+            number(3.0)
+        );
+        assert_eq!(
+            eval(
+                "=CODE(MID(FILTERXML(\"<r><!-- ' --><b c=\"\"p\"&CHAR(9)&\"q\"\"/></r>\",\"//@c\"),2,1))"
+            ),
+            number(32.0)
+        );
+        // A character reference keeps its character, and content keeps its
+        // white space.
+        assert_eq!(
+            eval("=CODE(MID(FILTERXML(\"<a x='p&#10;q'/>\",\"//@x\"),2,1))"),
+            number(10.0)
+        );
+        assert_eq!(
+            eval("=CODE(MID(FILTERXML(\"<a>p&#13;q</a>\",\"//a\"),2,1))"),
+            number(13.0)
+        );
+        assert_eq!(
+            eval("=CODE(MID(FILTERXML(\"<a>x='p\"&CHAR(9)&\"q'</a>\",\"//a\"),5,1))"),
+            number(9.0)
+        );
+    }
+
+    #[test]
+    fn characters_xml_forbids_are_invalid_xml() {
+        // XML 1.0 §2.2 and WFC Legal Character: a fatal error, so #VALUE!.
+        for formula in [
+            "=FILTERXML(\"<a>\"&CHAR(1)&\"z</a>\",\"//a\")",
+            "=FILTERXML(\"<a>&#1;</a>\",\"//a\")",
+            "=FILTERXML(\"<a>&#x1F;z</a>\",\"//a\")",
+            "=FILTERXML(\"<a>&#0;z</a>\",\"//a\")",
+            "=FILTERXML(\"<a x='&#2;'>1</a>\",\"//a\")",
+            "=FILTERXML(\"<!--\"&CHAR(2)&\"--><a>1</a>\",\"//a\")",
+            "=FILTERXML(\"<a>1</a><?pi \"&CHAR(31)&\"?>\",\"//a\")",
+            "=FILTERXML(\"<a xmlns:p='&#3;'>1</a>\",\"//a\")",
+            "=FILTERXML(\"<a>&#xD800;</a>\",\"//a\")",
+            "=FILTERXML(\"<a>&#xFFFE;</a>\",\"//a\")",
+        ] {
+            assert_eq!(
+                error_kind(eval(formula)),
+                ExcelErrorKind::Value,
+                "{formula}"
+            );
+        }
+        assert_eq!(filterxml("<a>&#9;z&#10;</a>", "//a"), text("z"));
+        assert_eq!(filterxml("<a>&#x10000;z</a>", "//a"), text("\u{10000}z"));
+        // In a comment or CDATA section `&#1;` is text, not a reference.
+        assert_eq!(
+            filterxml("<a><!--&#1;--><![CDATA[&#1;]]></a>", "//a"),
+            text("&#1;")
+        );
+    }
+
+    #[test]
+    fn lang_matches_the_nearest_xml_lang() {
+        // XPath 1.0 §4.3: the xml:lang of the node or its nearest ancestor is
+        // the language or a sublanguage of it, ignoring case.
+        let en = "<a xml:lang='en'><s>x</s></a>";
+        assert_eq!(filterxml(en, "//s[lang('en')]"), text("x"));
+        assert_eq!(filterxml(en, "//s[lang('EN')]"), text("x"));
+        assert_eq!(
+            filterxml("<a xml:lang='EN-us'><s>x</s></a>", "//s[lang('en')]"),
+            text("x")
+        );
+        assert_eq!(
+            filterxml("<a xml:lang='en-US'><s>x</s></a>", "//s[lang('en-us')]"),
+            text("x")
+        );
+        assert_eq!(
+            filterxml("<a xml:lang='en' b='y'/>", "//@b[lang('en')]"),
+            text("y")
+        );
+        assert_eq!(
+            filterxml("<a xml:lang='en'>z</a>", "//text()[lang('en')]"),
+            text("z")
+        );
+        assert_value_error(en, "//s[lang('en-US')]");
+        assert_value_error(en, "//s[lang('e')]");
+        assert_value_error("<a xml:lang='english'><s>x</s></a>", "//s[lang('en')]");
+        assert_value_error(
+            "<a xml:lang='en'><s xml:lang='de'>x</s></a>",
+            "//s[lang('en')]",
+        );
+        assert_value_error("<a><s>x</s></a>", "//s[lang('en')]");
+        assert_value_error(en, "//s[lang()]");
+    }
+
+    #[test]
+    fn deeply_nested_xpaths_evaluate_on_a_small_stack() {
+        // The finding's repro: 510 parentheses around //a, 1023 characters.
+        assert_eq!(
+            eval("=FILTERXML(\"<a>1</a>\",REPT(\"(\",510)&\"//a\"&REPT(\")\",510))"),
+            number(1.0)
+        );
+        fn nest(open: &str, inner: &str, close: &str, levels: usize) -> String {
+            format!("{}{inner}{}", open.repeat(levels), close.repeat(levels))
+        }
+        let one = || "<a>1</a>".to_string();
+        let deep_xml = |depth| format!("{}1{}", "<a>".repeat(depth), "</a>".repeat(depth));
+        // The deepest XPaths of each kind within 1024 characters.
+        let cases = vec![
+            (one(), nest("(", "//a", ")", 510)),
+            (one(), format!("//a[{}]", nest("(", "1", ")", 509))),
+            (one(), format!("//a[{}]", nest("not(", "false()", ")", 201))),
+            (one(), format!("//a[{}=1]", nest("-(", "1", ")", 338))),
+            (one(), format!("//a[{}=253]", nest("1+(", "0", ")", 253))),
+            (one(), format!("//a[{}1=1]", "-".repeat(1000))),
+            (one(), format!("//a[{}1>0]", "1+".repeat(500))),
+            (one(), format!("//a{}", "|//a".repeat(255))),
+            (deep_xml(341), format!("/{}", nest("a[", "1", "]", 340))),
+            // The deepest XML a cell holds.
+            (deep_xml(4680), "//a[not(a)]".to_string()),
+        ];
+        std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || {
+                for (xml, xpath) in cases {
+                    assert!(xpath.chars().count() <= super::MAX_XPATH_CHARS, "{xpath}");
+                    assert_eq!(
+                        super::select_node_texts(&xml, &xpath),
+                        Some(vec!["1".to_string()]),
+                        "{xpath}"
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        // Past the nesting bound (only reachable without the character limit)
+        // the XPath is invalid rather than deeper; the bound itself fits the
+        // stack deep XPaths run on.
+        std::thread::Builder::new()
+            .stack_size(super::DEEP_XPATH_STACK_BYTES)
+            .spawn(move || {
+                let compile = |levels| {
+                    let xpath = nest("(", "//a", ")", levels);
+                    super::xpath::tokenize(&xpath).and_then(super::xpath::compile)
+                };
+                assert!(compile(super::xpath::MAX_NESTING + 1).is_err());
+                assert!(compile(5000).is_err());
+                assert!(compile(super::xpath::MAX_NESTING).is_ok());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn axes_follow_xpath_1_0() {
+        let xml = "<r><a i='1'><b>1</b><c>2</c></a><d>3<e>4</e></d><f>5</f></r>";
+        let nodes = |xpath: &str| filterxml_spill(xml, xpath);
+        // Reverse axes count from the nearest node.
+        assert_eq!(nodes("//e/preceding::*[1]"), vec![number(2.0)]);
+        assert_eq!(nodes("//e/preceding::*[3]"), vec![number(12.0)]);
+        assert_eq!(nodes("//e/ancestor::*[1]"), vec![number(34.0)]);
+        assert_eq!(nodes("//e/ancestor-or-self::*[2]"), vec![number(34.0)]);
+        assert_eq!(nodes("//c/preceding-sibling::*[1]"), vec![number(1.0)]);
+        assert_eq!(nodes("//b/following-sibling::*"), vec![number(2.0)]);
+        // preceding leaves out ancestors, following leaves out descendants;
+        // the result is in document order.
+        assert_eq!(
+            nodes("//d/preceding::*"),
+            vec![number(12.0), number(1.0), number(2.0)]
+        );
+        assert_eq!(
+            nodes("//a/following::*"),
+            vec![number(34.0), number(4.0), number(5.0)]
+        );
+        assert_eq!(
+            nodes("//b/descendant-or-self::node()"),
+            vec![number(1.0), number(1.0)]
+        );
+        // An attribute's element and its children come before and after it.
+        assert_eq!(nodes("//@i/parent::*"), vec![number(12.0)]);
+        assert_eq!(nodes("//@i/following::*[1]"), vec![number(1.0)]);
+        assert_eq!(nodes("//b/parent::a/@i"), vec![number(1.0)]);
+        assert_value_error(xml, "//@i/following-sibling::node()");
+        assert_eq!(nodes("/descendant::*[2]"), vec![number(12.0)]);
+        assert_eq!(nodes("//*[2]"), vec![number(2.0), number(34.0)]);
+        assert_eq!(nodes("/r/*[last()]"), vec![number(5.0)]);
+        assert_eq!(nodes("//*[count(*)=2]"), vec![number(12.0)]);
+        assert_eq!(nodes("//e/../../f"), vec![number(5.0)]);
+        assert_eq!(nodes("//f/self::f"), vec![number(5.0)]);
+        assert_value_error(xml, "//f/self::g");
+        assert_eq!(
+            filterxml("<a xmlns:p='urn:p'>1</a>", "/a/namespace::p"),
+            text("urn:p")
+        );
+        // Node types.
+        let mixed = "<t><!--c--><?pi data?>x</t>";
+        assert_eq!(
+            filterxml_spill(mixed, "/t/node()"),
+            vec![text("c"), text("data"), text("x")]
+        );
+        assert_eq!(filterxml(mixed, "/t/comment()"), text("c"));
+        assert_eq!(
+            filterxml(mixed, "/t/processing-instruction('pi')"),
+            text("data")
+        );
+        assert_value_error(mixed, "/t/processing-instruction('other')");
+        assert_eq!(filterxml(mixed, "/t/text()"), text("x"));
+        assert_eq!(filterxml(mixed, "/"), text("x"));
+    }
+
+    #[test]
+    fn functions_follow_xpath_1_0() {
+        let xml = "<t><s> a  b </s><s>12345</s><s>-2.5</s></t>";
+        let one = |xpath: &str| filterxml(xml, xpath);
+        assert_eq!(one("//s[normalize-space()='a b']"), text("a  b"));
+        assert_eq!(one("//s[substring(.,1.5,2.6)='234']"), number(12345.0));
+        assert_eq!(one("//s[substring(.,0,3)='12']"), number(12345.0));
+        assert_eq!(
+            one("//s[substring(.,-42,1 div 0)='12345']"),
+            number(12345.0)
+        );
+        assert_eq!(one("//s[2][substring(.,1,0 div 0)='']"), number(12345.0));
+        assert_eq!(one("//s[translate(.,'135','ab')='a2b4']"), number(12345.0));
+        assert_eq!(one("//s[round(.)=-2]"), number(-2.5));
+        assert_eq!(one("//s[floor(.)=-3 and ceiling(.)=-2]"), number(-2.5));
+        assert_eq!(
+            one("//s[round(0.49999999999999994)=0 and . mod 10=5]"),
+            number(12345.0)
+        );
+        assert_eq!(
+            one("//s[5 mod -2=1 and -5 mod 2=-1 and . div 5=2469]"),
+            number(12345.0)
+        );
+        assert_eq!(
+            one("//s[string-length()=5 and string()='12345']"),
+            number(12345.0)
+        );
+        assert_eq!(
+            one("//s[substring-before(.,'34')='12' and substring-after(.,'23')='45']"),
+            number(12345.0)
+        );
+        assert_eq!(one("//s[concat(.,'x','y')='12345xy']"), number(12345.0));
+        assert_eq!(one("//s[number()=12345]"), number(12345.0));
+        assert_eq!(
+            one("(//s)[sum(//s[position()>1])=12342.5][2]"),
+            number(12345.0)
+        );
+        assert_eq!(one("//s[count(../s)=3][last()]"), number(-2.5));
+        assert_eq!(
+            one(
+                "//s[starts-with(.,'12') and contains(.,'34') and not(false()) and boolean(.) and true()]"
+            ),
+            number(12345.0)
+        );
+        let names = "<p:a xmlns:p='urn:p'><p:b x='1'/></p:a>";
+        assert_eq!(filterxml(names, "//*[name()='p:b']/@x"), number(1.0));
+        assert_eq!(
+            filterxml(
+                names,
+                "//*[local-name()='b' and namespace-uri()='urn:p']/@x"
+            ),
+            number(1.0)
+        );
+        // Without a DTD no node has an ID.
+        assert_value_error(xml, "id('x')");
+        // Unknown functions, wrong argument counts and node-set arguments that
+        // are not node-sets are invalid.
+        for xpath in [
+            "//s[concat('a')]",
+            "//s[substring(.)]",
+            "//s[true(1)]",
+            "//s[count(1)=1]",
+            "//s[sum('1')=1]",
+            "//s[name(1)='']",
+        ] {
+            assert_value_error(xml, xpath);
+        }
+    }
+
+    #[test]
+    fn operators_and_lexical_rules() {
+        let list = "<t><s>1</s><s>2</s><s>3</s></t>";
+        let one = |xpath: &str| filterxml(list, xpath);
+        // `*` multiplies after an operand and is a name test elsewhere.
+        assert_eq!(one("//s[. * 2 = 4]"), number(2.0));
+        assert_eq!(one("//s[.*.=9]"), number(3.0));
+        assert_eq!(one("/t/*[2]"), number(2.0));
+        // Operator names are element names where an operand starts.
+        let keywords = "<t><div>1</div><and>2</and><mod>3</mod></t>";
+        assert_eq!(filterxml(keywords, "//div[. div 1 = 1]"), number(1.0));
+        assert_eq!(filterxml(keywords, "/t/and"), number(2.0));
+        assert_eq!(filterxml(keywords, "//mod[. mod 2 = 1]"), number(3.0));
+        // Precedence, and left to right within one.
+        assert_eq!(one("//s[1 + 2 * 3 = 7][1]"), number(1.0));
+        assert_eq!(one("//s[(1 + 2) * 3 = 9][1]"), number(1.0));
+        assert_eq!(one("//s[10 - 2 - 3 = 5][1]"), number(1.0));
+        assert_eq!(one("//s[8 div 4 div 2 = 1][1]"), number(1.0));
+        assert_eq!(one("//s[1 = 1 = 1][1]"), number(1.0));
+        assert_value_error(list, "//s[3 > 2 > 1]");
+        assert_eq!(
+            one("//s[--1 = 1 and -(-(1)) = 1 and - - 2 = 2][1]"),
+            number(1.0)
+        );
+        assert_eq!(one("//s[1 or 0 and 0][1]"), number(1.0));
+        // Comparisons with node-sets hold for some node.
+        assert_eq!(one("//s[. = //s[3]]"), number(3.0));
+        assert_eq!(one("/t[s = 2]/s[1]"), number(1.0));
+        assert_eq!(one("/t[s != 1]/s[1]"), number(1.0));
+        assert_eq!(one("/t[s > 2 and 2 < s]/s[1]"), number(1.0));
+        assert_value_error(list, "/t[s > 3]");
+        assert_value_error(list, "/t[3 < s]");
+        assert_eq!(one("/t[s = true() and x = false()]/s[1]"), number(1.0));
+        assert_eq!(
+            one("/t[s[1] != s[2] and not(s[1] != s[1])]/s[1]"),
+            number(1.0)
+        );
+        // White space between tokens.
+        assert_eq!(one("// s [ count ( ../s ) = 3 ] [ 2 ]"), number(2.0));
+        assert_eq!(one("/t/child :: s[3]"), number(3.0));
+        for xpath in [
+            // . and .. take no predicates.
+            "//s/.[1]",
+            "//s/..[1]",
+            "/ /s",
+            "//s[. = $v]",
+            "//s[1 foo 2]",
+            "//s[.=']",
+            "//s[1e3]",
+            "//s[@]",
+            "//s[]",
+            "//s/",
+            "bogus::s",
+            "//s[. ! 1]",
+        ] {
+            assert_value_error(list, xpath);
         }
     }
 }
