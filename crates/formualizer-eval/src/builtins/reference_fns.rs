@@ -134,6 +134,10 @@ fn resolve_reference_bounds<'b>(
 pub struct IndexFn;
 
 impl IndexFn {
+    /// A row_num or column_num: `None` when it holds several values, which
+    /// dispatch lifts over. In a formula entered without the array flag a
+    /// multi-cell reference here has already been intersected with the
+    /// formula cell (`lift::legacy_arg`).
     fn index_argument<'a, 'b>(arg: &ArgumentHandle<'a, 'b>) -> Result<Option<i64>, ExcelError> {
         if arg.is_omitted() {
             return Ok(Some(0));

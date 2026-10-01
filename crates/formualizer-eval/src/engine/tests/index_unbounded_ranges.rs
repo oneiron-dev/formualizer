@@ -348,6 +348,186 @@ fn index_omitted_column_row_under_legacy_array_semantics() {
     }
 }
 
+/// A1:C3 = 1 2 3 / 10 20 30 / 7 8 9, A5:C5 = "M10" "M20" "M30" and
+/// M1:M40 = 1..40.
+fn single_value_argument_engine() -> Engine<TestWorkbook> {
+    let mut engine = new_engine();
+    for (row, values) in [(1, [1, 2, 3]), (2, [10, 20, 30]), (3, [7, 8, 9])] {
+        for (col, value) in (1..).zip(values) {
+            engine
+                .set_cell_value("Sheet1", row, col, LiteralValue::Int(value))
+                .unwrap();
+        }
+    }
+    for (col, text) in (1..).zip(["M10", "M20", "M30"]) {
+        engine
+            .set_cell_value("Sheet1", 5, col, LiteralValue::Text(text.into()))
+            .unwrap();
+    }
+    for row in 1..=40 {
+        engine
+            .set_cell_value("Sheet1", row, 13, LiteralValue::Int(row as i64))
+            .unwrap();
+    }
+    engine
+}
+
+fn assert_text(engine: &Engine<TestWorkbook>, row: u32, col: u32, expected: &str) {
+    match engine.get_cell_value("Sheet1", row, col) {
+        Some(LiteralValue::Text(text)) => assert_eq!(text, expected, "Sheet1!R{row}C{col}"),
+        other => panic!("Sheet1!R{row}C{col}: expected {expected:?}, got {other:?}"),
+    }
+}
+
+fn assert_value_error(engine: &Engine<TestWorkbook>, row: u32, col: u32) {
+    match engine.get_cell_value("Sheet1", row, col) {
+        Some(LiteralValue::Error(error)) => {
+            assert_eq!(error.kind, ExcelErrorKind::Value, "Sheet1!R{row}C{col}")
+        }
+        other => panic!("Sheet1!R{row}C{col}: expected #VALUE!, got {other:?}"),
+    }
+}
+
+#[test]
+fn single_value_arguments_intersect_a_row_in_legacy_formulas() {
+    // In an ordinary legacy formula a multi-cell reference passed to a
+    // single-value parameter (INDEX's row_num/column_num, OFFSET's rows,
+    // CHOOSE's index_num, INDIRECT's ref_text) or used as an operand takes the
+    // implicit intersection with the formula cell: its column of a row,
+    // #VALUE! when the formula sits outside the row's columns.
+    let mut engine = single_value_argument_engine();
+    let formulas = [
+        "=INDEX($M$1:$M$40,INDEX($A$1:$C$3,2))",
+        "=INDEX($M$1:$M$40,INDEX($A$1:$C$3,2),1)",
+        "=OFFSET($M$1,INDEX($A$1:$C$3,2),0)",
+        "=SUM(OFFSET($M$1,INDEX($A$1:$C$3,2),0,2))",
+        "=CHOOSE(INDEX($A$1:$C$3,1),\"p\",\"q\",\"r\")",
+        "=INDIRECT($A$5:$C$5)",
+        "=INDEX($M$1:$M$40,$A$1:$C$1+0)",
+        // A single-cell range is its own value wherever the formula is.
+        "=INDEX($M$1:$M$40,$A$2:$A$2)",
+        "=CHOOSE(INDEX($A$1:$C$3,3)-6,\"p\",\"q\",\"r\")",
+        "=INDIRECT(\"M\"&INDEX($A$1:$C$3,2))",
+    ];
+    for (row, formula) in (60..).zip(formulas) {
+        for col in [1, 2, 5] {
+            engine
+                .set_cell_formula("Sheet1", row, col, parse(formula).unwrap())
+                .unwrap();
+        }
+    }
+    engine.use_legacy_array_semantics();
+    engine.evaluate_all().unwrap();
+
+    for row in [60, 61] {
+        assert_number(&engine, "Sheet1", row, 1, 10.0);
+        assert_number(&engine, "Sheet1", row, 2, 20.0);
+        assert_value_error(&engine, row, 5);
+    }
+    assert_number(&engine, "Sheet1", 62, 1, 11.0);
+    assert_number(&engine, "Sheet1", 62, 2, 21.0);
+    assert_value_error(&engine, 62, 5);
+    assert_number(&engine, "Sheet1", 63, 1, 23.0);
+    assert_number(&engine, "Sheet1", 63, 2, 43.0);
+    assert_value_error(&engine, 63, 5);
+    assert_text(&engine, 64, 1, "p");
+    assert_text(&engine, 64, 2, "q");
+    assert_value_error(&engine, 64, 5);
+    assert_number(&engine, "Sheet1", 65, 1, 10.0);
+    assert_number(&engine, "Sheet1", 65, 2, 20.0);
+    assert_value_error(&engine, 65, 5);
+    for col in [1, 2, 5] {
+        assert_number(&engine, "Sheet1", 67, col, 10.0);
+    }
+    // An operator intersects its reference operand first.
+    assert_number(&engine, "Sheet1", 66, 1, 1.0);
+    assert_number(&engine, "Sheet1", 66, 2, 2.0);
+    assert_value_error(&engine, 66, 5);
+    assert_text(&engine, 68, 1, "p");
+    assert_text(&engine, 68, 2, "q");
+    assert_value_error(&engine, 68, 5);
+    assert_number(&engine, "Sheet1", 69, 1, 10.0);
+    assert_number(&engine, "Sheet1", 69, 2, 20.0);
+    assert_value_error(&engine, 69, 5);
+}
+
+#[test]
+fn single_value_arguments_lift_over_a_row_in_legacy_array_formulas() {
+    // OFFSET and INDIRECT over the row give an array of references, which N
+    // reads one reference at a time.
+    let mut engine = single_value_argument_engine();
+    let formulas = [
+        "=INDEX($M$1:$M$40,INDEX($A$1:$C$3,2))",
+        "=N(OFFSET($M$1,INDEX($A$1:$C$3,2),0))",
+        "=CHOOSE(INDEX($A$1:$C$3,3)-6,\"p\",\"q\",\"r\")",
+        "=N(INDIRECT($A$5:$C$5))",
+    ];
+    for (row, formula) in (60..).zip(formulas) {
+        engine
+            .set_cell_formula("Sheet1", row, 5, parse(formula).unwrap())
+            .unwrap();
+    }
+    engine.use_legacy_array_semantics();
+    for row in 60..64 {
+        engine.declare_array_formula("Sheet1", row, 5, 1, 3, false);
+    }
+    engine.evaluate_all().unwrap();
+
+    for (col, row_value, offset_value, choice) in [
+        (5, 10.0, 11.0, "p"),
+        (6, 20.0, 21.0, "q"),
+        (7, 30.0, 31.0, "r"),
+    ] {
+        assert_number(&engine, "Sheet1", 60, col, row_value);
+        assert_number(&engine, "Sheet1", 61, col, offset_value);
+        assert_text(&engine, 62, col, choice);
+        assert_number(&engine, "Sheet1", 63, col, row_value);
+    }
+}
+
+#[test]
+fn single_value_arguments_lift_over_a_row_with_dynamic_arrays() {
+    let mut engine = single_value_argument_engine();
+    let formulas = [
+        (60, "=INDEX($M$1:$M$40,INDEX($A$1:$C$3,2))"),
+        (62, "=N(OFFSET($M$1,INDEX($A$1:$C$3,2),0))"),
+        (64, "=CHOOSE(INDEX($A$1:$C$3,3)-6,\"p\",\"q\",\"r\")"),
+        (66, "=N(INDIRECT(\"M\"&INDEX($A$1:$C$3,2)))"),
+        (68, "=SUM(INDEX($M$1:$M$40,INDEX($A$1:$C$3,2)))"),
+        // Several indexes select element-wise, each choice broadcast.
+        (70, "=CHOOSE({1,2},$A$1:$A$3,$B$1:$B$3)"),
+        (74, "=VLOOKUP(20,CHOOSE({1,2},$B$1:$B$3,$A$1:$A$3),2,FALSE)"),
+        // An array of references has no value of its own.
+        (76, "=OFFSET($M$1,INDEX($A$1:$C$3,2),0)"),
+        (78, "=INDIRECT(\"M\"&INDEX($A$1:$C$3,2))"),
+    ];
+    for (row, formula) in formulas {
+        engine
+            .set_cell_formula("Sheet1", row, 5, parse(formula).unwrap())
+            .unwrap();
+    }
+    engine.evaluate_all().unwrap();
+
+    for (col, row_value, offset_value, choice) in [
+        (5, 10.0, 11.0, "p"),
+        (6, 20.0, 21.0, "q"),
+        (7, 30.0, 31.0, "r"),
+    ] {
+        assert_number(&engine, "Sheet1", 60, col, row_value);
+        assert_number(&engine, "Sheet1", 62, col, offset_value);
+        assert_text(&engine, 64, col, choice);
+        assert_number(&engine, "Sheet1", 66, col, row_value);
+    }
+    assert_number(&engine, "Sheet1", 68, 5, 60.0);
+    for (row, first, second) in [(70, 1.0, 2.0), (71, 10.0, 20.0), (72, 7.0, 8.0)] {
+        assert_number(&engine, "Sheet1", row, 5, first);
+        assert_number(&engine, "Sheet1", row, 6, second);
+    }
+    assert_number(&engine, "Sheet1", 74, 5, 10.0);
+    assert_value_error(&engine, 76, 5);
+    assert_value_error(&engine, 78, 5);
+}
+
 #[test]
 fn offset_whole_column_and_row_clamped() {
     let mut engine = new_engine();

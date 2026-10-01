@@ -29,6 +29,11 @@ pub struct ChooseRowsFn;
 /// - Indexes less than 1 or greater than the number of choices return `#VALUE!`.
 /// - Errors in `index_num` are propagated.
 /// - The selected argument is returned as-is, including non-text/non-numeric values.
+/// - An `index_num` holding several values selects element-wise
+///   (`CHOOSE({1,2},A1:A3,B1:B3)` pairs the two columns). In an ordinary
+///   (non-array) legacy formula a multi-cell reference there is first
+///   implicitly intersected with the formula cell (`#VALUE!` when they do not
+///   meet).
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -143,8 +148,14 @@ impl Function for ChooseFn {
             )));
         }
 
-        // Get index
-        let index_val = args[0].value()?.into_literal();
+        // Get index. Several indexes select element-wise. (In a formula
+        // entered without the array flag a multi-cell reference here has
+        // already been intersected with the formula cell.)
+        let index_value = args[0].value()?;
+        if let Some(indexes) = crate::lift::array_rows(&index_value) {
+            return choose_over_array(args, indexes);
+        }
+        let index_val = index_value.into_literal();
         if let LiteralValue::Error(e) = index_val {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
         }
@@ -187,8 +198,11 @@ fn resolve_choose_reference_or_value<'b>(
     if args.len() < 2 {
         return Ok(value_error());
     }
-    let index_value = args[0].value()?.into_literal();
-    let index = match index_value {
+    let index_value = args[0].value()?;
+    if let Some(indexes) = crate::lift::array_rows(&index_value) {
+        return choose_over_array(args, indexes).map(FunctionResolution::Value);
+    }
+    let index = match index_value.into_literal() {
         LiteralValue::Number(value) => value as i64,
         LiteralValue::Int(value) => value,
         LiteralValue::Error(error) => {
@@ -203,6 +217,71 @@ fn resolve_choose_reference_or_value<'b>(
     }
     let selected = &args[index as usize];
     selected.resolve_reference_or_value()
+}
+
+/// CHOOSE with several indexes selects element-wise: each position takes the
+/// value chosen there, every chosen value broadcast to the combined shape, so
+/// `CHOOSE({1,2},A1:A3,B1:B3)` pairs the two columns. Only the chosen values
+/// are evaluated. An index that is not a number, or is out of range, is
+/// `#VALUE!` at its position, exactly as a single index is.
+fn choose_over_array<'b>(
+    args: &[ArgumentHandle<'_, 'b>],
+    indexes: Vec<Vec<LiteralValue>>,
+) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+    let choices = args.len() - 1;
+    let choice = |index: &LiteralValue| -> Result<usize, ExcelError> {
+        let index = match index {
+            LiteralValue::Number(n) => *n as i64,
+            LiteralValue::Int(i) => *i,
+            LiteralValue::Error(error) => return Err(error.clone()),
+            _ => return Err(ExcelError::new(ExcelErrorKind::Value)),
+        };
+        if index < 1 || index as usize > choices {
+            return Err(ExcelError::new(ExcelErrorKind::Value));
+        }
+        Ok(index as usize)
+    };
+    let too_large = || {
+        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+            ExcelError::new(ExcelErrorKind::Value),
+        )))
+    };
+    let mut chosen: std::collections::BTreeMap<usize, Vec<Vec<LiteralValue>>> =
+        std::collections::BTreeMap::new();
+    for index in indexes.iter().flatten() {
+        if let Ok(index) = choice(index)
+            && !chosen.contains_key(&index)
+        {
+            let value = args[index].value()?;
+            if let crate::traits::CalcValue::Range(view) = &value {
+                let (rows, cols) = view.dims();
+                if rows.saturating_mul(cols) > crate::lift::MAX_LIFTED_ELEMENTS {
+                    return too_large();
+                }
+            }
+            let rows =
+                crate::lift::array_rows(&value).unwrap_or_else(|| vec![vec![value.into_literal()]]);
+            chosen.insert(index, rows);
+        }
+    }
+    let (height, width) =
+        crate::lift::broadcast_dims(std::iter::once(&indexes).chain(chosen.values()));
+    if height.saturating_mul(width) > crate::lift::MAX_LIFTED_ELEMENTS {
+        return too_large();
+    }
+    let rows = (0..height)
+        .map(|r| {
+            (0..width)
+                .map(
+                    |c| match choice(&crate::lift::broadcast_get(&indexes, r, c)) {
+                        Ok(index) => crate::lift::broadcast_get(&chosen[&index], r, c),
+                        Err(error) => LiteralValue::Error(error),
+                    },
+                )
+                .collect()
+        })
+        .collect();
+    Ok(crate::lift::array_result(rows, args[0].date_system()))
 }
 
 /* ───────────────────────── CHOOSECOLS() / CHOOSEROWS() ───────────────────────── */

@@ -51,7 +51,7 @@ impl Lift {
 pub(crate) type ReferenceArray = Vec<Vec<Result<ReferenceType, ExcelError>>>;
 
 /// Upper bound on lifted elements; larger shapes keep the unlifted path.
-const MAX_LIFTED_ELEMENTS: usize = 4_000_000;
+pub(crate) const MAX_LIFTED_ELEMENTS: usize = 4_000_000;
 
 /// Excel's scalar parameters for builtins whose other parameters take arrays
 /// or references, and for builtins whose parameters are all single values.
