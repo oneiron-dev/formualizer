@@ -843,6 +843,47 @@ impl Function for XMatchFn {
 
 /* ───────────────────────── SORT() ───────────────────────── */
 
+/// Key order shared by SORT and SORTBY, following Excel's sort order rather
+/// than the lookup comparison: numbers (dates and times as serials) < text
+/// (case-insensitive, never parsed as a number) < FALSE < TRUE < errors (all
+/// equal), and descending reverses that order. A blank is not ranked as 0: it
+/// goes last in both directions, after a real 0.
+fn cmp_for_sort(
+    a: &LiteralValue,
+    b: &LiteralValue,
+    ascending: bool,
+    date_system: crate::engine::DateSystem,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    fn rank(v: &LiteralValue) -> u8 {
+        match v {
+            LiteralValue::Text(_) => 1,
+            LiteralValue::Boolean(_) => 2,
+            LiteralValue::Error(_) | LiteralValue::Array(_) | LiteralValue::Pending => 3,
+            _ => 0,
+        }
+    }
+    match (a, b) {
+        (LiteralValue::Empty, LiteralValue::Empty) => return Ordering::Equal,
+        (LiteralValue::Empty, _) => return Ordering::Greater,
+        (_, LiteralValue::Empty) => return Ordering::Less,
+        _ => {}
+    }
+    let ord = rank(a).cmp(&rank(b)).then_with(|| match (a, b) {
+        (LiteralValue::Text(x), LiteralValue::Text(y)) => x.to_lowercase().cmp(&y.to_lowercase()),
+        (LiteralValue::Boolean(x), LiteralValue::Boolean(y)) => x.cmp(y),
+        _ => match (
+            a.as_serial_number_for(date_system),
+            b.as_serial_number_for(date_system),
+        ) {
+            // `+ 0.0` folds -0 into 0; total_cmp keeps the sort order total.
+            (Some(x), Some(y)) => (x + 0.0).total_cmp(&(y + 0.0)),
+            _ => Ordering::Equal,
+        },
+    });
+    if ascending { ord } else { ord.reverse() }
+}
+
 #[derive(Debug)]
 pub struct SortFn;
 /// Sorts an array by a selected row or column and returns a spilled result.
@@ -1032,10 +1073,12 @@ impl Function for SortFn {
 
             // Sort columns by the value in sort_row_idx
             columns.sort_by(|a, b| {
-                let val_a = &a.1[sort_row_idx];
-                let val_b = &b.1[sort_row_idx];
-                let cmp = cmp_for_lookup(val_a, val_b, _ctx.date_system()).unwrap_or(0);
-                if ascending { cmp.cmp(&0) } else { 0.cmp(&cmp) }
+                cmp_for_sort(
+                    &a.1[sort_row_idx],
+                    &b.1[sort_row_idx],
+                    ascending,
+                    _ctx.date_system(),
+                )
             });
 
             // Reconstruct the array with sorted columns
@@ -1068,10 +1111,12 @@ impl Function for SortFn {
 
             // Sort rows by the value in sort_col_idx
             row_data.sort_by(|a, b| {
-                let val_a = &a[sort_col_idx];
-                let val_b = &b[sort_col_idx];
-                let cmp = cmp_for_lookup(val_a, val_b, _ctx.date_system()).unwrap_or(0);
-                if ascending { cmp.cmp(&0) } else { 0.cmp(&cmp) }
+                cmp_for_sort(
+                    &a[sort_col_idx],
+                    &b[sort_col_idx],
+                    ascending,
+                    _ctx.date_system(),
+                )
             });
 
             Ok(collapse_if_scalar(row_data, _ctx.date_system()))
@@ -1300,11 +1345,14 @@ impl Function for SortByFn {
         // Sort using all criteria
         indexed_rows.sort_by(|a, b| {
             for (by_values, ascending) in &sort_criteria {
-                let val_a = &by_values[a.0];
-                let val_b = &by_values[b.0];
-                let cmp = cmp_for_lookup(val_a, val_b, _ctx.date_system()).unwrap_or(0);
-                if cmp != 0 {
-                    return if *ascending { cmp.cmp(&0) } else { 0.cmp(&cmp) };
+                let ord = cmp_for_sort(
+                    &by_values[a.0],
+                    &by_values[b.0],
+                    *ascending,
+                    _ctx.date_system(),
+                );
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
                 }
             }
             std::cmp::Ordering::Equal
@@ -3901,6 +3949,141 @@ mod tests {
             }
             other => panic!("expected array got {other:?}"),
         }
+    }
+
+    fn col(vals: Vec<LiteralValue>) -> LiteralValue {
+        LiteralValue::Array(vals.into_iter().map(|v| vec![v]).collect())
+    }
+
+    #[test]
+    fn sort_places_blanks_last_in_both_directions() {
+        // A blank is not a 0 to SORT: it goes after every value, a real 0 and
+        // negatives included, whether the order is ascending or descending.
+        let n = |v: f64| LiteralValue::Number(v);
+        let wb = TestWorkbook::new()
+            .with_function(Arc::new(SortFn))
+            .with_function(Arc::new(UniqueFn))
+            .with_cell_a1("Sheet1", "A1", n(3.0))
+            .with_cell_a1("Sheet1", "A3", n(-1.0))
+            .with_cell_a1("Sheet1", "A5", n(0.0))
+            .with_cell_a1("Sheet1", "B1", n(0.0))
+            .with_cell_a1("Sheet1", "B3", n(2.0))
+            .with_cell_a1("Sheet1", "B4", n(1.0))
+            .with_cell_a1("Sheet1", "B5", n(2.0))
+            .with_cell_a1("Sheet1", "B6", n(3.0))
+            .with_cell_a1("Sheet1", "C1", n(2.0))
+            .with_cell_a1("Sheet1", "E1", n(1.0));
+        let ctx = wb.interpreter();
+        let eval = |f: &str| {
+            ctx.evaluate_ast(&formualizer_parse::parser::parse(f).unwrap())
+                .unwrap()
+                .into_literal()
+        };
+        let e = || LiteralValue::Empty;
+        assert_eq!(
+            eval("=SORT(A1:A5)"),
+            col(vec![n(-1.0), n(0.0), n(3.0), e(), e()])
+        );
+        assert_eq!(
+            eval("=SORT(A1:A5,1,-1)"),
+            col(vec![n(3.0), n(0.0), n(-1.0), e(), e()])
+        );
+        // UNIQUE keeps one blank apart from the real 0; SORT keeps it last.
+        assert_eq!(
+            eval("=SORT(UNIQUE(B1:B6))"),
+            col(vec![n(0.0), n(1.0), n(2.0), n(3.0), e()])
+        );
+        assert_eq!(
+            eval("=SORT(C1:E1,1,1,TRUE)"),
+            LiteralValue::Array(vec![vec![n(1.0), n(2.0), e()]])
+        );
+        assert_eq!(
+            eval("=SORT(C1:E1,1,-1,TRUE)"),
+            LiteralValue::Array(vec![vec![n(2.0), n(1.0), e()]])
+        );
+    }
+
+    #[test]
+    fn sort_orders_mixed_types_like_excel() {
+        // Numbers (dates as serials) < text (numeric-looking text stays text,
+        // case-insensitive) < FALSE < TRUE < errors; descending reverses it.
+        let n = |v: f64| LiteralValue::Number(v);
+        let t = |v: &str| LiteralValue::Text(v.into());
+        let b = LiteralValue::Boolean;
+        let na = || LiteralValue::Error(ExcelError::new(ExcelErrorKind::Na));
+        let date = LiteralValue::Date(chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap());
+        let date_serial = n(45292.0);
+        let wb = TestWorkbook::new()
+            .with_function(Arc::new(SortFn))
+            .with_cell_a1("Sheet1", "A1", b(true))
+            .with_cell_a1("Sheet1", "A2", t("b"))
+            .with_cell_a1("Sheet1", "A3", na())
+            .with_cell_a1("Sheet1", "A4", n(50000.0))
+            .with_cell_a1("Sheet1", "A5", t("A"))
+            .with_cell_a1("Sheet1", "A6", b(false))
+            .with_cell_a1("Sheet1", "A7", t("10"))
+            .with_cell_a1("Sheet1", "A8", date)
+            .with_cell_a1("Sheet1", "A9", n(1.0))
+            .with_cell_a1("Sheet1", "B1", t("x"))
+            .with_cell_a1("Sheet1", "B2", t("X"));
+        let ctx = wb.interpreter();
+        let eval = |f: &str| {
+            ctx.evaluate_ast(&formualizer_parse::parser::parse(f).unwrap())
+                .unwrap()
+                .into_literal()
+        };
+        let ascending = vec![
+            n(1.0),
+            date_serial,
+            n(50000.0),
+            t("10"),
+            t("A"),
+            t("b"),
+            b(false),
+            b(true),
+            na(),
+        ];
+        assert_eq!(eval("=SORT(A1:A9)"), col(ascending.clone()));
+        let mut descending = ascending;
+        descending.reverse();
+        assert_eq!(eval("=SORT(A1:A9,1,-1)"), col(descending));
+        // Keys equal ignoring case keep their source order in both directions.
+        assert_eq!(eval("=SORT(B1:B2)"), col(vec![t("x"), t("X")]));
+        assert_eq!(eval("=SORT(B1:B2,1,-1)"), col(vec![t("x"), t("X")]));
+    }
+
+    #[test]
+    fn sortby_places_blank_keys_last_in_both_directions() {
+        // The blank key in B2 trails -5 and 0 alike; tied keys (p, q) stay in
+        // source order.
+        let n = |v: f64| LiteralValue::Number(v);
+        let t = |v: &str| LiteralValue::Text(v.into());
+        let wb = TestWorkbook::new()
+            .with_function(Arc::new(SortByFn))
+            .with_cell_a1("Sheet1", "A1", t("n"))
+            .with_cell_a1("Sheet1", "A2", t("blank"))
+            .with_cell_a1("Sheet1", "A3", t("p"))
+            .with_cell_a1("Sheet1", "A4", t("z"))
+            .with_cell_a1("Sheet1", "A5", t("q"))
+            .with_cell_a1("Sheet1", "B1", n(-5.0))
+            .with_cell_a1("Sheet1", "B3", n(2.0))
+            .with_cell_a1("Sheet1", "B4", n(0.0))
+            .with_cell_a1("Sheet1", "B5", n(2.0));
+        let ctx = wb.interpreter();
+        let eval = |f: &str| {
+            ctx.evaluate_ast(&formualizer_parse::parser::parse(f).unwrap())
+                .unwrap()
+                .into_literal()
+        };
+        let names = |v: &[&str]| col(v.iter().map(|s| t(s)).collect());
+        assert_eq!(
+            eval("=SORTBY(A1:A5,B1:B5)"),
+            names(&["n", "z", "p", "q", "blank"])
+        );
+        assert_eq!(
+            eval("=SORTBY(A1:A5,B1:B5,-1)"),
+            names(&["p", "q", "z", "n", "blank"])
+        );
     }
 
     #[test]
