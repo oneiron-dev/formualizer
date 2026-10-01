@@ -260,6 +260,68 @@ fn index_intersects_a_range_selector_in_a_formula_without_the_array_flag() {
 }
 
 #[test]
+fn index_area_num_lifts_and_intersects_like_row_and_column() {
+    // area_num is a single-value parameter like row_num and column_num: an
+    // array of area numbers selects once per element. A range is area 1 only,
+    // so area 2 is #REF! and area 0 #VALUE!, each in its own position.
+    assert_number("=SUM(IFERROR(INDEX(B1:C3,2,1,{1,2,1}),0))", 4.0);
+    assert_number("=COLUMNS(INDEX(B1:C3,2,1,{1,2,1}))", 3.0);
+    assert_number("=SUM(--ISERROR(INDEX(B1:C3,2,1,{1,0,2})))", 2.0);
+    assert_number("=SUM(INDEX(B1:B3,{1;3},1,{1;1}))", 4.0);
+    assert_number("=SUM(INDEX({10;20;30},{1;3},1,{1;1}))", 40.0);
+    let mut engine = engine();
+    assert_eq!(
+        eval(&mut engine, "=INDEX(B1:C3,2,1,{1,2})"),
+        LiteralValue::Number(2.0)
+    );
+    for (formula, kind) in [
+        ("=INDEX(B1:C3,2,1,{2,1})", ExcelErrorKind::Ref),
+        ("=INDEX(B1:C3,2,1,{0,1})", ExcelErrorKind::Value),
+    ] {
+        match eval(&mut engine, formula) {
+            LiteralValue::Error(e) => assert_eq!(e.kind, kind, "{formula}"),
+            other => panic!("{formula}: expected {kind:?}, got {other:?}"),
+        }
+    }
+
+    // In a formula without the array flag a range area_num is intersected
+    // with the formula cell: E5:F5 = 2,1 by column, G1:G3 = 3,1,2 by row.
+    let number = |n: f64| Some(LiteralValue::Number(n));
+    let error = |kind: ExcelErrorKind| Some(LiteralValue::Error(kind.into()));
+    assert_eq!(
+        plain_formula_values(&[
+            (10, 5, "=INDEX($B$1:$C$3,2,1,E5:F5)"),
+            (10, 6, "=INDEX($B$1:$C$3,2,1,E5:F5)"),
+            (10, 7, "=INDEX($B$1:$C$3,2,1,E5:F5)"),
+            (1, 8, "=INDEX($B$1:$B$3,3,1,G1:G3)"),
+            (2, 8, "=INDEX($B$1:$B$3,3,1,G1:G3)"),
+            (2, 9, "=SUM(INDEX($B$1:$B$3,0,1,G1:G3))"),
+        ]),
+        vec![
+            error(ExcelErrorKind::Ref),
+            number(2.0),
+            error(ExcelErrorKind::Value),
+            error(ExcelErrorKind::Ref),
+            number(3.0),
+            number(6.0),
+        ]
+    );
+    // A formula entered with the array flag lifts over the range.
+    assert_eq!(
+        file_values(
+            &[(1, 10, "=INDEX($B$1:$B$3,3,1,G1:G3)")],
+            &[(1, 10, 3)],
+            &[(1, 10), (2, 10), (3, 10)],
+        ),
+        vec![
+            error(ExcelErrorKind::Ref),
+            number(3.0),
+            error(ExcelErrorKind::Ref),
+        ]
+    );
+}
+
+#[test]
 fn concatenation_is_element_wise_over_arrays() {
     // A1:A3 & B1:B3 = "a1","b2","a3"
     assert_number("=MATCH(\"b2\",A1:A3&B1:B3,0)", 2.0);

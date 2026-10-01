@@ -579,6 +579,111 @@ fn single_value_arguments_lift_over_a_row_with_dynamic_arrays() {
 }
 
 #[test]
+fn static_index_self_loop_classification_reads_area_num() {
+    // An omitted area_num is area 1, so INDEX(r,i,j,1) selects like
+    // INDEX(r,i,j): selecting another cell of a range that contains the
+    // formula is not circular, selecting the formula's own cell is. Any other
+    // area is an error that never reads the range, so it is not circular.
+    for mode in [
+        FormulaPlaneMode::Off,
+        FormulaPlaneMode::AuthoritativeExperimental,
+    ] {
+        let mut engine = Engine::new(
+            TestWorkbook::new(),
+            EvalConfig::default().with_formula_plane_mode(mode),
+        );
+        engine
+            .set_cell_value("Sheet1", 1, 2, LiteralValue::Int(42))
+            .unwrap();
+        engine
+            .set_cell_formula("Sheet1", 100, 2, parse("=INDEX(B1:B100,1,1,1)").unwrap())
+            .unwrap();
+        for (row, formula) in [
+            (2, "=INDEX(2:2,1,5,1)"),
+            (3, "=INDEX(3:3,1,5,)"),
+            (4, "=INDEX(4:4,1,5,1.9)"),
+            (5, "=SUM(INDEX(5:5,0,5,1))"),
+            (6, "=INDEX(6:6,1,1,1)"),
+            (7, "=INDEX(7:7,1,1,2)"),
+            (8, "=INDEX(8:8,1,1,0)"),
+            (9, "=INDEX(9:9,1,1,-1)"),
+        ] {
+            engine
+                .set_cell_value("Sheet1", row, 5, LiteralValue::Int(7))
+                .unwrap();
+            engine
+                .set_cell_formula("Sheet1", row, 1, parse(formula).unwrap())
+                .unwrap();
+        }
+
+        engine.evaluate_all().unwrap();
+        assert_number(&engine, "Sheet1", 100, 2, 42.0);
+        for row in 2..=5 {
+            assert_number(&engine, "Sheet1", row, 1, 7.0);
+        }
+        for (row, kind) in [
+            (6, ExcelErrorKind::Circ),
+            (7, ExcelErrorKind::Ref),
+            (8, ExcelErrorKind::Value),
+            (9, ExcelErrorKind::Value),
+        ] {
+            match engine.get_cell_value("Sheet1", row, 1) {
+                Some(LiteralValue::Error(error)) => {
+                    assert_eq!(error.kind, kind, "{mode:?} row {row}")
+                }
+                other => panic!("{mode:?} Sheet1!R{row}C1: expected {kind:?}, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn index_area_num_reads_blank_and_numeric_text_cells() {
+    // A blank area_num cell is area 0 (#VALUE!); a cell holding the text "1"
+    // converts to area 1 and "2" to area 2 (#REF!).
+    for mode in [
+        FormulaPlaneMode::Off,
+        FormulaPlaneMode::AuthoritativeExperimental,
+    ] {
+        let mut engine = Engine::new(
+            TestWorkbook::new(),
+            EvalConfig::default().with_formula_plane_mode(mode),
+        );
+        engine
+            .set_cell_value("Sheet1", 2, 2, LiteralValue::Int(20))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", 2, 3, LiteralValue::Text("1".into()))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", 3, 3, LiteralValue::Text("2".into()))
+            .unwrap();
+        for (row, formula) in [
+            (1, "=INDEX(A1:B3,2,2,C1)"),
+            (2, "=INDEX(A1:B3,2,2,C2)"),
+            (3, "=INDEX(A1:B3,2,2,C3)"),
+            (4, "=SUM(INDEX(A1:B3,0,2,C2))"),
+        ] {
+            engine
+                .set_cell_formula("Sheet1", row, 5, parse(formula).unwrap())
+                .unwrap();
+        }
+
+        engine.evaluate_all().unwrap();
+        assert_number(&engine, "Sheet1", 2, 5, 20.0);
+        assert_number(&engine, "Sheet1", 4, 5, 20.0);
+        for (row, kind) in [(1, ExcelErrorKind::Value), (3, ExcelErrorKind::Ref)] {
+            match engine.get_cell_value("Sheet1", row, 5) {
+                Some(LiteralValue::Error(error)) => {
+                    assert_eq!(error.kind, kind, "{mode:?} row {row}")
+                }
+                other => panic!("{mode:?} Sheet1!R{row}C5: expected {kind:?}, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
 fn offset_whole_column_and_row_clamped() {
     let mut engine = new_engine();
     engine

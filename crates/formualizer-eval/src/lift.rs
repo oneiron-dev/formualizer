@@ -100,7 +100,7 @@ pub(crate) fn lift_spec(name: &str) -> Option<Lift> {
         "XMATCH" => Lift::Only(&[0, 2, 3]),
         "XLOOKUP" => Lift::Only(&[0, 4, 5]),
         "LOOKUP" => Lift::Only(&[0]),
-        "INDEX" => Lift::Only(&[1, 2]),
+        "INDEX" => Lift::Only(&[1, 2, 3]),
         "ADDRESS" => Lift::All,
         // Aggregates over an array with a single-value parameter.
         "LARGE" | "SMALL" | "PERCENTILE.INC" | "PERCENTILE.EXC" | "QUARTILE.INC"
@@ -201,7 +201,7 @@ pub(crate) enum LegacyArg {
     /// caller's context.
     Value,
     /// A single value even inside an array context (IF's test, CHOOSE's
-    /// index, IFERROR's value, INDEX's row and column).
+    /// index, IFERROR's value, INDEX's row, column and area).
     ForcedValue,
     /// A reference or value: a range passes whole and nested expressions
     /// keep the caller's context (SUM, MATCH's lookup array, ...).
@@ -227,7 +227,7 @@ pub(crate) fn legacy_arg(fun: &dyn Function, index: usize) -> LegacyArg {
     let split = |n: usize, head, tail| if index < n { head } else { tail };
     match name {
         "IF" | "CHOOSE" | "IFERROR" | "IFNA" => split(1, ForcedValue, Choice),
-        // INDEX's row and column, and the value VLOOKUP and HLOOKUP look up,
+        // INDEX's row, column and area, and the value VLOOKUP and HLOOKUP look up,
         // are single values even inside an array argument: an array of them
         // needs array entry.
         "INDEX" => split(1, Array, ForcedValue),

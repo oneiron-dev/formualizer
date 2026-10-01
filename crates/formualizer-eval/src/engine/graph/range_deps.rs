@@ -511,19 +511,41 @@ impl DependencyGraph {
             }
             match &node.node_type {
                 ASTNodeType::Function { name, args }
-                    if name.eq_ignore_ascii_case("INDEX") && (2..=3).contains(&args.len()) =>
+                    if name.eq_ignore_ascii_case("INDEX") && (2..=4).contains(&args.len()) =>
                 {
+                    // area_num: absent or omitted is area 1, the one area a
+                    // range has, so INDEX(r,i,j,1) selects like INDEX(r,i,j).
+                    // Any other static area is an error (#VALUE! below 1, #REF!
+                    // above it) that never reads the range.
+                    let area = match args.get(3) {
+                        None => Some(1),
+                        Some(node) if matches!(node.node_type, ASTNodeType::Omitted) => Some(1),
+                        Some(node) => static_index(node),
+                    };
                     let row = static_index(&args[1]);
                     let col = args.get(2).and_then(static_index);
                     let selection = row.and_then(|row| {
-                        if args.len() == 2 || col.is_some() {
+                        if area == Some(1) && (args.len() == 2 || col.is_some()) {
                             Some((row, col))
                         } else {
                             None
                         }
                     });
-                    let mut use_kind =
-                        visit(graph, &args[0], dependent, range_sheet, range, selection);
+                    let mut use_kind = match area {
+                        Some(area)
+                            if area != 1
+                                && matching_range(
+                                    graph,
+                                    &args[0],
+                                    dependent,
+                                    range_sheet,
+                                    range,
+                                ) =>
+                        {
+                            RangeSelfUse::Excluded
+                        }
+                        _ => visit(graph, &args[0], dependent, range_sheet, range, selection),
+                    };
                     for arg in &args[1..] {
                         use_kind =
                             use_kind.merge(visit(graph, arg, dependent, range_sheet, range, None));
