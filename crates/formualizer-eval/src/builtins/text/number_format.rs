@@ -7,6 +7,10 @@
 //! `E+`/`E-`, fractions (`# ?/?`, `?/8`), `@`, and the date/time tokens
 //! `y m d h s AM/PM A/P [h] [m] [s]` with fractional seconds. Output is the
 //! Excel for Mac en-US rendering; values keep at most 15 significant digits.
+//! Codes Excel cannot read are `#VALUE!`: a bare `n`, `N`, unsigned `E` or
+//! accented E/N, a trailing `B`, unterminated quotes or brackets, a dangling
+//! `\` `_` `*`, more than four sections, or date codes mixed with digit
+//! placeholders, `%` or `@`.
 
 use crate::engine::DateSystem;
 use formualizer_common::{ExcelError, try_serial_to_display_date_parts_for};
@@ -78,21 +82,23 @@ struct Section {
     condition: Option<(Cmp, f64)>,
 }
 
+fn is_date_tok(t: &Tok) -> bool {
+    matches!(
+        t,
+        Tok::Year(_)
+            | Tok::MonthOrMinute(_)
+            | Tok::Minute(_)
+            | Tok::Day(_)
+            | Tok::Hour(_)
+            | Tok::Second(_)
+            | Tok::AmPm(..)
+            | Tok::Elapsed(..)
+    )
+}
+
 impl Section {
     fn is_date(&self) -> bool {
-        self.toks.iter().any(|t| {
-            matches!(
-                t,
-                Tok::Year(_)
-                    | Tok::MonthOrMinute(_)
-                    | Tok::Minute(_)
-                    | Tok::Day(_)
-                    | Tok::Hour(_)
-                    | Tok::Second(_)
-                    | Tok::AmPm(..)
-                    | Tok::Elapsed(..)
-            )
-        })
+        self.toks.iter().any(is_date_tok)
     }
     fn has(&self, tok: &Tok) -> bool {
         self.toks.contains(tok)
@@ -109,7 +115,8 @@ fn split_sections(code: &str) -> Vec<&str> {
         }
         match c {
             '"' if !bracket => quoted = !quoted,
-            '\\' if !quoted && !bracket => escaped = true,
+            // `\x`, `_x` and `*x` take the next character literally.
+            '\\' | '_' | '*' if !quoted && !bracket => escaped = true,
             '[' if !quoted => bracket = true,
             ']' if !quoted => bracket = false,
             ';' if !quoted && !bracket => {
@@ -150,7 +157,14 @@ fn push_lit(toks: &mut Vec<Tok>, text: &str) {
     }
 }
 
-fn parse_section(text: &str) -> Section {
+/// Letters Excel rejects outside quotes, escapes and brackets: `E` without an
+/// exponent sign, `N`/`n`, and their accented forms.
+fn is_illegal_letter(c: char) -> bool {
+    "ENnÈÉÊËèéêëĒēĔĕĖėĘęĚěȄȅȆȇȨȩÑñŃńŅņŇňǸǹ".contains(c)
+}
+
+/// Parse one section; `last` marks the end of the whole code.
+fn parse_section(text: &str, last: bool) -> Result<Section, ExcelError> {
     let chars: Vec<char> = text.chars().collect();
     let mut section = Section::default();
     let toks = &mut section.toks;
@@ -161,23 +175,27 @@ fn parse_section(text: &str) -> Section {
             .take_while(|c| c.to_ascii_lowercase() == lower)
             .count()
     };
+    let closing = |i: usize, close: char| {
+        chars[i + 1..]
+            .iter()
+            .position(|&q| q == close)
+            .map(|p| i + 1 + p)
+            .ok_or_else(ExcelError::new_value)
+    };
     while i < chars.len() {
         let c = chars[i];
         let lower = c.to_ascii_lowercase();
         match c {
             '"' => {
-                let end = chars[i + 1..]
-                    .iter()
-                    .position(|&q| q == '"')
-                    .map_or(chars.len(), |p| i + 1 + p);
+                let end = closing(i, '"')?;
                 push_lit(toks, &chars[i + 1..end].iter().collect::<String>());
                 i = end + 1;
                 continue;
             }
+            // `\`, `_` and `*` need a character to act on.
+            '\\' | '_' | '*' if i + 1 == chars.len() => return Err(ExcelError::new_value()),
             '\\' => {
-                if let Some(next) = chars.get(i + 1) {
-                    push_lit(toks, &next.to_string());
-                }
+                push_lit(toks, &chars[i + 1].to_string());
                 i += 2;
                 continue;
             }
@@ -191,10 +209,7 @@ fn parse_section(text: &str) -> Section {
                 continue;
             }
             '[' => {
-                let end = chars[i + 1..]
-                    .iter()
-                    .position(|&q| q == ']')
-                    .map_or(chars.len(), |p| i + 1 + p);
+                let end = closing(i, ']')?;
                 let inner: String = chars[i + 1..end].iter().collect();
                 let lower_inner = inner.to_ascii_lowercase();
                 if let Some(currency) = inner.strip_prefix('$') {
@@ -260,6 +275,9 @@ fn parse_section(text: &str) -> Section {
                 i += 3;
                 continue;
             }
+            _ if is_illegal_letter(c) || (c == 'B' && last && i + 1 == chars.len()) => {
+                return Err(ExcelError::new_value());
+            }
             _ if matches!(lower, 'y' | 'e') => {
                 let n = run(i, lower);
                 toks.push(Tok::Year(if lower == 'e' { 4 } else { n }));
@@ -281,8 +299,48 @@ fn parse_section(text: &str) -> Section {
         }
         i += 1;
     }
+    if (section.is_date() || section.has(&Tok::General)) && mixes_numbers(&section.toks) {
+        return Err(ExcelError::new_value());
+    }
     resolve_minutes(&mut section.toks);
-    section
+    Ok(section)
+}
+
+/// Whether a section has digit placeholders, `%` or `@`, apart from the up to
+/// three `0`s of fractional seconds after a date or time code's `.`.
+fn mixes_numbers(toks: &[Tok]) -> bool {
+    let mut dated = false;
+    let mut i = 0;
+    while i < toks.len() {
+        match &toks[i] {
+            Tok::Point if dated => {
+                i += toks[i + 1..]
+                    .iter()
+                    .take(3)
+                    .take_while(|t| **t == Tok::Digit('0'))
+                    .count();
+            }
+            Tok::Digit(_) | Tok::Percent | Tok::At => return true,
+            t => dated |= is_date_tok(t),
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Parse every section of a format code. Excel rejects a code with more than
+/// four sections or with any section it cannot read.
+fn parse_sections(code: &str) -> Result<Vec<Section>, ExcelError> {
+    let parts = split_sections(code);
+    if parts.len() > 4 {
+        return Err(ExcelError::new_value());
+    }
+    let last = parts.len() - 1;
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(k, text)| parse_section(text, k == last))
+        .collect()
 }
 
 /// `m`/`mm` directly after an hour or before a second is a minute.
@@ -314,10 +372,7 @@ pub(crate) fn format_number(
     if !value.is_finite() {
         return Err(ExcelError::new_value());
     }
-    let sections: Vec<Section> = split_sections(code)
-        .into_iter()
-        .map(parse_section)
-        .collect();
+    let sections = parse_sections(code)?;
     // A fourth section formats text only.
     let numeric = &sections[..sections.len().min(3)];
     let conditional = numeric.iter().any(|s| s.condition.is_some());
@@ -363,18 +418,15 @@ pub(crate) fn format_number(
 
 /// Render text with the text section (the fourth, or one containing `@`).
 /// Without one, Excel returns the text unchanged.
-pub(crate) fn format_text(text: &str, code: &str) -> String {
-    let sections: Vec<Section> = split_sections(code)
-        .into_iter()
-        .map(parse_section)
-        .collect();
+pub(crate) fn format_text(text: &str, code: &str) -> Result<String, ExcelError> {
+    let sections = parse_sections(code)?;
     let section = if sections.len() >= 4 {
         Some(&sections[3])
     } else {
         sections.iter().find(|s| s.has(&Tok::At))
     };
     let Some(section) = section else {
-        return text.to_owned();
+        return Ok(text.to_owned());
     };
     let mut out = String::new();
     for tok in &section.toks {
@@ -384,7 +436,7 @@ pub(crate) fn format_text(text: &str, code: &str) -> String {
             _ => {}
         }
     }
-    out
+    Ok(out)
 }
 
 /// Decimal digits of `value` (non-negative) with at most 15 significant
@@ -1080,9 +1132,9 @@ mod tests {
         assert_eq!(fmt(450.0, "0.00;;0;\\0"), "450.00");
         assert_eq!(fmt(5.0, "[<10]\"small\";\"big\""), "small");
         assert_eq!(fmt(50.0, "[<10]\"small\";\"big\""), "big");
-        assert_eq!(format_text("abc", "0.00"), "abc");
-        assert_eq!(format_text("abc", "0;0;0;\"<\"@\">\""), "<abc>");
-        assert_eq!(format_text("abc", "\"x\"@"), "xabc");
+        assert_eq!(format_text("abc", "0.00").unwrap(), "abc");
+        assert_eq!(format_text("abc", "0;0;0;\"<\"@\">\"").unwrap(), "<abc>");
+        assert_eq!(format_text("abc", "\"x\"@").unwrap(), "xabc");
     }
 
     #[test]
@@ -1124,5 +1176,72 @@ mod tests {
         assert_eq!(fmt(45356.75, "m/d/yy h:mm"), "3/5/24 18:00");
         assert_eq!(fmt(1.0, "dddd"), "Sunday");
         assert!(format_number(-1.0, "yyyy", DateSystem::Excel1900).is_err());
+    }
+
+    #[test]
+    fn codes_excel_cannot_read_are_rejected() {
+        for code in [
+            // `n`/`N`, unsigned `E` and accented E/N are not format codes.
+            "eeee.hh.nn ",
+            "nn",
+            "0 N",
+            "E",
+            "0E0",
+            "EEEE",
+            "\u{e9}",
+            "0 \u{d1}",
+            // A code may not end in `B`.
+            "0.0B",
+            // Unterminated quotes and brackets, dangling `\` `_` `*`.
+            "\"abc",
+            "[Red",
+            "0\\",
+            "0_",
+            "0*",
+            // At most four sections.
+            "0;0;0;@;0",
+            "0;0;0;@;",
+            // Date and time codes mixed with placeholders, `%` or `@`.
+            "yyyy 0",
+            "mm%",
+            "mm@",
+            "d .#",
+            "h #",
+            "[h] 0",
+            "AM/PM ?",
+            "ss.0000",
+            "General 0",
+        ] {
+            assert!(
+                format_number(1.0, code, DateSystem::Excel1900).is_err(),
+                "{code:?}"
+            );
+            assert!(format_text("abc", code).is_err(), "{code:?}");
+        }
+    }
+
+    #[test]
+    fn literal_letters_and_protected_codes_still_format() {
+        assert_eq!(fmt(0.400544, "\u{f3}\u{f3}:pp:mm"), "\u{f3}\u{f3}:pp:01");
+        assert_eq!(fmt(1.5, "0.0x"), "1.5x");
+        assert_eq!(fmt(1.0, "acfijklopqrtuvwxz"), "acfijklopqrtuvwxz");
+        assert_eq!(fmt(1.0, "CFIJKLOPQRTUVWXZ"), "CFIJKLOPQRTUVWXZ");
+        assert_eq!(fmt(5.0, "0 \\n"), "5 n");
+        assert_eq!(fmt(5.0, "0 \"min\""), "5 min");
+        assert_eq!(fmt(5.0, "0_N"), "5 ");
+        assert_eq!(fmt(5.0, "0*E"), "5");
+        assert_eq!(
+            fmt(1234.5, "_-* #,##0.00_-;-* #,##0.00_-;_-* \"-\"??_-;_-@_-"),
+            " 1,234.50 "
+        );
+        assert_eq!(fmt(5.0, "[Green]0;[Red]-0"), "5");
+        assert_eq!(fmt(5.0, "[$-409]0"), "5");
+        assert_eq!(fmt(5.0, "B;0"), "B");
+        assert_eq!(fmt(5.0, "0;0;0;@"), "5");
+        assert_eq!(fmt(1234.5, "GENERAL"), "1234.5");
+        assert_eq!(fmt(45356.0, "mmmm d, yyyy"), "March 5, 2024");
+        assert_eq!(fmt(45356.5, "hh:mm:ss.000"), "12:00:00.000");
+        assert_eq!(fmt(45356.0, "eeee"), "2024");
+        assert_eq!(format_text("abc", "\"n\"@").unwrap(), "nabc");
     }
 }

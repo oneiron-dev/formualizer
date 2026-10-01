@@ -323,17 +323,23 @@ impl Function for TextFn {
             ) {
                 Ok(n) => n,
                 Err(_) => {
-                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(
-                        number_format::format_text(&t, &fmt),
-                    )));
+                    return Ok(crate::traits::CalcValue::Scalar(
+                        match number_format::format_text(&t, &fmt) {
+                            Ok(text) => LiteralValue::Text(text),
+                            Err(error) => LiteralValue::Error(error),
+                        },
+                    ));
                 }
             },
             // Logical values are not numbers to TEXT.
             LiteralValue::Boolean(b) => {
                 let text = if b { "TRUE" } else { "FALSE" };
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(
-                    number_format::format_text(text, &fmt),
-                )));
+                return Ok(crate::traits::CalcValue::Scalar(
+                    match number_format::format_text(text, &fmt) {
+                        Ok(text) => LiteralValue::Text(text),
+                        Err(error) => LiteralValue::Error(error),
+                    },
+                ));
             }
             LiteralValue::Empty => 0.0,
             LiteralValue::Error(e) => {
@@ -537,5 +543,48 @@ mod tests {
                 "TEXT({input:?},{format:?})"
             );
         }
+    }
+
+    #[test]
+    fn text_rejects_format_codes_excel_cannot_read() {
+        // Hungarian date codes in an en-US Excel: `n` is not a format code, so
+        // TEXT is #VALUE! for numbers, text and logicals alike; `ó` and `p`
+        // are plain literals.
+        let wb = TestWorkbook::new().with_function(std::sync::Arc::new(TextFn));
+        let ctx = wb.interpreter();
+        let f = ctx.context.get_function("", "TEXT").unwrap();
+        let eval = |value: LiteralValue, format: &str| {
+            let v = lit(value);
+            let fmt = lit(LiteralValue::Text(format.into()));
+            f.dispatch(
+                &[
+                    ArgumentHandle::new(&v, &ctx),
+                    ArgumentHandle::new(&fmt, &ctx),
+                ],
+                &ctx.function_context(None),
+            )
+            .unwrap()
+            .into_literal()
+        };
+        for (value, format) in [
+            (LiteralValue::Number(41645.0), "eeee.hh.nn "),
+            (LiteralValue::Text("abc".into()), "nn"),
+            (LiteralValue::Boolean(true), "n@"),
+            (LiteralValue::Number(1.0), "0;0;0;@;0"),
+        ] {
+            let out = eval(value.clone(), format);
+            assert!(
+                matches!(&out, LiteralValue::Error(e) if e.kind == ExcelErrorKind::Value),
+                "TEXT({value:?},{format:?}) = {out:?}"
+            );
+        }
+        assert_eq!(
+            eval(LiteralValue::Number(0.400544), "\u{f3}\u{f3}:pp:mm"),
+            LiteralValue::Text("\u{f3}\u{f3}:pp:01".into())
+        );
+        assert_eq!(
+            eval(LiteralValue::Text("abc".into()), "\"n\"@"),
+            LiteralValue::Text("nabc".into())
+        );
     }
 }
