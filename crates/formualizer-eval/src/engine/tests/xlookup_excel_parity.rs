@@ -101,3 +101,87 @@ fn xlookup_text_needle_does_not_coerce_to_number() {
         Some(LiteralValue::Number(200.0))
     );
 }
+
+fn eval_formula(engine: &mut Engine<TestWorkbook>, formula: &str) -> Option<LiteralValue> {
+    engine
+        .set_cell_formula("Sheet1", 30, 10, parse(formula).unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    engine.get_cell_value("Sheet1", 30, 10)
+}
+
+fn number(value: Option<LiteralValue>) -> f64 {
+    match value {
+        Some(LiteralValue::Number(n)) => n,
+        Some(LiteralValue::Int(i)) => i as f64,
+        other => panic!("expected a number, got {other:?}"),
+    }
+}
+
+/// XLOOKUP and XMATCH with match_mode -1/1 and a linear search_mode scan every
+/// entry: the lookup array need not be sorted, the nearest entry on the
+/// requested side wins, an exact match wins outright, and a miss reaches
+/// if_not_found. Only binary search modes (2/-2) assume sorted data.
+#[test]
+fn approximate_match_modes_scan_unsorted_data() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    // Row 1: headers; row 2: unsorted keys with a blank in F2.
+    for (col, (header, key)) in [
+        (10.0, Some(0.065)),
+        (20.0, Some(0.344)),
+        (30.0, Some(0.109)),
+        (40.0, Some(0.436)),
+        (50.0, Some(0.2)),
+        (60.0, None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let col = col as u32 + 1;
+        engine
+            .set_cell_value("Sheet1", 1, col, LiteralValue::Number(header))
+            .unwrap();
+        if let Some(key) = key {
+            engine
+                .set_cell_value("Sheet1", 2, col, LiteralValue::Number(key))
+                .unwrap();
+        }
+    }
+    for (formula, expected) in [
+        ("=XLOOKUP(0.3,A2:F2,A1:F1,\"\",1)", 20.0),
+        ("=XLOOKUP(0.3,A2:F2,A1:F1,\"\",-1)", 50.0),
+        ("=XLOOKUP(0.1,A2:F2,A1:F1,\"\",1)", 30.0),
+        ("=XLOOKUP(0.2,A2:F2,A1:F1,\"\",1)", 50.0),
+        ("=XLOOKUP(0.3,{0.1,0.4,0.2},{1,2,3},\"\",1)", 2.0),
+        ("=XLOOKUP(0.3,{0.1,0.4,0.2},{1,2,3},\"\",-1)", 3.0),
+        ("=XMATCH(0.3,{0.1,0.4,0.2},1)", 2.0),
+        // Equal nearest entries: the first met in search order.
+        ("=XLOOKUP(4,{5,1,5},{1,2,3},,1)", 1.0),
+        ("=XLOOKUP(4,{5,1,5},{1,2,3},,1,-1)", 3.0),
+        ("=XMATCH(4,{5,1,5},1,-1)", 3.0),
+        // Control: sorted data answers as before.
+        ("=XLOOKUP(25,{10,20,30},{1,2,3},,-1)", 2.0),
+        ("=XLOOKUP(25,{10,20,30},{1,2,3},,1)", 3.0),
+    ] {
+        assert_eq!(
+            number(eval_formula(&mut engine, formula)),
+            expected,
+            "{formula}"
+        );
+    }
+    assert_eq!(
+        eval_formula(
+            &mut engine,
+            "=XLOOKUP(0.5,{0.3,0.1,0.2},{1,2,3},\"none\",1)"
+        ),
+        Some(LiteralValue::Text("none".into()))
+    );
+    // A text lookup value is ordered against the text entries.
+    assert_eq!(
+        number(eval_formula(
+            &mut engine,
+            "=XLOOKUP(\"m\",{\"z\",\"a\",\"p\"},{1,2,3},,1)"
+        )),
+        3.0
+    );
+}

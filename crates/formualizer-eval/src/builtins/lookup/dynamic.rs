@@ -16,11 +16,12 @@
 //! TODO(backlog):
 //! - Binary search for XLOOKUP approximate modes; currently linear scan.
 //! - Better type coercion parity with Excel (booleans/text vs numbers nuances).
-//! - Match unsorted detection for approximate modes (#N/A) and wildcard escaping.
 //! - PERFORMANCE: streaming FILTER without full materialization; UNIQUE using smallvec for tiny sets.
 
 use super::super::utils::collapse_if_scalar;
-use super::lookup_utils::{PreparedLookupMatcher, cmp_for_lookup, value_to_f64_lenient};
+use super::lookup_utils::{
+    PreparedLookupMatcher, cmp_for_approximate, cmp_for_lookup,
+};
 use super::sort_collation::cmp_text_for_sort;
 use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
 use crate::engine::lookup_index_cache::LookupAxis;
@@ -94,6 +95,46 @@ fn find_semantic_empty(
     }
 }
 
+/// `XLOOKUP`/`XMATCH` with `match_mode` -1 or 1 (exact or next smaller /
+/// larger) and a linear `search_mode`. Every entry is visited in search order
+/// and the data need not be sorted: an exact match is returned at once,
+/// otherwise the nearest entry on the requested side, the first one met in
+/// search order among equals. Entries of another type than the lookup value
+/// are not candidates.
+fn linear_approximate_match(
+    len: usize,
+    cell: impl Fn(usize) -> LiteralValue,
+    needle: &LiteralValue,
+    match_mode: i64,
+    reverse: bool,
+    date_system: crate::engine::DateSystem,
+) -> Option<usize> {
+    let side = match_mode.signum() as i32;
+    let order: Box<dyn Iterator<Item = usize>> = if reverse {
+        Box::new((0..len).rev())
+    } else {
+        Box::new(0..len)
+    };
+    let mut best: Option<(usize, LiteralValue)> = None;
+    for i in order {
+        let cand = cell(i);
+        let Some(c) = cmp_for_approximate(&cand, needle, date_system) else {
+            continue;
+        };
+        if c == 0 {
+            return Some(i);
+        }
+        if c == side
+            && best
+                .as_ref()
+                .is_none_or(|(_, b)| cmp_for_approximate(&cand, b, date_system) == Some(-side))
+        {
+            best = Some((i, cand));
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
 /* ───────────────────────── XLOOKUP() ───────────────────────── */
 
 #[derive(Debug)]
@@ -109,6 +150,7 @@ pub struct XLookupFn;
 /// - `if_not_found` is optional; if omitted and no match exists, returns `#N/A`.
 /// - `match_mode`: `0` exact, `-1` exact-or-next-smaller, `1` exact-or-next-larger, `2` wildcard.
 /// - `search_mode`: `1` forward, `-1` reverse. Other modes are accepted with current fallback behavior.
+/// - Approximate modes (`-1`/`1`) scan every entry in search order, so the lookup array need not be sorted; only entries of the lookup value's type (number, text or logical) are candidates.
 /// - `lookup_array` must be 1D. Invalid shape returns `#VALUE!`.
 /// - If `return_array` is multi-column or multi-row, the matched row/column is returned as a spill.
 ///
@@ -496,56 +538,21 @@ impl XLookupFn {
                 }
             }
         } else if match_mode == -1 || match_mode == 1 {
-            let needle_num = value_to_f64_lenient(&needle, _ctx.date_system());
-            let mut best_idx: Option<usize> = None;
-            let mut best_val: f64 = if match_mode == -1 {
-                f64::NEG_INFINITY
-            } else {
-                f64::INFINITY
-            };
-
-            let mut prev: Option<LiteralValue> = None;
-            for i in 0..lookup_len {
-                let cand = if vertical {
-                    lookup_view.get_cell(i, 0)
-                } else {
-                    lookup_view.get_cell(0, i)
-                };
-
-                if let Some(p) = prev.as_ref() {
-                    let sorted_ok =
-                        cmp_for_lookup(p, &cand, _ctx.date_system()).is_some_and(|o| o <= 0);
-                    if !sorted_ok {
-                        return Ok(XlookupMatch::Settled(crate::traits::CalcValue::Scalar(
-                            LiteralValue::Error(ExcelError::new(ExcelErrorKind::Na)),
-                        )));
+            // A linear scan: unsorted data is searched, not rejected.
+            found = linear_approximate_match(
+                lookup_len,
+                |i| {
+                    if vertical {
+                        lookup_view.get_cell(i, 0)
+                    } else {
+                        lookup_view.get_cell(0, i)
                     }
-                }
-                prev = Some(cand.clone());
-
-                if cmp_for_lookup(&cand, &needle, _ctx.date_system()).is_some_and(|o| o == 0) {
-                    found = Some(i);
-                    break;
-                }
-
-                if let (Some(nn), Some(vv)) =
-                    (needle_num, value_to_f64_lenient(&cand, _ctx.date_system()))
-                {
-                    if match_mode == -1 {
-                        if vv <= nn && vv > best_val {
-                            best_val = vv;
-                            best_idx = Some(i);
-                        }
-                    } else if vv >= nn && vv < best_val {
-                        best_val = vv;
-                        best_idx = Some(i);
-                    }
-                }
-            }
-
-            if found.is_none() {
-                found = best_idx;
-            }
+                },
+                &needle,
+                match_mode,
+                search_mode == -1 || search_mode == -2,
+                _ctx.date_system(),
+            );
         } else {
             return Ok(XlookupMatch::Settled(crate::traits::CalcValue::Scalar(
                 LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)),
@@ -913,22 +920,6 @@ impl Function for XMatchFn {
             }
         } else if match_mode == -1 || match_mode == 1 {
             // Approximate match: -1 = exact or next smaller, 1 = exact or next larger
-            let needle_num = value_to_f64_lenient(&needle, _ctx.date_system());
-            let mut best_idx: Option<usize> = None;
-            let mut best_val: f64 = if match_mode == -1 {
-                f64::NEG_INFINITY
-            } else {
-                f64::INFINITY
-            };
-
-            // Determine iteration direction based on search_mode
-            let use_reverse = search_mode == -1 || search_mode == -2;
-            let indices: Box<dyn Iterator<Item = usize>> = if use_reverse {
-                Box::new((0..lookup_len).rev())
-            } else {
-                Box::new(0..lookup_len)
-            };
-
             // For binary search modes (2, -2), data should be sorted
             // We verify sorting for approximate modes
             if (search_mode == 2 || search_mode == -2) && match_mode != 0 {
@@ -956,40 +947,20 @@ impl Function for XMatchFn {
                 }
             }
 
-            for i in indices {
-                let cand = if vertical {
-                    lookup_view.get_cell(i, 0)
-                } else {
-                    lookup_view.get_cell(0, i)
-                };
-
-                if cmp_for_lookup(&cand, &needle, _ctx.date_system()).is_some_and(|o| o == 0) {
-                    found = Some(i);
-                    break;
-                }
-
-                if let (Some(nn), Some(vv)) =
-                    (needle_num, value_to_f64_lenient(&cand, _ctx.date_system()))
-                {
-                    if match_mode == -1 {
-                        // exact or next smaller
-                        if vv <= nn && vv > best_val {
-                            best_val = vv;
-                            best_idx = Some(i);
-                        }
+            found = linear_approximate_match(
+                lookup_len,
+                |i| {
+                    if vertical {
+                        lookup_view.get_cell(i, 0)
                     } else {
-                        // match_mode == 1: exact or next larger
-                        if vv >= nn && vv < best_val {
-                            best_val = vv;
-                            best_idx = Some(i);
-                        }
+                        lookup_view.get_cell(0, i)
                     }
-                }
-            }
-
-            if found.is_none() {
-                found = best_idx;
-            }
+                },
+                &needle,
+                match_mode,
+                search_mode == -1 || search_mode == -2,
+                _ctx.date_system(),
+            );
         } else {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new(ExcelErrorKind::Value),
