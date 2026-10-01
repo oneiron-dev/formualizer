@@ -188,9 +188,12 @@ fn scan_part<R: Read + Seek>(archive: &mut ZipArchive<R>, part: &str) -> Option<
                 scan.filter_mode = is_true(local_attr(&xml, &e, b"filterMode"));
             }
             (2, b"row") => {
+                // A row without r follows the previous one. Saturate so a
+                // malformed r near u32::MAX cannot overflow; anything past
+                // row 1048576 is out of range and skipped below.
                 let row = local_attr(&xml, &e, b"r")
                     .and_then(|r| r.parse().ok())
-                    .unwrap_or(last_row + 1);
+                    .unwrap_or_else(|| last_row.saturating_add(1));
                 last_row = row;
                 if (1..=1_048_576).contains(&row) && is_true(local_attr(&xml, &e, b"hidden")) {
                     scan.hidden.push(row);
@@ -380,5 +383,20 @@ mod tests {
         let rows = scan(xml, &[], &[]);
         assert_eq!(rows.filter, vec![3]);
         assert_eq!(rows.manual, vec![5]);
+    }
+
+    #[test]
+    fn rows_without_r_after_the_largest_r_do_not_overflow() {
+        // r is 1..=1048576 in a valid file; a row without r after
+        // r="4294967295" used to overflow computing the next row number.
+        let xml = r#"<worksheet><sheetData><row r="4294967295"/><row hidden="1"/><row hidden="1"/><row r="3" hidden="1"/><row hidden="1"/></sheetData></worksheet>"#;
+        let rows = scan(xml, &[], &[]);
+        assert_eq!(rows.manual, vec![3, 4]);
+        assert!(rows.filter.is_empty());
+
+        // Out-of-range rows are skipped even when they are hidden.
+        let xml = r#"<worksheet><sheetData><row r="1048576" hidden="1"/><row hidden="1"/></sheetData></worksheet>"#;
+        let rows = scan(xml, &[], &[]);
+        assert_eq!(rows.manual, vec![1_048_576]);
     }
 }
