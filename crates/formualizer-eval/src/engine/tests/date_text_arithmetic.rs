@@ -359,3 +359,46 @@ fn month_name_with_a_number_that_is_no_day_reads_as_a_year() {
         }
     }
 }
+
+#[test]
+fn numeric_month_and_number_that_is_no_day_reads_as_month_year() {
+    // Excel reads a two-part `m/n` as month/day in the current year, else as
+    // month/year on the 1st with the 2029 window (Microsoft's table: 12/99,
+    // 11/95, 1/99; 13/99 stays text).
+    for (formula, expected) in [
+        ("=DATEVALUE(\"12/99\")", 36495.0),
+        ("=DATEVALUE(\"11/95\")", 35004.0),
+        ("=DATEVALUE(\"1/99\")", 36161.0),
+        ("=\"12/99\"+0", 36495.0),
+        ("=DATEVALUE(\"2/30\")", 10990.0),
+        ("=DATEVALUE(\"12-99\")", 36495.0),
+        ("=VALUE(\"4/31\")", 11414.0),
+        ("=YEAR(\"1/00\")", 2000.0),
+        ("=MONTH(\"11/95\")", 11.0),
+        ("=DAY(\"1/30\")", 30.0),
+    ] {
+        match eval_formula(DateSystem::Excel1900, formula) {
+            LiteralValue::Number(n) => assert_eq!(n, expected, "{formula}"),
+            LiteralValue::Int(n) => assert_eq!(n as f64, expected, "{formula}"),
+            other => assert_eq!(
+                other.as_serial_number_for(DateSystem::Excel1900),
+                Some(expected),
+                "{formula}"
+            ),
+        }
+    }
+    assert_expected(
+        DateSystem::Excel1904,
+        "=\"12/99\"+0",
+        "excel",
+        Expected::Number(35033.0),
+    );
+    for formula in ["=DATEVALUE(\"13/99\")", "=\"0/99\"+0"] {
+        assert_expected(
+            DateSystem::Excel1900,
+            formula,
+            "excel",
+            Expected::Error(ExcelErrorKind::Value),
+        );
+    }
+}

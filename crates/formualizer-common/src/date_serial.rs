@@ -98,11 +98,12 @@ enum DateToken {
 
 /// Excel's en-US date shapes over numbers and English month names separated
 /// by spaces, `-`, `/` or `,` (a month name may touch its number: `July1`,
-/// `1June2021`): `d Mon y`, `Mon d y`, `m-d-y` / `y-m-d`, `m/y` with a 4-digit
-/// year, year-less `d Mon`, `m/d` in `current_year`, and `Mon n`, which Excel
-/// reads as month/day in `current_year` and, when `n` is no day of that month
-/// in that year (`Jan 0`, `Apr 31`, `Jan 45`) or has 4 digits, as month/year on
-/// the 1st.
+/// `1June2021`): `d Mon y`, `Mon d y`, `m-d-y` / `y-m-d`, year-less `d Mon`,
+/// and the two-part `Mon n` and `m/n` (or `m-n`), which Excel reads as
+/// month/day in `current_year` and, when `n` is no day of that month in that
+/// year (`Jan 0`, `Apr 31`, `Jan 45`, `12/99`, `2/30`) or has 4 digits, as
+/// month/year on the 1st (Microsoft, "How Excel works with two-digit year
+/// numbers").
 fn parse_general_date(text: &str, current_year: Option<i32>) -> Option<NaiveDate> {
     let mut tokens = Vec::new();
     let mut separators = String::new();
@@ -146,6 +147,20 @@ fn parse_general_date(text: &str, current_year: Option<i32>) -> Option<NaiveDate
         1 | 2 => Some(1900 + value as i32),
         _ => None,
     };
+    // Excel's two-part date, month first: month/day in the current year,
+    // else month/year on the 1st of the month (a 4-digit number is a year).
+    let month_day_or_year = |month: u32, value: u32, digits: usize| {
+        if digits == 4 {
+            day_in(value as i32, month, 1)
+        } else if let Some(date) = current_year.and_then(|year| day_in(year, month, value)) {
+            Some(date)
+        } else if current_year.is_none() && day_in(2000, month, value).is_some() {
+            // A possible day of the month needs the current year to resolve.
+            None
+        } else {
+            day_in(year_of(value, digits)?, month, 1)
+        }
+    };
     use DateToken::{Month, Number};
     match tokens.as_slice() {
         [
@@ -170,18 +185,7 @@ fn parse_general_date(text: &str, current_year: Option<i32>) -> Option<NaiveDate
                 digits: yd,
             },
         ] => day_in(year_of(*y, *yd)?, *m, *d),
-        [Month(m), Number { value, digits }] => {
-            if *digits == 4 {
-                day_in(*value as i32, *m, 1)
-            } else if let Some(date) = current_year.and_then(|year| day_in(year, *m, *value)) {
-                Some(date)
-            } else if current_year.is_none() && day_in(2000, *m, *value).is_some() {
-                // A possible day of the month needs the current year to resolve.
-                None
-            } else {
-                day_in(year_of(*value, *digits)?, *m, 1)
-            }
-        }
+        [Month(m), Number { value, digits }] => month_day_or_year(*m, *value, *digits),
         [
             Number {
                 value: d,
@@ -217,21 +221,8 @@ fn parse_general_date(text: &str, current_year: Option<i32>) -> Option<NaiveDate
                 value: m,
                 digits: 1 | 2,
             },
-            Number {
-                value: y,
-                digits: 4,
-            },
-        ] => day_in(*y as i32, *m, 1),
-        [
-            Number {
-                value: m,
-                digits: 1 | 2,
-            },
-            Number {
-                value: d,
-                digits: 1 | 2,
-            },
-        ] => day_in(current_year?, *m, *d),
+            Number { value, digits },
+        ] => month_day_or_year(*m, *value, *digits),
         _ => None,
     }
 }
@@ -984,6 +975,71 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn numeric_two_part_date_that_is_no_day_of_the_month_is_month_year() {
+        // Microsoft's table for a two-part date, current year 1999: month/day
+        // in the current year, else month/year on the 1st, else text.
+        for (text, expected) in [
+            ("12/01", Some(date(1999, 12, 1))),
+            ("12/99", Some(date(1999, 12, 1))),
+            ("11/95", Some(date(1995, 11, 1))),
+            ("13/99", None),
+            ("1/30", Some(date(1999, 1, 30))),
+            ("1/99", Some(date(1999, 1, 1))),
+        ] {
+            assert_eq!(
+                parse_excel_date_text_in_year(text, Some(1999)),
+                expected,
+                "{text}"
+            );
+        }
+        // The same rule with the 2029 window, a dash, day 0 and a 4-digit year.
+        for (text, expected) in [
+            ("2/30", date(1930, 2, 1)),
+            ("4/31", date(1931, 4, 1)),
+            ("1/32", date(1932, 1, 1)),
+            ("12-99", date(1999, 12, 1)),
+            ("1/00", date(2000, 1, 1)),
+            ("3/2021", date(2021, 3, 1)),
+        ] {
+            assert_eq!(parse_excel_date_text(text), Some(expected), "{text}");
+            assert_eq!(
+                parse_excel_date_text_in_year(text, Some(2026)),
+                Some(expected),
+                "{text}"
+            );
+        }
+        // 2/29 is a day only when the current year is a leap year.
+        assert_eq!(
+            parse_excel_date_text_in_year("2/29", Some(2024)),
+            Some(date(2024, 2, 29))
+        );
+        assert_eq!(
+            parse_excel_date_text_in_year("2/29", Some(2026)),
+            Some(date(2029, 2, 1))
+        );
+        // Without a current year a possible day stays unresolved; a first
+        // number that is no month (or a 3-digit second number) is text.
+        for text in ["2/29", "1/30", "12/01"] {
+            assert_eq!(parse_excel_date_text(text), None, "{text} without a year");
+        }
+        for text in ["13/99", "0/99", "1/100", "13-45"] {
+            assert_eq!(
+                parse_excel_date_text_in_year(text, Some(2026)),
+                None,
+                "{text}"
+            );
+        }
+        assert_eq!(
+            parse_excel_datetime_text_to_serial_in_year_for(
+                DateSystem::Excel1900,
+                "12/99",
+                Some(2026)
+            ),
+            Some(36495.0)
+        );
     }
 
     #[test]
