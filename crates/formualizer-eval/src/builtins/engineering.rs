@@ -2846,11 +2846,20 @@ fn clean_float(val: f64) -> f64 {
     }
 }
 
+/// Round to the 15 significant digits Excel keeps when it writes a number as
+/// text (IMSIN("4+3i") is "-7.61923172032141-6.548120040911i").
+fn round_significant_15(val: f64) -> f64 {
+    if val == 0.0 || !val.is_finite() {
+        return val;
+    }
+    format!("{val:.14e}").parse().unwrap_or(val)
+}
+
 /// Format a complex number as a string
 fn format_complex(real: f64, imag: f64, suffix: char) -> String {
-    // Clean up floating point noise
-    let real = clean_float(real);
-    let imag = clean_float(imag);
+    // Clean up floating point noise; each part keeps 15 significant digits
+    let real = round_significant_15(clean_float(real));
+    let imag = round_significant_15(clean_float(imag));
 
     // Handle special cases for cleaner output
     let real_is_zero = real.abs() < 1e-15;
@@ -5724,5 +5733,32 @@ mod tests {
         }
         let pole = eval("=IMCSC(\"0\")");
         assert!(matches!(pole, LiteralValue::Error(e) if e.kind == ExcelErrorKind::Num));
+    }
+
+    #[test]
+    fn complex_parts_keep_15_significant_digits() {
+        // Microsoft's documented results: IMSIN("4+3i"), IMCOS("1+i").
+        assert_eq!(
+            format_complex(-7.619231720321410, -6.548120040911001, 'i'),
+            "-7.61923172032141-6.548120040911i"
+        );
+        assert_eq!(
+            format_complex(0.8337300251311491, -0.9888977057628651, 'i'),
+            "0.833730025131149-0.988897705762865i"
+        );
+        // One ulp of libm noise does not reach the text.
+        let a = -27.016813258003932_f64;
+        let b = f64::from_bits(a.to_bits() + 1);
+        assert_eq!(
+            format_complex(3.853738037919377, a, 'i'),
+            format_complex(3.853738037919377, b, 'i')
+        );
+        assert_eq!(
+            format_complex(3.853738037919377, a, 'i'),
+            "3.85373803791938-27.0168132580039i"
+        );
+        // Short parts are unchanged.
+        assert_eq!(format_complex(3.0, -4.0, 'i'), "3-4i");
+        assert_eq!(format_complex(0.5, 0.0, 'j'), "0.5");
     }
 }
