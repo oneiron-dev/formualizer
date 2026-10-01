@@ -131,6 +131,7 @@ fn npv_variadic_oracle_table() {
         ("=NPV(0,B1:B4)", 80.0),
         ("=NPV(-0.5,B1:B4)", 1600.0),
         ("=NPV(B5,B1:B4)", 80.0),
+        ("=NPV(A1,{-100,\"n/a\",60})", -41.32231404958678),
     ];
 
     for (formula, expected) in cases {
@@ -142,7 +143,6 @@ fn npv_variadic_oracle_table() {
         ("=NPV(A1,B1:B4,1/0)", ExcelErrorKind::Div),
         ("=NPV(A1,F1:F4)", ExcelErrorKind::Div),
         ("=NPV(A1,{-100,1/0,60})", ExcelErrorKind::Div),
-        ("=NPV(A1,{-100,\"n/a\",60})", ExcelErrorKind::Value),
         ("=NPV(-1,B1:B4)", ExcelErrorKind::Num),
         ("=NPV(\"\",B1:B4)", ExcelErrorKind::Value),
     ] {
@@ -191,29 +191,35 @@ fn npv_reference_and_one_cell_range_have_identical_semantics() {
 }
 
 #[test]
-fn npv_logical_values_distinguish_direct_values_from_references() {
-    // oracle: lo-verified for direct scalar and array-literal logical values.
+fn npv_logical_values_distinguish_direct_values_from_arrays_and_references() {
+    // oracle: lo-verified for a direct scalar logical value.
     assert_number("=NPV(A1,TRUE)", 0.9090909090909091);
-    assert_number("=NPV(A1,{TRUE})", 0.9090909090909091);
-    assert_number("=NPV(A1,{-100,TRUE,60})", -45.00375657400452);
 
-    // Microsoft-documented Excel behavior: logical cells in references are ignored. LO 24.2.7
-    // diverges by counting TRUE as 1, so these rows are intentionally not LO expectations.
+    // Microsoft-documented Excel behavior: logical values in an array or reference are ignored.
+    // LO 24.2.7 diverges by counting TRUE as 1, so these rows are intentionally not LO
+    // expectations.
+    assert_number("=NPV(A1,{TRUE})", 0.0);
+    assert_number("=NPV(A1,{-100,TRUE,60})", -41.32231404958678);
     assert_number("=NPV(A1,M1)", 0.0);
     assert_number("=NPV(A1,M1:M1)", 0.0);
     assert_number("=NPV(A1,P1:P4)", 11.269722013523648);
 }
 
 #[test]
-fn npv_computed_arrays_use_value_semantics() {
-    // oracle: lo-verified. TRANSPOSE returns CalcValue::Range, but it is a computed value rather
-    // than a reference; embedded text therefore makes NPV fail instead of being skipped.
-    assert_error("=NPV(A1,TRANSPOSE(C1:C4))", ExcelErrorKind::Value);
-    assert_error(
-        "=NPV(A1,IF({1,1,1},{-100,\"n/a\",60}))",
-        ExcelErrorKind::Value,
+fn npv_computed_arrays_count_only_numbers() {
+    // Excel counts only the numbers of an array argument, computed arrays included: text and
+    // empty strings are skipped without taking a period (LO 24.2.7 returns #VALUE! instead).
+    assert_number("=NPV(A1,TRANSPOSE(C1:C4))", 11.269722013523648);
+    assert_number("=NPV(A1,IF({1,1,1},{-100,\"n/a\",60}))", -41.32231404958678);
+    assert_number("=NPV(-0.9,{1;\"\";2;3})-NPV(-0.9,{1;2;3})", 0.0);
+    assert_number(
+        "=NPV(-0.9,IF({1;0;1;1},{1;2;3;4},\"\"))-NPV(-0.9,{1;3;4})",
+        0.0,
     );
     assert_number("=NPV(A1,TRANSPOSE(B1:B4))", 43.30305307014546);
+    // Errors inside a computed array, and direct text, still fail.
+    assert_error("=NPV(A1,IF({1,0},-100,NA()))", ExcelErrorKind::Na);
+    assert_error("=NPV(A1,-100,\"n/a\",60)", ExcelErrorKind::Value);
 }
 
 #[test]

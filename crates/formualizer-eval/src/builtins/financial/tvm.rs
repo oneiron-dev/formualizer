@@ -351,8 +351,9 @@ impl Function for FvFn {
 /// # Remarks
 /// - `rate` is the discount rate per period.
 /// - Cash-flow sign convention: investments/outflows are negative, returns/inflows are positive.
-/// - Text, blank, and logical cells in references are ignored. Direct scalar and computed-array
-///   values are consumed left-to-right, and direct non-numeric text returns `#VALUE!`.
+/// - Text, blank, and logical entries of a reference or an array (constant or computed) are
+///   ignored and take no period. Direct scalar values are consumed left-to-right, and direct
+///   non-numeric text returns `#VALUE!`.
 /// - Embedded error values inside provided cash-flow values are propagated as errors.
 /// - Returns argument coercion errors for invalid `rate` or direct scalar failures.
 ///
@@ -427,10 +428,10 @@ impl Function for NpvFn {
                 continue;
             }
 
-            // CalcValue::Range describes shape, not provenance: both a cell range and a computed
-            // array (for example TRANSPOSE(...)) use it, while a one-cell reference is Scalar.
-            // ArgumentHandle's reference path retains that distinction, including functions that
-            // genuinely return references, without guessing from the argument's syntax.
+            // Excel counts only the numbers of an array or reference argument. CalcValue::Range
+            // and an array value cover both a cell range and a computed array; a one-cell
+            // reference is Scalar, so ArgumentHandle's reference path tells it apart from a
+            // direct value, including functions that genuinely return references.
             let reference_argument = arg.has_reference_semantics();
             match arg.value()? {
                 CalcValue::Range(range) => {
@@ -439,7 +440,7 @@ impl Function for NpvFn {
                         for col in 0..cols {
                             accumulate_npv_cash_flow(
                                 range.get_cell(row, col),
-                                reference_argument,
+                                true,
                                 rate,
                                 &mut npv,
                                 &mut period,
@@ -453,7 +454,7 @@ impl Function for NpvFn {
                         for cell in row {
                             accumulate_npv_cash_flow(
                                 cell,
-                                reference_argument,
+                                true,
                                 rate,
                                 &mut npv,
                                 &mut period,
@@ -493,7 +494,7 @@ impl Function for NpvFn {
 
 fn accumulate_npv_cash_flow(
     value: LiteralValue,
-    reference_argument: bool,
+    ignore_non_numeric: bool,
     rate: f64,
     npv: &mut f64,
     period: &mut i32,
@@ -502,11 +503,11 @@ fn accumulate_npv_cash_flow(
     let numeric = match value {
         LiteralValue::Number(n) => Some(n),
         LiteralValue::Int(i) => Some(i as f64),
-        // Excel's NPV documentation says logical values in references are ignored. LibreOffice
-        // 24.2.7 counts them as 1, so this intentionally follows the Excel-targeted rule.
-        LiteralValue::Boolean(_) if reference_argument => None,
+        // Excel's NPV documentation says logical values in arrays and references are ignored.
+        // LibreOffice 24.2.7 counts them as 1, so this intentionally follows the Excel rule.
+        LiteralValue::Boolean(_) if ignore_non_numeric => None,
         LiteralValue::Boolean(b) => Some(if b { 1.0 } else { 0.0 }),
-        LiteralValue::Text(_) | LiteralValue::Empty if reference_argument => None,
+        LiteralValue::Text(_) | LiteralValue::Empty if ignore_non_numeric => None,
         LiteralValue::Error(error) => return Err(error),
         // A date cell is a number on the sheet; take its serial rather than #VALUE!.
         ref other
