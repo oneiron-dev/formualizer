@@ -783,6 +783,30 @@ fn unsupported_specifiers_error_kind() {
 }
 
 #[test]
+fn index_over_source_table_has_no_sheet_position() {
+    // Source tables materialise values with no worksheet position, so INDEX
+    // cannot return a reference into them.
+    let ctx = SourceCtx::default();
+    let table = MemTable {
+        headers: vec!["A".into()],
+        data: vec![vec![LiteralValue::Number(1.0)]],
+    };
+    ctx.set_table("Sales", Arc::new(table));
+
+    let mut engine: Engine<_> = Engine::new(ctx, EvalConfig::default());
+    engine.add_sheet("Sheet1").unwrap();
+    engine.define_source_table("Sales", Some(1)).unwrap();
+
+    let ast = formualizer_parse::parser::parse("=INDEX(Sales[A],1)").unwrap();
+    engine.set_cell_formula("Sheet1", 1, 1, ast).unwrap();
+
+    match engine.evaluate_cell("Sheet1", 1, 1).unwrap() {
+        Some(LiteralValue::Error(e)) => assert_eq!(e.kind, ExcelErrorKind::Ref),
+        other => panic!("expected #REF!, got {other:?}"),
+    }
+}
+
+#[test]
 fn define_source_duplicate_name_rejected() {
     let ctx = SourceCtx::default();
     let mut engine: Engine<_> = Engine::new(ctx, EvalConfig::default());

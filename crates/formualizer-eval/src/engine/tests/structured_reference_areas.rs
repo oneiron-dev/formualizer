@@ -84,6 +84,50 @@ fn row_items_combine_with_columns() {
 }
 
 #[test]
+fn index_and_offset_read_structured_references() {
+    let mut engine = engine();
+    let n = LiteralValue::Number;
+    let text = |s: &str| LiteralValue::Text(s.into());
+    // Each structured reference is its A1 area: Sales[Qty] is B2:B4,
+    // Sales and Sales[#Data] are A2:B4, Sales[#All] is A1:B5.
+    assert_eq!(eval(&mut engine, 1, 7, "=INDEX(Sales[Qty],2)"), n(2.0));
+    assert_eq!(eval(&mut engine, 2, 7, "=INDEX(Sales,3,1)"), text("c"));
+    assert_eq!(eval(&mut engine, 3, 7, "=INDEX(Sales[#Data],1,2)"), n(1.0));
+    assert_eq!(
+        eval(&mut engine, 4, 7, "=INDEX(Sales[#All],1,2)"),
+        text("Qty")
+    );
+    assert_eq!(
+        eval(&mut engine, 5, 7, "=INDEX(Sales[[Item]:[Qty]],2,2)"),
+        n(2.0)
+    );
+    assert_eq!(eval(&mut engine, 6, 7, "=SUM(INDEX(Sales,,2))"), n(6.0));
+    assert_eq!(eval(&mut engine, 7, 7, "=ROWS(INDEX(Sales,,2))"), n(3.0));
+    assert_eq!(eval(&mut engine, 8, 7, "=SUM(INDEX(Sales[Qty],0))"), n(6.0));
+    assert_eq!(
+        eval(&mut engine, 9, 7, "=SUMIFS(INDEX(Sales,,2),A2:A4,\"b\")"),
+        n(2.0)
+    );
+    assert_eq!(
+        eval(&mut engine, 10, 7, "=OFFSET(Sales[Qty],1,0,1,1)"),
+        n(2.0)
+    );
+    // Out of the selected area stays #REF!, as for the A1 range.
+    let LiteralValue::Error(error) = eval(&mut engine, 11, 7, "=INDEX(Sales[Qty],4)") else {
+        panic!("INDEX past the data body must be an error");
+    };
+    assert_eq!(error.kind, ExcelErrorKind::Ref);
+
+    // From another sheet the reference stays on the table's sheet.
+    engine.add_sheet("Other").unwrap();
+    engine
+        .set_cell_formula("Other", 1, 1, parse("=INDEX(Sales[Item],2)").unwrap())
+        .unwrap();
+    engine.evaluate_cell("Other", 1, 1).unwrap();
+    assert_eq!(engine.get_cell_value("Other", 1, 1).unwrap(), text("b"));
+}
+
+#[test]
 fn this_row_outside_the_table_body_is_a_value_error() {
     let mut engine = engine();
     let error = engine

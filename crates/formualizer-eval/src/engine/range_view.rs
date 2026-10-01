@@ -444,6 +444,11 @@ impl<'a> RangeView<'a> {
     pub fn sheet_name(&self) -> &str {
         &self.sheet().name
     }
+    /// Whether this view reads a workbook sheet, so its bounds are sheet
+    /// coordinates. Owned views hold materialised values with no position.
+    pub(crate) fn is_sheet_backed(&self) -> bool {
+        matches!(self.backing, RangeBacking::Borrowed(_))
+    }
 
     pub fn kind_probe(&self) -> RangeKind {
         if self.is_empty() {

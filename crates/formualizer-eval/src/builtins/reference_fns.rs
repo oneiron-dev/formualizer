@@ -118,6 +118,22 @@ fn resolve_reference_bounds<'b>(
         ReferenceType::Cell {
             sheet, row, col, ..
         } => Ok((sheet.clone(), *row, *col, *row, *col)),
+        // A structured reference is the area it selects on the table's own
+        // sheet: INDEX(Table1[Qty],2) is the second data cell of that column.
+        // Source tables resolve to owned values with no sheet position.
+        ReferenceType::Table(_) => {
+            let rv = ctx.resolve_range_view(base, ctx.current_sheet())?;
+            if rv.is_empty() || !rv.is_sheet_backed() {
+                return Err(ExcelError::new(ExcelErrorKind::Ref));
+            }
+            Ok((
+                Some(rv.sheet_name().to_string()),
+                rv.start_row() as u32 + 1,
+                rv.start_col() as u32 + 1,
+                rv.end_row() as u32 + 1,
+                rv.end_col() as u32 + 1,
+            ))
+        }
         _ => Err(ExcelError::new(ExcelErrorKind::Ref)),
     }
 }
