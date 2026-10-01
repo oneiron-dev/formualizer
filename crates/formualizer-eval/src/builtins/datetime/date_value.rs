@@ -10,7 +10,7 @@ use formualizer_common::{
 };
 
 fn parse_legacy_datevalue_text(input: &str) -> Option<NaiveDate> {
-    let text = input.trim();
+    let text = input.trim_matches(' ');
     let parts: Vec<&str> = text.split('/').collect();
     if parts.len() == 3
         && parts

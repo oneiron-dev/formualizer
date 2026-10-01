@@ -182,6 +182,41 @@ fn invalid_date_time_text_remains_value_error() {
 }
 
 #[test]
+fn only_spaces_around_numeric_and_time_text_are_ignored() {
+    // A cell holding "14:41\n16:47\n": RIGHT(...,5) is "6:47\n", not a time.
+    let lf = "\"14:41\"&CHAR(10)&\"16:47\"&CHAR(10)";
+    let cases = [
+        format!("=RIGHT({lf},5)-LEFT({lf},5)"),
+        "=(\"5\"&CHAR(10))+0".to_string(),
+        "=(CHAR(10)&\"5\")+0".to_string(),
+        "=(\"5\"&CHAR(9))+0".to_string(),
+        "=VALUE(\"5\"&CHAR(10))".to_string(),
+        "=DATEVALUE(\"1/2/2023\"&CHAR(10))".to_string(),
+        "=TIMEVALUE(\"6:47\"&CHAR(13))".to_string(),
+    ];
+    for formula in &cases {
+        assert_expected(
+            DateSystem::Excel1900,
+            formula,
+            "56855: Excel #VALUE!",
+            Expected::Error(ExcelErrorKind::Value),
+        );
+    }
+    for (formula, expected) in [
+        ("=\"  5 \"+0", 5.0),
+        ("=VALUE(\" 6:00  \")", 0.25),
+        ("=\" 90 % \"+0", 0.9),
+    ] {
+        assert_expected(
+            DateSystem::Excel1900,
+            formula,
+            "spaces are ignored",
+            Expected::Number(expected),
+        );
+    }
+}
+
+#[test]
 fn excel_date_shapes_and_year_less_dates_use_the_clock_year() {
     // Excel en-US reads m-d-y with dashes and y/m/d with a four-digit year.
     for (formula, serial_1900) in [("=\"03-01-01\"+0", 36951.0), ("=\"2003/1/1\"+0", 37622.0)] {

@@ -21,10 +21,12 @@ impl Locale {
     ///
     /// Also supports percent-suffixed numeric text (e.g. "90%" -> 0.9),
     /// matching spreadsheet numeric-coercion behavior in numeric contexts.
+    /// Like Excel it ignores only the spaces around the text; a tab, line
+    /// feed or no-break space there leaves it text.
     pub fn parse_number_invariant(&self, s: &str) -> Option<f64> {
-        let trimmed = s.trim();
+        let trimmed = s.trim_matches(' ');
         if let Some(without_pct) = trimmed.strip_suffix('%') {
-            let n = without_pct.trim().parse::<f64>().ok()?;
+            let n = without_pct.trim_end_matches(' ').parse::<f64>().ok()?;
             Some(n / 100.0)
         } else {
             trimmed.parse::<f64>().ok()
@@ -47,6 +49,15 @@ mod tests {
         assert_eq!(loc.parse_number_invariant("90%"), Some(0.9));
         assert_eq!(loc.parse_number_invariant(" 90.5% "), Some(0.905));
         assert_eq!(loc.parse_number_invariant("90 %"), Some(0.9));
+    }
+
+    #[test]
+    fn parse_number_invariant_ignores_only_surrounding_spaces() {
+        let loc = Locale::invariant();
+        assert_eq!(loc.parse_number_invariant("  42 "), Some(42.0));
+        for text in ["5\n", "\n5", "5\t", "\r5", "\u{a0}5", "5%\n"] {
+            assert_eq!(loc.parse_number_invariant(text), None, "{text:?}");
+        }
     }
 
     #[test]
