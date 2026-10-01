@@ -14,7 +14,7 @@
 //!   * If width > height  → search the first *row*, return from the last *row*.
 //!   * Otherwise          → search the first *column*, return from the last *column*.
 
-use super::lookup_utils::{SearchedVector, cmp_for_approximate};
+use super::lookup_utils::{SearchedVector, excel_approximate_search, reference_extent};
 use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
 use crate::engine::DateSystem;
 use crate::function::Function;
@@ -22,32 +22,21 @@ use crate::traits::{ArgumentHandle, CalcValue, FunctionContext};
 use formualizer_common::{ArgKind, ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
 
-/// Binary-search style approximate match (largest value <= needle) for
-/// ascending-sorted data. Like the other approximate lookups, the search visits
-/// only entries comparable with the needle: errors, blanks and entries of
+/// Approximate match (largest value <= needle) over a lookup vector of `len`
+/// cells, `slice` being the ones read from it. LOOKUP runs the same bisection
+/// as MATCH and VLOOKUP ([`excel_approximate_search`]): inclusive bounds, a
+/// floor midpoint, an exact hit kept over the entries probed after it, and
+/// unsorted data searched rather than rejected. Errors, blanks and entries of
 /// another type are skipped, so `LOOKUP(2,1/(cond),result)` finds the last
 /// position where `cond` holds.
 fn approx_match_ascending(
     slice: &[LiteralValue],
     needle: &LiteralValue,
+    len: usize,
     date_system: DateSystem,
 ) -> Option<usize> {
     let searched = SearchedVector::new(slice, needle, date_system).ok()?;
-    let mut lo: usize = 0;
-    let mut hi: usize = searched.len();
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        match cmp_for_approximate(searched.get(mid), needle, date_system) {
-            Some(c) if c > 0 => hi = mid,
-            Some(_) => lo = mid + 1,
-            None => hi = mid,
-        }
-    }
-    if lo == 0 {
-        None
-    } else {
-        Some(searched.original_position(lo - 1))
-    }
+    excel_approximate_search(&searched, len, needle, false)
 }
 
 /// Searches for a value and returns a corresponding value from another range.
@@ -60,9 +49,8 @@ fn approx_match_ascending(
 /// - **Array form** `LOOKUP(value, array)`: if width > height searches first row
 ///   and returns from last row; otherwise searches first column and returns from
 ///   last column.
-/// - Data must be sorted ascending; unsorted data may return incorrect results
-///   (Excel does not guarantee #N/A for unsorted LOOKUP, but results are
-///   undefined).
+/// - Data should be sorted ascending. Like Excel, LOOKUP bisects without checking
+///   the order, so unsorted data gives whichever entry the search reaches.
 /// - Returns `#N/A` when the lookup value is smaller than every value in the
 ///   search range.
 ///
@@ -105,7 +93,7 @@ fn approx_match_ascending(
 ///   - q: "Does LOOKUP support exact matching?"
 ///     a: "No. LOOKUP always performs approximate matching (largest <= lookup value)."
 ///   - q: "What happens with unsorted data?"
-///     a: "Results are undefined. Unlike MATCH, LOOKUP does not guarantee #N/A for unsorted ranges."
+///     a: "LOOKUP runs Excel's binary search without checking the order, as MATCH and VLOOKUP do, so the result follows the search path and may be a wrong entry or #N/A."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: LOOKUP
@@ -198,7 +186,7 @@ impl Function for LookupFn {
         let has_result_vector = args.len() >= 3;
 
         // --- Materialise lookup vector / array ---
-        let lookup_data = materialise_range(&args[1], ctx)?;
+        let (lookup_data, written) = materialise_range(&args[1], ctx)?;
         let (l_rows, l_cols) = dims(&lookup_data);
         // The result vector is resolved before the search, so an error passed in
         // its place is the result whether or not the lookup value is found.
@@ -226,8 +214,22 @@ impl Function for LookupFn {
             )
         };
 
-        // Approximate match – largest <= needle
-        let match_idx = approx_match_ascending(&search_vec, &lookup_value, ctx.date_system());
+        // Approximate match – largest <= needle, searched over the vector as
+        // written: a whole column is 1,048,576 rows though only its used rows
+        // were read.
+        let len = match written {
+            Some((rows, 1)) => rows,
+            Some((1, cols)) => cols,
+            Some((rows, cols)) if !has_result_vector => {
+                if is_row_search {
+                    cols
+                } else {
+                    rows
+                }
+            }
+            _ => search_vec.len(),
+        };
+        let match_idx = approx_match_ascending(&search_vec, &lookup_value, len, ctx.date_system());
         let match_idx = match match_idx {
             Some(i) => i,
             None => {
@@ -238,7 +240,7 @@ impl Function for LookupFn {
         };
 
         // --- Retrieve result ---
-        if let Some(result_data) = result_data {
+        if let Some((result_data, _)) = result_data {
             let (r_rows, r_cols) = dims(&result_data);
             let result_vec = flatten_1d_vec(&result_data, r_rows, r_cols);
             let val = result_vec
@@ -276,14 +278,15 @@ impl Function for LookupFn {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Materialise a range argument into a 2-D Vec grid. An error passed in place
-/// of the vector (`#NAME?` from an unknown function, `#N/A`) is not a 1x1 vector
-/// to search: Excel returns it as the result, so it comes back as `Err` and the
-/// caller propagates it.
+/// Materialise a range argument into a 2-D Vec grid, with the rows and
+/// columns a reference spans as written (see [`reference_extent`]). An error
+/// passed in place of the vector (`#NAME?` from an unknown function, `#N/A`) is
+/// not a 1x1 vector to search: Excel returns it as the result, so it comes
+/// back as `Err` and the caller propagates it.
 fn materialise_range<'a, 'b>(
     arg: &ArgumentHandle<'a, 'b>,
     ctx: &dyn FunctionContext<'b>,
-) -> Result<Vec<Vec<LiteralValue>>, ExcelError> {
+) -> Result<(Vec<Vec<LiteralValue>>, Option<(usize, usize)>), ExcelError> {
     if let Ok(r) = arg.as_reference_or_eval() {
         let current_sheet = ctx.current_sheet();
         let rv = ctx.resolve_range_view(&r, current_sheet)?;
@@ -295,13 +298,13 @@ fn materialise_range<'a, 'b>(
             data.push(owned);
             Ok(())
         })?;
-        Ok(data)
+        Ok((data, reference_extent(&r)))
     } else {
         let v = arg.value()?.into_literal();
         match v {
             LiteralValue::Error(e) => Err(e),
-            LiteralValue::Array(rows) => Ok(rows),
-            other => Ok(vec![vec![other]]),
+            LiteralValue::Array(rows) => Ok((rows, None)),
+            other => Ok((vec![vec![other]], None)),
         }
     }
 }
@@ -360,7 +363,7 @@ mod tests {
     #[test]
     fn approx_empty_slice() {
         assert_eq!(
-            approx_match_ascending(&[], &LiteralValue::Int(1), DateSystem::Excel1900),
+            approx_match_ascending(&[], &LiteralValue::Int(1), 0, DateSystem::Excel1900),
             None
         );
     }
@@ -373,7 +376,12 @@ mod tests {
             LiteralValue::Int(30),
         ];
         assert_eq!(
-            approx_match_ascending(&vals, &LiteralValue::Int(5), DateSystem::Excel1900),
+            approx_match_ascending(
+                &vals,
+                &LiteralValue::Int(5),
+                vals.len(),
+                DateSystem::Excel1900
+            ),
             None
         );
     }
@@ -386,7 +394,12 @@ mod tests {
             LiteralValue::Int(30),
         ];
         assert_eq!(
-            approx_match_ascending(&vals, &LiteralValue::Int(20), DateSystem::Excel1900),
+            approx_match_ascending(
+                &vals,
+                &LiteralValue::Int(20),
+                vals.len(),
+                DateSystem::Excel1900
+            ),
             Some(1)
         );
     }
@@ -399,7 +412,12 @@ mod tests {
             LiteralValue::Int(30),
         ];
         assert_eq!(
-            approx_match_ascending(&vals, &LiteralValue::Int(25), DateSystem::Excel1900),
+            approx_match_ascending(
+                &vals,
+                &LiteralValue::Int(25),
+                vals.len(),
+                DateSystem::Excel1900
+            ),
             Some(1)
         );
     }
@@ -412,7 +430,12 @@ mod tests {
             LiteralValue::Int(30),
         ];
         assert_eq!(
-            approx_match_ascending(&vals, &LiteralValue::Int(100), DateSystem::Excel1900),
+            approx_match_ascending(
+                &vals,
+                &LiteralValue::Int(100),
+                vals.len(),
+                DateSystem::Excel1900
+            ),
             Some(2)
         );
     }
@@ -432,7 +455,7 @@ mod tests {
             value(),
         ];
         assert_eq!(
-            approx_match_ascending(&hits, &LiteralValue::Int(99999), d),
+            approx_match_ascending(&hits, &LiteralValue::Int(99999), hits.len(), d),
             Some(2)
         );
         // 1/(cond): the last position where cond holds.
@@ -447,12 +470,12 @@ mod tests {
             na(),
         ];
         assert_eq!(
-            approx_match_ascending(&last, &LiteralValue::Int(2), d),
+            approx_match_ascending(&last, &LiteralValue::Int(2), last.len(), d),
             Some(3)
         );
         let tail = vec![na(), na(), na(), na(), LiteralValue::Int(1)];
         assert_eq!(
-            approx_match_ascending(&tail, &LiteralValue::Int(2), d),
+            approx_match_ascending(&tail, &LiteralValue::Int(2), tail.len(), d),
             Some(4)
         );
         let mixed = vec![
@@ -463,12 +486,103 @@ mod tests {
             na(),
         ];
         assert_eq!(
-            approx_match_ascending(&mixed, &LiteralValue::Int(5), d),
+            approx_match_ascending(&mixed, &LiteralValue::Int(5), mixed.len(), d),
             Some(3)
         );
         assert_eq!(
-            approx_match_ascending(&[na(), na()], &LiteralValue::Int(2), d),
+            approx_match_ascending(&[na(), na()], &LiteralValue::Int(2), 2, d),
             None
+        );
+    }
+
+    #[test]
+    fn approx_bisects_with_inclusive_bounds_and_keeps_an_exact_hit() {
+        let d = DateSystem::Excel1900;
+        let ints = |v: &[i64]| v.iter().map(|&i| LiteralValue::Int(i)).collect::<Vec<_>>();
+        // Inclusive bounds and a floor midpoint: 30 is probed first, then 10.
+        let unsorted = ints(&[10, 30, 20, 40]);
+        assert_eq!(
+            approx_match_ascending(&unsorted, &LiteralValue::Int(25), 4, d),
+            Some(0)
+        );
+        // Equal keys: the last of the run.
+        let dups = ints(&[1, 5, 7, 7, 7, 9]);
+        assert_eq!(
+            approx_match_ascending(&dups, &LiteralValue::Int(7), 6, d),
+            Some(4)
+        );
+        // The first probe is an exact hit; the smaller entries probed after
+        // it do not replace it.
+        let titles: Vec<LiteralValue> = [
+            "Winter Guard #1",
+            "Iron man Annual 2021",
+            "Infinity War",
+            "Deadpool Kills the Marvel Universe AGAIN",
+            "Deadpool Kills the Marvel Universe",
+            "Black Cat Annual 2021",
+        ]
+        .into_iter()
+        .map(|t| LiteralValue::Text(t.into()))
+        .collect();
+        assert_eq!(
+            approx_match_ascending(&titles, &LiteralValue::Text("Infinity War".into()), 6, d),
+            Some(2)
+        );
+        // Every probe is above "Black Cat Annual 2021".
+        assert_eq!(
+            approx_match_ascending(
+                &titles,
+                &LiteralValue::Text("Black Cat Annual 2021".into()),
+                6,
+                d
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn lookup_bisects_the_vector_as_written() {
+        use crate::engine::{Engine, EvalConfig};
+        use formualizer_parse::parser::parse;
+        let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+        for (i, title) in [
+            "Winter Guard #1",
+            "Iron man Annual 2021",
+            "Infinity War",
+            "Deadpool Kills the Marvel Universe AGAIN",
+            "Deadpool Kills the Marvel Universe",
+            "Black Cat Annual 2021",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let row = i as u32 + 4;
+            engine
+                .set_cell_value("Sheet1", row, 1, LiteralValue::Text(title.into()))
+                .unwrap();
+            engine
+                .set_cell_value("Sheet1", row, 8, LiteralValue::Int(i as i64 + 1))
+                .unwrap();
+        }
+        let mut eval = |formula: &str| {
+            engine
+                .set_cell_formula("Sheet1", 3, 12, parse(formula).unwrap())
+                .unwrap();
+            engine.evaluate_all().unwrap();
+            engine.get_cell_value("Sheet1", 3, 12)
+        };
+        // A$4:A$1048576 is bisected over all its rows: the probes come down
+        // the blank tail to "Infinity War", an exact hit.
+        for formula in [
+            "=LOOKUP(\"Infinity War\",A$4:A$1048576,H$4:H$1048576)",
+            "=LOOKUP(\"Infinity War\",A4:A9,H4:H9)",
+        ] {
+            assert_eq!(eval(formula), Some(LiteralValue::Number(3.0)), "{formula}");
+        }
+        let na = eval("=LOOKUP(\"Black Cat Annual 2021\",A$4:A$1048576,H$4:H$1048576)");
+        assert!(
+            matches!(na, Some(LiteralValue::Error(ref e)) if e.kind == ExcelErrorKind::Na),
+            "{na:?}"
         );
     }
 
