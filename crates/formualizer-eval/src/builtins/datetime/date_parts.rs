@@ -93,6 +93,34 @@ fn days_360_between(start: NaiveDate, end: NaiveDate, european: bool) -> i64 {
         + i64::from(ed as i32 - sd as i32)
 }
 
+/// YEARFRAC basis 0 day count (`start <= end`): Excel's US 30/360, which is
+/// not DAYS360's rule (ODFF 1.2 4.11.7.7; Apache POI and LibreOffice agree).
+/// A start on the 31st becomes the 30th; an end on the 31st becomes the 30th
+/// only when the start is then the 30th. Otherwise a start on the last day of
+/// February becomes the 30th, and so does an end on the last day of February.
+/// No other end of month moves (Feb 28 or Apr 30 count as themselves).
+fn yearfrac_us_30_360_days(start: NaiveDate, end: NaiveDate) -> i64 {
+    let last_of_february = |d: NaiveDate| d.month() == 2 && is_last_day_of_month(d);
+    let mut sd = start.day();
+    let mut ed = end.day();
+
+    if sd == 31 {
+        sd = 30;
+    }
+    if sd == 30 && ed == 31 {
+        ed = 30;
+    } else if last_of_february(start) {
+        sd = 30;
+        if last_of_february(end) {
+            ed = 30;
+        }
+    }
+
+    360 * i64::from(end.year() - start.year())
+        + 30 * i64::from(end.month() as i32 - start.month() as i32)
+        + i64::from(ed as i32 - sd as i32)
+}
+
 /// Returns the number of whole days between two date serial values.
 ///
 /// # Remarks
@@ -398,7 +426,7 @@ impl Function for YearFracFn {
 
         let actual_days = (e - s).num_days() as f64;
         let frac = match basis {
-            0 => days_360_between(s, e, false) as f64 / 360.0,
+            0 => yearfrac_us_30_360_days(s, e) as f64 / 360.0,
             1 => {
                 if s.year() == e.year() {
                     actual_days / days_in_year(s.year())
@@ -1216,6 +1244,52 @@ mod tests {
             .unwrap()
             .into_literal();
         assert_eq!(iso, LiteralValue::Int(53));
+    }
+
+    /// YEARFRAC basis 0 is Excel's US 30/360, not DAYS360's rule: an end on
+    /// the last day of a month shorter than 31 days counts as itself unless
+    /// both dates are the last day of February.
+    #[test]
+    fn yearfrac_basis0_us_30_360_day_count() {
+        use crate::interpreter::Interpreter;
+        use formualizer_parse::parser::parse;
+
+        let wb = TestWorkbook::new()
+            .with_function(Arc::new(YearFracFn))
+            .with_function(Arc::new(super::super::date_time::DateFn));
+        let engine = crate::engine::Engine::new(wb, crate::engine::EvalConfig::default());
+        let interpreter = Interpreter::new(&engine, "Sheet1");
+        let days = |start: &str, end: &str, basis: u8| -> f64 {
+            let formula = format!("=YEARFRAC({start},{end},{basis})");
+            match interpreter
+                .evaluate_ast(&parse(&formula).unwrap())
+                .map(|v| v.into_literal())
+            {
+                Ok(LiteralValue::Number(n)) => (n * 360.0).round(),
+                other => panic!("{formula} gave {other:?}"),
+            }
+        };
+
+        for (start, end, want) in [
+            // Short-month end dates are not moved.
+            ("DATE(2022,8,31)", "DATE(2023,2,28)", 178.0),
+            ("DATE(2022,1,15)", "DATE(2022,4,30)", 105.0),
+            ("DATE(2022,1,30)", "DATE(2022,2,28)", 28.0),
+            // An end on the 31st becomes the 30th only after a 30th/31st start.
+            ("DATE(2023,2,28)", "DATE(2023,3,31)", 31.0),
+            // Unchanged: 30th/31st pairs, a mid-month start, February pairs.
+            ("DATE(2022,1,30)", "DATE(2022,3,31)", 60.0),
+            ("DATE(2022,1,31)", "DATE(2022,3,31)", 60.0),
+            ("DATE(2022,1,15)", "DATE(2022,3,31)", 76.0),
+            ("DATE(2023,2,28)", "DATE(2024,2,29)", 360.0),
+            ("DATE(2024,2,29)", "DATE(2024,4,30)", 60.0),
+            ("DATE(2021,1,1)", "DATE(2021,7,1)", 180.0),
+        ] {
+            assert_eq!(days(start, end, 0), want, "YEARFRAC({start},{end},0)*360");
+        }
+        // Basis 4 (European 30/360) is unchanged.
+        assert_eq!(days("DATE(2022,1,31)", "DATE(2022,2,28)", 4), 28.0);
+        assert_eq!(days("DATE(2022,1,15)", "DATE(2022,3,31)", 4), 75.0);
     }
 
     fn eval_date_part_formula(system: crate::engine::DateSystem, formula: &str) -> LiteralValue {
