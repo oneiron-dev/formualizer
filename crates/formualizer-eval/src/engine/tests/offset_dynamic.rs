@@ -187,3 +187,41 @@ fn recalc_plan_with_offset_falls_back_to_dynamic_recalc() {
         Some(LiteralValue::Number(10.0))
     );
 }
+
+#[test]
+fn offset_array_of_references_tracks_each_target() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(1.0))
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 1, 3, LiteralValue::Number(5.0))
+        .unwrap();
+    // A2 = C1*2 is computed before the array of references {A1;A2} is read.
+    engine
+        .set_cell_formula("Sheet1", 2, 1, parse("=C1*2"))
+        .unwrap();
+    engine
+        .set_cell_formula(
+            "Sheet1",
+            1,
+            2,
+            parse("=SUMPRODUCT(SUBTOTAL(9,OFFSET(A1,{0;1},0)))"),
+        )
+        .unwrap();
+
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 2),
+        Some(LiteralValue::Number(11.0))
+    );
+
+    engine
+        .set_cell_value("Sheet1", 1, 3, LiteralValue::Number(7.0))
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 2),
+        Some(LiteralValue::Number(15.0))
+    );
+}

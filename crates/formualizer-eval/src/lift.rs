@@ -11,11 +11,16 @@
 //! consume the whole array and are never lifted, so lifting is declared per
 //! function and parameter from Excel's documented parameter types rather than
 //! inferred from argument schemas.
+//!
+//! A reference-returning function lifted the same way (`OFFSET(A1,{0;1},0)`)
+//! returns an array of references. It has no value of its own; a function
+//! taking a reference or a single value there is evaluated once per
+//! reference instead (`SUBTOTAL(9,OFFSET(A1,{0;1},0))` is `{A1;A2}`).
 
 use crate::engine::range_view::RangeView;
 use crate::traits::{ArgumentHandle, CalcValue};
 use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
-use formualizer_parse::parser::{ASTNode, ASTNodeType};
+use formualizer_parse::parser::{ASTNode, ASTNodeType, ReferenceType};
 
 /// Which parameter positions (0-based) take a single value.
 #[derive(Clone, Copy, Debug)]
@@ -37,6 +42,9 @@ impl Lift {
         }
     }
 }
+
+/// An array of references: one reference, or the error in its place, per element.
+pub(crate) type ReferenceArray = Vec<Vec<Result<ReferenceType, ExcelError>>>;
 
 /// Upper bound on lifted elements; larger shapes keep the unlifted path.
 const MAX_LIFTED_ELEMENTS: usize = 4_000_000;
@@ -102,6 +110,31 @@ pub(crate) fn lift_spec(name: &str) -> Option<Lift> {
     })
 }
 
+/// Excel's reference parameters of builtins that are evaluated once per
+/// reference of an array of references. Their single-value parameters
+/// (criteria) lift over it as well, as do those of every `lift_spec` builtin.
+fn reference_lift_spec(name: &str) -> Option<Lift> {
+    Some(match name {
+        "SUBTOTAL" => Lift::Every { start: 1, step: 1 },
+        "AGGREGATE" => Lift::Every { start: 2, step: 1 },
+        "SUMIF" | "COUNTIF" | "AVERAGEIF" | "SUMIFS" | "COUNTIFS" | "AVERAGEIFS" | "MAXIFS"
+        | "MINIFS" | "COUNTBLANK" => Lift::All,
+        _ => return None,
+    })
+}
+
+/// The single-value parameters of the reference-returning builtins, which
+/// return an array of references when lifted.
+pub(crate) fn reference_array_spec(name: &str) -> Option<Lift> {
+    if name.eq_ignore_ascii_case("OFFSET") {
+        Some(Lift::Only(&[1, 2, 3, 4]))
+    } else if name.eq_ignore_ascii_case("INDIRECT") {
+        Some(Lift::All)
+    } else {
+        None
+    }
+}
+
 /// The rows of a multi-cell array value; `None` for scalars and single cells.
 pub(crate) fn array_rows(value: &CalcValue<'_>) -> Option<Vec<Vec<LiteralValue>>> {
     match value {
@@ -132,19 +165,24 @@ pub(crate) fn array_rows(value: &CalcValue<'_>) -> Option<Vec<Vec<LiteralValue>>
 /// Element `(row, col)` of `rows` broadcast to a larger shape: a single row or
 /// column repeats; positions beyond a longer dimension are `#N/A`.
 pub(crate) fn broadcast_get(rows: &[Vec<LiteralValue>], row: usize, col: usize) -> LiteralValue {
-    let height = rows.len();
-    let width = rows.first().map_or(0, Vec::len);
-    let r = if height == 1 { 0 } else { row };
-    let c = if width == 1 { 0 } else { col };
-    rows.get(r)
-        .and_then(|cells| cells.get(c))
+    broadcast_at(rows, row, col)
         .cloned()
         .unwrap_or_else(|| LiteralValue::Error(ExcelError::new(ExcelErrorKind::Na)))
 }
 
+/// Element `(row, col)` of `rows` broadcast to a larger shape; `None` beyond
+/// a longer dimension.
+fn broadcast_at<T>(rows: &[Vec<T>], row: usize, col: usize) -> Option<&T> {
+    let height = rows.len();
+    let width = rows.first().map_or(0, Vec::len);
+    let r = if height == 1 { 0 } else { row };
+    let c = if width == 1 { 0 } else { col };
+    rows.get(r).and_then(|cells| cells.get(c))
+}
+
 /// The broadcast shape of several arrays.
-pub(crate) fn broadcast_dims<'r>(
-    arrays: impl IntoIterator<Item = &'r Vec<Vec<LiteralValue>>>,
+pub(crate) fn broadcast_dims<'r, T: 'r>(
+    arrays: impl IntoIterator<Item = &'r Vec<Vec<T>>>,
 ) -> (usize, usize) {
     arrays.into_iter().fold((1, 1), |(h, w), rows| {
         (h.max(rows.len()), w.max(rows.first().map_or(0, Vec::len)))
@@ -170,15 +208,61 @@ pub(crate) fn array_result<'b>(
     CalcValue::Range(RangeView::from_owned_rows(rows, date_system))
 }
 
-/// Evaluate `call` once per element when a lifted parameter holds an array.
-/// Returns `None` when no lifted argument is a multi-cell array.
+/// Evaluate `call` once per element when a lifted parameter holds an array,
+/// or a lifted or reference parameter holds an array of references.
+/// Returns `None` when no such argument is a multi-cell array.
 pub(crate) fn lift_call<'a, 'b, F>(
-    spec: Lift,
+    name: &str,
     args: &[ArgumentHandle<'a, 'b>],
     call: F,
 ) -> Result<Option<CalcValue<'b>>, ExcelError>
 where
     F: for<'x> Fn(&[ArgumentHandle<'x, 'b>]) -> Result<CalcValue<'b>, ExcelError>,
+{
+    let values = lift_spec(name);
+    let Some(references) = reference_lift_spec(name).or(values) else {
+        return Ok(None);
+    };
+    let mut arrays = Vec::new();
+    for (index, arg) in args.iter().enumerate() {
+        if !references.lifts(index) || arg.is_omitted() {
+            continue;
+        }
+        if values.is_some_and(|spec| spec.lifts(index)) {
+            let Ok(value) = arg.value() else {
+                return Ok(None);
+            };
+            if let Some(rows) = array_rows(&value) {
+                arrays.push((index, literal_nodes(rows)));
+                continue;
+            }
+            // An array of references has no value; it reads as an error.
+            if !matches!(value, CalcValue::Scalar(LiteralValue::Error(_))) {
+                continue;
+            }
+        }
+        if let Some(refs) = arg.reference_array()? {
+            arrays.push((index, reference_nodes(refs)));
+        }
+    }
+    let lifted = each_element(args, &arrays, |handles| match call(handles) {
+        Ok(value) => Ok(element(value)),
+        Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+        Err(error) => Ok(LiteralValue::Error(error)),
+    })?;
+    Ok(lifted.map(|rows| array_result(rows, args[0].date_system())))
+}
+
+/// The references of a reference-returning call whose single-value
+/// parameters (`spec`) hold an array, one per element of their broadcast
+/// shape. Returns `None` when none of them is a multi-cell array.
+pub(crate) fn lift_reference<'a, 'b, F>(
+    spec: Lift,
+    args: &[ArgumentHandle<'a, 'b>],
+    call: F,
+) -> Result<Option<ReferenceArray>, ExcelError>
+where
+    F: for<'x> Fn(&[ArgumentHandle<'x, 'b>]) -> Option<Result<ReferenceType, ExcelError>>,
 {
     let mut arrays = Vec::new();
     for (index, arg) in args.iter().enumerate() {
@@ -189,44 +273,116 @@ where
             return Ok(None);
         };
         if let Some(rows) = array_rows(&value) {
-            arrays.push((index, rows));
+            arrays.push((index, literal_nodes(rows)));
         }
     }
+    each_element(args, &arrays, |handles| match call(handles) {
+        Some(Err(error)) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+        Some(result) => Ok(result),
+        None => Ok(Err(ExcelError::new(ExcelErrorKind::Ref))),
+    })
+}
+
+fn literal_nodes(rows: Vec<Vec<LiteralValue>>) -> Vec<Vec<ASTNode>> {
+    rows.into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|value| ASTNode::new(ASTNodeType::Literal(value), None))
+                .collect()
+        })
+        .collect()
+}
+
+/// Reference elements as absolute references, so a relocated evaluation
+/// (shared formulas) does not shift a reference that is already resolved.
+fn reference_nodes(rows: ReferenceArray) -> Vec<Vec<ASTNode>> {
+    rows.into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|reference| {
+                    let node_type = match reference {
+                        Ok(reference) => {
+                            let reference = absolute(reference);
+                            ASTNodeType::Reference {
+                                original: reference.to_string(),
+                                reference,
+                            }
+                        }
+                        Err(error) => ASTNodeType::Literal(LiteralValue::Error(error)),
+                    };
+                    ASTNode::new(node_type, None)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn absolute(reference: ReferenceType) -> ReferenceType {
+    match reference {
+        ReferenceType::Cell {
+            sheet, row, col, ..
+        } => ReferenceType::Cell {
+            sheet,
+            row,
+            col,
+            row_abs: true,
+            col_abs: true,
+        },
+        ReferenceType::Range {
+            sheet,
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            ..
+        } => ReferenceType::Range {
+            sheet,
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            start_row_abs: true,
+            start_col_abs: true,
+            end_row_abs: true,
+            end_col_abs: true,
+        },
+        other => other,
+    }
+}
+
+/// Evaluate `call` once per element of the broadcast shape of `arrays`, each
+/// lifted argument replaced by its element (`#N/A` beyond a shorter array).
+/// Returns `None` when there is nothing to lift.
+fn each_element<'a, 'b, T, F>(
+    args: &[ArgumentHandle<'a, 'b>],
+    arrays: &[(usize, Vec<Vec<ASTNode>>)],
+    call: F,
+) -> Result<Option<Vec<Vec<T>>>, ExcelError>
+where
+    F: for<'x> Fn(&[ArgumentHandle<'x, 'b>]) -> Result<T, ExcelError>,
+{
     if arrays.is_empty() {
         return Ok(None);
     }
-    let (height, width) = broadcast_dims(arrays.iter().map(|(_, rows)| rows));
-    let per_element = arrays.len();
-    if height.saturating_mul(width).saturating_mul(per_element) > MAX_LIFTED_ELEMENTS {
+    let (height, width) = broadcast_dims(arrays.iter().map(|(_, nodes)| nodes));
+    if height.saturating_mul(width).saturating_mul(arrays.len()) > MAX_LIFTED_ELEMENTS {
         return Ok(None);
     }
-    let mut nodes = Vec::with_capacity(height * width * per_element);
-    for r in 0..height {
-        for c in 0..width {
-            for (_, rows) in &arrays {
-                nodes.push(ASTNode::new(
-                    ASTNodeType::Literal(broadcast_get(rows, r, c)),
-                    None,
-                ));
-            }
-        }
-    }
+    let na = ASTNode::new(
+        ASTNodeType::Literal(LiteralValue::Error(ExcelError::new(ExcelErrorKind::Na))),
+        None,
+    );
     let mut handles: Vec<ArgumentHandle<'_, 'b>> = args.to_vec();
     let mut out = Vec::with_capacity(height);
     for r in 0..height {
         let mut row = Vec::with_capacity(width);
         for c in 0..width {
-            let base = (r * width + c) * per_element;
-            for (j, (index, _)) in arrays.iter().enumerate() {
-                handles[*index] = args[*index].literal(&nodes[base + j]);
+            for (index, nodes) in arrays {
+                handles[*index] = args[*index].literal(broadcast_at(nodes, r, c).unwrap_or(&na));
             }
-            row.push(match call(&handles) {
-                Ok(value) => element(value),
-                Err(error) if error.kind == ExcelErrorKind::Cancelled => return Err(error),
-                Err(error) => LiteralValue::Error(error),
-            });
+            row.push(call(&handles)?);
         }
         out.push(row);
     }
-    Ok(Some(array_result(out, args[0].date_system())))
+    Ok(Some(out))
 }

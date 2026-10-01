@@ -628,6 +628,9 @@ pub struct OffsetFn;
 /// - Non-positive target coordinates or dimensions return `#REF!`.
 /// - Non-numeric offset/size inputs return `#VALUE!`.
 /// - In value context, a 1x1 result returns a scalar; larger results spill as an array.
+/// - An array offset/size returns an array of references, one per element: reference
+///   parameters such as SUBTOTAL's or SUMIF's evaluate once per reference, and `N`
+///   reads each one. On its own it has no value (`#VALUE!`).
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -702,20 +705,12 @@ impl Function for OffsetFn {
             Ok(r) => r,
             Err(e) => return Some(Err(e)),
         };
-        let dr = match args[1].value() {
-            Ok(cv) => match cv.into_literal() {
-                LiteralValue::Number(n) => n as i64,
-                LiteralValue::Int(i) => i,
-                _ => return Some(Err(ExcelError::new(ExcelErrorKind::Value))),
-            },
+        let dr = match offset_number(&args[1]) {
+            Ok(n) => n,
             Err(e) => return Some(Err(e)),
         };
-        let dc = match args[2].value() {
-            Ok(cv) => match cv.into_literal() {
-                LiteralValue::Number(n) => n as i64,
-                LiteralValue::Int(i) => i,
-                _ => return Some(Err(ExcelError::new(ExcelErrorKind::Value))),
-            },
+        let dc = match offset_number(&args[2]) {
+            Ok(n) => n,
             Err(e) => return Some(Err(e)),
         };
 
@@ -729,24 +724,16 @@ impl Function for OffsetFn {
         let nsr = (sr as i64) + dr;
         let nsc = (sc as i64) + dc;
         let height = if args.len() >= 4 && !args[3].is_omitted() {
-            match args[3].value() {
-                Ok(cv) => match cv.into_literal() {
-                    LiteralValue::Number(n) => n as i64,
-                    LiteralValue::Int(i) => i,
-                    _ => return Some(Err(ExcelError::new(ExcelErrorKind::Value))),
-                },
+            match offset_number(&args[3]) {
+                Ok(n) => n,
                 Err(e) => return Some(Err(e)),
             }
         } else {
             (er as i64) - (sr as i64) + 1
         };
         let width = if args.len() >= 5 && !args[4].is_omitted() {
-            match args[4].value() {
-                Ok(cv) => match cv.into_literal() {
-                    LiteralValue::Number(n) => n as i64,
-                    LiteralValue::Int(i) => i,
-                    _ => return Some(Err(ExcelError::new(ExcelErrorKind::Value))),
-                },
+            match offset_number(&args[4]) {
+                Ok(n) => n,
                 Err(e) => return Some(Err(e)),
             }
         } else {
@@ -777,26 +764,41 @@ impl Function for OffsetFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        if let Some(Ok(r)) = self.eval_reference(args, ctx) {
-            let current_sheet = ctx.current_sheet();
-            match ctx.resolve_range_view(&r, current_sheet) {
-                Ok(rv) => {
-                    let (rows, cols) = rv.dims();
-                    if rows == 1 && cols == 1 {
-                        Ok(crate::traits::CalcValue::Scalar(
-                            rv.as_1x1().unwrap_or(LiteralValue::Empty),
-                        ))
-                    } else {
-                        Ok(crate::traits::CalcValue::Range(rv))
+        match self.eval_reference(args, ctx) {
+            Some(Ok(r)) => {
+                let current_sheet = ctx.current_sheet();
+                match ctx.resolve_range_view(&r, current_sheet) {
+                    Ok(rv) => {
+                        let (rows, cols) = rv.dims();
+                        if rows == 1 && cols == 1 {
+                            Ok(crate::traits::CalcValue::Scalar(
+                                rv.as_1x1().unwrap_or(LiteralValue::Empty),
+                            ))
+                        } else {
+                            Ok(crate::traits::CalcValue::Range(rv))
+                        }
                     }
+                    Err(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
                 }
-                Err(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
             }
-        } else {
-            Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+            // An array offset or size makes an array of references, which has
+            // no value (#VALUE!); reference-taking callers lift over it.
+            Some(Err(e)) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+            None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new(ExcelErrorKind::Ref),
-            )))
+            ))),
         }
+    }
+}
+
+/// An OFFSET offset or size: a number, or the argument's own error. An array
+/// is lifted by the caller (`ArgumentHandle::reference_array`) and is #VALUE! here.
+fn offset_number(arg: &ArgumentHandle<'_, '_>) -> Result<i64, ExcelError> {
+    match arg.value()?.into_literal() {
+        LiteralValue::Number(n) => Ok(n as i64),
+        LiteralValue::Int(i) => Ok(i),
+        LiteralValue::Error(e) => Err(e),
+        _ => Err(ExcelError::new(ExcelErrorKind::Value)),
     }
 }
 
@@ -1539,5 +1541,31 @@ mod tests {
             .unwrap()
             .into_literal();
         assert_eq!(v, LiteralValue::Number(5.0));
+    }
+
+    #[test]
+    fn offset_with_array_offsets_is_an_array_of_references() {
+        crate::builtins::load_builtins();
+        let wb = TestWorkbook::new()
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Int(1))
+            .with_cell_a1("Sheet1", "A2", LiteralValue::Int(2))
+            .with_cell_a1("Sheet1", "A3", LiteralValue::Int(4));
+        let eval = |formula: &str| evaluate_formula(formula, &wb).unwrap();
+        assert_eq!(
+            eval("=SUMPRODUCT(SUBTOTAL(9,OFFSET(A1,{0;1;2},0))*{1;10;100})"),
+            LiteralValue::Number(421.0)
+        );
+        assert_eq!(
+            eval("=SUM(SUMIF(OFFSET(A1,0,0,{1,2,3}),\">0\"))"),
+            LiteralValue::Number(11.0)
+        );
+        assert_eq!(
+            eval("=SUMPRODUCT(N(OFFSET(A1,{2;0},0)))"),
+            LiteralValue::Number(5.0)
+        );
+        assert!(matches!(
+            eval("=OFFSET(A1,{0;1},0)"),
+            LiteralValue::Error(e) if e.kind == ExcelErrorKind::Value
+        ));
     }
 }

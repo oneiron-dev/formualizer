@@ -848,6 +848,70 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         }
     }
 
+    /// The references this argument evaluates to when it is a reference-returning
+    /// call lifted over an array (`OFFSET(A1,{0;1},0)`): an array of references,
+    /// one per element. `None` for any other argument.
+    pub(crate) fn reference_array(
+        &self,
+    ) -> Result<Option<crate::lift::ReferenceArray>, ExcelError> {
+        let (name, spec, handles): (&str, _, Vec<ArgumentHandle<'a, 'b>>) = match &self.expr {
+            ArgumentExpr::Ast(node) => {
+                let ASTNodeType::Function { name, args } = &node.node_type else {
+                    return Ok(None);
+                };
+                let Some(spec) = crate::lift::reference_array_spec(name) else {
+                    return Ok(None);
+                };
+                let handles = args
+                    .iter()
+                    .map(|arg| ArgumentHandle::new(arg, self.interp))
+                    .collect();
+                (name, spec, handles)
+            }
+            ArgumentExpr::Arena {
+                id,
+                data_store,
+                sheet_registry,
+            } => {
+                let Some(crate::engine::arena::AstNodeData::Function { name_id, .. }) =
+                    data_store.get_node(*id)
+                else {
+                    return Ok(None);
+                };
+                let name = data_store.resolve_ast_string(*name_id);
+                let (Some(spec), Some(args)) = (
+                    crate::lift::reference_array_spec(name),
+                    data_store.get_args(*id),
+                ) else {
+                    return Ok(None);
+                };
+                let handles = args
+                    .iter()
+                    .copied()
+                    .map(|arg_id| {
+                        ArgumentHandle::new_arena(arg_id, self.interp, data_store, sheet_registry)
+                    })
+                    .collect();
+                (name, spec, handles)
+            }
+        };
+        // Only a call that fails to resolve to a single reference can be one.
+        match self.resolve_reference_or_value() {
+            Ok(crate::function::FunctionResolution::ReferenceError(_)) => {}
+            Err(error) if error.kind == ExcelErrorKind::Cancelled => return Err(error),
+            _ => return Ok(None),
+        }
+        let Some(fun) = self.interp.context.get_function("", name) else {
+            return Ok(None);
+        };
+        let ctx = DefaultFunctionContext::new_with_sheet(
+            self.interp.context,
+            None,
+            self.interp.current_sheet(),
+        );
+        crate::lift::lift_reference(spec, &handles, |call| fun.eval_reference(call, &ctx))
+    }
+
     pub(crate) fn resolve_reference_or_value(
         &self,
     ) -> Result<crate::function::FunctionResolution<'b>, ExcelError> {

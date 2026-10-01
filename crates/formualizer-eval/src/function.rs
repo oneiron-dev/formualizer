@@ -262,10 +262,10 @@ pub trait Function: Send + Sync + 'static {
                 .map(|result| self.apply_format_propagation(result));
         }
 
-        // A single-value parameter holding an array evaluates per element.
-        if let Some(spec) = crate::lift::lift_spec(self.name())
-            && let Some(lifted) =
-                crate::lift::lift_call(spec, args, |call| self.dispatch_scalar(call, ctx))?
+        // A single-value parameter holding an array, or a reference parameter
+        // holding an array of references, evaluates per element.
+        if let Some(lifted) =
+            crate::lift::lift_call(self.name(), args, |call| self.dispatch_scalar(call, ctx))?
         {
             return Ok(lifted);
         }

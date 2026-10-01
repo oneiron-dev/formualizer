@@ -135,3 +135,73 @@ fn operators_pad_the_shorter_array_with_na() {
         other => panic!("expected #N/A, got {other:?}"),
     }
 }
+
+fn assert_error(formula: &str, kind: ExcelErrorKind) {
+    let mut engine = engine();
+    match eval(&mut engine, formula) {
+        LiteralValue::Error(e) => assert_eq!(e.kind, kind, "{formula}"),
+        other => panic!("{formula} = {other:?}, expected {kind:?}"),
+    }
+}
+
+#[test]
+fn reference_parameters_lift_over_offset_with_array_offsets() {
+    // OFFSET(B1,{0;1;2},0) is the array of references {B1;B2;B3}.
+    assert_number("=SUMPRODUCT(SUBTOTAL(9,OFFSET(B1,{0;1;2},0)))", 6.0);
+    assert_number("=MAX(SUBTOTAL(9,OFFSET(B1,ROW(B1:B3)-1,0)))", 3.0);
+    assert_number(
+        "=SUMPRODUCT(SUBTOTAL(9,OFFSET(B$1,ROW(B$1:B$3)-ROW(B$1),0)),--(A1:A3=\"a\"))",
+        4.0,
+    );
+    // Each reference may be a range: per-column maxima of B1:C3 (text skipped).
+    assert_number("=SUM(SUBTOTAL(4,OFFSET(B1:B3,,{0,1},)))", 45103.0);
+    assert_number(
+        "=SUMPRODUCT(_xlfn.AGGREGATE(9,6,OFFSET(B1,{0;1;2},0)))",
+        6.0,
+    );
+    // Criteria ranges, sum ranges and an array width.
+    assert_number("=SUM(SUMIF(A1:A3,\"a\",OFFSET(A1:A3,,{1,2})))", 45004.0);
+    assert_number("=SUMPRODUCT(COUNTIF(OFFSET(A1,{0;1;2},0),\"a\"))", 2.0);
+    assert_number("=SUM(SUMIF(OFFSET(B1,,,{1,2,3}),\"<>\"))", 10.0);
+    assert_number("=SUM(SUMIFS(OFFSET(B1:B3,0,{0,1}),A1:A3,\"a\"))", 45004.0);
+    assert_number(
+        "=SUM(COUNTIFS(OFFSET(A1,{0;1;2},0),\"a\",B1:B1,\">1\"))",
+        0.0,
+    );
+    assert_number("=SUM(COUNTIFS(OFFSET(A1,{0;1;2},0),\"a\"))", 2.0);
+    // A single-value parameter reads each reference.
+    assert_number("=SUMPRODUCT(N(OFFSET(B1,{0;1;2},0)))", 6.0);
+    assert_number("=SUMPRODUCT(--ISNUMBER(OFFSET(B1,{0;1},{0,1,2})))", 4.0);
+    // INDIRECT with an array of addresses is an array of references too.
+    assert_number("=SUMPRODUCT(N(INDIRECT(\"B\"&{1,2,3})))", 6.0);
+    assert_number("=SUM(COUNTIF(INDIRECT({\"A1:A3\",\"A2\"}),\"a\"))", 2.0);
+}
+
+#[test]
+fn array_of_references_elements_broadcast_and_keep_their_errors() {
+    // {0;1;2} against {0;1}: the third reference is #N/A.
+    assert_error(
+        "=SUMPRODUCT(SUBTOTAL(9,OFFSET(B1,{0;1;2},{0;1})))",
+        ExcelErrorKind::Na,
+    );
+    // B0 is #REF! in its own position only.
+    assert_number(
+        "=SUMPRODUCT(--ISERROR(SUBTOTAL(9,OFFSET(B1,{-1;0;1},0))))",
+        1.0,
+    );
+    // An array of references has no value of its own.
+    assert_error("=OFFSET(B1,{0;1},0)", ExcelErrorKind::Value);
+}
+
+#[test]
+fn single_offset_references_are_not_lifted() {
+    assert_number("=SUBTOTAL(9,OFFSET(B1,1,0,2))", 5.0);
+    assert_number("=SUMIF(A1:A3,\"a\",OFFSET(A1:A3,0,1))", 4.0);
+    assert_number("=COUNTIF(OFFSET(A1,0,0,3),\"a\")", 2.0);
+    assert_number("=SUM(OFFSET(B1,0,0,3))", 6.0);
+    assert_number("=ROWS(OFFSET(B1,0,0,3,2))", 3.0);
+    assert_number("=N(OFFSET(B1,2,0))", 3.0);
+    assert_error("=OFFSET(B1,-1,0)", ExcelErrorKind::Ref);
+    assert_error("=OFFSET(B1,\"x\",0)", ExcelErrorKind::Value);
+    assert_error("=OFFSET(B1,NA(),0)", ExcelErrorKind::Na);
+}
