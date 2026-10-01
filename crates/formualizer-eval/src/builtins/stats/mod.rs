@@ -7730,7 +7730,8 @@ impl Function for PercentRankExcFn {
 ///
 /// # Remarks
 /// - Returns an array with `bins + 1` rows.
-/// - Bins are sorted before counting.
+/// - Counts follow the order of `bins_array`; bins are sorted only to find each value's
+///   interval, and a repeated bin value takes the count at its first position.
 /// - If `bins_array` has no numeric values, result is a single count of all data points.
 /// - Non-numeric values in input ranges are ignored by statistical-collection rules.
 ///
@@ -7794,7 +7795,7 @@ impl Function for FrequencyFn {
         let data = collect_numeric_stats(&args[0..1])?;
 
         // Collect bins array
-        let mut bins = collect_numeric_stats(&args[1..2])?;
+        let bins = collect_numeric_stats(&args[1..2])?;
 
         // Handle empty bins - return single count of all data
         if bins.is_empty() {
@@ -7802,37 +7803,18 @@ impl Function for FrequencyFn {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Array(rows)));
         }
 
-        // Sort bins
-        bins.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // A value counts toward the smallest bin >= it, but the counts stay in
+        // bins_array's own order; a repeated bin value takes the count at its
+        // first position (the stable sort keeps it first among equals).
+        let mut order: Vec<usize> = (0..bins.len()).collect();
+        order.sort_by(|&a, &b| bins[a].partial_cmp(&bins[b]).unwrap());
 
-        // Calculate frequencies
-        // Result has bins.len() + 1 elements
+        // Result has bins.len() + 1 elements; the last counts values above every bin.
         let mut frequencies = vec![0usize; bins.len() + 1];
 
         for &value in &data {
-            // Find which bin the value belongs to
-            let mut found = false;
-            for (i, &bin) in bins.iter().enumerate() {
-                if i == 0 {
-                    // First bin: count values <= bins[0]
-                    if value <= bin {
-                        frequencies[0] += 1;
-                        found = true;
-                        break;
-                    }
-                } else {
-                    // Intermediate bins: count values > bins[i-1] AND <= bins[i]
-                    if value <= bin {
-                        frequencies[i] += 1;
-                        found = true;
-                        break;
-                    }
-                }
-            }
-            // Last bin: values > bins[last]
-            if !found {
-                frequencies[bins.len()] += 1;
-            }
+            let slot = order.partition_point(|&i| bins[i] < value);
+            frequencies[order.get(slot).copied().unwrap_or(bins.len())] += 1;
         }
 
         // Return as vertical array (column vector)
@@ -11110,6 +11092,56 @@ mod tests_basic_stats {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    fn frequency_eval(formula: &str) -> LiteralValue {
+        crate::builtins::load_builtins();
+        let wb = TestWorkbook::new();
+        let ctx = interp(&wb);
+        ctx.evaluate_ast(&formualizer_parse::parser::parse(formula).unwrap())
+            .unwrap()
+            .into_literal()
+    }
+
+    fn column(counts: &[f64]) -> LiteralValue {
+        LiteralValue::Array(
+            counts
+                .iter()
+                .map(|&n| vec![LiteralValue::Number(n)])
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn frequency_counts_follow_bins_array_order() {
+        // Bins 5 then 2: {3,4,5} fall in (2,5], {1,2} in (..,2], {6} above.
+        assert_eq!(
+            frequency_eval("=FREQUENCY({1,2,3,4,5,6},{5,2})"),
+            column(&[3.0, 2.0, 1.0])
+        );
+        // A repeated bin keeps the count at its first position.
+        assert_eq!(
+            frequency_eval("=FREQUENCY(0,{2,0,2})"),
+            column(&[0.0, 1.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            frequency_eval("=FREQUENCY({1,1,2},{2,1,2,1})"),
+            column(&[1.0, 2.0, 0.0, 0.0, 0.0])
+        );
+        // The nearest-value idiom picks the matching position.
+        assert_eq!(
+            frequency_eval("=LOOKUP(1,1/FREQUENCY(0,ABS({13,15,17}-15)),{13,15,17})"),
+            LiteralValue::Number(15.0)
+        );
+        // Ascending bins, and no bins at all, are unchanged.
+        assert_eq!(
+            frequency_eval("=FREQUENCY({1,2,3,4,5},{2,4})"),
+            column(&[2.0, 2.0, 1.0])
+        );
+        assert_eq!(
+            frequency_eval("=FREQUENCY({1,2,3},{\"a\"})"),
+            column(&[3.0])
+        );
     }
 
     #[test]
