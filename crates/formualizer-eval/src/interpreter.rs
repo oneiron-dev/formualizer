@@ -1103,8 +1103,13 @@ impl<'a> Interpreter<'a> {
                     return callable.invoke(self, &eval_args);
                 }
 
-                Err(ExcelError::new(ExcelErrorKind::Name)
-                    .with_message(format!("Unknown function: {name}")))
+                // An unknown function is a #NAME? value at the call site, as on the
+                // tree path, so IFERROR, ISERROR or a criteria argument sees it like
+                // any other error instead of the whole formula aborting.
+                Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                    ExcelError::new(ExcelErrorKind::Name)
+                        .with_message(format!("Unknown function: {name}")),
+                )))
             }
         }
     }
