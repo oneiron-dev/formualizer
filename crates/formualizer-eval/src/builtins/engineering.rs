@@ -2907,7 +2907,7 @@ fn coerce_complex_str(v: &LiteralValue) -> Result<String, ExcelError> {
     match v {
         LiteralValue::Text(s) => Ok(s.clone()),
         LiteralValue::Int(i) => Ok(i.to_string()),
-        LiteralValue::Number(n) => Ok(n.to_string()),
+        LiteralValue::Number(n) => Ok(crate::coercion::normalize_zero(*n).to_string()),
         LiteralValue::Error(e) => Err(e.clone()),
         _ => Err(ExcelError::new_value()),
     }
@@ -5757,5 +5757,18 @@ mod tests {
         );
         assert_eq!(format_complex(0.0, 2.5e20, 'j'), "2.5E+20j");
         assert_eq!(format_complex(1e15, 0.0, 'i'), "1E+15");
+    }
+
+    #[test]
+    fn a_negative_zero_number_is_complex_text_zero() {
+        // Excel has no negative zero: a -0 from ROUND(-0.4,0) is "0".
+        assert_eq!(
+            coerce_complex_str(&LiteralValue::Number(-0.0)).unwrap(),
+            "0"
+        );
+        assert_eq!(
+            coerce_complex_str(&LiteralValue::Number(-2.5)).unwrap(),
+            "-2.5"
+        );
     }
 }

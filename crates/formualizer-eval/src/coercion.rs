@@ -929,4 +929,13 @@ mod tests {
         assert_eq!(to_text_invariant(&LiteralValue::Number(-0.0)), "0");
         assert_eq!(to_text_invariant(&LiteralValue::Number(-2.0)), "-2");
     }
+
+    #[test]
+    fn number_to_text_drops_the_sign_of_zero_only() {
+        assert_eq!(number_to_text(-0.0), "0");
+        assert_eq!(number_to_text(0.0), "0");
+        assert_eq!(number_to_text(-2.5), "-2.5");
+        assert_eq!(number_to_text(3.0), "3");
+        assert_eq!(number_to_text(-1e-300), "-1E-300");
+    }
 }
