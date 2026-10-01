@@ -15,8 +15,16 @@ fn scalar_like_value(arg: &ArgumentHandle<'_, '_>) -> Result<LiteralValue, Excel
     })
 }
 
+/// The text VALUE, NUMBERVALUE and TEXT's format read. An empty slot written in
+/// the call is empty text. An empty slot that IF selects stays the 0 Microsoft
+/// documents for IF (`VALUE(IF(FALSE,1,))` is 0): the "" that `&` and the other
+/// text functions read for it is not a number for VALUE to parse.
 fn to_text<'a, 'b>(a: &ArgumentHandle<'a, 'b>) -> Result<String, ExcelError> {
-    let v = scalar_text_value(a)?;
+    let v = if a.is_omitted() {
+        scalar_text_value(a)?
+    } else {
+        scalar_like_value(a)?
+    };
     Ok(match v {
         LiteralValue::Text(s) => s,
         LiteralValue::Empty => String::new(),

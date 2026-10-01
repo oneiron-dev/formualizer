@@ -430,3 +430,24 @@ fn intersecting_a_single_blank_cell_keeps_it_blank() {
     assert_eq!(legacy(4, "=@A4"), legacy(4, "=A4"));
     assert_eq!(evaluate(false, &[(4, 4, "=@A4&\"x\"")]), vec![text("x")]);
 }
+
+#[test]
+fn an_empty_if_slot_is_empty_text_to_ampersand_with_an_intersected_test() {
+    // IF's test intersects as it does for IF itself (A1=1 at row 1, A2=0 at
+    // row 2), and the empty slot it selects reads as "" to `&`.
+    assert_eq!(legacy(1, "=IF(A1:A3=0,\"not \",)&\"ok\""), text("ok"));
+    assert_eq!(legacy(2, "=IF(A1:A3=0,\"not \",)&\"ok\""), text("not ok"));
+    assert_eq!(legacy(1, "=IF(A1:A3,,\"x\")&\"ok\""), text("ok"));
+    assert_eq!(legacy(2, "=IF(A1:A3,,\"x\")&\"ok\""), text("xok"));
+    assert_eq!(legacy(1, "=LEN(IF(A1:A3,,\"x\"))"), number(0.0));
+    // A range IF selects intersects as an operand of `&`.
+    assert_eq!(legacy(2, "=IF(TRUE,B1:B3,)&\"x\""), text("20x"));
+    // Inside an array argument IF still tests one value.
+    assert_eq!(
+        legacy(2, "=SUMPRODUCT(LEN(IF(A1:A3=1,\"ab\",)&\"c\"))"),
+        number(1.0)
+    );
+    // Outside text the slot stays IF's 0.
+    assert_eq!(legacy(1, "=IF(A1:A3=0,1,)+5"), number(5.0));
+    assert_eq!(legacy(1, "=COUNT(IF(A1:A3=0,1,))"), number(1.0));
+}

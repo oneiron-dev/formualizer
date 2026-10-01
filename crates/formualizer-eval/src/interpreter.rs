@@ -694,13 +694,26 @@ impl<'a> Interpreter<'a> {
                 self.implicit_intersection_from_reference(&reference),
             ));
         }
-        match self.evaluate_arena_ast(node_id, data_store, sheet_registry)? {
-            crate::traits::CalcValue::Range(view) if Self::is_sheet_range(&view) => {
-                Ok(crate::traits::CalcValue::Scalar(
+        self.evaluate_arena_ast(node_id, data_store, sheet_registry)
+            .map(|value| self.legacy_operand_value(value))
+    }
+
+    /// The computed value of an operand of a value operator: in a legacy
+    /// formula's value context a range it yields is implicitly intersected
+    /// with the formula cell; arrays and other values stay as they are.
+    fn legacy_operand_value(
+        &self,
+        value: crate::traits::CalcValue<'a>,
+    ) -> crate::traits::CalcValue<'a> {
+        match value {
+            crate::traits::CalcValue::Range(view)
+                if self.in_legacy_value_context() && Self::is_sheet_range(&view) =>
+            {
+                crate::traits::CalcValue::Scalar(
                     self.eval_implicit_intersection_calc(crate::traits::CalcValue::Range(view)),
-                ))
+                )
             }
-            other => Ok(other),
+            other => other,
         }
     }
 
@@ -982,12 +995,22 @@ impl<'a> Interpreter<'a> {
                     return self.range_value(range);
                 }
 
-                let left_calc =
-                    self.evaluate_arena_operand(*left_id, data_store, sheet_registry)?;
+                // `&` reads its operands as text, where an empty slot that IF
+                // selects is "" rather than IF's 0.
+                let operand = |id: AstNodeId| {
+                    if op == "&"
+                        && let Some(value) =
+                            ArgumentHandle::new_arena(id, self, data_store, sheet_registry)
+                                .if_branch_value_for_text()
+                    {
+                        return value.map(|value| self.legacy_operand_value(value));
+                    }
+                    self.evaluate_arena_operand(id, data_store, sheet_registry)
+                };
+                let left_calc = operand(*left_id)?;
                 let left_format = left_calc.format_id();
                 let left = left_calc.into_literal();
-                let right_calc =
-                    self.evaluate_arena_operand(*right_id, data_store, sheet_registry)?;
+                let right_calc = operand(*right_id)?;
                 let right_format = right_calc.format_id();
                 let right = right_calc.into_literal();
 
@@ -1585,10 +1608,20 @@ impl<'a> Interpreter<'a> {
             });
             return self.range_value(range);
         }
-        let left_calc = self.evaluate_ast(left_node)?;
+        // `&` reads its operands as text, where an empty slot that IF selects
+        // is "" rather than IF's 0.
+        let operand = |node: &ASTNode| {
+            if op == "&"
+                && let Some(value) = ArgumentHandle::new(node, self).if_branch_value_for_text()
+            {
+                return value;
+            }
+            self.evaluate_ast(node)
+        };
+        let left_calc = operand(left_node)?;
         let left_format = left_calc.format_id();
         let left = left_calc.into_literal();
-        let right_calc = self.evaluate_ast(right_node)?;
+        let right_calc = operand(right_node)?;
         let right_format = right_calc.format_id();
         let right = right_calc.into_literal();
         if matches!(op, "=" | "<>" | ">" | "<" | ">=" | "<=") {

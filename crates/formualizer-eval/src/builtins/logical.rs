@@ -378,8 +378,10 @@ pub struct IfFn;
 /// - A blank condition is treated as FALSE.
 /// - Text `"TRUE"`/`"FALSE"` (any case) are logical; other text conditions return `#VALUE!`.
 /// - With only two arguments, the FALSE branch defaults to logical `FALSE`.
-/// - A selected empty argument slot (`IF(FALSE,1,)`) is a blank: `""` inside `&`,
-///   `0` in arithmetic and as the cell's result.
+/// - A selected empty argument slot (`IF(FALSE,1,)`) returns 0, also element-wise
+///   for an array condition. `&` and text functions such as CONCAT and LEN read
+///   an empty slot that a single-value condition selects as empty text, so
+///   `IF(FALSE,"not ",)&"ok"` is `"ok"`; VALUE and NUMBERVALUE still read 0.
 /// - An array condition selects element-wise between the (broadcast) branches.
 ///
 /// # Examples
@@ -488,9 +490,9 @@ impl Function for IfFn {
         };
 
         if b {
-            if_branch_value(&args[1])
+            args[1].value()
         } else if let Some(arg) = args.get(2) {
-            if_branch_value(arg)
+            arg.value()
         } else {
             Ok(crate::traits::CalcValue::Scalar(LiteralValue::Boolean(
                 false,
@@ -499,16 +501,22 @@ impl Function for IfFn {
     }
 }
 
-/// The value of a selected IF branch. An empty argument slot, as in
-/// `IF(FALSE,1,)`, is a blank like an empty cell: `""` to `&`, 0 to arithmetic,
-/// and 0 once published as the cell's result.
-fn if_branch_value<'b>(
-    arg: &ArgumentHandle<'_, 'b>,
-) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-    if arg.is_omitted() {
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Empty))
+/// The argument (1 or 2) whose value IF returns for a single-value condition,
+/// as `IfFn::eval` selects it. `None` when IF returns no argument's value: a
+/// wrong argument count, an array or error condition, or a FALSE condition
+/// with no value_if_false.
+pub(crate) fn if_selected_argument(args: &[ArgumentHandle<'_, '_>]) -> Option<usize> {
+    if !(2..=3).contains(&args.len()) {
+        return None;
+    }
+    let condition = args[0].value().ok()?;
+    if crate::lift::array_rows(&condition).is_some() {
+        return None;
+    }
+    if if_condition(condition.into_literal()).ok()? {
+        Some(1)
     } else {
-        arg.value()
+        (args.len() == 3).then_some(2)
     }
 }
 
@@ -536,7 +544,7 @@ fn if_over_array<'b>(
     let branch = |index: usize| -> Vec<Vec<LiteralValue>> {
         let value = match args.get(index) {
             None => return vec![vec![LiteralValue::Boolean(false)]],
-            Some(arg) => match if_branch_value(arg) {
+            Some(arg) => match arg.value() {
                 Ok(value) => value,
                 Err(error) => return vec![vec![LiteralValue::Error(error)]],
             },
@@ -584,15 +592,14 @@ fn try_resolve_if_reference_or_value<'b>(
             )));
         }
     };
-    let branch = if selected { args.get(1) } else { args.get(2) };
-    match branch {
-        Some(arg) if arg.is_omitted() => Ok(Some(FunctionResolution::Value(
-            crate::traits::CalcValue::Scalar(LiteralValue::Empty),
-        ))),
-        Some(arg) => arg.resolve_reference_or_value().map(Some),
-        None => Ok(Some(FunctionResolution::Value(
+    if selected {
+        args[1].resolve_reference_or_value().map(Some)
+    } else if let Some(arg) = args.get(2) {
+        arg.resolve_reference_or_value().map(Some)
+    } else {
+        Ok(Some(FunctionResolution::Value(
             crate::traits::CalcValue::Scalar(LiteralValue::Boolean(false)),
-        ))),
+        )))
     }
 }
 

@@ -504,23 +504,121 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
     /// Omitted arguments materialize as numeric zero through `value()`, which is
     /// correct for Any/numeric consumers and aggregates. Text consumers must use
     /// this boundary so omission becomes empty text without changing explicit 0.
+    ///
+    /// An IF written here reads through to the argument it selects, so an
+    /// empty slot that IF selects is empty text as well: Excel gives "ok" for
+    /// `IF(FALSE,"not ",)&"ok"`. Every other consumer, aggregates and lookups
+    /// included, still sees the 0 that Microsoft documents for IF.
     pub(crate) fn value_for_text(&self) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         if self.is_omitted() {
-            Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(
                 String::new(),
-            )))
-        } else {
-            self.value()
+            )));
         }
+        if let Some(value) = self.if_branch_value_for_text() {
+            return value;
+        }
+        self.value()
     }
 
+    /// The text value of an IF written as this argument that may select an
+    /// empty slot (see [`Self::value_for_text`]); `None` for any other
+    /// argument, which reads as its plain value. The `&` operator uses this so
+    /// its other operands evaluate exactly as before.
+    pub(crate) fn if_branch_value_for_text(
+        &self,
+    ) -> Option<Result<crate::traits::CalcValue<'b>, ExcelError>> {
+        self.with_if_branch_for_text(|branch| {
+            // IF's value is the selected argument's; an evaluation error there
+            // is IF's error value, as the interpreter makes it for any call.
+            match branch.value_for_text() {
+                Err(error) if error.kind != ExcelErrorKind::Cancelled => {
+                    Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)))
+                }
+                other => other,
+            }
+        })
+    }
+
+    /// [`Self::resolve_once`] for a text consumer, with the empty slots that
+    /// [`Self::value_for_text`] reads as empty text.
     pub(crate) fn resolve_once_for_text(&self) -> Result<ResolvedArgument<'b>, ExcelError> {
         if self.is_omitted() {
-            Ok(ResolvedArgument::Value(crate::traits::CalcValue::Scalar(
+            return Ok(ResolvedArgument::Value(crate::traits::CalcValue::Scalar(
                 LiteralValue::Text(String::new()),
-            )))
-        } else {
-            self.resolve_once()
+            )));
+        }
+        if let Some(resolved) =
+            self.with_if_branch_for_text(|branch| branch.resolve_once_for_text())
+        {
+            return resolved;
+        }
+        self.resolve_once()
+    }
+
+    /// For an IF written as this argument that may select an empty slot, `f`
+    /// applied to the argument its single-value condition selects; a text
+    /// consumer reads that argument in place of IF's value. The argument
+    /// handles are the ones IF itself is evaluated with, so in a formula
+    /// without the array flag a range condition is intersected as it is for
+    /// IF. The condition is evaluated here only when an empty slot is among
+    /// IF's value arguments (directly or in an IF written there), so any
+    /// other IF evaluates once, as a call.
+    fn with_if_branch_for_text<R>(
+        &self,
+        f: impl FnOnce(&ArgumentHandle<'_, 'b>) -> R,
+    ) -> Option<R> {
+        if !self.is_if_with_empty_slot() {
+            return None;
+        }
+        let fun = self
+            .interp
+            .context
+            .get_function("", self.function_name()?)?;
+        self.with_call_handles(fun.as_ref(), |handles| {
+            let index = crate::builtins::logical::if_selected_argument(handles)?;
+            Some(f(&handles[index]))
+        })
+        .flatten()
+    }
+
+    /// Whether this argument is a call to IF with an empty slot among its
+    /// value arguments, directly or in an IF written there. Syntax only:
+    /// nothing is evaluated.
+    fn is_if_with_empty_slot(&self) -> bool {
+        let may_be_empty =
+            |arg: ArgumentHandle<'_, 'b>| arg.is_omitted() || arg.is_if_with_empty_slot();
+        match self.expr {
+            ArgumentExpr::Ast(node) => match &node.node_type {
+                ASTNodeType::Function { name, args } if name.eq_ignore_ascii_case("IF") => args
+                    .iter()
+                    .skip(1)
+                    .any(|arg| may_be_empty(ArgumentHandle::new(arg, self.interp))),
+                _ => false,
+            },
+            ArgumentExpr::Arena {
+                id,
+                data_store,
+                sheet_registry,
+            } => match data_store.get_node(id) {
+                Some(crate::engine::arena::AstNodeData::Function { name_id, .. })
+                    if data_store
+                        .resolve_ast_string(*name_id)
+                        .eq_ignore_ascii_case("IF") =>
+                {
+                    data_store.get_args(id).is_some_and(|args| {
+                        args.iter().skip(1).any(|&arg| {
+                            may_be_empty(ArgumentHandle::new_arena(
+                                arg,
+                                self.interp,
+                                data_store,
+                                sheet_registry,
+                            ))
+                        })
+                    })
+                }
+                _ => false,
+            },
         }
     }
 

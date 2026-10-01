@@ -304,28 +304,58 @@ fn omitted_lazy_branch_does_not_evaluate_the_unselected_error() {
 }
 
 #[test]
-fn selected_omitted_if_branch_is_blank_until_published() {
-    // Excel (SpreadsheetBench 57137): =IF(FALSE,"not ",)&"ok" is "ok". The
-    // selected empty slot is a blank, like an empty cell, not the number 0.
+fn selected_omitted_if_branch_is_empty_text_to_text_consumers() {
+    // Excel (SpreadsheetBench 57137): =IF(FALSE,"not ",)&"ok" is "ok". A text
+    // consumer reads the empty slot IF selects as "", not as IF's 0.
     let cases = [
         ("=IF(FALSE,\"not \",)&\"ok\"", Expected::Text("ok")),
+        ("=\"ok\"&IF(FALSE,\"not \",)", Expected::Text("ok")),
         ("=IF(TRUE,,1)&\"ok\"", Expected::Text("ok")),
         ("=IF(1=2,\"x\",)&\"\"", Expected::Text("")),
-        (
-            "=INDEX(IF({TRUE,FALSE},\"a\",)&\"x\",1,2)",
-            Expected::Text("x"),
-        ),
-        ("=IF(FALSE,1,)+1", Expected::Number(1.0)),
+        ("=IF(TRUE,IF(FALSE,\"not \",))&\"ok\"", Expected::Text("ok")),
         ("=LEN(IF(FALSE,1,))", Expected::Number(0.0)),
-        // Unchanged: the published result, a supplied branch, an absent branch.
-        ("=IF(FALSE,1,)", Expected::Number(0.0)),
+        ("=CONCAT(IF(FALSE,\"not \",),\"ok\")", Expected::Text("ok")),
+        (
+            "=CONCATENATE(IF(FALSE,\"not \",),\"ok\")",
+            Expected::Text("ok"),
+        ),
+        (
+            "=TEXTJOIN(\"-\",FALSE,IF(FALSE,1,),\"ok\")",
+            Expected::Text("-ok"),
+        ),
+        // Unchanged: a supplied branch, an absent branch, arithmetic, errors.
         ("=IF(TRUE,\"not \",)&\"ok\"", Expected::Text("not ok")),
         ("=IF(FALSE,\"not \",0)&\"ok\"", Expected::Text("0ok")),
         ("=IF(FALSE,\"not \")&\"ok\"", Expected::Text("FALSEok")),
+        (
+            "=IF(TRUE,1/0,)&\"ok\"",
+            Expected::Error(ExcelErrorKind::Div),
+        ),
+        (
+            "=IF(1/0,\"not \",)&\"ok\"",
+            Expected::Error(ExcelErrorKind::Div),
+        ),
+        ("=IF(FALSE,1,)+1", Expected::Number(1.0)),
         ("=CHOOSE(1,,5)", Expected::Number(0.0)),
     ];
     for (formula, expected) in cases {
-        assert_expected(formula, "excel: omitted IF branch", expected);
+        assert_expected(formula, "excel: omitted IF branch as text", expected);
+    }
+
+    // The interpreter's AST path reads `&` operands the same way.
+    crate::builtins::load_builtins();
+    let workbook = TestWorkbook::new();
+    for (formula, expected) in [
+        ("=IF(FALSE,\"not \",)&\"ok\"", "ok"),
+        ("=IF(TRUE,IF(FALSE,1,))&\"ok\"", "ok"),
+        ("=IF(FALSE,\"not \",0)&\"ok\"", "0ok"),
+    ] {
+        let value = workbook
+            .interpreter()
+            .evaluate_ast(&parse(formula).unwrap())
+            .unwrap()
+            .into_literal();
+        assert_eq!(value, LiteralValue::Text(expected.into()), "{formula}");
     }
 
     // A cell holding the omitted branch publishes 0, which a reader sees as 0.
@@ -345,6 +375,90 @@ fn selected_omitted_if_branch_is_blank_until_published() {
         engine.get_cell_value("Sheet1", 1, 2),
         Some(LiteralValue::Text("0x".into()))
     );
+}
+
+#[test]
+fn selected_omitted_if_branch_is_zero_to_other_consumers() {
+    // Microsoft's IF reference: a blank value_if_true or value_if_false returns
+    // 0. Outside text, the slot counts, compares and looks up as that 0, as the
+    // same slot written directly in the consumer's call does (COUNT(1,) is 2).
+    let cases = [
+        ("=IF(FALSE,1,)", Expected::Number(0.0)),
+        ("=COUNT(1,IF(FALSE,1,))", Expected::Number(2.0)),
+        ("=COUNTA(1,IF(FALSE,1,))", Expected::Number(2.0)),
+        ("=AVERAGE(2,IF(FALSE,1,))", Expected::Number(1.0)),
+        ("=MAX(-5,IF(FALSE,1,))", Expected::Number(0.0)),
+        ("=AND(TRUE,IF(FALSE,1,))", Expected::Boolean(false)),
+        (
+            "=XLOOKUP(IF(FALSE,1,),{0,1},{\"z\",\"y\"})",
+            Expected::Text("z"),
+        ),
+        ("=MATCH(IF(FALSE,1,),{0,1},0)", Expected::Number(1.0)),
+        ("=VALUE(IF(FALSE,1,))", Expected::Number(0.0)),
+        ("=NUMBERVALUE(IF(FALSE,1,))", Expected::Number(0.0)),
+        ("=ISNUMBER(IF(FALSE,1,))", Expected::Boolean(true)),
+        ("=ISBLANK(IF(FALSE,1,))", Expected::Boolean(false)),
+        ("=IF(FALSE,1,)=FALSE", Expected::Boolean(false)),
+        ("=IF(FALSE,1,)=0", Expected::Boolean(true)),
+    ];
+    for (formula, expected) in cases {
+        assert_expected(formula, "microsoft: IF blank branch is 0", expected);
+    }
+}
+
+#[test]
+fn omitted_if_branch_in_an_array_is_zero_to_aggregates_and_lookups() {
+    // Microsoft's IF reference: a blank branch returns 0, element by element
+    // for an array condition, so MIN/SMALL/COUNT(IF(cond,range,)) see the 0s.
+    let cases = [
+        ("=MIN(IF({TRUE,FALSE},{5,6},))", Expected::Number(0.0)),
+        ("=MAX(IF({TRUE,FALSE},{-5,-6},))", Expected::Number(0.0)),
+        ("=AVERAGE(IF({TRUE,FALSE},{5,6},))", Expected::Number(2.5)),
+        ("=COUNT(IF({TRUE,FALSE},{5,6},))", Expected::Number(2.0)),
+        ("=SMALL(IF({TRUE,FALSE},{5,6},),1)", Expected::Number(0.0)),
+        ("=LARGE(IF({TRUE,FALSE},{-5,-6},),1)", Expected::Number(0.0)),
+        ("=MEDIAN(IF({TRUE,FALSE},{5,4},))", Expected::Number(2.5)),
+        ("=PRODUCT(IF({TRUE,FALSE},{5,6},))", Expected::Number(0.0)),
+        (
+            "=AGGREGATE(15,6,IF({TRUE,FALSE},{5,6},),1)",
+            Expected::Number(0.0),
+        ),
+        ("=MATCH(0,IF({TRUE,FALSE},{5,6},),0)", Expected::Number(2.0)),
+        ("=MIN(IF({FALSE,TRUE},,{5,6}))", Expected::Number(0.0)),
+    ];
+    for (formula, expected) in cases {
+        assert_expected(formula, "microsoft: IF blank branch is 0", expected);
+    }
+
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    for (row, key, value) in [(1, 1, 10), (2, 2, 20), (3, 3, 30)] {
+        engine
+            .set_cell_value("Sheet1", row, 2, LiteralValue::Int(key))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", row, 3, LiteralValue::Int(value))
+            .unwrap();
+    }
+    engine
+        .set_cell_formula("Sheet1", 1, 5, parse("=MIN(IF(B1:B3>1,C1:C3,))").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula(
+            "Sheet1",
+            2,
+            5,
+            parse("=AVERAGE(IF(B1:B3>1,C1:C3,))").unwrap(),
+        )
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 5),
+        Some(LiteralValue::Number(0.0))
+    );
+    match engine.get_cell_value("Sheet1", 2, 5) {
+        Some(LiteralValue::Number(n)) => assert!((n - 50.0 / 3.0).abs() < 1e-12, "{n}"),
+        other => panic!("AVERAGE(IF(B1:B3>1,C1:C3,)): {other:?}"),
+    }
 }
 
 #[test]
@@ -397,6 +511,8 @@ fn ingest_omitted_formula_set(mode: FormulaPlaneMode) -> Engine<TestWorkbook> {
         "=IF(TRUE,,5)",
         "=ROUND(1.6,)",
         "=CONCATENATE(\"a\",)",
+        "=IF(FALSE,\"not \",)&\"ok\"",
+        "=COUNT(1,IF(FALSE,1,))",
     ];
     let mut records = Vec::new();
     for (column, formula) in formulas.iter().enumerate() {
@@ -429,13 +545,21 @@ fn formula_plane_omitted_argument_values_match_legacy_evaluation() {
             > 0
     );
     for row in 1..=20 {
-        for col in 1..=4 {
+        for col in 1..=6 {
             assert_eq!(
                 formula_plane.get_cell_value("Sheet1", row, col),
                 legacy.get_cell_value("Sheet1", row, col),
                 "FormulaPlane mismatch at ({row}, {col})"
             );
         }
+        assert_eq!(
+            formula_plane.get_cell_value("Sheet1", row, 5),
+            Some(LiteralValue::Text("ok".into()))
+        );
+        assert_eq!(
+            formula_plane.get_cell_value("Sheet1", row, 6),
+            Some(LiteralValue::Number(2.0))
+        );
     }
 }
 
