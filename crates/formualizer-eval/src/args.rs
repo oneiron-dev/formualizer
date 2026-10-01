@@ -65,6 +65,11 @@ pub enum CriteriaPredicate {
         pattern: String,
         case_insensitive: bool,
     },
+    /// `"<>"` with a wildcard pattern: every cell that `TextLike` would not match.
+    NotTextLike {
+        pattern: String,
+        case_insensitive: bool,
+    },
     IsBlank,
     IsNumber,
     IsText,
@@ -175,6 +180,27 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
                         }
                         _ => LiteralValue::Text(unquote(rhs)),
                     };
+                    // Wildcards apply after "=" and "<>" as they do with no operator.
+                    if let LiteralValue::Text(t) = &lit
+                        && (t.contains('*') || t.contains('?'))
+                    {
+                        let (pattern, case_insensitive) = (t.clone(), true);
+                        match *op {
+                            "=" => {
+                                return Ok(CriteriaPredicate::TextLike {
+                                    pattern,
+                                    case_insensitive,
+                                });
+                            }
+                            "<>" => {
+                                return Ok(CriteriaPredicate::NotTextLike {
+                                    pattern,
+                                    case_insensitive,
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
                     return Ok(match *op {
                         "=" => CriteriaPredicate::Eq(lit),
                         "<>" => CriteriaPredicate::Ne(lit),
@@ -653,6 +679,31 @@ mod criteria_tests {
             parse_criteria(&text("Mar 1")).unwrap(),
             CriteriaPredicate::Eq(LiteralValue::Text(_))
         ));
+    }
+
+    #[test]
+    fn eq_and_ne_criteria_apply_wildcards() {
+        let ne = parse_criteria(&text("<>*approval")).unwrap();
+        let eq = parse_criteria(&text("=*approval")).unwrap();
+        for (value, matches_pattern) in [
+            (text("In Approval"), true),
+            (text("IN APPROVAL"), true),
+            (text("In Progress"), false),
+            (LiteralValue::Number(5.0), false),
+            (LiteralValue::Boolean(true), false),
+            (LiteralValue::Empty, false),
+        ] {
+            assert_eq!(criteria_match(&eq, &value), matches_pattern, "{value:?}");
+            assert_eq!(criteria_match(&ne, &value), !matches_pattern, "{value:?}");
+        }
+        let ne_one_char = parse_criteria(&text("<>?")).unwrap();
+        assert!(!criteria_match(&ne_one_char, &text("x")));
+        assert!(criteria_match(&ne_one_char, &text("xy")));
+        // Without a wildcard "<>" still compares the whole value.
+        let ne_literal = parse_criteria(&text("<>in approval")).unwrap();
+        assert!(!criteria_match(&ne_literal, &text("In Approval")));
+        assert!(criteria_match(&ne_literal, &text("In Progress")));
+        assert!(criteria_match(&ne_literal, &LiteralValue::Empty));
     }
 
     #[test]

@@ -316,6 +316,11 @@ pub fn criteria_match(pred: &crate::args::CriteriaPredicate, v: &LiteralValue) -
             pattern,
             case_insensitive,
         } => text_like_match(pattern, *case_insensitive, v),
+        // Blanks, numbers and logicals never match a pattern, so "<>*x" keeps them.
+        P::NotTextLike {
+            pattern,
+            case_insensitive,
+        } => !text_like_match(pattern, *case_insensitive, v),
         P::IsBlank => matches!(v, LiteralValue::Empty),
         P::IsNumber => value_to_number(v).is_ok(),
         P::IsText => matches!(v, LiteralValue::Text(_)),

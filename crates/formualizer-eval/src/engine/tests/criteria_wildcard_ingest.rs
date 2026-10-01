@@ -69,3 +69,52 @@ fn wildcard_masks_preserve_scalar_contract_for_base_and_overlay() {
         }
     }
 }
+
+#[test]
+fn ne_and_eq_wildcard_criteria_in_if_functions() {
+    // A1:A5 = In Approval, In Progress, In Review, 5, (blank); B1:B5 = 30, 20, 10, 40, 50.
+    let mut engine = Engine::new(TestWorkbook::new(), arrow_eval_config());
+    let rows: [(LiteralValue, f64); 5] = [
+        (LiteralValue::Text("In Approval".into()), 30.0),
+        (LiteralValue::Text("In Progress".into()), 20.0),
+        (LiteralValue::Text("In Review".into()), 10.0),
+        (LiteralValue::Number(5.0), 40.0),
+        (LiteralValue::Empty, 50.0),
+    ];
+    for (row, (tag, amount)) in rows.into_iter().enumerate() {
+        let row = row as u32 + 1;
+        if tag != LiteralValue::Empty {
+            engine.set_cell_value("Sheet1", row, 1, tag).unwrap();
+        }
+        engine
+            .set_cell_value("Sheet1", row, 2, LiteralValue::Number(amount))
+            .unwrap();
+    }
+    for (formula, expected) in [
+        ("=COUNTIF(A1:A3,\"<>*approval\")", 2.0),
+        ("=COUNTIF(A1:A5,\"<>*approval\")", 4.0),
+        ("=COUNTIFS(A1:A3,\"<>In*\")", 0.0),
+        ("=COUNTIF(A1:A5,\"<>*\")", 2.0),
+        ("=COUNTIF(A1:A5,\"=*approval\")", 1.0),
+        ("=SUMIF(A1:A3,\"<>*approval\",B1:B3)", 30.0),
+        ("=AVERAGEIFS(B1:B3,A1:A3,\"<>*approval\")", 15.0),
+        ("=SUMIFS(B1:B5,A1:A5,\"<>*re*\",B1:B5,\">=20\")", 120.0),
+        // Without a wildcard "<>" is a whole-value comparison.
+        ("=COUNTIF(A1:A3,\"<>in approval\")", 2.0),
+    ] {
+        engine
+            .set_cell_formula(
+                "Sheet1",
+                1,
+                10,
+                formualizer_parse::parser::parse(formula).unwrap(),
+            )
+            .unwrap();
+        engine.evaluate_cell("Sheet1", 1, 10).unwrap();
+        assert_eq!(
+            engine.get_cell_value("Sheet1", 1, 10).unwrap(),
+            LiteralValue::Number(expected),
+            "{formula}"
+        );
+    }
+}
