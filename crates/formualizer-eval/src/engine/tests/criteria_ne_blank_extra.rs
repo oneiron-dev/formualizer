@@ -219,3 +219,94 @@ fn whole_column_ne_does_not_explode() {
     let finite = num(&mut engine, "=COUNTIFS(A1:A128, \"<>Debt\")");
     assert_eq!(finite, LiteralValue::Number(96.0));
 }
+
+/// A1=blank A2=blank A3=-29 A4=0 ; B1..B4 = 1, 2, 4, 8. Column A holds no
+/// text, so numeric criteria take the Arrow numeric lane. `bulk` stores the
+/// data in base lanes over two chunks; otherwise it lands in overlays.
+fn numeric_ne_engine(bulk: bool) -> Engine<TestWorkbook> {
+    let a = [
+        LiteralValue::Empty,
+        LiteralValue::Empty,
+        LiteralValue::Number(-29.0),
+        LiteralValue::Number(0.0),
+    ];
+    let b = [1.0, 2.0, 4.0, 8.0];
+    if bulk {
+        let mut engine = Engine::new(TestWorkbook::new(), arrow_eval_config());
+        let mut ab = engine.begin_bulk_ingest_arrow();
+        ab.add_sheet("Sheet1", 2, 2);
+        for (a, b) in a.iter().zip(b) {
+            ab.append_row("Sheet1", &[a.clone(), LiteralValue::Number(b)])
+                .unwrap();
+        }
+        ab.finish().unwrap();
+        engine
+    } else {
+        let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+        for (i, (a, b)) in a.iter().zip(b).enumerate() {
+            let row = i as u32 + 1;
+            if !matches!(a, LiteralValue::Empty) {
+                engine.set_cell_value("Sheet1", row, 1, a.clone()).unwrap();
+            }
+            engine
+                .set_cell_value("Sheet1", row, 2, LiteralValue::Number(b))
+                .unwrap();
+        }
+        engine
+    }
+}
+
+#[test]
+fn numeric_ne_counts_blanks_in_every_if_function() {
+    // Excel: a blank cell is not equal to a number, so `<>0` / `<>5` match
+    // blanks in COUNTIF(S), SUMIF(S) and AVERAGEIF(S) alike.
+    for bulk in [false, true] {
+        let mut engine = numeric_ne_engine(bulk);
+        let cases = [
+            ("=COUNTIF(A1:A4, \"<>0\")", 3.0),
+            ("=COUNTIF(A1:A4, \"<>5\")", 4.0),
+            ("=COUNTIF(A1:A4, \"<>-29\")", 3.0),
+            ("=COUNTIFS(A1:A4, \"<>0\")", 3.0),
+            ("=COUNTIFS(A1:A4, \"<>0\", B1:B4, \">1\")", 2.0),
+            ("=SUMIF(A1:A4, \"<>0\", B1:B4)", 7.0),
+            ("=SUMIFS(B1:B4, A1:A4, \"<>0\")", 7.0),
+            ("=AVERAGEIF(A1:A4, \"<>-29\", B1:B4)", 11.0 / 3.0),
+            ("=AVERAGEIFS(B1:B4, A1:A4, \"<>0\")", 7.0 / 3.0),
+            // A single blank cell is not 0 either.
+            ("=COUNTIF(A2, \"<>0\")", 1.0),
+            ("=COUNTIF(A1:A2, \"<>0\")", 2.0),
+        ];
+        for (formula, expected) in cases {
+            assert_eq!(
+                num(&mut engine, formula),
+                LiteralValue::Number(expected),
+                "bulk={bulk}: {formula}"
+            );
+        }
+    }
+}
+
+#[test]
+fn numeric_eq_and_comparisons_still_skip_blanks() {
+    // Only `<>n` matches blanks: `=0`, `0`, comparisons and `<>` do not.
+    for bulk in [false, true] {
+        let mut engine = numeric_ne_engine(bulk);
+        let cases = [
+            ("=COUNTIF(A1:A4, 0)", 1.0),
+            ("=COUNTIF(A1:A4, \"=0\")", 1.0),
+            ("=COUNTIF(A1:A4, \">-30\")", 2.0),
+            ("=COUNTIF(A1:A4, \"<5\")", 2.0),
+            ("=COUNTIF(A1:A4, \"<>\")", 2.0),
+            ("=COUNTIF(A1:A4, \"\")", 2.0),
+            ("=SUMIFS(B1:B4, A1:A4, \"=0\")", 8.0),
+            ("=SUMIFS(B1:B4, A1:A4, \"<=0\")", 12.0),
+        ];
+        for (formula, expected) in cases {
+            assert_eq!(
+                num(&mut engine, formula),
+                LiteralValue::Number(expected),
+                "bulk={bulk}: {formula}"
+            );
+        }
+    }
+}

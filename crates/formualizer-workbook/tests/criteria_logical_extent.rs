@@ -86,3 +86,36 @@ fn blank_counts_keep_wide_logical_extents_arithmetic() {
         );
     }
 }
+
+#[test]
+fn numeric_not_equal_counts_stored_and_unstored_blanks() {
+    // A blank is not equal to a number, so COUNTIF(range,"<>n") counts the
+    // blanks inside the stored rows as well as the unstored tail.
+    let mut wb = Workbook::new_with_config(WorkbookConfig::ephemeral());
+    wb.add_sheet("Data").unwrap();
+    wb.add_sheet("Results").unwrap();
+    wb.set_value("Data", 3, 1, LiteralValue::Number(-29.0))
+        .unwrap();
+    wb.set_value("Data", 4, 1, LiteralValue::Number(0.0))
+        .unwrap();
+    let cases = [
+        (r#"COUNTIF(Data!A:A,"<>0")"#, 1_048_575.0),
+        (r#"COUNTIF(Data!A:A,"<>-29")"#, 1_048_575.0),
+        (r#"COUNTIF(Data!A1:A4,"<>0")"#, 3.0),
+        (r#"COUNTIF(Data!A1:A10,"<>0")"#, 9.0),
+        (r#"COUNTIF(Data!A2,"<>0")"#, 1.0),
+        (r#"COUNTIF(Data!A:A,"0")"#, 1.0),
+    ];
+    for (row, (formula, _)) in cases.iter().enumerate() {
+        wb.set_formula("Results", row as u32 + 1, 1, formula)
+            .unwrap();
+    }
+    wb.evaluate_all().unwrap();
+    for (row, (formula, expected)) in cases.iter().enumerate() {
+        assert_eq!(
+            wb.get_value("Results", row as u32 + 1, 1),
+            Some(LiteralValue::Number(*expected)),
+            "{formula}"
+        );
+    }
+}

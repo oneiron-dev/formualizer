@@ -2851,12 +2851,30 @@ fn compute_criteria_mask(
     // This avoids materializing the full numeric column (64-bit per element) and instead
     // concatenates boolean masks (1-bit per element) - a 64x memory reduction.
     if is_numeric_pred {
+        // A null comparison is a cell without a number (blank, logical,
+        // error). For `<>n` that is not "no match": COUNTIF(A:A,"<>0") counts
+        // blanks, so those rows take the scalar matcher's answer.
+        let fill_nulls = matches!(pred, crate::args::CriteriaPredicate::Ne(_));
         let mut bool_parts: Vec<BooleanArray> = Vec::new();
         for res in view.numbers_slices() {
-            let (_rs, _rl, cols_seg) = res.ok()?;
+            let (rs, _rl, cols_seg) = res.ok()?;
             if col_in_view < cols_seg.len() {
                 let chunk = cols_seg[col_in_view].as_ref();
-                let mask = apply_numeric_pred(chunk, pred)?;
+                let mut mask = apply_numeric_pred(chunk, pred)?;
+                if fill_nulls && mask.null_count() > 0 {
+                    mask = (0..mask.len())
+                        .map(|i| {
+                            Some(if mask.is_valid(i) {
+                                mask.value(i)
+                            } else {
+                                crate::builtins::criteria_match(
+                                    pred,
+                                    &view.get_cell(rs + i, col_in_view),
+                                )
+                            })
+                        })
+                        .collect();
+                }
                 bool_parts.push(mask);
             }
         }
