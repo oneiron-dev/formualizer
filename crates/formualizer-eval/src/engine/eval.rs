@@ -1137,6 +1137,59 @@ fn fit_array_formula_result(value: LiteralValue, rows: u32, cols: u32) -> Litera
     }
 }
 
+/// The rows and columns of the array a formula built from references and
+/// element-wise operators yields. A whole column (row) has every row (column)
+/// of the grid, and an operator's result is as large as its larger operand
+/// in each direction (Excel pads the smaller with #N/A). Functions, names and
+/// other references count as one cell, so this is a lower bound.
+fn arena_operator_result_extent(
+    data_store: &crate::engine::arena::DataStore,
+    root: AstNodeId,
+) -> (u64, u64) {
+    use crate::engine::arena::{AstNodeData, CompactRefType};
+    match data_store.get_node(root) {
+        Some(AstNodeData::Reference {
+            ref_type:
+                CompactRefType::Range {
+                    start_row,
+                    start_col,
+                    end_row,
+                    end_col,
+                    ..
+                },
+            ..
+        }) => {
+            // Open bounds are stored as 0 (start) and u32::MAX (end).
+            let span =
+                |start: u32, end: u32, max: u32| u64::from(end.min(max).abs_diff(start.max(1))) + 1;
+            (
+                span(*start_row, *end_row, EXCEL_MAX_ROWS),
+                span(*start_col, *end_col, EXCEL_MAX_COLUMNS),
+            )
+        }
+        Some(AstNodeData::UnaryOp { op_id, expr_id })
+            if data_store.resolve_ast_string(*op_id) != "@" =>
+        {
+            arena_operator_result_extent(data_store, *expr_id)
+        }
+        Some(AstNodeData::BinaryOp {
+            op_id,
+            left_id,
+            right_id,
+        }) if matches!(
+            data_store.resolve_ast_string(*op_id),
+            "+" | "-" | "*" | "/" | "^" | "&" | "=" | "<>" | "<" | ">" | "<=" | ">="
+        ) =>
+        {
+            let left = arena_operator_result_extent(data_store, *left_id);
+            let right = arena_operator_result_extent(data_store, *right_id);
+            (left.0.max(right.0), left.1.max(right.1))
+        }
+        Some(AstNodeData::Array { rows, cols, .. }) => (u64::from(*rows), u64::from(*cols)),
+        _ => (1, 1),
+    }
+}
+
 pub struct Engine<R> {
     pub(crate) graph: DependencyGraph,
     resolver: R,
@@ -5173,18 +5226,38 @@ where
         &self,
         interpreter: &Interpreter<'c>,
         cell: CellRef,
+        ast_id: AstNodeId,
         result: crate::traits::CalcValue<'c>,
     ) -> LiteralValue {
-        let Some(shapes) = &self.array_formula_shapes else {
-            return result.into_literal();
-        };
-        match shapes.get(&(cell.sheet_id, cell.coord.row(), cell.coord.col())) {
-            Some(ArrayFormulaShape::Dynamic) => result.into_literal(),
-            Some(ArrayFormulaShape::Fixed { rows, cols }) => {
-                fit_array_formula_result(result.into_literal(), *rows, *cols)
+        if let Some(shapes) = &self.array_formula_shapes {
+            match shapes.get(&(cell.sheet_id, cell.coord.row(), cell.coord.col())) {
+                Some(ArrayFormulaShape::Dynamic) => {}
+                Some(ArrayFormulaShape::Fixed { rows, cols }) => {
+                    return fit_array_formula_result(result.into_literal(), *rows, *cols);
+                }
+                None => return interpreter.eval_implicit_intersection_calc(result),
             }
-            None => interpreter.eval_implicit_intersection_calc(result),
         }
+        // A dynamic array spills from its cell; one that would run past the
+        // last row or column of the sheet is #SPILL!. Whole columns and rows
+        // are evaluated over their used part only, so their full extent comes
+        // from the formula.
+        if cell.coord.row() > 0 || cell.coord.col() > 0 {
+            let (rows, cols) = arena_operator_result_extent(self.graph.data_store(), ast_id);
+            if u64::from(cell.coord.row()) + rows > u64::from(EXCEL_MAX_ROWS)
+                || u64::from(cell.coord.col()) + cols > u64::from(EXCEL_MAX_COLUMNS)
+            {
+                return LiteralValue::Error(
+                    ExcelError::new(ExcelErrorKind::Spill)
+                        .with_message("Spill exceeds sheet bounds")
+                        .with_extra(formualizer_common::ExcelErrorExtra::Spill {
+                            expected_rows: u32::try_from(rows).unwrap_or(u32::MAX),
+                            expected_cols: u32::try_from(cols).unwrap_or(u32::MAX),
+                        }),
+                );
+            }
+        }
+        result.into_literal()
     }
 
     /// The interpreter for the formula at `cell`: under the declared array
@@ -20234,7 +20307,7 @@ where
                 let derived_format = cv.format_id();
                 self.record_derived_format(vertex_id, derived_format);
                 let result_literal = crate::engine::result_finalization::finalize_formula_result(
-                    self.shape_formula_result(&interpreter, cell_ref, cv),
+                    self.shape_formula_result(&interpreter, cell_ref, ast_id, cv),
                 );
                 let output_sheet_name = sheet_name.to_string();
                 self.write_computed_overlay_format_0based(
@@ -26339,7 +26412,7 @@ where
                     .insert(vertex_id, format);
                 self.record_derived_format(vertex_id, format);
                 crate::engine::result_finalization::finalize_formula_result(
-                    self.shape_formula_result(&interpreter, cell_ref, cv),
+                    self.shape_formula_result(&interpreter, cell_ref, ast_id, cv),
                 )
             })
     }
@@ -29000,7 +29073,7 @@ where
                             .insert(vertex_id, format);
                         self.record_derived_format(vertex_id, format);
                         crate::engine::result_finalization::finalize_formula_result(
-                            self.shape_formula_result(&interpreter, cell_ref, cv),
+                            self.shape_formula_result(&interpreter, cell_ref, ast_id, cv),
                         )
                     })
             }

@@ -58,6 +58,100 @@ fn spill_exceeds_sheet_bounds_rows() {
     }
 }
 
+fn assert_spill(value: Option<LiteralValue>, what: &str) {
+    match value {
+        Some(LiteralValue::Error(e)) => assert_eq!(e, "#SPILL!", "{what}"),
+        v => panic!("{what}: expected #SPILL!, got {v:?}"),
+    }
+}
+
+#[test]
+fn whole_column_arrays_spill_past_the_last_row() {
+    // A whole column holds all 1,048,576 rows, so an element-wise result over
+    // it cannot spill from below row 1, however few of its rows hold data.
+    let mut engine = Engine::new(TestWorkbook::new(), serial_eval_config());
+    for r in 1..=3u32 {
+        for c in [1, 8, 9, 10] {
+            engine
+                .set_cell_value("Sheet1", r, c, LiteralValue::Int(r as i64))
+                .unwrap();
+        }
+    }
+    let formulas = [
+        (2, 3, "=A:A*2"),
+        (2, 4, "=SUMPRODUCT(--(A:A=1))*H:J"),
+        (2, 5, "=A:A"),
+        (2, 6, "=-(H:J>1)"),
+        (5, 2, "=1:1&\"\""),
+        (2, 12, "=SUM(A:A*2)"),
+        (2, 13, "=INDEX(A:A,3)"),
+        (2, 14, "=A1:A3*2"),
+    ];
+    for (r, c, f) in formulas {
+        engine
+            .set_cell_formula("Sheet1", r, c, parse(f).unwrap())
+            .unwrap();
+    }
+    engine.evaluate_all().unwrap();
+    for (r, c, f) in &formulas[..5] {
+        assert_spill(engine.get_cell_value("Sheet1", *r, *c), f);
+    }
+    let n = |v: f64| Some(LiteralValue::Number(v));
+    // Reductions and selections are not spilled arrays.
+    assert_eq!(engine.get_cell_value("Sheet1", 2, 12), n(12.0));
+    assert_eq!(engine.get_cell_value("Sheet1", 2, 13), n(3.0));
+    // A bounded range spills.
+    assert_eq!(engine.get_cell_value("Sheet1", 4, 14), n(6.0));
+
+    // A whole column fits from row 1 and a whole row from column A.
+    for ((r, c, f), spilled) in [((1, 3, "=A:A*2"), (2, 3)), ((4, 1, "=1:1*2"), (4, 2))] {
+        let mut engine = Engine::new(TestWorkbook::new(), serial_eval_config());
+        for (r, c) in [(1, 1), (2, 1), (1, 2)] {
+            engine
+                .set_cell_value("Sheet1", r, c, LiteralValue::Int(5))
+                .unwrap();
+        }
+        engine
+            .set_cell_formula("Sheet1", r, c, parse(f).unwrap())
+            .unwrap();
+        engine.evaluate_all().unwrap();
+        assert_eq!(
+            engine.get_cell_value("Sheet1", spilled.0, spilled.1),
+            n(10.0),
+            "{f}"
+        );
+    }
+}
+
+#[test]
+fn whole_column_arrays_keep_legacy_formula_semantics() {
+    // In a workbook file only dynamic arrays spill: an ordinary formula takes
+    // the implicit intersection and a CSE array fills its own cells.
+    let mut engine = Engine::new(TestWorkbook::new(), serial_eval_config());
+    for r in 1..=3u32 {
+        engine
+            .set_cell_value("Sheet1", r, 1, LiteralValue::Int(r as i64))
+            .unwrap();
+    }
+    for c in 2..=4 {
+        engine
+            .set_cell_formula("Sheet1", 2, c, parse("=A:A*2").unwrap())
+            .unwrap();
+    }
+    engine.use_legacy_array_semantics();
+    engine.declare_array_formula("Sheet1", 2, 3, 2, 1, false);
+    engine.declare_array_formula("Sheet1", 2, 4, 1, 1, true);
+    engine.evaluate_all().unwrap();
+    let n = |v: f64| Some(LiteralValue::Number(v));
+    assert!(matches!(
+        engine.get_cell_value("Sheet1", 2, 2),
+        Some(LiteralValue::Number(_))
+    ));
+    assert_eq!(engine.get_cell_value("Sheet1", 2, 3), n(2.0));
+    assert_eq!(engine.get_cell_value("Sheet1", 3, 3), n(4.0));
+    assert_spill(engine.get_cell_value("Sheet1", 2, 4), "dynamic =A:A*2");
+}
+
 #[test]
 fn spill_values_update_dependents() {
     let wb = TestWorkbook::new();

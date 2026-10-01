@@ -2257,6 +2257,32 @@ fn whole_columns_span_the_grid() {
     }
 }
 #[test]
+fn dynamic_arrays_over_whole_columns_run_past_the_sheet() {
+    // A dynamic array of a whole column times a scalar has 1,048,576 rows:
+    // from row 2 it cannot spill (#SPILL!, cached as #VALUE!), as Excel saved
+    // B2 with its #SPILL! tag; C2 was cached as a number. Without the array
+    // flag D2 and E2 are legacy formulas: the operator's whole-column operand
+    // takes row 2's cell (A2*2 = 4), inside SUM as well.
+    let rows = "<row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"H1\"><v>1</v></c></row>\
+        <row r=\"2\"><c r=\"A2\"><v>2</v></c><c r=\"B2\" t=\"e\" cm=\"1\" vm=\"1\"><f t=\"array\" ref=\"B2\">SUMPRODUCT(--(A:A=1))*H:J</f><v>#VALUE!</v></c>\
+        <c r=\"C2\" cm=\"1\"><f t=\"array\" ref=\"C2\">A:A*2</f><v>2</v></c>\
+        <c r=\"D2\"><f>A:A*2</f><v>0</v></c><c r=\"E2\"><f>SUM(A:A*2)</f><v>0</v></c></row>\
+        <row r=\"3\"><c r=\"B3\"><f>B2</f><v>0</v></c></row>";
+    let input = pack(&with_rich_errors(parts(rows), &[8]));
+    let out = recalculate_xlsx_bytes(&input, Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<c r=\"B2\" t=\"e\" cm=\"1\" vm=\"1\"><f t=\"array\" ref=\"B2\">SUMPRODUCT(--(A:A=1))*H:J</f><v>#VALUE!</v>",
+        "<c r=\"C2\" cm=\"1\" t=\"e\"><f t=\"array\" ref=\"C2\">A:A*2</f><v>#VALUE!</v>",
+        "<c r=\"D2\"><f>A:A*2</f><v>4</v>",
+        "<f>SUM(A:A*2)</f><v>4</v>",
+        "<c r=\"B3\" t=\"e\"><f>B2</f><v>#VALUE!</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected} in {sheet}");
+    }
+    assert_eq!(out.summary.error_summary["#SPILL!"].count, 3);
+}
+#[test]
 fn arrays_larger_than_ten_thousand_cells_fill_their_extent() {
     // A legacy array over 1001 x 10 cells (more than the engine's default
     // spill cap) fills its extent like any other.
