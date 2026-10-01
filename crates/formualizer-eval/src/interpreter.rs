@@ -111,6 +111,19 @@ impl LocalEnv {
         None
     }
 
+    /// [`Self::lookup`] without copying the binding.
+    pub(crate) fn get(&self, name: &str) -> Option<&LocalBinding> {
+        let key = Self::norm(name);
+        let mut frame = self.head.as_deref();
+        while let Some(current) = frame {
+            if let Some(binding) = current.bindings.get(&key) {
+                return Some(binding);
+            }
+            frame = current.parent.as_deref();
+        }
+        None
+    }
+
     pub fn with_binding(&self, name: &str, value: LocalBinding) -> Self {
         let mut bindings = FxHashMap::default();
         bindings.insert(Self::norm(name), value);
@@ -387,8 +400,16 @@ impl<'a> Interpreter<'a> {
     /// Whether `name` is a LET name or LAMBDA parameter bound to something
     /// other than a reference. Such a name resolves only on the value path.
     pub(crate) fn is_local_value_name(&self, name: &str) -> bool {
-        self.resolve_local_name(name)
+        self.local_binding(name)
             .is_some_and(|binding| !matches!(binding, LocalBinding::Reference(_)))
+    }
+
+    /// The LET/LAMBDA local `name` is bound to, without copying it.
+    pub(crate) fn local_binding(&self, name: &str) -> Option<&LocalBinding> {
+        if self.local_env.is_empty() {
+            return None;
+        }
+        self.local_env.get(name)
     }
 
     pub fn resolve_range_view<'c>(

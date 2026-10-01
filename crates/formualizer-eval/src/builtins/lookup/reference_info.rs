@@ -497,7 +497,8 @@ impl Function for ColumnFn {
 /// formula `COLUMN(IF(A1:C1<>"",A1:C1))`: Excel applies the function to each
 /// element of the value, so an error element keeps its error and any other
 /// element is #VALUE!. `result` is the reference path's result, an error
-/// whenever the argument is not a reference.
+/// whenever the argument is not a reference (a name that holds a value
+/// included).
 fn non_reference_result<'b>(
     args: &[ArgumentHandle<'_, 'b>],
     result: crate::traits::CalcValue<'b>,
@@ -520,6 +521,12 @@ fn non_reference_result<'b>(
         _ => LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)),
     };
     match value.into_literal() {
+        // Excel has no empty array; an empty result is #CALC!.
+        LiteralValue::Array(rows) if rows.first().is_none_or(Vec::is_empty) => {
+            crate::traits::CalcValue::Scalar(LiteralValue::Error(ExcelError::new(
+                ExcelErrorKind::Calc,
+            )))
+        }
         LiteralValue::Array(rows) => crate::lift::array_result(
             rows.into_iter()
                 .map(|row| row.into_iter().map(element).collect())

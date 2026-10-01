@@ -664,3 +664,172 @@ fn row_and_column_of_a_computed_array_keep_errors_and_give_value_otherwise() {
     assert_number("=COLUMN(A1:C3 B1:B3)", 2.0);
     assert_number("=ROWS(IF(B1:B3>1,B1:B3))", 3.0);
 }
+
+/// The array `formula` spills from J1, `rows` by `cols` cells of it, written
+/// as an array constant (`{1,2;3,4}`).
+fn spill_in(engine: &mut Engine<TestWorkbook>, formula: &str, rows: u32, cols: u32) -> String {
+    eval(engine, formula);
+    let text = |value: Option<LiteralValue>| match value {
+        Some(LiteralValue::Number(n)) => n.to_string(),
+        Some(LiteralValue::Int(i)) => i.to_string(),
+        Some(LiteralValue::Error(error)) => error.kind.to_string(),
+        other => format!("{other:?}"),
+    };
+    let rows: Vec<String> = (1..=rows)
+        .map(|row| {
+            (10..10 + cols)
+                .map(|col| text(engine.get_cell_value("Sheet1", row, col)))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .collect();
+    format!("{{{}}}", rows.join(";"))
+}
+
+fn spill(formula: &str, rows: u32, cols: u32) -> String {
+    spill_in(&mut engine(), formula, rows, cols)
+}
+
+/// The test engine with names that hold values (`Konst`, `Calc`, `Konst1`)
+/// and one that names a range (`Amounts`).
+fn engine_with_value_names() -> Engine<TestWorkbook> {
+    let mut engine = engine();
+    for (name, formula) in [
+        ("Konst", "={1,2,3}"),
+        ("Calc", "=Sheet1!$B$1:$B$3*2"),
+        ("Konst1", "=5"),
+        ("Amounts", "=Sheet1!$B$1:$B$3"),
+    ] {
+        engine
+            .define_name(
+                name,
+                NamedDefinition::Formula {
+                    ast: parse(formula).unwrap(),
+                    dependencies: Vec::new(),
+                    range_deps: Vec::new(),
+                },
+                NameScope::Workbook,
+            )
+            .unwrap();
+    }
+    engine
+}
+
+#[test]
+fn row_and_column_of_a_name_holding_a_value_lift_like_a_computed_array() {
+    // A name whose formula yields a value, not a reference, is a computed
+    // array: not a reference anchored at A1.
+    let spill_named = |formula: &str, rows: u32, cols: u32| {
+        spill_in(&mut engine_with_value_names(), formula, rows, cols)
+    };
+    assert_eq!(
+        spill_named("=COLUMN(Konst)", 1, 3),
+        "{#VALUE!,#VALUE!,#VALUE!}"
+    );
+    assert_eq!(spill_named("=ROW(Calc)", 3, 1), "{#VALUE!;#VALUE!;#VALUE!}");
+    assert_eq!(spill_named("=COLUMN(Konst1)", 1, 1), "{#VALUE!}");
+    // A name for a range is that reference.
+    assert_eq!(spill_named("=ROW(Amounts)", 3, 1), "{1;2;3}");
+    // Functions that take a reference or a value read the name's value.
+    let mut engine = engine_with_value_names();
+    assert_eq!(
+        eval(&mut engine, "=COLUMNS(Konst)"),
+        LiteralValue::Number(3.0)
+    );
+    assert_eq!(
+        eval(&mut engine, "=INDEX(Konst,2)"),
+        LiteralValue::Number(2.0)
+    );
+    assert_eq!(
+        eval(&mut engine, "=ISREF(Konst)"),
+        LiteralValue::Boolean(false)
+    );
+}
+
+#[test]
+fn let_and_lambda_keep_references_for_row_and_column() {
+    // LET and LAMBDA keep references, so ROW/COLUMN of a bound range give its
+    // row and column numbers.
+    assert_eq!(spill("=LET(r,A1:C1,COLUMN(r))", 1, 3), "{1,2,3}");
+    assert_number("=LET(r,B2:B3,SUM(ROW(r)))", 5.0);
+    assert_eq!(spill("=LET(d,B1:B3,ROW(d)-MIN(ROW(d))+1)", 3, 1), "{1;2;3}");
+    assert_eq!(spill("=LET(r,A1:C1,s,r,COLUMN(s))", 1, 3), "{1,2,3}");
+    assert_eq!(spill("=LET(r,IF(TRUE,B2:B3),ROW(r))", 2, 1), "{2;3}");
+    assert_eq!(spill("=LAMBDA(r,COLUMN(r))(A1:C1)", 1, 3), "{1,2,3}");
+    assert_eq!(spill("=LET(f,LAMBDA(r,ROW(r)),f(B2:B3))", 2, 1), "{2;3}");
+    // MAP, BYROW and BYCOL give the LAMBDA each cell, row or column of a range
+    // as a reference.
+    assert_eq!(spill("=BYROW(A1:C3,LAMBDA(r,ROW(r)))", 3, 1), "{1;2;3}");
+    assert_eq!(spill("=BYCOL(A1:C3,LAMBDA(c,COLUMN(c)))", 1, 3), "{1,2,3}");
+    assert_eq!(spill("=MAP(B2:B3,LAMBDA(x,ROW(x)))", 2, 1), "{2;3}");
+    // An eta-reduced function receives the references the same way.
+    assert_eq!(spill("=MAP(B2:B3,ROW)", 2, 1), "{2;3}");
+    assert_eq!(spill("=BYCOL(A1:C3,COLUMN)", 1, 3), "{1,2,3}");
+    // The bound values are the cells' values.
+    assert_number("=LET(r,B1:B3,SUM(r))", 6.0);
+    assert_number("=SUM(BYROW(B1:C2,LAMBDA(r,SUM(r))))", 90103.0);
+    assert_number("=SUM(MAP(B1:B3,LAMBDA(x,x*2)))", 12.0);
+    assert_number("=SUM(BYROW({1,2;3,4},LAMBDA(r,SUM(r))))", 10.0);
+    // A local bound to a value is a computed array, and functions that take a
+    // reference or a value read its value.
+    assert_eq!(
+        spill("=LET(a,{1,2,3},COLUMN(a))", 1, 3),
+        "{#VALUE!,#VALUE!,#VALUE!}"
+    );
+    assert_number("=LET(a,{1,2;3,4},VLOOKUP(3,a,2,0))", 4.0);
+    assert_number("=LET(a,{1,2,3},MATCH(2,a,0))", 2.0);
+    assert_number("=LET(r,B1:B3,MATCH(2,r,0))", 2.0);
+    assert_number("=LET(r,B1:B3,ROWS(r))", 3.0);
+}
+
+#[test]
+fn let_and_lambda_keep_references_when_evaluated_from_the_formula_tree() {
+    crate::builtins::load_builtins();
+    let mut wb = TestWorkbook::new();
+    for row in 1..=3 {
+        for col in 1..=3 {
+            wb = wb.with_cell("Sheet1", row, col, LiteralValue::Number((row * col) as f64));
+        }
+    }
+    let interpreter = wb.interpreter();
+    for (formula, expected) in [
+        ("=SUM(LET(r,B2:D2,COLUMN(r)))", 9.0),
+        ("=SUM(LAMBDA(r,ROW(r))(B2:B3))", 5.0),
+        ("=LET(f,LAMBDA(r,COLUMN(r)),SUM(f(B1:C1)))", 5.0),
+        ("=SUM(BYROW(A2:C3,LAMBDA(r,ROW(r))))", 5.0),
+        ("=SUM(MAP(B2:B3,LAMBDA(x,ROW(x))))", 5.0),
+        ("=SUM(LET(r,B2:B3,r))", 10.0),
+    ] {
+        let ast = parse(formula).unwrap();
+        assert_eq!(
+            interpreter.evaluate_ast(&ast).unwrap().into_literal(),
+            LiteralValue::Number(expected),
+            "{formula}"
+        );
+    }
+}
+
+#[test]
+fn row_and_column_of_an_empty_array_are_calc() {
+    // Excel has no empty array (an empty result is #CALC!), so an
+    // engine-internal 0x0 array gives #CALC!, not a cell with no value.
+    use formualizer_parse::parser::{ASTNode, ASTNodeType};
+    crate::builtins::load_builtins();
+    let wb = TestWorkbook::new();
+    let interpreter = wb.interpreter();
+    for name in ["ROW", "COLUMN"] {
+        let empty = ASTNode::new(ASTNodeType::Literal(LiteralValue::Array(Vec::new())), None);
+        let call = ASTNode::new(
+            ASTNodeType::Function {
+                name: name.to_string(),
+                args: vec![empty],
+            },
+            None,
+        );
+        let value = interpreter.evaluate_ast(&call).unwrap().into_literal();
+        assert!(
+            matches!(&value, LiteralValue::Error(error) if error.kind == ExcelErrorKind::Calc),
+            "{name}: {value:?}"
+        );
+    }
+}

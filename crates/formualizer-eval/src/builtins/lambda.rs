@@ -407,6 +407,20 @@ impl CustomCallable for EtaCallable {
         interp: &crate::interpreter::Interpreter<'ctx>,
         args: &[LiteralValue],
     ) -> Result<CalcValue<'ctx>, ExcelError> {
+        self.invoke_bindings(
+            interp,
+            args.iter().cloned().map(LocalBinding::Value).collect(),
+        )
+    }
+
+    /// Each name holds its argument as a LAMBDA parameter would, so a
+    /// reference argument stays a reference for the function's reference
+    /// parameters (`MAP(A1:A3,ROW)` is {1;2;3}).
+    fn invoke_bindings<'ctx>(
+        &self,
+        interp: &crate::interpreter::Interpreter<'ctx>,
+        args: Vec<LocalBinding>,
+    ) -> Result<CalcValue<'ctx>, ExcelError> {
         if !self.accepts(args.len()) {
             return Ok(CalcValue::Scalar(LiteralValue::Error(value_error(
                 format!("{} cannot take {} argument(s)", self.name, args.len()),
@@ -416,9 +430,9 @@ impl CustomCallable for EtaCallable {
         // function on those names, the same path a written LAMBDA takes.
         let mut env = LocalEnv::default();
         let mut params = Vec::with_capacity(args.len());
-        for (i, value) in args.iter().enumerate() {
+        for (i, binding) in args.into_iter().enumerate() {
             let name = format!("\u{1}ETA{i}");
-            env = env.with_binding(&name, LocalBinding::Value(value.clone()));
+            env = env.with_binding(&name, binding);
             params.push(ASTNode::new(
                 ASTNodeType::Reference {
                     original: name.clone(),
@@ -514,6 +528,93 @@ fn grid_arg(arg: &ArgumentHandle<'_, '_>) -> Result<Grid, ExcelError> {
     })
 }
 
+/// The top-left cell of the block of cells an array argument refers to.
+struct GridOrigin {
+    sheet: Option<String>,
+    row: u32,
+    col: u32,
+}
+
+impl GridOrigin {
+    /// The reference to the `rows` x `cols` block `(r, c)` cells from the origin.
+    fn block(&self, r: usize, c: usize, rows: usize, cols: usize) -> ReferenceType {
+        let (row, col) = (self.row + r as u32, self.col + c as u32);
+        if rows == 1 && cols == 1 {
+            return ReferenceType::Cell {
+                sheet: self.sheet.clone(),
+                row,
+                col,
+                row_abs: true,
+                col_abs: true,
+            };
+        }
+        ReferenceType::Range {
+            sheet: self.sheet.clone(),
+            start_row: Some(row),
+            start_col: Some(col),
+            end_row: Some(row + rows as u32 - 1),
+            end_col: Some(col + cols as u32 - 1),
+            start_row_abs: true,
+            start_col_abs: true,
+            end_row_abs: true,
+            end_col_abs: true,
+        }
+    }
+
+    /// The block `(r, c)` cells from the origin, bound as a reference, or
+    /// `value` when the array is not a reference.
+    fn bind(
+        origin: Option<&GridOrigin>,
+        (r, c, rows, cols): (usize, usize, usize, usize),
+        value: LiteralValue,
+    ) -> LocalBinding {
+        match origin {
+            Some(origin) => LocalBinding::Reference(origin.block(r, c, rows, cols)),
+            None => LocalBinding::Value(value),
+        }
+    }
+}
+
+/// An array argument of MAP, BYROW or BYCOL as rows of values, with its
+/// origin when it is a reference to a block of cells: a range given to these
+/// helpers passes the LAMBDA a reference to each cell, row or column, as
+/// LAMBDA keeps references (`BYROW(A1:C3,LAMBDA(r,ROW(r)))` is {1;2;3}).
+/// Any other array passes values.
+fn grid_with_origin(
+    arg: &ArgumentHandle<'_, '_>,
+) -> Result<(Grid, Option<GridOrigin>), ExcelError> {
+    let reference = arg.bindable_reference()?;
+    let grid = grid_arg(arg)?;
+    let block = match reference {
+        Some(ReferenceType::Cell {
+            sheet, row, col, ..
+        }) => Some((sheet, row, col, row, col)),
+        Some(ReferenceType::Range {
+            sheet,
+            start_row: Some(start_row),
+            start_col: Some(start_col),
+            end_row: Some(end_row),
+            end_col: Some(end_col),
+            ..
+        }) => Some((
+            sheet,
+            start_row.min(end_row),
+            start_col.min(end_col),
+            start_row.max(end_row),
+            start_col.max(end_col),
+        )),
+        _ => None,
+    };
+    // Only a block whose cells are the grid can be split into references.
+    let origin = block.and_then(|(sheet, row, col, end_row, end_col)| {
+        let height = (end_row - row + 1) as usize;
+        let width = (end_col - col + 1) as usize;
+        (grid.len() == height && grid.iter().all(|cells| cells.len() == width))
+            .then_some(GridOrigin { sheet, row, col })
+    });
+    Ok((grid, origin))
+}
+
 /// A 1x1 array passes to a LAMBDA as its single value.
 fn array_value(rows: Grid) -> LiteralValue {
     if rows.len() == 1 && rows[0].len() == 1 {
@@ -529,6 +630,18 @@ pub(crate) fn invoke(
     values: &[LiteralValue],
 ) -> LiteralValue {
     match callable.invoke(arg.interpreter(), values) {
+        Ok(result) => result.into_literal(),
+        Err(error) => LiteralValue::Error(error),
+    }
+}
+
+/// [`invoke`] with arguments bound as a LAMBDA call binds them.
+fn invoke_bound(
+    arg: &ArgumentHandle<'_, '_>,
+    callable: &Arc<dyn CustomCallable>,
+    bindings: Vec<LocalBinding>,
+) -> LiteralValue {
+    match callable.invoke_bindings(arg.interpreter(), bindings) {
         Ok(result) => result.into_literal(),
         Err(error) => LiteralValue::Error(error),
     }
@@ -566,17 +679,18 @@ fn array_result<'b>(rows: Grid, ctx: &dyn FunctionContext<'b>) -> CalcValue<'b> 
     }
 }
 
-/// Element `(r, c)` of an array broadcast to a larger result: a single row or
-/// column repeats, and positions past the array's edge are `#N/A`.
-fn broadcast_get(rows: &Grid, r: usize, c: usize) -> LiteralValue {
+/// Element `(r, c)` of an array broadcast to a larger result, with its
+/// position in the array: a single row or column repeats, and positions past
+/// the array's edge are `#N/A`, which has none.
+fn broadcast_get(rows: &Grid, r: usize, c: usize) -> (LiteralValue, Option<(usize, usize)>) {
     let height = rows.len();
     let width = rows.first().map_or(0, Vec::len);
     let r = if height == 1 { 0 } else { r };
     let c = if width == 1 { 0 } else { c };
-    rows.get(r)
-        .and_then(|row| row.get(c))
-        .cloned()
-        .unwrap_or_else(|| error_value(ExcelErrorKind::Na, "Array too small"))
+    match rows.get(r).and_then(|row| row.get(c)) {
+        Some(value) => (value.clone(), Some((r, c))),
+        None => (error_value(ExcelErrorKind::Na, "Array too small"), None),
+    }
 }
 
 macro_rules! lambda_helper {
@@ -643,19 +757,29 @@ fn eval_map<'a, 'b>(
         Ok(callable) => callable,
         Err(value) => return Ok(scalar(value)),
     };
-    let grids = arrays.iter().map(grid_arg).collect::<Result<Vec<_>, _>>()?;
-    let height = grids.iter().map(Vec::len).max().unwrap_or(0);
+    let grids = arrays
+        .iter()
+        .map(grid_with_origin)
+        .collect::<Result<Vec<_>, _>>()?;
+    let height = grids.iter().map(|(g, _)| g.len()).max().unwrap_or(0);
     let width = grids
         .iter()
-        .map(|g| g.first().map_or(0, Vec::len))
+        .map(|(g, _)| g.first().map_or(0, Vec::len))
         .max()
         .unwrap_or(0);
     let mut out = Vec::with_capacity(height);
     for r in 0..height {
         let mut row = Vec::with_capacity(width);
         for c in 0..width {
-            let values: Vec<LiteralValue> = grids.iter().map(|g| broadcast_get(g, r, c)).collect();
-            match element_value(invoke(lambda, &callable, &values)) {
+            // A range passes a reference to each of its cells.
+            let bindings: Vec<LocalBinding> = grids
+                .iter()
+                .map(|(g, origin)| match broadcast_get(g, r, c) {
+                    (value, Some((r, c))) => GridOrigin::bind(origin.as_ref(), (r, c, 1, 1), value),
+                    (value, None) => LocalBinding::Value(value),
+                })
+                .collect();
+            match element_value(invoke_bound(lambda, &callable, bindings)) {
                 Some(value) => row.push(value),
                 None => return Ok(scalar(nested_array_error())),
             }
@@ -736,9 +860,13 @@ fn eval_byrow<'a, 'b>(
         Ok(callable) => callable,
         Err(value) => return Ok(scalar(value)),
     };
+    let (grid, origin) = grid_with_origin(&args[0])?;
+    let width = grid.first().map_or(0, Vec::len);
     let mut out = Vec::new();
-    for row in grid_arg(&args[0])? {
-        match element_value(invoke(&args[1], &callable, &[array_value(vec![row])])) {
+    for (r, row) in grid.into_iter().enumerate() {
+        // A range passes a reference to each of its rows.
+        let binding = GridOrigin::bind(origin.as_ref(), (r, 0, 1, width), array_value(vec![row]));
+        match element_value(invoke_bound(&args[1], &callable, vec![binding])) {
             Some(value) => out.push(vec![value]),
             None => return Ok(scalar(nested_array_error())),
         }
@@ -755,7 +883,7 @@ fn eval_bycol<'a, 'b>(
         Ok(callable) => callable,
         Err(value) => return Ok(scalar(value)),
     };
-    let grid = grid_arg(&args[0])?;
+    let (grid, origin) = grid_with_origin(&args[0])?;
     let width = grid.first().map_or(0, Vec::len);
     let mut out = Vec::with_capacity(width);
     for c in 0..width {
@@ -763,7 +891,9 @@ fn eval_bycol<'a, 'b>(
             .iter()
             .map(|row| vec![row.get(c).cloned().unwrap_or(LiteralValue::Empty)])
             .collect();
-        match element_value(invoke(&args[1], &callable, &[array_value(column)])) {
+        // A range passes a reference to each of its columns.
+        let binding = GridOrigin::bind(origin.as_ref(), (0, c, grid.len(), 1), array_value(column));
+        match element_value(invoke_bound(&args[1], &callable, vec![binding])) {
             Some(value) => out.push(value),
             None => return Ok(scalar(nested_array_error())),
         }

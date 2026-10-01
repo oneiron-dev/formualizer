@@ -1084,6 +1084,22 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         }
     }
 
+    /// Whether this argument is a name that holds a value rather than a
+    /// reference: a LET or LAMBDA local bound to a value, or a defined name
+    /// whose formula yields one (`={1,2,3}`, `=Sheet1!$B$1:$B$3*2`).
+    fn names_a_value(&self) -> bool {
+        let Some(name) = self.name_reference() else {
+            return false;
+        };
+        match self.interp.local_binding(name) {
+            Some(binding) => !matches!(binding, crate::interpreter::LocalBinding::Reference(_)),
+            None => self
+                .interp
+                .context
+                .is_value_name(name, self.interp.current_sheet()),
+        }
+    }
+
     /// The array of references a LET binding or a defined name holds.
     fn name_reference_array(
         &self,
@@ -1672,7 +1688,14 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
 
     /// Returns a `ReferenceType` if this argument is a reference or a function that
     /// can yield a reference via `eval_reference`. Materializes no values.
+    ///
+    /// A name that holds a value (a LET or LAMBDA local bound to a value, a
+    /// defined name such as `={1,2,3}`) is not a reference: `#VALUE!`.
     pub fn as_reference_or_eval(&self) -> Result<ReferenceType, ExcelError> {
+        if self.names_a_value() {
+            return Err(ExcelError::new(ExcelErrorKind::Value)
+                .with_message("The name holds a value, not a reference"));
+        }
         match &self.expr {
             ArgumentExpr::Ast(node) => match &node.node_type {
                 ASTNodeType::Reference { reference, .. } => {
