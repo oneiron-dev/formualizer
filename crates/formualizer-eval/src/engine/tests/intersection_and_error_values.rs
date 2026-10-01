@@ -161,6 +161,35 @@ fn computed_colon_range_keeps_reference_semantics() {
     assert_eq!(got[8], n(-1.0));
 }
 
+/// An error row_num or column_num makes INDEX that error where INDEX is used
+/// as a reference (a `:` endpoint, SUM's range) just as in value context, so
+/// IFNA catches MATCH's #N/A; a non-numeric index stays #VALUE!.
+#[test]
+fn index_reference_propagates_an_error_index() {
+    let got = eval_all(&[
+        "=SUM(INDEX(A1:D4,NA(),1))",
+        "=SUM(A1:INDEX(A1:D4,NA(),1))",
+        "=SUM(INDEX(A1:D4,1,MATCH(99,A1:D1,0)):D4)",
+        "=IFNA(SUM(INDEX(A1:D4,MATCH(99,A1:A4,0),2):INDEX(A1:D4,4,2)),\"none\")",
+        "=SUM(INDEX(A1:D4,1/0,NA()))",
+        "=ROWS(A1:INDEX(A1:A4,#REF!))",
+        "=INDEX(A1:D4,NA(),1)",
+        "=SUM(INDEX(A1:D4,\"x\",1))",
+        "=SUM(A1:INDEX(A1:D4,2,2))",
+        "=SUM(INDEX(A1:D4,5,1))",
+    ]);
+    assert_eq!(kind(&got[0]), Some(ExcelErrorKind::Na));
+    assert_eq!(kind(&got[1]), Some(ExcelErrorKind::Na));
+    assert_eq!(kind(&got[2]), Some(ExcelErrorKind::Na));
+    assert_eq!(got[3], LiteralValue::Text("none".into()));
+    assert_eq!(kind(&got[4]), Some(ExcelErrorKind::Div));
+    assert_eq!(kind(&got[5]), Some(ExcelErrorKind::Ref));
+    assert_eq!(kind(&got[6]), Some(ExcelErrorKind::Na));
+    assert_eq!(kind(&got[7]), Some(ExcelErrorKind::Value));
+    assert_eq!(got[8], n(1.0 + 2.0 + 5.0 + 6.0));
+    assert_eq!(kind(&got[9]), Some(ExcelErrorKind::Ref));
+}
+
 /// A `:` range as a whole formula spills like the literal range, and under
 /// stored-workbook semantics a plain cell intersects it while a CSE array
 /// fills its extent.

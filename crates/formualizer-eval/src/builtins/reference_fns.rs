@@ -157,6 +157,8 @@ impl IndexFn {
             value => match value.into_literal() {
                 LiteralValue::Number(number) => Ok(Some(number as i64)),
                 LiteralValue::Int(integer) => Ok(Some(integer)),
+                // An error index is the result, as in value context (MATCH's #N/A).
+                LiteralValue::Error(error) => Err(error),
                 _ => Err(ExcelError::new(ExcelErrorKind::Value)),
             },
         }
