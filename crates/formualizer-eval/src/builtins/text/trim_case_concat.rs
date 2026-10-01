@@ -628,18 +628,20 @@ impl Function for TextJoinFn {
         // Get delimiter
         let delimiter = to_text(&args[0])?;
 
-        // Get ignore_empty flag
-        let ignore_empty = match scalar_like_value(&args[1])? {
-            LiteralValue::Boolean(b) => b,
-            LiteralValue::Int(i) => i != 0,
-            LiteralValue::Number(f) => f != 0.0,
-            LiteralValue::Text(t) => t.to_uppercase() == "TRUE",
-            LiteralValue::Empty => false,
-            LiteralValue::Error(e) => {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
-            }
-            _ => false,
-        };
+        // Get ignore_empty flag; an empty slot, TEXTJOIN(",",,...), skips
+        // empty values as TRUE does.
+        let ignore_empty = args[1].is_omitted()
+            || match scalar_like_value(&args[1])? {
+                LiteralValue::Boolean(b) => b,
+                LiteralValue::Int(i) => i != 0,
+                LiteralValue::Number(f) => f != 0.0,
+                LiteralValue::Text(t) => t.to_uppercase() == "TRUE",
+                LiteralValue::Empty => false,
+                LiteralValue::Error(e) => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+                }
+                _ => false,
+            };
 
         let mut out = String::new();
         let mut out_chars = 0;

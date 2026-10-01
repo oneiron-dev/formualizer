@@ -123,6 +123,31 @@ fn textjoin_formula_range_blanks_obey_ignore_empty() {
 }
 
 #[test]
+fn textjoin_omitted_ignore_empty_skips_empty_values() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    set_value(&mut engine, 1, 1, LiteralValue::Text("a".into()));
+    set_value(&mut engine, 1, 3, LiteralValue::Text(String::new()));
+    set_value(&mut engine, 1, 4, LiteralValue::Text("d".into()));
+    set_formula(&mut engine, 1, 6, "=TEXTJOIN(\"-\",,A1:D1)");
+    set_formula(
+        &mut engine,
+        2,
+        6,
+        "=TEXTJOIN(\",\",,IF({1,0,1,0},{\"x\",\"y\",\"z\",\"w\"},\"\"))",
+    );
+    // An explicit FALSE or 0, or a blank cell as the flag, keeps them.
+    set_formula(&mut engine, 3, 6, "=TEXTJOIN(\"-\",0,A1:D1)");
+    set_formula(&mut engine, 4, 6, "=TEXTJOIN(\"-\",H1,A1:D1)");
+
+    engine.evaluate_all().expect("evaluate formulas");
+
+    assert_text(&engine, 1, 6, "a-d");
+    assert_text(&engine, 2, 6, "x,z");
+    assert_text(&engine, 3, 6, "a---d");
+    assert_text(&engine, 4, 6, "a---d");
+}
+
+#[test]
 fn expanded_formula_range_propagates_later_error_and_concatenate_stays_scalar() {
     let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
     set_value(&mut engine, 1, 1, LiteralValue::Text("first".into()));
