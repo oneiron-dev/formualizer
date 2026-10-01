@@ -107,6 +107,21 @@ pub trait CustomCallable: Send + Sync {
         interp: &Interpreter<'ctx>,
         args: &[LiteralValue],
     ) -> Result<CalcValue<'ctx>, ExcelError>;
+
+    /// Invokes with the arguments of a call written in a formula
+    /// (`LAMBDA(r,ROWS(r))(A:A)`), where an argument written as a reference is
+    /// bound as that reference. The default passes each argument's value.
+    fn invoke_bindings<'ctx>(
+        &self,
+        interp: &Interpreter<'ctx>,
+        args: Vec<crate::interpreter::LocalBinding>,
+    ) -> Result<CalcValue<'ctx>, ExcelError> {
+        let mut values = Vec::with_capacity(args.len());
+        for arg in args {
+            values.push(interp.binding_value(arg)?.into_literal());
+        }
+        self.invoke(interp, &values)
+    }
 }
 
 #[derive(Clone)]
@@ -461,7 +476,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         match &self.expr {
             ArgumentExpr::Ast(node) => match &node.node_type {
                 ASTNodeType::Reference { reference, .. } => {
-                    !matches!(reference, ReferenceType::NamedRange(name) if self.interp.resolve_local_name(name).is_some())
+                    !matches!(reference, ReferenceType::NamedRange(name) if self.interp.is_local_value_name(name))
                 }
                 ASTNodeType::BinaryOp { op, .. } => op == ":",
                 ASTNodeType::Function { name, .. } => self
@@ -477,8 +492,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                     crate::engine::arena::CompactRefType::NamedRange(name_id)
                         if self
                             .interp
-                            .resolve_local_name(data_store.resolve_ast_string(*name_id))
-                            .is_some()
+                            .is_local_value_name(data_store.resolve_ast_string(*name_id))
                 ),
                 Some(crate::engine::arena::AstNodeData::BinaryOp { op_id, .. }) => {
                     data_store.resolve_ast_string(*op_id) == ":"
@@ -869,12 +883,16 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
             ArgumentExpr::Ast(node) => match &node.node_type {
                 ASTNodeType::Reference { reference, .. } => {
                     // A LET/LAMBDA local shadows any workbook name of the same
-                    // spelling; locals only resolve on the value path, so a
-                    // bound name must not be sent down the named-range route.
+                    // spelling. A local bound to a reference is that reference;
+                    // any other local resolves only on the value path, so it
+                    // must not be sent down the named-range route.
                     if let ReferenceType::NamedRange(name) = reference
-                        && self.interp.resolve_local_name(name).is_some()
+                        && let Some(binding) = self.interp.resolve_local_name(name)
                     {
-                        return None;
+                        return match binding {
+                            crate::interpreter::LocalBinding::Reference(bound) => Some(Ok(bound)),
+                            _ => None,
+                        };
                     }
                     // A closed linked workbook yields values, not a reference.
                     if matches!(reference, ReferenceType::External(_)) {
@@ -923,12 +941,16 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                     crate::engine::arena::AstNodeData::Reference { ref_type, .. } => {
                         // Same local-shadowing rule as the AST branch above.
                         if let crate::engine::arena::CompactRefType::NamedRange(name_id) = ref_type
-                            && self
+                            && let Some(binding) = self
                                 .interp
                                 .resolve_local_name(data_store.resolve_ast_string(*name_id))
-                                .is_some()
                         {
-                            return None;
+                            return match binding {
+                                crate::interpreter::LocalBinding::Reference(bound) => {
+                                    Some(Ok(bound))
+                                }
+                                _ => None,
+                            };
                         }
                         if matches!(
                             ref_type,
@@ -1023,11 +1045,12 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         .unwrap_or(Ok(None))
     }
 
-    /// [`Self::reference_array`] evaluated with a LET scope's bindings.
-    pub(crate) fn reference_array_with_env(
+    /// Runs `f` on this argument as evaluated with a LET scope's bindings.
+    pub(crate) fn with_env<R>(
         &self,
         env: crate::interpreter::LocalEnv,
-    ) -> Result<Option<crate::lift::ReferenceArray>, ExcelError> {
+        f: impl FnOnce(&ArgumentHandle<'_, 'b>) -> R,
+    ) -> R {
         let scoped = self.interp.with_local_env(env);
         let handle = match self.expr {
             ArgumentExpr::Ast(node) => ArgumentHandle::new(node, &scoped),
@@ -1037,7 +1060,23 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                 sheet_registry,
             } => ArgumentHandle::new_arena(id, &scoped, data_store, sheet_registry),
         };
-        handle.reference_array()
+        f(&handle)
+    }
+
+    /// The cell or range reference this argument evaluates to, which a LET
+    /// name or LAMBDA parameter bound to it keeps: a reference written here, a
+    /// `:` range, a name bound to a reference, or the reference a function such
+    /// as INDEX, OFFSET or XLOOKUP returns. `None` for values, for references
+    /// that fail, and for other references (tables, external, 3D), which are
+    /// bound by value.
+    pub(crate) fn bindable_reference(&self) -> Result<Option<ReferenceType>, ExcelError> {
+        match self.resolve_reference_or_value() {
+            Ok(crate::function::FunctionResolution::Reference(
+                reference @ (ReferenceType::Cell { .. } | ReferenceType::Range { .. }),
+            )) => Ok(Some(reference)),
+            Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+            _ => Ok(None),
+        }
     }
 
     /// The array of references a LET binding or a defined name holds.

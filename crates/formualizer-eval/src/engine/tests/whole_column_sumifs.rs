@@ -193,3 +193,150 @@ fn ifs_ranges_of_different_shapes_are_value_error() {
         );
     }
 }
+
+#[test]
+fn ifs_whole_axis_ranges_from_let_lambda_and_xlookup_keep_full_size() {
+    // Excel: a LET name or LAMBDA parameter bound to a reference stays that
+    // reference, and XLOOKUP returns a reference into its return range. A whole
+    // column reached that way is still 1,048,576 rows (a whole row 16,384
+    // columns) however much of it is used, so it matches another whole column
+    // and not a bounded range of its used height.
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    let data = [("A", 10.0), ("C", 20.0), ("B", 30.0)];
+    for (sheet, first_row) in [("Sheet1", 1), ("Sheet3", 2), ("Sheet4", 1)] {
+        for (offset, (tag, amount)) in data.iter().enumerate() {
+            let row = first_row + offset as u32;
+            engine
+                .set_cell_value(sheet, row, 1, LiteralValue::Text((*tag).into()))
+                .unwrap();
+            engine
+                .set_cell_value(sheet, row, 2, LiteralValue::Number(*amount))
+                .unwrap();
+        }
+    }
+    for (col, header) in [(1, "Cat"), (2, "Amt")] {
+        engine
+            .set_cell_value("Sheet3", 1, col, LiteralValue::Text(header.into()))
+            .unwrap();
+    }
+    let eval = |engine: &mut Engine<TestWorkbook>, formula: &str| {
+        engine
+            .set_cell_formula("Sheet1", 1, 10, parse(formula).unwrap())
+            .unwrap();
+        engine.evaluate_cell("Sheet1", 1, 10).unwrap();
+        engine.get_cell_value("Sheet1", 1, 10).unwrap()
+    };
+    for (formula, expected) in [
+        ("=LET(c,A:A,SUMIFS(B:B,c,\"A\"))", 10.0),
+        ("=LET(c,A:A,AVERAGEIFS(B:B,c,\"A\"))", 10.0),
+        ("=LET(c,A:A,COUNTIFS(c,\"A\",B:B,\">0\"))", 1.0),
+        ("=LET(c,A:A,d,c,SUMIFS(B:B,d,\"B\"))", 30.0),
+        ("=LAMBDA(r,SUMIFS(B:B,r,\"A\"))(A:A)", 10.0),
+        ("=LET(f,LAMBDA(r,SUMIFS(B:B,r,\"C\")),f(A:A))", 20.0),
+        ("=LET(r,Sheet3!2:2,SUMIFS(Sheet3!3:3,r,\"A\"))", 0.0),
+        (
+            "=SUMIFS(XLOOKUP(\"Amt\",Sheet3!A1:B1,Sheet3!A:B),Sheet3!A:A,\"A\")",
+            10.0,
+        ),
+        (
+            "=SUMIFS(Sheet3!B:B,XLOOKUP(\"Cat\",Sheet3!A1:B1,Sheet3!A:B),\"A\")",
+            10.0,
+        ),
+        // Bounded ranges through the same paths keep their own size.
+        ("=LET(c,A1:A3,SUMIFS(B1:B3,c,\"B\"))", 30.0),
+        ("=LAMBDA(r,SUMIFS(B1:B3,r,\"B\"))(A1:A3)", 30.0),
+    ] {
+        assert_eq!(
+            eval(&mut engine, formula),
+            LiteralValue::Number(expected),
+            "{formula}"
+        );
+    }
+    for formula in [
+        // Sheet4 uses only rows 1-3, but its whole column A is not B1:B3's shape.
+        "=LET(c,Sheet4!A:A,SUMIFS(Sheet4!B1:B3,c,\"A\"))",
+        "=LAMBDA(r,SUMIFS(Sheet4!B1:B3,r,\"A\"))(Sheet4!A:A)",
+        // XLOOKUP gives Sheet3!A:A, not the four rows Sheet3 uses.
+        "=SUMIFS(Sheet3!B1:B4,XLOOKUP(\"Cat\",Sheet3!A1:B1,Sheet3!A:B),\"A\")",
+        "=LET(c,A1:A2,COUNTIFS(c,\"A\",B1:B3,\">0\"))",
+    ] {
+        match eval(&mut engine, formula) {
+            LiteralValue::Error(e) => {
+                assert_eq!(
+                    e.kind,
+                    formualizer_common::ExcelErrorKind::Value,
+                    "{formula}"
+                )
+            }
+            other => panic!("{formula}: expected #VALUE!, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn let_lambda_and_xlookup_results_are_references() {
+    // The same rule outside the IFS functions: a bound name or an XLOOKUP
+    // result works wherever Excel takes a reference.
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    for (row, tag, amount) in [(1, "A", 10.0), (2, "C", 20.0), (3, "B", 30.0)] {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Text(tag.into()))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", row, 2, LiteralValue::Number(amount))
+            .unwrap();
+    }
+    let eval = |engine: &mut Engine<TestWorkbook>, formula: &str| {
+        engine
+            .set_cell_formula("Sheet1", 1, 10, parse(formula).unwrap())
+            .unwrap();
+        engine.evaluate_cell("Sheet1", 1, 10).unwrap();
+        engine.get_cell_value("Sheet1", 1, 10).unwrap()
+    };
+    for (formula, expected) in [
+        ("=LET(c,A:A,ROWS(c))", LiteralValue::Number(1_048_576.0)),
+        ("=LAMBDA(r,ROWS(r))(2:2)", LiteralValue::Number(1.0)),
+        ("=LAMBDA(r,COLUMNS(r))(2:2)", LiteralValue::Number(16_384.0)),
+        ("=LET(c,B2,ISREF(c))", LiteralValue::Boolean(true)),
+        ("=LET(c,B2,ROW(c))", LiteralValue::Number(2.0)),
+        ("=LAMBDA(r,ROW(r))(B3)", LiteralValue::Number(3.0)),
+        (
+            "=LET(c,B1:B3,SUM(OFFSET(c,1,0,2)))",
+            LiteralValue::Number(50.0),
+        ),
+        (
+            "=LET(c,A1:A3,SUMIF(c,\"B\",B1:B3))",
+            LiteralValue::Number(30.0),
+        ),
+        ("=LET(x,5,x*2)", LiteralValue::Number(10.0)),
+        (
+            "=ISREF(XLOOKUP(\"C\",A1:A3,B1:B3))",
+            LiteralValue::Boolean(true),
+        ),
+        (
+            "=ROW(XLOOKUP(\"B\",A1:A3,B1:B3))",
+            LiteralValue::Number(3.0),
+        ),
+        // Microsoft's XLOOKUP example builds a range from two XLOOKUPs.
+        (
+            "=SUM(XLOOKUP(\"C\",A1:A3,B1:B3):XLOOKUP(\"B\",A1:A3,B1:B3))",
+            LiteralValue::Number(50.0),
+        ),
+        ("=XLOOKUP(\"C\",A1:A3,B1:B3)", LiteralValue::Number(20.0)),
+        (
+            "=XLOOKUP(\"Z\",A1:A3,B1:B3,\"none\")",
+            LiteralValue::Text("none".into()),
+        ),
+    ] {
+        let got = eval(&mut engine, formula);
+        let number = |value: &LiteralValue| match value {
+            LiteralValue::Int(i) => Some(*i as f64),
+            LiteralValue::Number(n) => Some(*n),
+            _ => None,
+        };
+        match (number(&got), number(&expected)) {
+            (Some(got), Some(expected)) => assert_eq!(got, expected, "{formula}"),
+            _ => assert_eq!(got, expected, "{formula}"),
+        }
+    }
+}

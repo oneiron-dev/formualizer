@@ -240,7 +240,9 @@ pub(crate) fn closed_workbook_range(
 
 /// A range argument's Excel dimensions. A whole column or row keeps its full
 /// height or width: the engine trims such a view to the used region, and two
-/// whole columns trimmed differently are still the same shape.
+/// whole columns trimmed differently are still the same shape. A LET name or
+/// LAMBDA parameter bound to a reference, and XLOOKUP's result, resolve to
+/// their reference here too, so only genuine arrays use their view's size.
 fn declared_dims(
     arg: &ArgumentHandle<'_, '_>,
     view: &crate::engine::range_view::RangeView<'_>,

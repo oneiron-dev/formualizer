@@ -64,6 +64,11 @@ pub(crate) fn probe_range_dimensions<C: EvaluationContext + ?Sized>(
 #[derive(Clone)]
 pub enum LocalBinding {
     Value(LiteralValue),
+    /// A reference (`LET(c,A:A,...)`, a LAMBDA called with `B1:B3`). As in
+    /// Excel, the name stays that reference: it reads as the referenced cells,
+    /// and a parameter that takes a reference (SUMIFS's ranges, ROW, OFFSET)
+    /// receives the reference itself, a whole column at its full height.
+    Reference(ReferenceType),
     Callable(Arc<dyn crate::traits::CustomCallable>),
     /// An array of references (`LET(r,OFFSET(A1,{0;1},0),...)`). It has no
     /// value of its own (`#VALUE!`); reference parameters and N/T read each
@@ -292,7 +297,7 @@ impl<'a> Interpreter<'a> {
     fn resolve_local_reference(
         &self,
         reference: &ReferenceType,
-    ) -> Option<crate::traits::CalcValue<'a>> {
+    ) -> Option<Result<crate::traits::CalcValue<'a>, ExcelError>> {
         if self.local_env.is_empty() {
             return None;
         }
@@ -300,10 +305,20 @@ impl<'a> Interpreter<'a> {
             ReferenceType::NamedRange(name) => name,
             _ => return None,
         };
-        match self.local_env.lookup(name)? {
-            LocalBinding::Value(v) => Some(crate::traits::CalcValue::Scalar(v)),
-            LocalBinding::Callable(c) => Some(crate::traits::CalcValue::Callable(c)),
-            LocalBinding::References(_) => Some(crate::traits::CalcValue::Scalar(
+        Some(self.binding_value(self.local_env.lookup(name)?))
+    }
+
+    /// The value a local binding reads as. A bound reference reads exactly
+    /// like the same reference written in its place.
+    pub(crate) fn binding_value(
+        &self,
+        binding: LocalBinding,
+    ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        match binding {
+            LocalBinding::Value(v) => Ok(crate::traits::CalcValue::Scalar(v)),
+            LocalBinding::Reference(reference) => self.eval_reference_to_calc(&reference),
+            LocalBinding::Callable(c) => Ok(crate::traits::CalcValue::Callable(c)),
+            LocalBinding::References(_) => Ok(crate::traits::CalcValue::Scalar(
                 LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)),
             )),
         }
@@ -315,12 +330,21 @@ impl<'a> Interpreter<'a> {
         }
         match self.local_env.lookup(name)? {
             LocalBinding::Callable(c) => Some(c),
-            LocalBinding::Value(_) | LocalBinding::References(_) => None,
+            LocalBinding::Value(_) | LocalBinding::Reference(_) | LocalBinding::References(_) => {
+                None
+            }
         }
     }
 
     pub fn resolve_local_name(&self, name: &str) -> Option<LocalBinding> {
         self.local_env.lookup(name)
+    }
+
+    /// Whether `name` is a LET name or LAMBDA parameter bound to something
+    /// other than a reference. Such a name resolves only on the value path.
+    pub(crate) fn is_local_value_name(&self, name: &str) -> bool {
+        self.resolve_local_name(name)
+            .is_some_and(|binding| !matches!(binding, LocalBinding::Reference(_)))
     }
 
     pub fn resolve_range_view<'c>(
@@ -618,8 +642,9 @@ impl<'a> Interpreter<'a> {
     }
 
     /// The reference written at `node_id` when it can span several cells (a
-    /// range, a whole row or column, a name or a table); `None` for anything
-    /// else, including single cells and LET/LAMBDA locals.
+    /// range, a whole row or column, a name or a table, or a LET/LAMBDA local
+    /// bound to a range); `None` for anything else, including single cells and
+    /// locals bound to values.
     fn arena_range_reference(
         &self,
         node_id: AstNodeId,
@@ -639,8 +664,15 @@ impl<'a> Interpreter<'a> {
         }
         let reference = data_store.reconstruct_reference_type_for_eval(ref_type, sheet_registry);
         let reference = self.effective_reference(&reference)?.into_owned();
-        if self.resolve_local_reference(&reference).is_some() {
-            return Ok(None);
+        // A LET name or LAMBDA parameter bound to a range is that range written
+        // here; any other local is a value.
+        if let ReferenceType::NamedRange(name) = &reference
+            && let Some(binding) = self.resolve_local_name(name)
+        {
+            return Ok(match binding {
+                LocalBinding::Reference(bound @ ReferenceType::Range { .. }) => Some(bound),
+                _ => None,
+            });
         }
         // A name for a range intersects through that range; a name for a cell,
         // a constant or a computed value evaluates as usual.
@@ -746,13 +778,20 @@ impl<'a> Interpreter<'a> {
         &self,
         reference: &ReferenceType,
     ) -> Result<ReferenceType, ExcelError> {
-        if let ReferenceType::NamedRange(name) = reference
-            && self.resolve_local_name(name).is_none()
-            && let Some(resolved) = self
-                .context
-                .resolve_name_reference(name, self.current_sheet)
-        {
-            return resolved;
+        if let ReferenceType::NamedRange(name) = reference {
+            match self.resolve_local_name(name) {
+                // Already resolved (and offset) where it was bound.
+                Some(LocalBinding::Reference(bound)) => return Ok(bound),
+                Some(_) => {}
+                None => {
+                    if let Some(resolved) = self
+                        .context
+                        .resolve_name_reference(name, self.current_sheet)
+                    {
+                        return resolved;
+                    }
+                }
+            }
         }
         self.effective_reference(reference)
             .map(|reference| reference.into_owned())
@@ -923,7 +962,7 @@ impl<'a> Interpreter<'a> {
                         data_store.reconstruct_reference_type_for_eval(ref_type, sheet_registry);
                     let reference = self.effective_reference(&reference)?;
                     if let Some(local) = self.resolve_local_reference(&reference) {
-                        return Ok(local);
+                        return local;
                     }
                     self.eval_reference_to_calc(&reference)
                 }
@@ -1089,14 +1128,16 @@ impl<'a> Interpreter<'a> {
                     && let Some((callee_id, call_args)) = args.split_first()
                 {
                     let callee = self.evaluate_arena_ast(*callee_id, data_store, sheet_registry)?;
-                    let mut eval_args = Vec::with_capacity(call_args.len());
+                    let mut bindings = Vec::with_capacity(call_args.len());
                     for arg_id in call_args {
-                        eval_args.push(
-                            self.evaluate_arena_ast(*arg_id, data_store, sheet_registry)?
-                                .into_literal(),
-                        );
+                        bindings.push(self.call_argument(&ArgumentHandle::new_arena(
+                            *arg_id,
+                            self,
+                            data_store,
+                            sheet_registry,
+                        ))?);
                     }
-                    return self.invoke_call_value(callee, &eval_args);
+                    return self.invoke_call_bindings(callee, bindings);
                 }
 
                 if let Some(fun) = self.context.get_function("", name) {
@@ -1116,14 +1157,16 @@ impl<'a> Interpreter<'a> {
                 }
 
                 if let Some(callable) = self.resolve_local_callable(name) {
-                    let mut eval_args = Vec::with_capacity(args.len());
+                    let mut bindings = Vec::with_capacity(args.len());
                     for arg_id in args {
-                        eval_args.push(
-                            self.evaluate_arena_ast(*arg_id, data_store, sheet_registry)?
-                                .into_literal(),
-                        );
+                        bindings.push(self.call_argument(&ArgumentHandle::new_arena(
+                            *arg_id,
+                            self,
+                            data_store,
+                            sheet_registry,
+                        ))?);
                     }
-                    return callable.invoke(self, &eval_args);
+                    return callable.invoke_bindings(self, bindings);
                 }
 
                 // An unknown function is a #NAME? value at the call site, as on the
@@ -1254,7 +1297,7 @@ impl<'a> Interpreter<'a> {
         if !self.local_env.is_empty() {
             let reference = self.effective_reference(reference)?;
             if let Some(local) = self.resolve_local_reference(&reference) {
-                return Ok(local);
+                return local;
             }
             return self.eval_reference_to_calc(&reference);
         }
@@ -1670,22 +1713,32 @@ impl<'a> Interpreter<'a> {
         args: &[ASTNode],
     ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
         let callee = self.evaluate_ast(callee)?;
-        let mut eval_args = Vec::with_capacity(args.len());
+        let mut bindings = Vec::with_capacity(args.len());
         for arg in args {
-            eval_args.push(self.evaluate_ast(arg)?.into_literal());
+            bindings.push(self.call_argument(&ArgumentHandle::new(arg, self))?);
         }
-        self.invoke_call_value(callee, &eval_args)
+        self.invoke_call_bindings(callee, bindings)
+    }
+
+    /// What a LAMBDA parameter receives for a call argument: a reference stays
+    /// a reference (`LAMBDA(r,ROWS(r))(A:A)` is 1048576), anything else passes
+    /// its value.
+    fn call_argument(&self, arg: &ArgumentHandle<'_, 'a>) -> Result<LocalBinding, ExcelError> {
+        Ok(match arg.bindable_reference()? {
+            Some(reference) => LocalBinding::Reference(reference),
+            None => LocalBinding::Value(arg.value()?.into_literal()),
+        })
     }
 
     /// Invokes an evaluated callee. An error callee propagates; any other
     /// non-callable value cannot be called and yields `#VALUE!`.
-    pub(crate) fn invoke_call_value(
+    fn invoke_call_bindings(
         &self,
         callee: crate::traits::CalcValue<'a>,
-        args: &[LiteralValue],
+        args: Vec<LocalBinding>,
     ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
         match callee {
-            crate::traits::CalcValue::Callable(callable) => callable.invoke(self, args),
+            crate::traits::CalcValue::Callable(callable) => callable.invoke_bindings(self, args),
             other => match other.into_literal() {
                 error @ LiteralValue::Error(_) => Ok(crate::traits::CalcValue::Scalar(error)),
                 _ => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -1714,11 +1767,11 @@ impl<'a> Interpreter<'a> {
         }
 
         if let Some(callable) = self.resolve_local_callable(name) {
-            let mut eval_args = Vec::with_capacity(args.len());
+            let mut bindings = Vec::with_capacity(args.len());
             for arg in args {
-                eval_args.push(self.evaluate_ast(arg)?.into_literal());
+                bindings.push(self.call_argument(&ArgumentHandle::new(arg, self))?);
             }
-            return callable.invoke(self, &eval_args);
+            return callable.invoke_bindings(self, bindings);
         }
 
         // Include the function name in the error message for better debugging

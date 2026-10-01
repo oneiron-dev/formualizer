@@ -44,6 +44,23 @@ fn binding_from_calc_value(cv: CalcValue<'_>) -> LocalBinding {
     }
 }
 
+/// What a LET name is bound to. A name bound to a reference stays that
+/// reference, as in Excel (`LET(c,A:A,ROWS(c))` is 1048576); an array of
+/// references, which reads as an error, binds its references; anything else
+/// binds its value.
+fn let_binding(value: &ArgumentHandle<'_, '_>) -> Result<LocalBinding, ExcelError> {
+    if let Some(reference) = value.bindable_reference()? {
+        return Ok(LocalBinding::Reference(reference));
+    }
+    let bound = value.value()?;
+    if let CalcValue::Scalar(LiteralValue::Error(_)) = bound
+        && let Some(references) = value.reference_array()?
+    {
+        return Ok(LocalBinding::References(Arc::new(references)));
+    }
+    Ok(binding_from_calc_value(bound))
+}
+
 #[derive(Debug)]
 pub struct LetFn;
 
@@ -164,18 +181,7 @@ impl Function for LetFn {
                 Err(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
             };
 
-            let bound = args[pair_idx + 1].value_with_env(env.clone())?;
-            // An array of references reads as an error; bind its references.
-            let references = match bound {
-                CalcValue::Scalar(LiteralValue::Error(_)) => {
-                    args[pair_idx + 1].reference_array_with_env(env.clone())?
-                }
-                _ => None,
-            };
-            let binding = match references {
-                Some(references) => LocalBinding::References(Arc::new(references)),
-                None => binding_from_calc_value(bound),
-            };
+            let binding = args[pair_idx + 1].with_env(env.clone(), let_binding)?;
             env = env.with_binding(&name, binding);
         }
 
@@ -200,6 +206,18 @@ impl CustomCallable for LambdaClosure {
         interp: &crate::interpreter::Interpreter<'ctx>,
         args: &[LiteralValue],
     ) -> Result<CalcValue<'ctx>, ExcelError> {
+        self.invoke_bindings(
+            interp,
+            args.iter().cloned().map(LocalBinding::Value).collect(),
+        )
+    }
+
+    /// A parameter called with a reference stays that reference, as in Excel.
+    fn invoke_bindings<'ctx>(
+        &self,
+        interp: &crate::interpreter::Interpreter<'ctx>,
+        args: Vec<LocalBinding>,
+    ) -> Result<CalcValue<'ctx>, ExcelError> {
         if args.len() != self.arity() {
             return Ok(CalcValue::Scalar(LiteralValue::Error(value_error(
                 format!(
@@ -211,8 +229,8 @@ impl CustomCallable for LambdaClosure {
         }
 
         let mut env = self.captured_env.clone();
-        for (name, value) in self.params.iter().zip(args.iter()) {
-            env = env.with_binding(name, LocalBinding::Value(value.clone()));
+        for (name, binding) in self.params.iter().zip(args) {
+            env = env.with_binding(name, binding);
         }
 
         let scoped = interp.with_local_env(env);

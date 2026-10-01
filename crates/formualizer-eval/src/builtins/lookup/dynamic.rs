@@ -160,10 +160,12 @@ pub struct XLookupFn;
 /// Variadic: true
 /// Signature: XLOOKUP(arg1: any@scalar, arg2: range@range, arg3: range@range, arg4?: any@scalar, arg5?: number@scalar, arg6?...: number@scalar)
 /// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg4{kinds=any,required=false,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg5{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}; arg6{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}
-/// Caps: PURE, LOOKUP
+/// Caps: PURE, LOOKUP, RETURNS_REFERENCE
 /// [formualizer-docgen:schema:end]
 impl Function for XLookupFn {
-    func_caps!(PURE, LOOKUP, MAY_SPILL);
+    // Like INDEX, XLOOKUP returns a reference into return_array when that is a
+    // reference (Microsoft's XLOOKUP documentation sums XLOOKUP(...):XLOOKUP(...)).
+    func_caps!(PURE, LOOKUP, RETURNS_REFERENCE, MAY_SPILL);
     fn name(&self) -> &'static str {
         "XLOOKUP"
     }
@@ -247,6 +249,19 @@ impl Function for XLookupFn {
         });
         &SCHEMA
     }
+    fn eval_reference<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+    ) -> Option<Result<formualizer_parse::parser::ReferenceType, ExcelError>> {
+        match xlookup_reference(args, ctx) {
+            Ok(reference) => reference.map(Ok),
+            Err(error) if error.kind == ExcelErrorKind::Cancelled => Some(Err(error)),
+            // The value path reports the error.
+            Err(_) => None,
+        }
+    }
+
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
@@ -263,13 +278,99 @@ impl Function for XLookupFn {
                 e.clone(),
             )));
         }
+        let found = match XLookupFn::find_match(args, _ctx, lookup_value)? {
+            XlookupMatch::Settled(value) => return Ok(value),
+            XlookupMatch::Found {
+                index,
+                vertical,
+                return_view,
+            } => Some((index, vertical, return_view)),
+            XlookupMatch::NotFound => None,
+        };
+
+        if let Some((idx, vertical, ret_view)) = found {
+            let (ret_rows, ret_cols) = ret_view.dims();
+            if ret_rows == 0 || ret_cols == 0 {
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Empty));
+            }
+
+            if vertical {
+                if ret_cols == 1 {
+                    return Ok(crate::traits::CalcValue::Scalar(ret_view.get_cell(idx, 0)));
+                }
+                let mut row_out: Vec<LiteralValue> = Vec::with_capacity(ret_cols);
+                for c in 0..ret_cols {
+                    row_out.push(ret_view.get_cell(idx, c));
+                }
+                return Ok(crate::traits::CalcValue::Range(
+                    crate::engine::range_view::RangeView::from_owned_rows(
+                        vec![row_out],
+                        _ctx.date_system(),
+                    ),
+                ));
+            }
+
+            // Horizontal orientation: treat idx as column.
+            if ret_rows == 1 {
+                return Ok(crate::traits::CalcValue::Scalar(ret_view.get_cell(0, idx)));
+            }
+
+            let mut col_out: Vec<Vec<LiteralValue>> = Vec::with_capacity(ret_rows);
+            for r in 0..ret_rows {
+                col_out.push(vec![ret_view.get_cell(r, idx)]);
+            }
+            return Ok(crate::traits::CalcValue::Range(
+                crate::engine::range_view::RangeView::from_owned_rows(col_out, _ctx.date_system()),
+            ));
+        }
+
+        // An omitted-in-place slot (`XLOOKUP(v,l,r,,mode)`) is not a supplied
+        // if_not_found; Excel returns #N/A, not the omitted slot's 0.
+        if args.len() >= 4 && !args[3].is_omitted() {
+            return args[3].value();
+        }
+        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+            ExcelError::new(ExcelErrorKind::Na),
+        )))
+    }
+}
+
+/// Where XLOOKUP's match is, once its arguments are read.
+enum XlookupMatch<'b> {
+    /// The result is settled without a match (an argument error, a lookup
+    /// array that is not one-dimensional).
+    Settled(crate::traits::CalcValue<'b>),
+    /// Entry `index` of the lookup array matched; `vertical` when the lookup
+    /// array is a column, so the result is that row of the return array.
+    Found {
+        index: usize,
+        vertical: bool,
+        return_view: crate::engine::range_view::RangeView<'b>,
+    },
+    NotFound,
+}
+
+impl XLookupFn {
+    fn find_match<'a, 'b>(
+        args: &[ArgumentHandle<'a, 'b>],
+        _ctx: &dyn FunctionContext<'b>,
+        lookup_value: LiteralValue,
+    ) -> Result<XlookupMatch<'b>, ExcelError> {
         let lookup_view = match args[1].range_view_or_scalar() {
             Ok(v) => v,
-            Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+            Err(e) => {
+                return Ok(XlookupMatch::Settled(crate::traits::CalcValue::Scalar(
+                    LiteralValue::Error(e),
+                )));
+            }
         };
         let ret_view = match args[2].range_view_or_scalar() {
             Ok(v) => v,
-            Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+            Err(e) => {
+                return Ok(XlookupMatch::Settled(crate::traits::CalcValue::Scalar(
+                    LiteralValue::Error(e),
+                )));
+            }
         };
 
         let (lookup_rows, lookup_cols) = lookup_view.dims();
@@ -289,13 +390,13 @@ impl Function for XLookupFn {
             } else if ret_rows == 1 {
                 false
             } else {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                    ExcelError::new(ExcelErrorKind::Value),
+                return Ok(XlookupMatch::Settled(crate::traits::CalcValue::Scalar(
+                    LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)),
                 )));
             }
         } else {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new(ExcelErrorKind::Value),
+            return Ok(XlookupMatch::Settled(crate::traits::CalcValue::Scalar(
+                LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)),
             )));
         };
 
@@ -309,8 +410,8 @@ impl Function for XLookupFn {
         };
 
         if lookup_len == 0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new(ExcelErrorKind::Na),
+            return Ok(XlookupMatch::Settled(crate::traits::CalcValue::Scalar(
+                LiteralValue::Error(ExcelError::new(ExcelErrorKind::Na)),
             )));
         }
 
@@ -415,8 +516,8 @@ impl Function for XLookupFn {
                     let sorted_ok =
                         cmp_for_lookup(p, &cand, _ctx.date_system()).is_some_and(|o| o <= 0);
                     if !sorted_ok {
-                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                            ExcelError::new(ExcelErrorKind::Na),
+                        return Ok(XlookupMatch::Settled(crate::traits::CalcValue::Scalar(
+                            LiteralValue::Error(ExcelError::new(ExcelErrorKind::Na)),
                         )));
                     }
                 }
@@ -446,55 +547,119 @@ impl Function for XLookupFn {
                 found = best_idx;
             }
         } else {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new(ExcelErrorKind::Value),
+            return Ok(XlookupMatch::Settled(crate::traits::CalcValue::Scalar(
+                LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)),
             )));
         }
 
-        if let Some(idx) = found {
-            let (ret_rows, ret_cols) = ret_view.dims();
-            if ret_rows == 0 || ret_cols == 0 {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Empty));
-            }
+        Ok(match found {
+            Some(index) => XlookupMatch::Found {
+                index,
+                vertical,
+                return_view: ret_view,
+            },
+            None => XlookupMatch::NotFound,
+        })
+    }
+}
 
-            if vertical {
-                if ret_cols == 1 {
-                    return Ok(crate::traits::CalcValue::Scalar(ret_view.get_cell(idx, 0)));
-                }
-                let mut row_out: Vec<LiteralValue> = Vec::with_capacity(ret_cols);
-                for c in 0..ret_cols {
-                    row_out.push(ret_view.get_cell(idx, c));
-                }
-                return Ok(crate::traits::CalcValue::Range(
-                    crate::engine::range_view::RangeView::from_owned_rows(
-                        vec![row_out],
-                        _ctx.date_system(),
-                    ),
-                ));
-            }
-
-            // Horizontal orientation: treat idx as column.
-            if ret_rows == 1 {
-                return Ok(crate::traits::CalcValue::Scalar(ret_view.get_cell(0, idx)));
-            }
-
-            let mut col_out: Vec<Vec<LiteralValue>> = Vec::with_capacity(ret_rows);
-            for r in 0..ret_rows {
-                col_out.push(vec![ret_view.get_cell(r, idx)]);
-            }
-            return Ok(crate::traits::CalcValue::Range(
-                crate::engine::range_view::RangeView::from_owned_rows(col_out, _ctx.date_system()),
-            ));
+/// XLOOKUP's result as a reference, when return_array is a cell or range
+/// reference and an entry matched: the matched row (lookup column) or column
+/// (lookup row) of return_array. A whole-column return array gives the matched
+/// whole column, which keeps its 1,048,576 rows. `None` when the result is a
+/// value: no match (if_not_found or #N/A), a return array that is not a cell
+/// or range reference, or a lookup value or mode holding an array, over which
+/// XLOOKUP lifts.
+fn xlookup_reference<'a, 'b>(
+    args: &[ArgumentHandle<'a, 'b>],
+    ctx: &dyn FunctionContext<'b>,
+) -> Result<Option<formualizer_parse::parser::ReferenceType>, ExcelError> {
+    use crate::function::FunctionResolution;
+    use formualizer_parse::parser::ReferenceType;
+    if !(3..=6).contains(&args.len()) {
+        return Ok(None);
+    }
+    let return_reference = match args[2].resolve_reference_or_value()? {
+        FunctionResolution::Reference(
+            reference @ (ReferenceType::Cell { .. } | ReferenceType::Range { .. }),
+        ) => reference,
+        _ => return Ok(None),
+    };
+    for lifted in [0, 4, 5] {
+        if let Some(arg) = args.get(lifted)
+            && crate::lift::array_rows(&arg.value()?).is_some()
+        {
+            return Ok(None);
         }
+    }
+    let lookup_value = args[0].value()?.into_literal();
+    if matches!(lookup_value, LiteralValue::Error(_)) {
+        return Ok(None);
+    }
+    let XlookupMatch::Found {
+        index, vertical, ..
+    } = XLookupFn::find_match(args, ctx, lookup_value)?
+    else {
+        return Ok(None);
+    };
+    Ok(matched_reference(return_reference, index, vertical))
+}
 
-        // An omitted-in-place slot (`XLOOKUP(v,l,r,,mode)`) is not a supplied
-        // if_not_found; Excel returns #N/A, not the omitted slot's 0.
-        if args.len() >= 4 && !args[3].is_omitted() {
-            return args[3].value();
+/// Row (`vertical`) or column `index` of a cell or range reference, or `None`
+/// when the index falls outside it. The other axis is kept as written, so a
+/// whole column stays whole.
+fn matched_reference(
+    reference: formualizer_parse::parser::ReferenceType,
+    index: usize,
+    vertical: bool,
+) -> Option<formualizer_parse::parser::ReferenceType> {
+    use formualizer_parse::parser::ReferenceType;
+    const MAX_ROW: u32 = 1_048_576;
+    const MAX_COL: u32 = 16_384;
+    let index = u32::try_from(index).ok()?;
+    match reference {
+        ReferenceType::Cell { .. } => (index == 0).then_some(reference),
+        ReferenceType::Range {
+            sheet,
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            ..
+        } => {
+            // An open bound reaches the sheet's edge.
+            let pick = |first: Option<u32>, last: Option<u32>, max: u32| {
+                let (first, last) = (first.unwrap_or(1), last.unwrap_or(max));
+                let at = first.min(last).checked_add(index)?;
+                (at <= first.max(last)).then_some(at)
+            };
+            let ((start_row, end_row), (start_col, end_col)) = if vertical {
+                let row = pick(start_row, end_row, MAX_ROW)?;
+                ((Some(row), Some(row)), (start_col, end_col))
+            } else {
+                let col = pick(start_col, end_col, MAX_COL)?;
+                ((start_row, end_row), (Some(col), Some(col)))
+            };
+            Some(match (start_row, end_row, start_col, end_col) {
+                (Some(row), Some(last_row), Some(col), Some(last_col))
+                    if row == last_row && col == last_col =>
+                {
+                    ReferenceType::cell(sheet, row, col)
+                }
+                _ => ReferenceType::Range {
+                    sheet,
+                    start_row,
+                    start_col,
+                    end_row,
+                    end_col,
+                    start_row_abs: false,
+                    start_col_abs: false,
+                    end_row_abs: false,
+                    end_col_abs: false,
+                },
+            })
         }
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-            ExcelError::new(ExcelErrorKind::Na),
-        )))
+        _ => None,
     }
 }
 
