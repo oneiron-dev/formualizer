@@ -119,3 +119,47 @@ fn numeric_not_equal_counts_stored_and_unstored_blanks() {
         );
     }
 }
+
+#[test]
+fn countifs_counts_unstored_blank_rows_and_logicals_are_not_numbers() {
+    // COUNTIFS counts every cell of its criteria ranges that meets all
+    // criteria, the blanks past the last stored row included. Criteria
+    // compare like types: FALSE is not 0, so "<>0" counts it.
+    let mut wb = Workbook::new_with_config(WorkbookConfig::ephemeral());
+    wb.add_sheet("Data").unwrap();
+    wb.add_sheet("Results").unwrap();
+    wb.set_value("Data", 3, 1, LiteralValue::Number(-29.0))
+        .unwrap();
+    wb.set_value("Data", 4, 1, LiteralValue::Number(0.0))
+        .unwrap();
+    wb.set_value("Data", 5, 1, LiteralValue::Boolean(false))
+        .unwrap();
+    wb.set_value("Data", 6, 1, LiteralValue::Boolean(true))
+        .unwrap();
+    let cases = [
+        (r#"COUNTIFS(Data!A1:A10,"<>0")"#, 9.0),
+        (r#"COUNTIFS(Data!A:A,"<>0")"#, 1_048_575.0),
+        (r#"COUNTIFS(Data!A1:A10,"<>0",Data!A1:A10,"<>-29")"#, 8.0),
+        (r#"COUNTIFS(Data!A1:A10,"")"#, 6.0),
+        (r#"COUNTIFS(Data!A:A,"<>1")"#, 1_048_576.0),
+        (r#"COUNTIF(Data!A1:A5,"<>0")"#, 4.0),
+        (r#"COUNTIF(Data!A1:A6,"<>1")"#, 6.0),
+        (r#"COUNTIF(Data!A:A,0)"#, 1.0),
+        (r#"COUNTIF(Data!A:A,1)"#, 0.0),
+        (r#"COUNTIF(Data!A:A,TRUE)"#, 1.0),
+        (r#"COUNTIFS(Data!A:A,"<1")"#, 2.0),
+        (r#"COUNTIF(Data!A:A,">=0")"#, 1.0),
+    ];
+    for (row, (formula, _)) in cases.iter().enumerate() {
+        wb.set_formula("Results", row as u32 + 1, 1, formula)
+            .unwrap();
+    }
+    wb.evaluate_all().unwrap();
+    for (row, (formula, expected)) in cases.iter().enumerate() {
+        assert_eq!(
+            wb.get_value("Results", row as u32 + 1, 1),
+            Some(LiteralValue::Number(*expected)),
+            "{formula}"
+        );
+    }
+}

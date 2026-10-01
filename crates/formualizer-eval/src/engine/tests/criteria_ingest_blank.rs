@@ -74,9 +74,11 @@ fn blank_masks_use_cell_types_across_base_overlay_and_chunk_slices() {
 
 #[test]
 fn numeric_ne_masks_count_blanks_across_base_overlay_and_chunk_slices() {
-    // No text in the column, so `<>n` takes the numeric Arrow lane. Its null
-    // positions (blank, logical, error) must agree with the scalar matcher:
-    // a blank is not equal to any number, so `<>0` and `<>-29` match it.
+    // No text in the column, so the numeric criteria take the numeric Arrow
+    // lane. Expected values are Excel's, not the scalar matcher's: criteria
+    // compare like types, so a blank, a logical or an error is never equal to
+    // a number. `<>n` matches all of them (TRUE for `<>1`, FALSE for `<>0`),
+    // while `=n` and `>n` match numbers only.
     let values = vec![
         LiteralValue::Empty,
         LiteralValue::Number(0.0),
@@ -86,6 +88,20 @@ fn numeric_ne_masks_count_blanks_across_base_overlay_and_chunk_slices() {
         LiteralValue::Error(ExcelError::new_na()),
         LiteralValue::Int(5),
         LiteralValue::Empty,
+        LiteralValue::Boolean(false),
+        LiteralValue::Number(1.0),
+    ];
+    type Excel = fn(Option<f64>) -> bool;
+    let criteria: [(&str, Excel); 9] = [
+        ("<>0", |n| n != Some(0.0)),
+        ("<>1", |n| n != Some(1.0)),
+        ("<>-29", |n| n != Some(-29.0)),
+        ("<>5", |n| n != Some(5.0)),
+        ("=0", |n| n == Some(0.0)),
+        ("=1", |n| n == Some(1.0)),
+        (">-30", |n| n.is_some_and(|n| n > -30.0)),
+        (">=0", |n| n.is_some_and(|n| n >= 0.0)),
+        ("<1", |n| n.is_some_and(|n| n < 1.0)),
     ];
     for overlay in [false, true] {
         let mut engine = Engine::new(TestWorkbook::new(), arrow_eval_config());
@@ -113,11 +129,11 @@ fn numeric_ne_masks_count_blanks_across_base_overlay_and_chunk_slices() {
                     .unwrap();
             }
         }
-        for (start, end) in [(1, 8), (2, 7), (3, 3), (1, 2)] {
+        for (start, end) in [(1, 10), (2, 7), (3, 3), (1, 2), (5, 9)] {
             let range =
                 ReferenceType::range(Some("S".into()), Some(start), Some(1), Some(end), Some(1));
             let view = engine.resolve_range_view(&range, "S").unwrap();
-            for criterion in ["<>0", "<>-29", "<>5", "=0", ">-30"] {
+            for (criterion, excel) in criteria {
                 let pred =
                     crate::args::parse_criteria(&LiteralValue::Text(criterion.into())).unwrap();
                 let mask = engine.build_criteria_mask(&view, 0, &pred).unwrap();
@@ -126,25 +142,24 @@ fn numeric_ne_masks_count_blanks_across_base_overlay_and_chunk_slices() {
                     .iter()
                     .enumerate()
                 {
-                    let expected = if criterion.starts_with("<>") {
-                        crate::builtins::criteria_match(&pred, value)
-                    } else {
-                        // `=0` and `>-30` never match a blank (or a logical).
-                        matches!(value, LiteralValue::Number(_) | LiteralValue::Int(_))
-                            && crate::builtins::criteria_match(&pred, value)
+                    let number = match value {
+                        LiteralValue::Number(n) => Some(*n),
+                        LiteralValue::Int(n) => Some(*n as f64),
+                        _ => None,
                     };
+                    let expected = excel(number);
                     assert_eq!(
                         mask.is_valid(i) && mask.value(i),
                         expected,
-                        "overlay={overlay} range={start}:{end} criterion={criterion} row={i}"
+                        "mask: overlay={overlay} range={start}:{end} criterion={criterion} row={i} value={value:?}"
                     );
-                    if matches!(value, LiteralValue::Empty) {
-                        assert_eq!(
-                            mask.is_valid(i) && mask.value(i),
-                            criterion.starts_with("<>"),
-                            "blank: overlay={overlay} range={start}:{end} criterion={criterion}"
-                        );
-                    }
+                    // The scalar matcher (text columns, MAXIFS/MINIFS, the
+                    // D-functions) gives the same answer.
+                    assert_eq!(
+                        crate::builtins::criteria_match(&pred, value),
+                        expected,
+                        "scalar: criterion={criterion} value={value:?}"
+                    );
                 }
             }
         }

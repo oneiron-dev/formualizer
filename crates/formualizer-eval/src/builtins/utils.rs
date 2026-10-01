@@ -314,10 +314,10 @@ pub fn criteria_match(pred: &crate::args::CriteriaPredicate, v: &LiteralValue) -
     match pred {
         P::Eq(t) => values_equal_invariant(t, v),
         P::Ne(t) => !values_equal_invariant(t, v),
-        P::Gt(n) => value_to_number(v).map(|x| x > *n).unwrap_or(false),
-        P::Ge(n) => value_to_number(v).map(|x| x >= *n).unwrap_or(false),
-        P::Lt(n) => value_to_number(v).map(|x| x < *n).unwrap_or(false),
-        P::Le(n) => value_to_number(v).map(|x| x <= *n).unwrap_or(false),
+        P::Gt(n) => criteria_ordered_number(v).is_some_and(|x| x > *n),
+        P::Ge(n) => criteria_ordered_number(v).is_some_and(|x| x >= *n),
+        P::Lt(n) => criteria_ordered_number(v).is_some_and(|x| x < *n),
+        P::Le(n) => criteria_ordered_number(v).is_some_and(|x| x <= *n),
         P::TextLike {
             pattern,
             case_insensitive,
@@ -333,11 +333,24 @@ fn value_to_number(v: &LiteralValue) -> Result<f64, ExcelError> {
     crate::coercion::to_number_lenient(v)
 }
 
+/// The number a cell offers to an ordered numeric criterion (`">5"`, `"<=0"`).
+/// Criteria compare like types only: a blank cell or a logical is not a
+/// number, so `COUNTIF(r,"<5")` skips blanks and FALSE, and `">0"` skips TRUE.
+fn criteria_ordered_number(v: &LiteralValue) -> Option<f64> {
+    match v {
+        LiteralValue::Empty | LiteralValue::Boolean(_) => None,
+        _ => value_to_number(v).ok(),
+    }
+}
+
 fn values_equal_invariant(a: &LiteralValue, b: &LiteralValue) -> bool {
     match (a, b) {
         (LiteralValue::Number(x), LiteralValue::Number(y)) => (x - y).abs() < 1e-12,
         (LiteralValue::Int(x), LiteralValue::Int(y)) => x == y,
         (LiteralValue::Boolean(x), LiteralValue::Boolean(y)) => x == y,
+        // A logical never equals a number (or a date) for criteria: TRUE=1 is
+        // FALSE, so COUNTIF(r,1) skips TRUE and COUNTIF(r,"<>0") counts FALSE.
+        (LiteralValue::Boolean(_), _) | (_, LiteralValue::Boolean(_)) => false,
         (LiteralValue::Text(x), LiteralValue::Text(y)) => x.to_lowercase() == y.to_lowercase(),
         // Treat blank and empty text as equal (Excel semantics)
         (LiteralValue::Text(x), LiteralValue::Empty) if x.is_empty() => true,

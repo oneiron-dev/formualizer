@@ -2,11 +2,12 @@
 //! complementing the basic repro in `sumifs_ne_blank_158.rs` (landed in #160).
 //!
 //! The core fix (Arrow `nilike` returns NULL for blank inputs, so `<>X` dropped
-//! blanks) is bounded to the criteria range's materialized/used region: a finite
-//! range counts its interior blanks, but a whole-column `A:A` reference must NOT
-//! count the ~1M trailing empty cells. These tests pin that boundary plus the
-//! surrounding predicate semantics on blanks (AVERAGEIFS, `<>`, `""`/`"="`,
-//! numeric comparisons, wildcards, multi-criteria).
+//! blanks) covers interior blanks; COUNTIF(S) also counts the blank cells past
+//! the last stored row, as Excel does (`COUNTIFS(A:A,"<>Debt")` counts the
+//! ~1M trailing empty cells), arithmetically and without iterating them. These
+//! tests pin that plus the surrounding predicate semantics on blanks
+//! (AVERAGEIFS, `<>`, `""`/`"="`, numeric comparisons, wildcards,
+//! multi-criteria).
 
 use super::common::arrow_eval_config;
 use crate::engine::{Engine, EvalConfig};
@@ -177,10 +178,11 @@ fn multi_criteria_ne_with_blanks() {
 }
 
 #[test]
-fn whole_column_ne_does_not_explode() {
-    // Whole-column `A:A` reference: `<>Debt` must be bounded to the used region,
-    // NOT count the ~1M trailing empty cells. Uses bulk-ingest so the cached
-    // Arrow criteria-mask path (build_criteria_mask/compute_criteria_mask) runs.
+fn whole_column_ne_counts_trailing_blanks_arithmetically() {
+    // Whole-column `A:A` reference: `<>Debt` matches every blank cell of the
+    // column, including the ~1M after the used region (Excel counts them).
+    // The tail is counted arithmetically, not iterated. Uses bulk-ingest so the
+    // cached Arrow criteria-mask path (build_criteria_mask/compute_criteria_mask) runs.
     let mut cfg = arrow_eval_config();
     cfg.enable_parallel = false;
     cfg.range_expansion_limit = 2_000_000; // allow whole-column expansion
@@ -206,18 +208,22 @@ fn whole_column_ne_does_not_explode() {
         ab.finish().unwrap();
     }
 
-    // i%4 == 0 => Debt (32 rows). Everything else is <>Debt: 128 - 32 = 96 rows
-    // (including the 32 interior blanks). It must NOT explode to ~1,048,544.
-    let count = num(&mut engine, "=COUNTIFS(A:A, \"<>Debt\")");
-    assert_eq!(
-        count,
-        LiteralValue::Number(96.0),
-        "whole-column <>Debt must count only used-region rows (incl. interior blanks), not 1M blanks"
-    );
+    // i%4 == 0 => Debt (32 rows). Everything else in the column is <>Debt:
+    // 1,048,576 - 32 = 1,048,544 cells (the 32 interior blanks included).
+    for formula in ["=COUNTIFS(A:A, \"<>Debt\")", "=COUNTIF(A:A, \"<>Debt\")"] {
+        assert_eq!(
+            num(&mut engine, formula),
+            LiteralValue::Number(1_048_544.0),
+            "{formula}: whole-column <>Debt counts every non-Debt cell of the column"
+        );
+    }
 
     // And the interior blanks ARE included: compare against the same finite range.
     let finite = num(&mut engine, "=COUNTIFS(A1:A128, \"<>Debt\")");
     assert_eq!(finite, LiteralValue::Number(96.0));
+    // A finite range past the stored rows counts its unstored blanks too.
+    let longer = num(&mut engine, "=COUNTIFS(A1:A200, \"<>Debt\")");
+    assert_eq!(longer, LiteralValue::Number(168.0));
 }
 
 /// A1=blank A2=blank A3=-29 A4=0 ; B1..B4 = 1, 2, 4, 8. Column A holds no
@@ -300,6 +306,163 @@ fn numeric_eq_and_comparisons_still_skip_blanks() {
             ("=COUNTIF(A1:A4, \"\")", 2.0),
             ("=SUMIFS(B1:B4, A1:A4, \"=0\")", 8.0),
             ("=SUMIFS(B1:B4, A1:A4, \"<=0\")", 12.0),
+        ];
+        for (formula, expected) in cases {
+            assert_eq!(
+                num(&mut engine, formula),
+                LiteralValue::Number(expected),
+                "bulk={bulk}: {formula}"
+            );
+        }
+    }
+}
+
+/// A1=TRUE A2=FALSE A3=5 A4=blank ; B1..B4 = 1, 2, 4, 8, plus A5="x" B5=16
+/// when `text` (a text cell sends numeric equality to the scalar matcher).
+/// `bulk` stores the data in base lanes over two chunks; otherwise it lands
+/// in overlays.
+fn logical_engine(bulk: bool, text: bool) -> Engine<TestWorkbook> {
+    let mut a = vec![
+        LiteralValue::Boolean(true),
+        LiteralValue::Boolean(false),
+        LiteralValue::Number(5.0),
+        LiteralValue::Empty,
+    ];
+    let mut b = vec![1.0, 2.0, 4.0, 8.0];
+    if text {
+        a.push(LiteralValue::Text("x".into()));
+        b.push(16.0);
+    }
+    if bulk {
+        let mut engine = Engine::new(TestWorkbook::new(), arrow_eval_config());
+        let mut ab = engine.begin_bulk_ingest_arrow();
+        ab.add_sheet("Sheet1", 2, 2);
+        for (a, b) in a.iter().zip(b) {
+            ab.append_row("Sheet1", &[a.clone(), LiteralValue::Number(b)])
+                .unwrap();
+        }
+        ab.finish().unwrap();
+        engine
+    } else {
+        let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+        for (i, (a, b)) in a.iter().zip(b).enumerate() {
+            let row = i as u32 + 1;
+            if !matches!(a, LiteralValue::Empty) {
+                engine.set_cell_value("Sheet1", row, 1, a.clone()).unwrap();
+            }
+            engine
+                .set_cell_value("Sheet1", row, 2, LiteralValue::Number(b))
+                .unwrap();
+        }
+        engine
+    }
+}
+
+#[test]
+fn numeric_criteria_never_treat_logicals_as_numbers() {
+    // Excel criteria compare like types: TRUE=1 is FALSE. So `<>0` and `<>1`
+    // match both TRUE and FALSE, `1`/`=0` match neither, and comparisons
+    // (`>0`, `<5`) skip logicals as they skip blanks.
+    for text in [false, true] {
+        for bulk in [false, true] {
+            let mut engine = logical_engine(bulk, text);
+            // The text row (A5="x", B5=16) is never a number either, so it
+            // matches every `<>n` and adds 1 to those counts and 16 to sums.
+            let (t, ts) = if text { (1.0, 16.0) } else { (0.0, 0.0) };
+            let r = if text { "A1:A5" } else { "A1:A4" };
+            let s = if text { "B1:B5" } else { "B1:B4" };
+            let cases = [
+                (format!("=COUNTIF({r}, \"<>0\")"), 4.0 + t),
+                (format!("=COUNTIF({r}, \"<>1\")"), 4.0 + t),
+                (format!("=COUNTIFS({r}, \"<>0\")"), 4.0 + t),
+                (format!("=COUNTIFS({r}, \"<>1\", {s}, \"<8\")"), 3.0),
+                (format!("=SUMIF({r}, \"<>1\", {s})"), 15.0 + ts),
+                (format!("=SUMIFS({s}, {r}, \"<>0\")"), 15.0 + ts),
+                (
+                    format!("=AVERAGEIF({r}, \"<>0\", {s})"),
+                    (15.0 + ts) / (4.0 + t),
+                ),
+                (
+                    format!("=AVERAGEIFS({s}, {r}, \"<>1\")"),
+                    (15.0 + ts) / (4.0 + t),
+                ),
+                (format!("=MINIFS({s}, {r}, \"<>1\")"), 1.0),
+                (format!("=MAXIFS({s}, {r}, \"=0\")"), 0.0),
+                (format!("=COUNTIF({r}, 1)"), 0.0),
+                (format!("=COUNTIF({r}, 0)"), 0.0),
+                (format!("=COUNTIF({r}, \"=1\")"), 0.0),
+                (format!("=SUMIF({r}, \"=0\", {s})"), 0.0),
+                (format!("=COUNTIF({r}, TRUE)"), 1.0),
+                (format!("=COUNTIF({r}, \">0\")"), 1.0),
+                (format!("=COUNTIF({r}, \"<5\")"), 0.0),
+                (format!("=COUNTIF({r}, \">=0\")"), 1.0),
+                (format!("=SUMIFS({s}, {r}, \"<=5\")"), 4.0),
+            ];
+            for (formula, expected) in cases {
+                assert_eq!(
+                    num(&mut engine, &formula),
+                    LiteralValue::Number(expected),
+                    "bulk={bulk} text={text}: {formula}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn countifs_counts_blank_rows_past_the_stored_rows() {
+    // Excel: COUNTIFS counts every cell of its criteria ranges that meets all
+    // criteria. Cells past the last stored row are ordinary blanks, so `<>n`
+    // and `""` match them while `n`, `>n` and `<n` do not.
+    //   A1=blank A2=blank A3=-29 A4=0 (nothing stored below row 4)
+    for bulk in [false, true] {
+        let mut engine = numeric_ne_engine(bulk);
+        let cases = [
+            ("=COUNTIFS(A1:A10, \"<>0\")", 9.0),
+            ("=COUNTIF(A1:A10, \"<>0\")", 9.0),
+            ("=COUNTIFS(A1:A10, \"<>0\", A1:A10, \"<>-29\")", 8.0),
+            ("=COUNTIFS(A1:A10, \"<>0\", B1:B10, \"\")", 6.0),
+            ("=COUNTIFS(A1:A10, \"<>0\", B1:B10, \">1\")", 2.0),
+            ("=COUNTIFS(A1:A10, \"\")", 8.0),
+            ("=COUNTIF(A1:A10, \"\")", 8.0),
+            ("=COUNTIFS(A:A, \"<>0\")", 1_048_575.0),
+            ("=COUNTIFS(A:A, \"<>0\", B:B, \"<>1\")", 1_048_574.0),
+            ("=COUNTIFS(A:A, \"<>0\", B:B, \">1\")", 2.0),
+            // Comparisons and equality never match the blank tail.
+            ("=COUNTIFS(A1:A10, \"<5\")", 2.0),
+            ("=COUNTIF(A1:A10, \"<5\")", 2.0),
+            ("=COUNTIF(A:A, \">=-29\")", 2.0),
+            ("=COUNTIFS(A:A, \"<=0\")", 2.0),
+            ("=COUNTIFS(A1:A10, 0)", 1.0),
+            ("=COUNTIFS(A1:A10, \"=0\")", 1.0),
+        ];
+        for (formula, expected) in cases {
+            assert_eq!(
+                num(&mut engine, formula),
+                LiteralValue::Number(expected),
+                "bulk={bulk}: {formula}"
+            );
+        }
+    }
+}
+
+#[test]
+fn countifs_reads_rows_stored_only_in_a_later_criteria_range() {
+    // Sheet1 stores 4 rows; Sheet2 stores 8. Rows 5..8 of the first criteria
+    // range are blank, but the second range holds data there, so they must be
+    // read, not skipped as part of the blank tail.
+    for bulk in [false, true] {
+        let mut engine = numeric_ne_engine(bulk);
+        for row in [2u32, 6, 8] {
+            engine
+                .set_cell_value("Sheet2", row, 1, LiteralValue::Text("x".into()))
+                .unwrap();
+        }
+        let cases = [
+            ("=COUNTIFS(A1:A10, \"<>0\", Sheet2!A1:A10, \"x\")", 3.0),
+            ("=COUNTIFS(A1:A10, \"<>-29\", Sheet2!A1:A10, \"<>x\")", 6.0),
+            ("=COUNTIFS(A:A, \"<>0\", Sheet2!A:A, \"x\")", 3.0),
+            ("=COUNTIFS(A:A, \"<>0\", Sheet2!A:A, \"\")", 1_048_572.0),
         ];
         for (formula, expected) in cases {
             assert_eq!(

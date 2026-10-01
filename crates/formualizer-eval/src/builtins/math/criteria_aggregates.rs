@@ -84,6 +84,16 @@ fn resolve_count_argument<'a, 'b>(
     arg: &ArgumentHandle<'a, 'b>,
     ctx: &dyn FunctionContext<'b>,
 ) -> Result<(AggregateArgument<'b>, Option<u64>), ExcelError> {
+    let (argument, logical_dims) = resolve_count_extent(arg, ctx)?;
+    Ok((argument, logical_dims.map(|(rows, cols)| rows * cols)))
+}
+
+/// [`resolve_count_argument`] that reports the logical extent as
+/// `(rows, cols)` instead of a cell count.
+fn resolve_count_extent<'a, 'b>(
+    arg: &ArgumentHandle<'a, 'b>,
+    ctx: &dyn FunctionContext<'b>,
+) -> Result<(AggregateArgument<'b>, Option<(u64, u64)>), ExcelError> {
     use formualizer_parse::parser::ReferenceType;
 
     let unbounded = match arg.resolve_reference_or_value()? {
@@ -107,7 +117,7 @@ fn resolve_count_argument<'a, 'b>(
     let argument = resolve_aggregate_argument(arg, ctx)?;
     if let AggregateArgument::Range(mut view) = argument {
         let (rows, cols) = view.dims();
-        let mut logical_cells = rows as u64 * cols as u64;
+        let mut logical_dims = (rows as u64, cols as u64);
         if let Some(mut reference) = unbounded {
             let ReferenceType::Range {
                 start_row,
@@ -127,7 +137,7 @@ fn resolve_count_argument<'a, 'b>(
             let (c1, c2) = (start_col.unwrap_or(1), end_col.unwrap_or(16_384));
             let logical_rows = r1.abs_diff(r2) as u64 + 1;
             let logical_cols = c1.abs_diff(c2) as u64 + 1;
-            logical_cells = logical_rows * logical_cols;
+            logical_dims = (logical_rows, logical_cols);
             // Use already-resolved coordinates (including shared-formula rebasing).
             let (sr, sc) = (view.start_row() as u32 + 1, view.start_col() as u32 + 1);
             let er = (sr as u64 - 1 + logical_rows).min(view.sheet().nrows as u64) as u32;
@@ -162,7 +172,7 @@ fn resolve_count_argument<'a, 'b>(
         let physical_cols = cols.min(view.sheet().columns.len().saturating_sub(view.start_col()));
         return Ok((
             AggregateArgument::Range(view.sub_view(0, 0, physical_rows, physical_cols)),
-            Some(logical_cells),
+            Some(logical_dims),
         ));
     }
     Ok((argument, None))
@@ -320,21 +330,39 @@ fn eval_if_family<'a, 'b>(
                     )),
                 )));
             }
+            // Each criteria range is read only over its stored rows; its
+            // logical extent (A1:A10, A:A) is kept so that the blank cells
+            // past the last stored row still count (see the tail below).
+            let mut logical = (0u64, 0u64);
             for i in (0..args.len()).step_by(2) {
-                let (mut rv, mut val) = resolve_range_or_scalar!(&args[i]);
+                let (argument, logical_dims) = resolve_count_extent(&args[i], ctx)?;
+                let (mut rv, mut val) = match argument {
+                    AggregateArgument::Range(view) => (Some(view), None),
+                    AggregateArgument::Scalar(LiteralValue::Error(error))
+                    | AggregateArgument::ReferenceError(error) => {
+                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
+                    }
+                    AggregateArgument::Scalar(value) => (None, Some(value)),
+                };
 
                 // Broadcast semantics: treat 1x1 criteria ranges as scalar criteria.
-                if let Some(ref view) = rv {
-                    let (r, c) = view.dims();
-                    if r == 1 && c == 1 {
-                        val = Some(view.as_1x1().unwrap_or(LiteralValue::Empty));
+                if let Some((rows, cols)) = logical_dims {
+                    if rows == 1 && cols == 1 {
+                        val = Some(
+                            rv.as_ref()
+                                .and_then(|view| view.as_1x1())
+                                .unwrap_or(LiteralValue::Empty),
+                        );
                         rv = None;
+                    } else {
+                        logical = (logical.0.max(rows), logical.1.max(cols));
                     }
                 }
 
                 let pred = crate::args::parse_criteria(&args[i + 1].value()?.into_literal())?;
                 crit_specs.push((rv, pred, val));
             }
+            logical_count_cells = Some(logical.0 * logical.1);
         } else {
             if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -383,10 +411,22 @@ fn eval_if_family<'a, 'b>(
     let mut total_sum = 0.0f64;
     let mut total_count = 0i64;
 
-    // Use a driver view for chunked iteration. Prefer sum_view, else first criteria range.
-    let driver = sum_view
-        .as_ref()
-        .or_else(|| crit_specs.iter().find_map(|(rv, _, _)| rv.as_ref()));
+    // Use a driver view for chunked iteration. Prefer sum_view, else the
+    // criteria range with the most rows. COUNTIFS ranges are cut to their
+    // stored rows, so that driver visits every stored row of every criteria
+    // range and everything after it is blank in all of them.
+    let driver = sum_view.as_ref().or_else(|| {
+        crit_specs
+            .iter()
+            .filter_map(|(rv, _, _)| rv.as_ref())
+            .reduce(|best, view| {
+                if view.dims().0 > best.dims().0 {
+                    view
+                } else {
+                    best
+                }
+            })
+    });
 
     if let Some(drv) = driver {
         // We can't easily iterate over union dims if they are larger than driver.
@@ -850,12 +890,18 @@ fn eval_if_family<'a, 'b>(
                 }
             }
         }
-        // COUNTIF's logical range can extend beyond physically stored rows.
-        // Every cell in that tail is Empty: account for it arithmetically,
-        // without allocating masks or iterating a million empty cells.
-        if !multi
-            && agg_type == AggregationType::Count
-            && criteria_match(&crit_specs[0].1, &LiteralValue::Empty)
+        // A COUNTIF(S) logical range can extend beyond physically stored rows.
+        // Every criteria cell in that tail is Empty (a broadcast 1x1 criteria
+        // keeps its one value): account for it arithmetically, without
+        // allocating masks or iterating a million empty cells.
+        if agg_type == AggregationType::Count
+            && crit_specs.iter().all(|(rv, pred, scalar_val)| {
+                let tail_value = match (rv, scalar_val) {
+                    (None, Some(value)) => value,
+                    _ => &LiteralValue::Empty,
+                };
+                criteria_match(pred, tail_value)
+            })
         {
             let logical_cells = logical_count_cells.unwrap_or(dims.0 as u64 * dims.1 as u64);
             total_count += logical_cells.saturating_sub(visited_rows as u64 * dims.1 as u64) as i64;
