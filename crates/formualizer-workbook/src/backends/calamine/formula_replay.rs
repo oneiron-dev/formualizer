@@ -5,7 +5,7 @@ use std::{
     io::{BufReader, Read, Seek, SeekFrom, Write},
 };
 
-use calamine::expand_shared_formula_into;
+use super::shared_formula::expand_shared_formula_into;
 use formualizer_eval::engine::{
     DeferredFormulaReplay, DeferredReplayFormula, FormulaReplayCoordinateDisposition,
     FormulaReplayDisposition, FormulaReplayPartitionRouter, PartitionedSourceFormulaFamily,

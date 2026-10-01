@@ -32,6 +32,7 @@ use zip::ZipArchive;
 mod compressed_evidence;
 mod external_links;
 mod formula_replay;
+mod shared_formula;
 
 use super::row_visibility;
 use compressed_evidence::{EvidenceRecord, MonotonicFormulaEvidence};

@@ -949,6 +949,65 @@ fn shared_formula_members_left_of_the_master_shift_from_the_master() {
     reject(&parts(rows));
 }
 #[test]
+fn shared_formula_members_keep_quoted_sheet_names() {
+    // Excel quotes sheet names that read as A1 references ('Q1', 'FY2024').
+    // A member is the master at the member's place: its relative cells move,
+    // the sheet name does not. Shifting 'Q1' would read Q2, and 'FY2024'
+    // would name the missing FY2025 (or FX2025 left of the master).
+    let rows = "<row r=\"1\"><c r=\"B1\"><f t=\"shared\" ref=\"B1:B2\" si=\"0\">'Q1'!A1*2</f><v>0</v></c></row>\
+        <row r=\"2\"><c r=\"B2\"><f t=\"shared\" si=\"0\"/><v>0</v></c><c r=\"D2\"><f t=\"shared\" ref=\"C2:D3\" si=\"1\">'FY2024'!B1+'Q1'!B1</f><v>0</v></c></row>\
+        <row r=\"3\"><c r=\"C3\"><f t=\"shared\" si=\"1\"/><v>0</v></c><c r=\"D3\"><f t=\"shared\" si=\"1\"/><v>0</v></c></row>";
+    let mut p = parts(rows);
+    let wb = p.get_mut("xl/workbook.xml").unwrap();
+    *wb = wb.replace("name=\"Sheet1\"", "name=\"Main\"");
+    let others = [
+        (
+            "Q1",
+            "<c r=\"A1\"><v>1</v></c><c r=\"B1\"><v>30</v></c>",
+            "<c r=\"A2\"><v>5</v></c><c r=\"B2\"><v>20</v></c>",
+        ),
+        (
+            "Q2",
+            "<c r=\"A1\"><v>100</v></c><c r=\"B1\"><v>3000</v></c>",
+            "<c r=\"A2\"><v>500</v></c><c r=\"B2\"><v>2000</v></c>",
+        ),
+        (
+            "FY2024",
+            "<c r=\"B1\"><v>3</v></c>",
+            "<c r=\"A2\"><v>7</v></c><c r=\"B2\"><v>9</v></c>",
+        ),
+    ];
+    for (n, (name, row1, row2)) in others.into_iter().enumerate() {
+        let id = n + 2;
+        let wb = p.get_mut("xl/workbook.xml").unwrap();
+        *wb = wb.replace(
+            "</sheets>",
+            &format!("<sheet name=\"{name}\" sheetId=\"{id}\" r:id=\"rId{id}\"/></sheets>"),
+        );
+        let rel = p.get_mut("xl/_rels/workbook.xml.rels").unwrap();
+        *rel = rel.replace("</Relationships>", &format!("<Relationship Id=\"rId{id}\" Type=\"{OFFICE}/worksheet\" Target=\"worksheets/sheet{id}.xml\"/></Relationships>"));
+        let ct = p.get_mut("[Content_Types].xml").unwrap();
+        *ct = ct.replace("</Types>", &format!("<Override PartName=\"/xl/worksheets/sheet{id}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/></Types>"));
+        p.insert(
+            format!("xl/worksheets/sheet{id}.xml"),
+            format!("<worksheet xmlns=\"{MAIN}\"><sheetData><row r=\"1\">{row1}</row><row r=\"2\">{row2}</row></sheetData></worksheet>"),
+        );
+    }
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    assert!(sheet.contains(">'Q1'!A1*2</f><v>2</v>"), "{sheet}");
+    assert!(
+        sheet.contains(">'FY2024'!B1+'Q1'!B1</f><v>33</v>"),
+        "{sheet}"
+    );
+    // B2 = 'Q1'!A2*2; C3 (left of the master) = 'FY2024'!A2+'Q1'!A2;
+    // D3 = 'FY2024'!B2+'Q1'!B2.
+    for (cell, si, value) in [("B2", 0, 10), ("C3", 1, 12), ("D3", 1, 29)] {
+        let written = format!("<c r=\"{cell}\"><f t=\"shared\" si=\"{si}\"/><v>{value}</v>");
+        assert!(sheet.contains(&written), "{sheet}");
+    }
+}
+#[test]
 fn multi_cell_array_formulas_write_results_into_their_extent() {
     // A1:A3 = 1,2,3. B1:B3 is a spilled dynamic array; C1:D2 a legacy CSE
     // array whose one-column result repeats across and pads with #N/A.
