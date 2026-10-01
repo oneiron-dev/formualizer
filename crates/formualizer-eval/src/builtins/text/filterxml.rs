@@ -4,11 +4,13 @@
 use super::super::utils::{ARG_ANY_TWO, collapse_if_scalar};
 use super::scalar_text_value;
 use crate::args::ArgSchema;
+use crate::engine::CancelToken;
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, CalcValue, FunctionContext};
-use formualizer_common::{ExcelError, LiteralValue};
+use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
 use xml::{Document, is_xml_space};
+use xpath::Failure;
 
 mod xml;
 mod xpath;
@@ -42,38 +44,46 @@ fn to_text(arg: &ArgumentHandle<'_, '_>) -> Result<String, ExcelError> {
     })
 }
 
-/// The text of each node `xpath` selects in `xml`, in document order; `None`
-/// when the XML or the XPath is invalid, the XPath evaluates to something
-/// other than nodes (`count(//a)`) or selects no node.
+/// The text of each node `xpath` selects in `xml`, in document order (none
+/// when it selects no node); `Err(Failure::Invalid)` when the XML or the
+/// XPath is invalid or the XPath evaluates to something other than nodes
+/// (`count(//a)`), `Err(Failure::Cancelled)` when `cancel` is signalled.
 ///
 /// MSXML loads the XML without its white-space-only text nodes (white space is
 /// not preserved unless `xml:space="preserve"`), and a node's text is trimmed
 /// of leading and trailing white space; XPath tests see the untrimmed values.
-fn select_node_texts(xml: &str, xpath: &str) -> Option<Vec<String>> {
+fn select_node_texts(
+    xml: &str,
+    xpath: &str,
+    cancel: Option<&CancelToken>,
+) -> Result<Vec<String>, Failure> {
     if xpath.chars().count() > MAX_XPATH_CHARS {
-        return None;
+        return Err(Failure::Invalid);
     }
-    let tokens = xpath::tokenize(xpath).ok()?;
+    let tokens = xpath::tokenize(xpath)?;
     if tokens.nesting() <= INLINE_NESTING {
-        return evaluate(xml, tokens);
+        return evaluate(xml, tokens, cancel);
     }
     // Where no thread can start (wasm), a deep XPath is #VALUE!.
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .stack_size(DEEP_XPATH_STACK_BYTES)
-            .spawn_scoped(scope, || evaluate(xml, tokens))
-            .ok()?
+            .spawn_scoped(scope, || evaluate(xml, tokens, cancel))
+            .map_err(|_| Failure::Invalid)?
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     })
 }
 
 /// Parses the XPath, loads the XML and returns the text of the selected nodes.
-fn evaluate(xml: &str, tokens: xpath::Tokens) -> Option<Vec<String>> {
-    let xpath = xpath::compile(tokens).ok()?;
-    let document = Document::parse(xml, xpath.uses_namespace_axis)?;
-    let texts: Vec<String> = xpath::select(&document, &xpath)
-        .ok()?
+fn evaluate(
+    xml: &str,
+    tokens: xpath::Tokens,
+    cancel: Option<&CancelToken>,
+) -> Result<Vec<String>, Failure> {
+    let xpath = xpath::compile(tokens)?;
+    let document = Document::parse(xml).ok_or(Failure::Invalid)?;
+    Ok(xpath::select(&document, &xpath, cancel)?
         .into_iter()
         .map(|node| {
             document
@@ -81,8 +91,7 @@ fn evaluate(xml: &str, tokens: xpath::Tokens) -> Option<Vec<String>> {
                 .trim_matches(is_xml_space)
                 .to_string()
         })
-        .collect();
-    (!texts.is_empty()).then_some(texts)
+        .collect())
 }
 
 #[derive(Debug)]
@@ -91,8 +100,9 @@ pub struct FilterXmlFn;
 ///
 /// # Remarks
 /// - Invalid XML, an invalid XPath (or one over 1024 characters, or with a
-///   namespace prefix), an XPath that evaluates to a number, string or boolean
-///   instead of nodes, and an XPath that selects no node all return `#VALUE!`.
+///   namespace prefix other than `xml`), an XPath that evaluates to a number,
+///   string or boolean instead of nodes, and an XPath that selects no node all
+///   return `#VALUE!`.
 /// - Each selected node gives its text (an element's text content, an
 ///   attribute's value), trimmed of surrounding white space; an empty one is
 ///   `#VALUE!`.
@@ -139,10 +149,15 @@ impl Function for FilterXmlFn {
     ) -> Result<CalcValue<'b>, ExcelError> {
         let xml = to_text(&args[0])?;
         let xpath = to_text(&args[1])?;
-        let Some(texts) = select_node_texts(&xml, &xpath) else {
-            return Ok(CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_value(),
-            )));
+        let cancel = ctx.cancellation_token();
+        let texts = match select_node_texts(&xml, &xpath, cancel.as_ref()) {
+            Ok(texts) if !texts.is_empty() => texts,
+            Err(Failure::Cancelled) => return Err(ExcelError::new(ExcelErrorKind::Cancelled)),
+            _ => {
+                return Ok(CalcValue::Scalar(LiteralValue::Error(
+                    ExcelError::new_value(),
+                )));
+            }
         };
         let locale = ctx.locale();
         let year = args[0].current_year();
@@ -176,10 +191,15 @@ pub fn register_builtins() {
 
 #[cfg(test)]
 mod tests {
-    use crate::engine::{Engine, EvalConfig};
+    use super::xml::Document;
+    use super::xpath::{self, Failure};
+    use crate::engine::{CancelToken, Engine, EvalConfig};
     use crate::test_workbook::TestWorkbook;
     use formualizer_common::{ExcelErrorKind, LiteralValue};
     use formualizer_parse::parser::parse;
+    use std::time::{Duration, Instant};
+
+    const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 
     /// The split idiom: `items` separated by `delimiter`, as `<t><s>` nodes.
     fn split(items: &str, delimiter: &str) -> String {
@@ -795,8 +815,8 @@ mod tests {
                 for (xml, xpath) in cases {
                     assert!(xpath.chars().count() <= super::MAX_XPATH_CHARS, "{xpath}");
                     assert_eq!(
-                        super::select_node_texts(&xml, &xpath),
-                        Some(vec!["1".to_string()]),
+                        super::select_node_texts(&xml, &xpath, None),
+                        Ok(vec!["1".to_string()]),
                         "{xpath}"
                     );
                 }
@@ -1006,5 +1026,430 @@ mod tests {
         ] {
             assert_value_error(list, xpath);
         }
+    }
+
+    #[test]
+    fn attributes_keep_their_source_order() {
+        // MSXML keeps attributes in source order (XPath 1.0 leaves the order
+        // to the implementation).
+        let a = "<a z='1' b='2' m='3'/>";
+        assert_eq!(
+            filterxml_spill(a, "/a/@*"),
+            vec![number(1.0), number(2.0), number(3.0)]
+        );
+        assert_eq!(filterxml(a, "/a/@*[1]"), number(1.0));
+        assert_eq!(filterxml(a, "/a/@*[last()]"), number(3.0));
+        assert_eq!(
+            filterxml_spill("<r><a z='1' b='2'/><c y='3' x='4'/></r>", "//@*"),
+            vec![number(1.0), number(2.0), number(3.0), number(4.0)]
+        );
+        // Namespace declarations are not attributes.
+        assert_eq!(
+            filterxml_spill(
+                "<a z='1' xmlns:p='urn:p' p:b='2' xmlns='urn:d' c='3'/>",
+                "/*/@*"
+            ),
+            vec![number(1.0), number(2.0), number(3.0)]
+        );
+    }
+
+    #[test]
+    fn default_namespace_declarations_cover_the_content_they_are_in() {
+        // Namespaces in XML 1.0 §6.2: a default declaration on a prefixed
+        // element covers its unprefixed content, which an unprefixed name
+        // test (null namespace) then does not match.
+        let prefixed = "<p:a xmlns:p='urn:p' xmlns='urn:d'><b>1</b></p:a>";
+        assert_value_error(prefixed, "//b");
+        assert_eq!(
+            filterxml(prefixed, "//*[namespace-uri()='urn:d']"),
+            number(1.0)
+        );
+        assert_eq!(filterxml(prefixed, "//*[local-name()='b']"), number(1.0));
+        // RSS 1.0.
+        let rss = "<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#' xmlns='http://purl.org/rss/1.0/'><item><title>x</title></item></rdf:RDF>";
+        assert_value_error(rss, "//item/title");
+        assert_eq!(filterxml(rss, "//*[local-name()='title']"), text("x"));
+        // xmlns='' takes the default namespace away for the whole subtree.
+        let undeclared = "<a xmlns='urn:d'><b xmlns=''><c>1</c></b></a>";
+        assert_eq!(filterxml(undeclared, "//c"), number(1.0));
+        assert_eq!(filterxml(undeclared, "/*/b/c"), number(1.0));
+        assert_value_error(
+            undeclared,
+            "//*[local-name()='c' and namespace-uri()='urn:d']",
+        );
+        assert_eq!(
+            filterxml_spill(undeclared, "//c/namespace::*"),
+            vec![text(XML_NAMESPACE)]
+        );
+        // An inner declaration holds for its subtree only.
+        let nested = "<a xmlns='urn:1'><b xmlns='urn:2'><c>2</c></b><d>1</d></a>";
+        assert_eq!(
+            filterxml(nested, "//*[namespace-uri()='urn:1' and not(*)]"),
+            number(1.0)
+        );
+        assert_eq!(
+            filterxml(nested, "//*[namespace-uri()='urn:2' and not(*)]"),
+            number(2.0)
+        );
+        // Unprefixed attributes are in no namespace, under a default too.
+        assert_eq!(filterxml("<a xmlns='urn:d' x='1'/>", "//@x"), number(1.0));
+    }
+
+    #[test]
+    fn the_namespace_axis_has_one_order() {
+        // The predeclared xml prefix first, then the declarations in effect
+        // in document order: a recalculation spills them the same way.
+        let four = "<a xmlns:p='urn:p' xmlns:q='urn:q' xmlns:r='urn:r' xmlns:t='urn:t'/>";
+        let expected = vec![
+            text(XML_NAMESPACE),
+            text("urn:p"),
+            text("urn:q"),
+            text("urn:r"),
+            text("urn:t"),
+        ];
+        for _ in 0..40 {
+            assert_eq!(filterxml_spill(four, "/a/namespace::*"), expected);
+        }
+        // An inner declaration of a prefix takes its place; the default
+        // namespace is a namespace node too.
+        let nested =
+            "<a xmlns:q='urn:q1' xmlns='urn:d'><b xmlns:p='urn:p' xmlns:q='urn:q2'>z</b></a>";
+        assert_eq!(
+            filterxml_spill(nested, "//*[local-name()='b']/namespace::*"),
+            vec![
+                text(XML_NAMESPACE),
+                text("urn:d"),
+                text("urn:p"),
+                text("urn:q2")
+            ]
+        );
+        assert_eq!(
+            filterxml(nested, "//*[local-name()='b']/namespace::q"),
+            text("urn:q2")
+        );
+        assert_eq!(filterxml(nested, "//*[count(namespace::*)=4]"), text("z"));
+        // Namespace nodes come after their element and before its
+        // attributes and children.
+        let doc = "<a xmlns:p='urn:p'><b x='y'><c>1</c></b><d>2</d></a>";
+        assert_eq!(
+            filterxml_spill(doc, "//b/namespace::* | //b | //b/@x | //c"),
+            vec![
+                number(1.0),
+                text(XML_NAMESPACE),
+                text("urn:p"),
+                text("y"),
+                number(1.0)
+            ]
+        );
+        assert_eq!(
+            filterxml_spill(doc, "//b/namespace::p/following::*"),
+            vec![number(1.0), number(2.0)]
+        );
+        assert_eq!(
+            filterxml_spill(doc, "//d/namespace::p/preceding::*"),
+            vec![number(1.0), number(1.0)]
+        );
+        assert_eq!(
+            filterxml_spill(doc, "//c/namespace::p/ancestor::*"),
+            vec![number(12.0), number(1.0), number(1.0)]
+        );
+        assert_eq!(
+            filterxml(doc, "//c/namespace::*[name()='p']/.."),
+            number(1.0)
+        );
+    }
+
+    #[test]
+    fn the_xml_prefix_is_bound_in_the_xpath() {
+        // Namespaces in XML 1.0 §3: xml is bound by definition to the XML
+        // namespace; no other prefix is bound for the XPath.
+        assert_eq!(
+            filterxml("<a xml:lang='en'>1</a>", "//@xml:lang"),
+            text("en")
+        );
+        let two = "<r><a xml:lang='en'>1</a><a>2</a></r>";
+        assert_eq!(filterxml(two, "//a[@xml:lang='en']"), number(1.0));
+        assert_eq!(filterxml(two, "//a[not(@xml:lang)]"), number(2.0));
+        assert_eq!(
+            filterxml(
+                "<r><s xml:space='preserve'> x </s><s>y</s></r>",
+                "//s[@xml:space]"
+            ),
+            text("x")
+        );
+        assert_eq!(
+            filterxml_spill("<a xml:lang='en' b='1' xml:space='default'/>", "/a/@xml:*"),
+            vec![text("en"), text("default")]
+        );
+        assert_eq!(
+            filterxml("<xml:a xml:lang='en'>1</xml:a>", "/xml:a[@xml:lang]"),
+            number(1.0)
+        );
+        for xpath in [
+            "//@p:x",
+            "//p:*",
+            "//@xml:lang()",
+            "//xml:lang::a",
+            "//@xml : lang",
+            "//@xml:",
+            "//@xml:1",
+            "//@xml:a:b",
+        ] {
+            assert_value_error("<a xmlns:p='urn:p' p:x='1' xml:lang='en'/>", xpath);
+        }
+    }
+
+    #[test]
+    fn xml_must_be_well_formed() {
+        // XML 1.0 and Namespaces in XML 1.0: each of these is a fatal error,
+        // so #VALUE!.
+        for xml in [
+            // Attributes.
+            "<a x='1' x='2'>1</a>",
+            "<a x='<'>1</a>",
+            "<a x=1>1</a>",
+            "<a x='1'y='2'>1</a>",
+            "<a x>1</a>",
+            "<a x='&e;'>1</a>",
+            "<a x='&'>1</a>",
+            // Content.
+            "<a>]]></a>",
+            "<a>&e;</a>",
+            "<a>&#X41;</a>",
+            "<a>&#x;</a>",
+            "<a>&am p;</a>",
+            "<a/>x",
+            "x<a/>",
+            "<a/><b/>",
+            "<a>",
+            "</a>",
+            "<a></b>",
+            "<a></ a>",
+            "< a></a>",
+            "<1a/>",
+            "<![CDATA[x]]><a/>",
+            "<a/>&amp;",
+            // Comments and processing instructions.
+            "<!--a--b--><a/>",
+            "<!--a---><a/>",
+            "<a><?xml x?></a>",
+            "<?XML x?><a/>",
+            "<a><?1 x?></a>",
+            // The XML declaration: at the very start, version first.
+            " <?xml version='1.0'?><a/>",
+            "<a/><?xml version='1.0'?>",
+            "<?xml version='1.0'?><?xml version='1.0'?><a/>",
+            "<?xml version='2.0'?><a/>",
+            "<?xml encoding='UTF-8'?><a/>",
+            "<?xml version='1.0' standalone='maybe'?><a/>",
+            "<?xml version='1.0' standalone='yes' encoding='UTF-8'?><a/>",
+            // The document type declaration: after the start of the prolog,
+            // SYSTEM identifiers only.
+            "<!DOCTYPE a><a/>",
+            "<a><!DOCTYPE a></a>",
+            "<?xml version='1.0'?><!DOCTYPE a PUBLIC 'x' 'y'><a/>",
+            "<?xml version='1.0'?><!doctype a><a/>",
+            // Namespaces.
+            "<p:a/>",
+            "<a p:x='1'/>",
+            "<a xmlns:p=''/>",
+            "<a xmlns:p='urn:u' xmlns:q='urn:u' p:x='1' q:x='2'/>",
+            "<a xmlns:xml='urn:x'/>",
+            "<a xmlns:p='http://www.w3.org/XML/1998/namespace'/>",
+            "<a xmlns='http://www.w3.org/XML/1998/namespace'/>",
+            "<a xmlns:xmlns='urn:x'/>",
+            "<xmlns:a/>",
+            "<a:b:c/>",
+            "<a xmlns:p='urn:p'/><p:b/>",
+        ] {
+            assert_value_error(xml, "//*");
+        }
+        // A byte order mark belongs to an encoded file, not to text.
+        assert_eq!(
+            error_kind(eval("=FILTERXML(UNICHAR(65279)&\"<a>1</a>\",\"//a\")")),
+            ExcelErrorKind::Value
+        );
+        for xml in [
+            "<?xml version='1.0' encoding='UTF-8' standalone='yes' ?><a>1</a>",
+            "<?xml version='1.0'?><!DOCTYPE a SYSTEM 'a.dtd' [<!ELEMENT a ANY>]><a>1</a>",
+            "<!--c--> <!DOCTYPE a><?pi x?><a x='>'>1</a><!--d--><?pi?>",
+            "<a  x = '1' >1</a >",
+            "<a x='&lt;&#62;'>1<!----><?xml-stylesheet x?></a>",
+            "<p:a xmlns:p='urn:p' p:x='1' x='2'>1</p:a>",
+            "<a xmlns:p='urn:u' p:x='1' x='2'>1</a>",
+            "<a xmlns:xml='http://www.w3.org/XML/1998/namespace'>1</a>",
+        ] {
+            assert_eq!(filterxml(xml, "//*[.!='']"), number(1.0), "{xml}");
+        }
+        // `]]>` may be written with a reference.
+        assert_eq!(filterxml("<a>]]&gt;</a>", "/a"), text("]]>"));
+    }
+
+    /// The nodes `xpath` selects in `document`, and the work it took.
+    fn select_counting_work(document: &Document, xpath: &str) -> (Vec<usize>, u64) {
+        let xpath = xpath::compile(xpath::tokenize(xpath).unwrap()).unwrap();
+        let (nodes, work) = xpath::select_counting_work(document, &xpath);
+        (nodes.unwrap(), work)
+    }
+
+    /// The split idiom's XML for `items`.
+    fn split_xml(items: impl Iterator<Item = String>) -> String {
+        format!(
+            "<t><s>{}</s></t>",
+            items.collect::<Vec<_>>().join("</s><s>")
+        )
+    }
+
+    #[test]
+    fn namespace_nodes_are_made_only_where_the_axis_reaches() {
+        // The finding's repro: 1,100 declarations on the root and 4,000
+        // children, 32,500 characters, one namespace node selected.
+        let declarations: String = (1..=1100).map(|i| format!(" xmlns:p{i}='u'")).collect();
+        let xml = format!("<r{declarations}>{}</r>", "<a/>".repeat(4000));
+        assert_eq!(xml.len(), 32_500);
+        let start = Instant::now();
+        let document = Document::parse(&xml).unwrap();
+        let (nodes, _) = select_counting_work(&document, "/r/namespace::p1");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(document.string_value(nodes[0]), "u");
+        // The root's 1,100 prefixes and xml.
+        assert_eq!(document.namespace_nodes_made(), 1101);
+        let (nodes, _) = select_counting_work(&document, "/r/a[position() <= 3]/namespace::*");
+        assert_eq!(nodes.len(), 3 * 1101);
+        assert_eq!(document.namespace_nodes_made(), 4 * 1101);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+        // Through FILTERXML.
+        assert_eq!(
+            super::select_node_texts(&xml, "/r/namespace::p1100", None),
+            Ok(vec!["u".to_string()])
+        );
+    }
+
+    #[test]
+    fn steps_take_work_in_proportion_to_the_document() {
+        // The finding's shapes: the following or preceding nodes of every
+        // node, and nested descendants and ancestors. A step selects each
+        // node once and walks no part of an axis twice, so twice the
+        // document is about twice the work, not four times.
+        let list = |n: usize| split_xml((0..n).map(|i| (i % 10).to_string()));
+        let deep = |n: usize| format!("{}1{}", "<a>".repeat(n), "</a>".repeat(n));
+        // The XML of a size, an XPath, and how many nodes it selects.
+        type Case<'a> = (&'a dyn Fn(usize) -> String, &'a str, fn(usize) -> usize);
+        let cases: [Case; 4] = [
+            (&list, "//node()/following::node()", |n| 2 * n - 2),
+            (&list, "//node()/preceding::node()", |n| 2 * n - 2),
+            (&deep, "//a//a", |n| n - 1),
+            (&deep, "//a/ancestor::a", |n| n - 1),
+        ];
+        for (xml, xpath, selected) in cases {
+            let work = |n: usize| {
+                let (nodes, work) = select_counting_work(&Document::parse(&xml(n)).unwrap(), xpath);
+                assert_eq!(nodes.len(), selected(n), "{xpath}");
+                work
+            };
+            let (small, large) = (work(500), work(1000));
+            assert!(large < 3 * small, "{xpath}: {small} then {large}");
+            // The finding's sizes (32,007 and 32,761 characters).
+            let n = if xpath.contains("node()") { 4000 } else { 4680 };
+            let start = Instant::now();
+            work(n);
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "{xpath}: {:?}",
+                start.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn comparisons_use_the_string_values_in_the_document() {
+        // The finding's repros of the dedupe idiom, each node against all
+        // nodes before or after it: 3,200 distinct and 4,000 equal items
+        // (about 32,000 characters), well within a second.
+        let distinct = split_xml((0..3200).map(|i| format!("{i:03}")));
+        let equal = split_xml((0..4000).map(|_| "1".to_string()));
+        for xpath in [
+            "//s[not(.=preceding::*)]",
+            "//s[not(.=following::*)]",
+            "//s[not(preceding::*=.)]",
+            "//s[not(.=preceding-sibling::s)]",
+        ] {
+            for (xml, kept) in [(&distinct, 3200), (&equal, 1)] {
+                let start = Instant::now();
+                let document = Document::parse(xml).unwrap();
+                assert_eq!(
+                    select_counting_work(&document, xpath).0.len(),
+                    kept,
+                    "{xpath}"
+                );
+                assert!(
+                    start.elapsed() < Duration::from_secs(1),
+                    "{xpath}: {:?}",
+                    start.elapsed()
+                );
+                // Each item's text is one text node: nothing is copied.
+                assert_eq!(document.texts_joined(), 0);
+            }
+        }
+        // 1,500 empty items after a 1,000-deep chain around 12,000
+        // characters: every item meets each chain element, whose
+        // string-value is the whole text, borrowed rather than rebuilt.
+        let nested = format!(
+            "<r>{}{}{}{}</r>",
+            "<x>".repeat(1000),
+            "y".repeat(12_000),
+            "</x>".repeat(1000),
+            "<s/>".repeat(1500)
+        );
+        assert_eq!(nested.len(), 25_007);
+        let start = Instant::now();
+        let document = Document::parse(&nested).unwrap();
+        assert_eq!(
+            select_counting_work(&document, "//s[not(.=preceding::*)]")
+                .0
+                .len(),
+            1
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(document.texts_joined(), 0);
+        // Text in several text nodes is joined once, however often compared.
+        let split_text = split_xml((0..200).map(|i| format!("{}<b/>{}", i % 3, i % 2)));
+        let document = Document::parse(&split_text).unwrap();
+        assert_eq!(
+            select_counting_work(&document, "//s[not(.=preceding::s)]")
+                .0
+                .len(),
+            6
+        );
+        assert_eq!(document.texts_joined(), 200);
+    }
+
+    #[test]
+    fn a_cancelled_evaluation_stops() {
+        let xml = split_xml((0..3200).map(|i| format!("{i:03}")));
+        let token = CancelToken::new();
+        assert_eq!(
+            super::select_node_texts(&xml, "//s[not(.=preceding::*)][last()]", Some(&token)),
+            Ok(vec!["3199".to_string()])
+        );
+        token.cancel();
+        assert_eq!(
+            super::select_node_texts(&xml, "//s[not(.=preceding::*)]", Some(&token)),
+            Err(Failure::Cancelled)
+        );
+        // Deep XPaths run on a thread of their own, with the token.
+        let deep = format!("{}//s{}", "(".repeat(40), ")".repeat(40));
+        assert_eq!(
+            super::select_node_texts(&xml, &deep, Some(&token)),
+            Err(Failure::Cancelled)
+        );
     }
 }

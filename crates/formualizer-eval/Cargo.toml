@@ -41,8 +41,9 @@ bumpalo = { version = "3.16", features = ["collections"] }
 smallvec = { workspace = true }
 # web-time is only needed for the js-runtime (browser/wasm-bindgen) profile.
 web-time = { workspace = true, optional = true }
-# FILTERXML: XML parsing (pure Rust); the XPath 1.0 evaluator is builtins/text/filterxml/xpath.rs.
-sxd-document = "0.3.2"
+# FILTERXML: XML tokenizing (pure Rust); the document model is builtins/text/filterxml/xml.rs
+# and the XPath 1.0 evaluator builtins/text/filterxml/xpath.rs.
+quick-xml = { version = "0.39" }
 
 # Arrow (per-crate) — pinned to 58.x series
 arrow-array = "59.2.0"

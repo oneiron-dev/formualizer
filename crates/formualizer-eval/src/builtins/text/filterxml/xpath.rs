@@ -1,17 +1,27 @@
 //! XPath 1.0 (W3C Recommendation, 16 November 1999), as MSXML evaluates it
 //! for FILTERXML: the full expression language and core function library
-//! over a [`Document`], with no variables and no namespace prefixes bound.
+//! over a [`Document`], with no variables and no namespace prefix bound but
+//! `xml`, which is bound by definition.
 //!
 //! Parsing and evaluation recurse as deep as the XPath's parentheses and
 //! brackets nest ([`Tokens::nesting`], at most [`MAX_NESTING`]): operator
 //! chains, runs of minus signs, unions and steps are flat lists, and the
 //! document is walked without recursion.
+//!
+//! A step removes duplicates as it selects nodes, so a node-set never holds
+//! more than the document's nodes; without predicates, a step walks no part
+//! of an axis twice (`//a//b`, `//node()/following::node()` take time in
+//! proportion to the document). String-values are borrowed from the document,
+//! which joins an element's text once.
 
-use std::collections::HashSet;
+use std::cell::Cell;
 use std::iter::Peekable;
 use std::vec::IntoIter;
 
-use super::xml::{Document, Kind, XML_NAMESPACE, is_xml_space};
+use rustc_hash::FxHashSet;
+
+use super::xml::{Document, Kind, XML_NAMESPACE, is_name_char, is_name_start_char, is_xml_space};
+use crate::engine::CancelToken;
 
 /// The deepest nesting of parentheses and brackets an XPath may have. Each
 /// level takes two characters, so an XPath within FILTERXML's 1024
@@ -19,34 +29,46 @@ use super::xml::{Document, Kind, XML_NAMESPACE, is_xml_space};
 /// known whatever the input.
 pub(super) const MAX_NESTING: usize = 512;
 
-/// The XPath is invalid, or evaluating it fails (an operand that must be a
-/// node-set is not).
-#[derive(Debug)]
-pub(super) struct Invalid;
+/// Why an XPath gives no nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Failure {
+    /// The XPath is invalid, or evaluating it fails (an operand that must be
+    /// a node-set is not).
+    Invalid,
+    /// The evaluation's cancellation token was signalled.
+    Cancelled,
+}
 
-type Result<T> = std::result::Result<T, Invalid>;
+use Failure::Invalid;
+
+type Result<T> = std::result::Result<T, Failure>;
 
 /// The nodes `xpath` selects in `document` from its root, in document order.
-/// `Err` when the XPath is invalid or its value is not a node-set.
-pub(super) fn select(document: &Document, xpath: &Compiled) -> Result<Vec<usize>> {
-    let evaluator = Evaluator { document };
-    let context = Context {
-        node: 0,
-        position: 1,
-        size: 1,
-    };
-    match evaluator.eval(&xpath.expr, context)? {
-        Value::Nodes(nodes) => Ok(nodes),
-        _ => Err(Invalid),
-    }
+/// `Err` when the XPath is invalid or its value is not a node-set, or when
+/// `cancel` is signalled during the evaluation.
+pub(super) fn select(
+    document: &Document,
+    xpath: &Compiled,
+    cancel: Option<&CancelToken>,
+) -> Result<Vec<usize>> {
+    Evaluator::new(document, cancel).select(xpath)
+}
+
+/// [`select`], and the work the evaluation took: the nodes its steps
+/// visited, the predicates it evaluated and the nodes it compared.
+#[cfg(test)]
+pub(super) fn select_counting_work(
+    document: &Document,
+    xpath: &Compiled,
+) -> (Result<Vec<usize>>, u64) {
+    let evaluator = Evaluator::new(document, None);
+    let nodes = evaluator.select(xpath);
+    (nodes, evaluator.work.get())
 }
 
 /// A parsed XPath.
 pub(super) struct Compiled {
     expr: Expr,
-    /// Whether a step uses the namespace axis (the only way to namespace
-    /// nodes).
-    pub uses_namespace_axis: bool,
 }
 
 /// An XPath split into tokens.
@@ -78,16 +100,12 @@ pub(super) fn compile(tokens: Tokens) -> Result<Compiled> {
     }
     let mut parser = Parser {
         tokens: tokens.0.into_iter().peekable(),
-        uses_namespace_axis: false,
     };
     let expr = parser.expr()?;
     if parser.tokens.next().is_some() {
         return Err(Invalid);
     }
-    Ok(Compiled {
-        expr,
-        uses_namespace_axis: parser.uses_namespace_axis,
-    })
+    Ok(Compiled { expr })
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +198,30 @@ impl Axis {
             _ => Kind::Element,
         }
     }
+
+    /// Whether the axis goes in reverse document order.
+    fn is_reverse(self) -> bool {
+        matches!(
+            self,
+            Axis::Ancestor | Axis::AncestorOrSelf | Axis::Preceding | Axis::PrecedingSibling
+        )
+    }
+
+    /// Whether, walking the axis from nodes in document order, meeting a node
+    /// that an earlier walk met means the rest of this walk was met too: the
+    /// earlier walk went on from that node the same way (up to the root, to
+    /// the end of a subtree or of the siblings).
+    fn walks_on_from_met_nodes(self) -> bool {
+        matches!(
+            self,
+            Axis::Ancestor
+                | Axis::AncestorOrSelf
+                | Axis::Descendant
+                | Axis::DescendantOrSelf
+                | Axis::FollowingSibling
+                | Axis::PrecedingSibling
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,29 +250,16 @@ enum Token {
     Operator(Op),
     /// The name test `*`.
     Star,
-    /// A name test.
-    Name(String),
+    /// The name test `prefix:*`: the namespace bound to the prefix.
+    NamespaceStar(&'static str),
+    /// A name test: the namespace bound to its prefix, if it has one, and its
+    /// local part.
+    Name(Option<&'static str>, String),
     NodeType(NodeType),
     Function(String),
     Axis(Axis),
     Literal(String),
     Number(f64),
-}
-
-/// The XML `NameStartChar` production, without the colon.
-fn is_name_start_char(c: char) -> bool {
-    matches!(c,
-        'A'..='Z' | '_' | 'a'..='z' | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}'
-        | '\u{F8}'..='\u{2FF}' | '\u{370}'..='\u{37D}' | '\u{37F}'..='\u{1FFF}'
-        | '\u{200C}'..='\u{200D}' | '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}'
-        | '\u{3001}'..='\u{D7FF}' | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}'
-        | '\u{10000}'..='\u{EFFFF}')
-}
-
-/// The XML `NameChar` production, without the colon.
-fn is_name_char(c: char) -> bool {
-    is_name_start_char(c)
-        || matches!(c, '-' | '.' | '0'..='9' | '\u{B7}' | '\u{300}'..='\u{36F}' | '\u{203F}'..='\u{2040}')
 }
 
 /// Splits `xpath` into tokens.
@@ -321,20 +350,47 @@ pub(super) fn tokenize(xpath: &str) -> Result<Tokens> {
                 while at(after).is_some_and(is_xml_space) {
                     after += 1;
                 }
-                let token = if after_operand {
-                    Token::Operator(match name.as_str() {
+                if after_operand {
+                    let op = match name.as_str() {
                         "and" => Op::And,
                         "or" => Op::Or,
                         "div" => Op::Div,
                         "mod" => Op::Mod,
                         _ => return Err(Invalid),
-                    })
+                    };
+                    (Token::Operator(op), end - index)
                 } else if at(end) == Some(':') && at(end + 1) != Some(':') {
-                    // A prefixed name (`p:a`, `p:*`, `p:f()`): FILTERXML binds
-                    // no namespace prefix for the XPath.
-                    return Err(Invalid);
+                    // A prefixed name test (`p:a`, `p:*`). FILTERXML binds no
+                    // prefix for the XPath, but `xml` is bound by definition
+                    // to the XML namespace (Namespaces in XML 1.0 §3).
+                    if name != "xml" {
+                        return Err(Invalid);
+                    }
+                    let local = end + 1;
+                    if at(local) == Some('*') {
+                        (Token::NamespaceStar(XML_NAMESPACE), local + 1 - index)
+                    } else if at(local).is_some_and(is_name_start_char) {
+                        let local_end = (local + 1..chars.len())
+                            .find(|&i| !is_name_char(chars[i]))
+                            .unwrap_or(chars.len());
+                        let mut after = local_end;
+                        while at(after).is_some_and(is_xml_space) {
+                            after += 1;
+                        }
+                        // No function or axis has a prefixed name.
+                        if at(after) == Some('(') || at(after) == Some(':') {
+                            return Err(Invalid);
+                        }
+                        let local_name = chars[local..local_end].iter().collect();
+                        (
+                            Token::Name(Some(XML_NAMESPACE), local_name),
+                            local_end - index,
+                        )
+                    } else {
+                        return Err(Invalid);
+                    }
                 } else if at(after) == Some('(') {
-                    match name.as_str() {
+                    let token = match name.as_str() {
                         "comment" => Token::NodeType(NodeType::Comment),
                         "text" => Token::NodeType(NodeType::Text),
                         "processing-instruction" => {
@@ -342,13 +398,16 @@ pub(super) fn tokenize(xpath: &str) -> Result<Tokens> {
                         }
                         "node" => Token::NodeType(NodeType::Node),
                         _ => Token::Function(name),
-                    }
+                    };
+                    (token, end - index)
                 } else if at(after) == Some(':') && at(after + 1) == Some(':') {
-                    Token::Axis(Axis::from_name(&name).ok_or(Invalid)?)
+                    (
+                        Token::Axis(Axis::from_name(&name).ok_or(Invalid)?),
+                        end - index,
+                    )
                 } else {
-                    Token::Name(name)
-                };
-                (token, end - index)
+                    (Token::Name(None, name), end - index)
+                }
             }
             // Includes `$`: no variable is bound.
             _ => return Err(Invalid),
@@ -405,9 +464,11 @@ impl Step {
 
 #[derive(Debug)]
 enum NodeTest {
-    /// A name test without a prefix: a node of the principal kind with that
-    /// name and no namespace.
-    Name(String),
+    /// A name test: a node of the principal kind with that namespace (none
+    /// without a prefix) and local name.
+    Name(Option<&'static str>, String),
+    /// `prefix:*`: any node of the principal kind in that namespace.
+    NamespaceAny(&'static str),
     /// `*`: any node of the principal kind.
     Any,
     Node,
@@ -487,7 +548,6 @@ impl Function {
 
 struct Parser {
     tokens: Peekable<IntoIter<Token>>,
-    uses_namespace_axis: bool,
 }
 
 impl Parser {
@@ -626,9 +686,9 @@ impl Parser {
             }
             _ => Axis::Child,
         };
-        self.uses_namespace_axis |= axis == Axis::Namespace;
         let test = match self.tokens.next() {
-            Some(Token::Name(name)) => NodeTest::Name(name),
+            Some(Token::Name(namespace, local_name)) => NodeTest::Name(namespace, local_name),
+            Some(Token::NamespaceStar(namespace)) => NodeTest::NamespaceAny(namespace),
             Some(Token::Star) => NodeTest::Any,
             Some(Token::NodeType(node_type)) => {
                 self.expect(&Token::LeftParen)?;
@@ -711,7 +771,8 @@ impl Parser {
 fn starts_step(token: &Token) -> bool {
     matches!(
         token,
-        Token::Name(_)
+        Token::Name(..)
+            | Token::NamespaceStar(_)
             | Token::Star
             | Token::NodeType(_)
             | Token::Axis(_)
@@ -859,11 +920,73 @@ struct Context {
     size: usize,
 }
 
-struct Evaluator<'a> {
-    document: &'a Document,
+/// A node test as the axis loops check it: by kind, and by the id of the
+/// expanded name a name test names.
+enum QuickTest {
+    Node,
+    Kind(u8),
+    Name(u8, u32),
+    Other,
 }
 
-impl Evaluator<'_> {
+/// A set of node ids, to remove duplicates as nodes are selected.
+struct Seen(Vec<u64>);
+
+impl Seen {
+    fn new(ids: usize) -> Self {
+        Seen(vec![0; ids.div_ceil(64)])
+    }
+
+    /// Adds `id`; false when the set held it already.
+    fn insert(&mut self, id: usize) -> bool {
+        let (word, bit) = (id / 64, 1u64 << (id % 64));
+        if word >= self.0.len() {
+            self.0.resize(word + 1, 0);
+        }
+        let new = self.0[word] & bit == 0;
+        self.0[word] |= bit;
+        new
+    }
+}
+
+struct Evaluator<'a> {
+    document: &'a Document,
+    cancel: Option<&'a CancelToken>,
+    /// The nodes visited, predicates evaluated and nodes compared so far.
+    work: Cell<u64>,
+}
+
+impl<'a> Evaluator<'a> {
+    fn new(document: &'a Document, cancel: Option<&'a CancelToken>) -> Self {
+        Evaluator {
+            document,
+            cancel,
+            work: Cell::new(0),
+        }
+    }
+
+    fn select(&self, xpath: &Compiled) -> Result<Vec<usize>> {
+        let context = Context {
+            node: 0,
+            position: 1,
+            size: 1,
+        };
+        match self.eval(&xpath.expr, context)? {
+            Value::Nodes(nodes) => Ok(nodes),
+            _ => Err(Invalid),
+        }
+    }
+
+    /// Counts `units` of work, and stops the evaluation once it is cancelled.
+    fn charge(&self, units: usize) -> Result<()> {
+        self.work.set(self.work.get().saturating_add(units as u64));
+        if self.cancel.is_some_and(CancelToken::is_cancelled) {
+            Err(Failure::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
     fn eval(&self, expr: &Expr, context: Context) -> Result<Value> {
         match expr {
             Expr::Number(n) => Ok(Value::Number(*n)),
@@ -889,7 +1012,7 @@ impl Evaluator<'_> {
         }
     }
 
-    fn string_value(&self, node: usize) -> String {
+    fn string_value(&self, node: usize) -> &'a str {
         self.document.string_value(node)
     }
 
@@ -902,7 +1025,7 @@ impl Evaluator<'_> {
             Value::String(s) => s.clone(),
             Value::Nodes(nodes) => nodes
                 .first()
-                .map(|&node| self.string_value(node))
+                .map(|&node| self.string_value(node).to_string())
                 .unwrap_or_default(),
         }
     }
@@ -913,7 +1036,9 @@ impl Evaluator<'_> {
             Value::Boolean(b) => f64::from(u8::from(*b)),
             Value::Number(n) => *n,
             Value::String(s) => string_to_number(s),
-            Value::Nodes(_) => string_to_number(&self.string(value)),
+            Value::Nodes(nodes) => {
+                string_to_number(nodes.first().map_or("", |&node| self.string_value(node)))
+            }
         }
     }
 
@@ -927,7 +1052,7 @@ impl Evaluator<'_> {
                     Value::Boolean(value.boolean() && self.eval(operand, context)?.boolean())
                 }
                 Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge => {
-                    Value::Boolean(self.compare(*op, &value, &self.eval(operand, context)?))
+                    Value::Boolean(self.compare(*op, &value, &self.eval(operand, context)?)?)
                 }
                 Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod => {
                     let left = self.number(&value);
@@ -949,60 +1074,90 @@ impl Evaluator<'_> {
     /// The comparisons of §3.4. A node-set compares true when some node's
     /// string-value (or its number, for a number and for `<`, `<=`, `>`,
     /// `>=`) does.
-    fn compare(&self, op: Op, left: &Value, right: &Value) -> bool {
-        match (left, right) {
+    fn compare(&self, op: Op, left: &Value, right: &Value) -> Result<bool> {
+        Ok(match (left, right) {
             (Value::Nodes(left), Value::Nodes(right)) => {
-                if matches!(op, Op::Eq | Op::Ne) {
-                    let strings = |nodes: &[usize]| -> HashSet<String> {
-                        nodes.iter().map(|&node| self.string_value(node)).collect()
-                    };
-                    let (left, right) = (strings(left), strings(right));
-                    if op == Op::Eq {
-                        !left.is_disjoint(&right)
-                    } else {
-                        // Some pair differs unless both hold one same string.
-                        !(left.is_empty() || right.is_empty() || (left.len() == 1 && left == right))
-                    }
-                } else {
-                    let numbers = |nodes: &[usize]| -> Vec<f64> {
-                        nodes
-                            .iter()
-                            .map(|&node| string_to_number(&self.string_value(node)))
-                            .filter(|n| !n.is_nan())
-                            .collect()
-                    };
-                    let (left, right) = (numbers(left), numbers(right));
-                    let min = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
-                    let max = |v: &[f64]| v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-                    !left.is_empty()
-                        && !right.is_empty()
-                        && match op {
-                            Op::Lt | Op::Le => compare_numbers(op, min(&left), max(&right)),
-                            _ => compare_numbers(op, max(&left), min(&right)),
+                self.charge(left.len() + right.len())?;
+                match op {
+                    Op::Eq => self.share_a_string(left, right),
+                    // Some pair differs unless all the nodes of both have one
+                    // same string-value.
+                    Op::Ne => match left.first() {
+                        Some(&first) if !right.is_empty() => {
+                            let document = self.document;
+                            let first = document.value_id(first);
+                            left.iter()
+                                .chain(right)
+                                .any(|&node| document.value_id(node) != first)
                         }
+                        _ => false,
+                    },
+                    _ => {
+                        let numbers = |nodes: &[usize]| -> Option<(f64, f64)> {
+                            nodes
+                                .iter()
+                                .map(|&node| string_to_number(self.string_value(node)))
+                                .filter(|n| !n.is_nan())
+                                .fold(None, |range, n| match range {
+                                    None => Some((n, n)),
+                                    Some((min, max)) => Some((f64::min(min, n), f64::max(max, n))),
+                                })
+                        };
+                        match (numbers(left), numbers(right)) {
+                            (Some((left_min, left_max)), Some((right_min, right_max))) => {
+                                match op {
+                                    Op::Lt | Op::Le => compare_numbers(op, left_min, right_max),
+                                    _ => compare_numbers(op, left_max, right_min),
+                                }
+                            }
+                            _ => false,
+                        }
+                    }
                 }
             }
-            (Value::Nodes(nodes), other) => self.compare_nodes(op, nodes, other),
-            (other, Value::Nodes(nodes)) => self.compare_nodes(op.flipped(), nodes, other),
+            (Value::Nodes(nodes), other) => self.compare_nodes(op, nodes, other)?,
+            (other, Value::Nodes(nodes)) => self.compare_nodes(op.flipped(), nodes, other)?,
             _ => self.compare_values(op, left, right),
+        })
+    }
+
+    /// Whether some node of `left` and some node of `right` have the same
+    /// string-value. Equal string-values have equal ids, so this compares
+    /// ids.
+    fn share_a_string(&self, left: &[usize], right: &[usize]) -> bool {
+        let document = self.document;
+        let (few, many) = if left.len() <= right.len() {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        // `. = preceding::*` and the like: one node against many.
+        if let [one] = few {
+            let value = document.value_id(*one);
+            many.iter().any(|&node| document.value_id(node) == value)
+        } else {
+            let few: FxHashSet<u32> = few.iter().map(|&node| document.value_id(node)).collect();
+            many.iter()
+                .any(|&node| few.contains(&document.value_id(node)))
         }
     }
 
     /// Whether `node op other` holds for some node of `nodes`; `other` is not
     /// a node-set.
-    fn compare_nodes(&self, op: Op, nodes: &[usize], other: &Value) -> bool {
-        match other {
+    fn compare_nodes(&self, op: Op, nodes: &[usize], other: &Value) -> Result<bool> {
+        self.charge(nodes.len())?;
+        Ok(match other {
             Value::Boolean(_) => self.compare_values(op, &Value::Boolean(!nodes.is_empty()), other),
             Value::String(s) if matches!(op, Op::Eq | Op::Ne) => nodes
                 .iter()
-                .any(|&node| (self.string_value(node) == *s) == (op == Op::Eq)),
+                .any(|&node| (self.string_value(node) == s) == (op == Op::Eq)),
             _ => {
                 let other = self.number(other);
                 nodes.iter().any(|&node| {
-                    compare_numbers(op, string_to_number(&self.string_value(node)), other)
+                    compare_numbers(op, string_to_number(self.string_value(node)), other)
                 })
             }
-        }
+        })
     }
 
     /// Compares two values that are not node-sets: `=` and `!=` as booleans
@@ -1022,13 +1177,25 @@ impl Evaluator<'_> {
         }
     }
 
+    /// Puts distinct nodes in document order.
+    fn sort(&self, nodes: &mut [usize]) {
+        let document = self.document;
+        if nodes.iter().all(|&node| node < document.len()) {
+            nodes.sort_unstable();
+        } else {
+            nodes.sort_unstable_by_key(|&node| document.order(node));
+        }
+    }
+
     fn union(&self, paths: &[Expr], context: Context) -> Result<Vec<usize>> {
+        let mut seen = Seen::new(self.document.len());
         let mut nodes = Vec::new();
         for path in paths {
-            nodes.extend(self.nodes(path, context)?);
+            let selected = self.nodes(path, context)?;
+            self.charge(selected.len())?;
+            nodes.extend(selected.into_iter().filter(|&node| seen.insert(node)));
         }
-        nodes.sort_unstable();
-        nodes.dedup();
+        self.sort(&mut nodes);
         Ok(nodes)
     }
 
@@ -1044,93 +1211,325 @@ impl Evaluator<'_> {
         Ok(nodes)
     }
 
-    /// The nodes `step` selects from each of `nodes`, in document order.
-    fn step(&self, step: &Step, nodes: &[usize]) -> Result<Vec<usize>> {
+    /// The nodes `step` selects from each of `contexts` (distinct nodes in
+    /// document order), in document order and each once.
+    fn step(&self, step: &Step, contexts: &[usize]) -> Result<Vec<usize>> {
+        let document = self.document;
+        let principal = step.axis.principal_kind();
         let mut selected = Vec::new();
-        for &node in nodes {
-            // Predicates count positions in the axis's order.
-            let mut candidates: Vec<usize> = self
-                .axis(step.axis, node)
-                .into_iter()
-                .filter(|&candidate| self.test(step, candidate))
-                .collect();
-            for predicate in &step.predicates {
-                candidates = self.predicate(predicate, candidates)?;
+        if !step.predicates.is_empty() {
+            // Predicates count positions in each context node's axis, so each
+            // is walked whole.
+            let mut seen = (contexts.len() > 1).then(|| Seen::new(document.len()));
+            for &context in contexts {
+                let mut candidates = Vec::new();
+                let visited =
+                    self.collect(step.axis, context, &step.test, principal, &mut candidates);
+                self.charge(visited)?;
+                for predicate in &step.predicates {
+                    candidates = self.predicate(predicate, candidates)?;
+                }
+                match &mut seen {
+                    Some(seen) => {
+                        selected.extend(candidates.into_iter().filter(|&node| seen.insert(node)))
+                    }
+                    None => selected = candidates,
+                }
             }
-            selected.extend(candidates);
+        } else {
+            // The step selects the nodes that pass the test on the axis of
+            // any context node, so no part of an axis needs walking twice.
+            let (test, axis) = (&step.test, step.axis);
+            let visited = match axis {
+                // The following nodes of each context node are those of the
+                // one whose subtree ends first...
+                Axis::Following => contexts
+                    .iter()
+                    .min_by_key(|&&context| document.following_start(context))
+                    .map_or(0, |&from| {
+                        self.collect(axis, from, test, principal, &mut selected)
+                    }),
+                // ...and the preceding nodes those of the last one.
+                Axis::Preceding => contexts
+                    .iter()
+                    .max_by_key(|&&context| document.preceding_end(context))
+                    .map_or(0, |&from| {
+                        self.collect(axis, from, test, principal, &mut selected)
+                    }),
+                _ if contexts.len() == 1 => {
+                    self.collect(axis, contexts[0], test, principal, &mut selected)
+                }
+                _ => {
+                    let walks_on = axis.walks_on_from_met_nodes();
+                    let mut met = Seen::new(document.len());
+                    let mut visited = 0;
+                    for &context in contexts {
+                        self.walk(axis, context, |node| {
+                            if !met.insert(node) {
+                                return !walks_on;
+                            }
+                            visited += 1;
+                            if self.test(test, principal, node) {
+                                selected.push(node);
+                            }
+                            true
+                        });
+                    }
+                    visited
+                }
+            };
+            self.charge(visited)?;
         }
-        selected.sort_unstable();
-        selected.dedup();
+        if contexts.len() > 1 {
+            self.sort(&mut selected);
+        } else if step.axis.is_reverse() {
+            selected.reverse();
+        }
         Ok(selected)
     }
 
-    /// The nodes on `axis` from `node`, in the axis's order: document order,
-    /// or reverse document order on the reverse axes (ancestor,
-    /// ancestor-or-self, preceding, preceding-sibling).
-    fn axis(&self, axis: Axis, node: usize) -> Vec<usize> {
+    /// Appends the nodes on `axis` from `node` that pass `test` to `out`, in
+    /// the axis's order (as [`Self::walk`] visits them); returns the number of
+    /// nodes visited. The long axes are plain loops.
+    fn collect(
+        &self,
+        axis: Axis,
+        node: usize,
+        test: &NodeTest,
+        principal: Kind,
+        out: &mut Vec<usize>,
+    ) -> usize {
         let document = self.document;
-        let this = &document.nodes[node];
-        let ancestors =
-            || std::iter::successors(this.parent, |&ancestor| document.nodes[ancestor].parent);
+        let ends = document.tree_ends();
+        let quick = self.quick_test(test, principal);
+        let mut visited = 0;
         match axis {
-            Axis::Itself => vec![node],
-            Axis::Child => this.children.clone(),
-            Axis::Descendant => document.descendants(node).collect(),
-            Axis::DescendantOrSelf => std::iter::once(node)
-                .chain(document.descendants(node))
-                .collect(),
-            Axis::Parent => this.parent.into_iter().collect(),
-            Axis::Ancestor => ancestors().collect(),
-            Axis::AncestorOrSelf => std::iter::once(node).chain(ancestors()).collect(),
-            Axis::FollowingSibling => document
-                .siblings(node)
-                .get(this.sibling_index + 1..)
-                .unwrap_or_default()
-                .to_vec(),
-            Axis::PrecedingSibling => document
-                .siblings(node)
-                .get(..this.sibling_index)
-                .unwrap_or_default()
-                .iter()
-                .rev()
-                .copied()
-                .collect(),
+            Axis::Child => {
+                let children = document.children(node);
+                let mut index = 0;
+                while index < children.len() {
+                    visited += 1;
+                    if self.passes(&quick, test, principal, children[index]) {
+                        out.push(children[index]);
+                    }
+                    index += 1;
+                }
+            }
+            Axis::FollowingSibling | Axis::PrecedingSibling => {
+                let (siblings, position) = document.siblings(node);
+                if axis == Axis::FollowingSibling {
+                    let mut index = position + 1;
+                    while index < siblings.len() {
+                        visited += 1;
+                        if self.passes(&quick, test, principal, siblings[index]) {
+                            out.push(siblings[index]);
+                        }
+                        index += 1;
+                    }
+                } else {
+                    let mut index = position.min(siblings.len());
+                    while index > 0 {
+                        index -= 1;
+                        visited += 1;
+                        if self.passes(&quick, test, principal, siblings[index]) {
+                            out.push(siblings[index]);
+                        }
+                    }
+                }
+            }
+            Axis::Preceding => {
+                let end = document.preceding_end(node);
+                let mut other = end;
+                while other > 0 {
+                    other -= 1;
+                    if ends[other] <= end {
+                        visited += 1;
+                        if self.passes(&quick, test, principal, other) {
+                            out.push(other);
+                        }
+                    }
+                }
+            }
+            Axis::Following | Axis::Descendant | Axis::DescendantOrSelf => {
+                let (mut other, end) = match axis {
+                    Axis::Following => (document.following_start(node), document.len()),
+                    _ => (node + 1, document.end(node)),
+                };
+                if axis == Axis::DescendantOrSelf {
+                    visited += 1;
+                    if self.test(test, principal, node) {
+                        out.push(node);
+                    }
+                }
+                while other < end {
+                    if ends[other] != usize::MAX {
+                        visited += 1;
+                        if self.passes(&quick, test, principal, other) {
+                            out.push(other);
+                        }
+                    }
+                    other += 1;
+                }
+            }
+            _ => self.walk(axis, node, |other| {
+                visited += 1;
+                if self.test(test, principal, other) {
+                    out.push(other);
+                }
+                true
+            }),
+        }
+        visited
+    }
+
+    /// Calls `visit` with each node on `axis` from `node`, in the axis's
+    /// order (reverse document order on the reverse axes: ancestor,
+    /// ancestor-or-self, preceding, preceding-sibling), until it returns
+    /// false.
+    fn walk(&self, axis: Axis, node: usize, mut visit: impl FnMut(usize) -> bool) {
+        let document = self.document;
+        match axis {
+            Axis::Itself => {
+                visit(node);
+            }
+            Axis::Child => {
+                for &child in document.children(node) {
+                    if !visit(child) {
+                        return;
+                    }
+                }
+            }
+            Axis::Descendant | Axis::DescendantOrSelf => {
+                if axis == Axis::DescendantOrSelf && !visit(node) {
+                    return;
+                }
+                for descendant in document.descendants(node) {
+                    if !visit(descendant) {
+                        return;
+                    }
+                }
+            }
+            Axis::Parent => {
+                if let Some(parent) = document.parent(node) {
+                    visit(parent);
+                }
+            }
+            Axis::Ancestor | Axis::AncestorOrSelf => {
+                if axis == Axis::AncestorOrSelf && !visit(node) {
+                    return;
+                }
+                let mut at = document.parent(node);
+                while let Some(ancestor) = at {
+                    if !visit(ancestor) {
+                        return;
+                    }
+                    at = document.parent(ancestor);
+                }
+            }
+            Axis::FollowingSibling => {
+                let (siblings, index) = document.siblings(node);
+                for &sibling in siblings.get(index + 1..).unwrap_or_default() {
+                    if !visit(sibling) {
+                        return;
+                    }
+                }
+            }
+            Axis::PrecedingSibling => {
+                let (siblings, index) = document.siblings(node);
+                for &sibling in siblings[..index].iter().rev() {
+                    if !visit(sibling) {
+                        return;
+                    }
+                }
+            }
             // After the node's subtree (an attribute's element's children
             // come after the attribute).
-            Axis::Following => (this.end..document.nodes.len())
-                .filter(|&other| document.nodes[other].is_tree_node())
-                .collect(),
+            Axis::Following => {
+                for other in document.following_start(node)..document.len() {
+                    if document.is_tree_node(other) && !visit(other) {
+                        return;
+                    }
+                }
+            }
             // Before the node, ancestors excluded: an ancestor's subtree
             // reaches past the node.
-            Axis::Preceding => (0..node)
-                .rev()
-                .filter(|&other| {
-                    let other = &document.nodes[other];
-                    other.end <= node && other.is_tree_node()
-                })
-                .collect(),
-            Axis::Attribute => this.attributes.clone().collect(),
-            Axis::Namespace => this.namespaces.clone().collect(),
+            Axis::Preceding => {
+                let end = document.preceding_end(node);
+                for other in (0..end).rev() {
+                    if document.is_tree_node(other) && document.end(other) <= end && !visit(other) {
+                        return;
+                    }
+                }
+            }
+            Axis::Attribute => {
+                for attribute in document.attributes(node) {
+                    if !visit(attribute) {
+                        return;
+                    }
+                }
+            }
+            Axis::Namespace => {
+                for namespace in document.namespaces(node) {
+                    if !visit(namespace) {
+                        return;
+                    }
+                }
+            }
         }
     }
 
-    fn test(&self, step: &Step, node: usize) -> bool {
-        let node = &self.document.nodes[node];
-        match &step.test {
-            NodeTest::Name(name) => {
-                node.kind == step.axis.principal_kind()
-                    && node.namespace_uri.is_none()
-                    && node.local_name == *name
+    /// `test` with the document's name id looked up, for [`Self::passes`].
+    fn quick_test(&self, test: &NodeTest, principal: Kind) -> QuickTest {
+        match test {
+            NodeTest::Node => QuickTest::Node,
+            NodeTest::Any if principal != Kind::Namespace => QuickTest::Kind(principal as u8),
+            NodeTest::Text => QuickTest::Kind(Kind::Text as u8),
+            NodeTest::Comment => QuickTest::Kind(Kind::Comment as u8),
+            NodeTest::Name(namespace, local_name) if principal != Kind::Namespace => {
+                QuickTest::Name(
+                    principal as u8,
+                    self.document.name_id(*namespace, local_name),
+                )
             }
-            NodeTest::Any => node.kind == step.axis.principal_kind(),
+            _ => QuickTest::Other,
+        }
+    }
+
+    /// Whether `node` (not a namespace node) passes `test`, as `quick`
+    /// checks it.
+    #[inline(always)]
+    fn passes(&self, quick: &QuickTest, test: &NodeTest, principal: Kind, node: usize) -> bool {
+        match *quick {
+            QuickTest::Node => true,
+            QuickTest::Kind(kind) => self.document.kinds()[node] as u8 == kind,
+            QuickTest::Name(kind, name) => {
+                self.document.kinds()[node] as u8 == kind && self.document.name_ids()[node] == name
+            }
+            QuickTest::Other => self.test(test, principal, node),
+        }
+    }
+
+    #[inline(always)]
+    fn test(&self, test: &NodeTest, principal: Kind, node: usize) -> bool {
+        let document = self.document;
+        match test {
+            NodeTest::Name(namespace, local_name) => {
+                document.kind(node) == principal
+                    && document.namespace_uri(node) == *namespace
+                    && document.local_name(node) == local_name
+            }
+            NodeTest::NamespaceAny(namespace) => {
+                document.kind(node) == principal && document.namespace_uri(node) == Some(namespace)
+            }
+            NodeTest::Any => document.kind(node) == principal,
             NodeTest::Node => true,
-            NodeTest::Text => node.kind == Kind::Text,
-            NodeTest::Comment => node.kind == Kind::Comment,
+            NodeTest::Text => document.kind(node) == Kind::Text,
+            NodeTest::Comment => document.kind(node) == Kind::Comment,
             NodeTest::ProcessingInstruction(target) => {
-                node.kind == Kind::ProcessingInstruction
+                document.kind(node) == Kind::ProcessingInstruction
                     && target
                         .as_ref()
-                        .is_none_or(|target| *target == node.local_name)
+                        .is_none_or(|target| target == document.local_name(node))
             }
         }
     }
@@ -1142,6 +1541,7 @@ impl Evaluator<'_> {
         let size = nodes.len();
         let mut kept = Vec::new();
         for (index, &node) in nodes.iter().enumerate() {
+            self.charge(1)?;
             let position = index + 1;
             let context = Context {
                 node,
@@ -1171,20 +1571,16 @@ impl Evaluator<'_> {
     /// nearest ancestor that has one) is `language` or a sublanguage of it,
     /// ignoring case (§4.3 `lang()`).
     fn lang(&self, node: usize, language: &str) -> bool {
-        let nodes = &self.document.nodes;
+        let document = self.document;
         let declared =
-            std::iter::successors(Some(node), |&node| nodes[node].parent).find_map(|node| {
-                nodes[node]
-                    .attributes
-                    .clone()
-                    .map(|a| &nodes[a])
-                    .find(|attribute| {
-                        attribute.local_name == "lang"
-                            && attribute.namespace_uri.as_deref() == Some(XML_NAMESPACE)
-                    })
+            std::iter::successors(Some(node), |&node| document.parent(node)).find_map(|node| {
+                document.attributes(node).find(|&attribute| {
+                    document.local_name(attribute) == "lang"
+                        && document.namespace_uri(attribute) == Some(XML_NAMESPACE)
+                })
             });
         declared.is_some_and(|attribute| {
-            let value = attribute.value.to_lowercase();
+            let value = document.string_value(attribute).to_lowercase();
             value
                 .strip_prefix(&language.to_lowercase())
                 .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
@@ -1201,7 +1597,7 @@ impl Evaluator<'_> {
         // The string of the argument, or the string-value of the context node.
         let string_or_context = || match values.first() {
             Some(value) => self.string(value),
-            None => self.string_value(context.node),
+            None => self.string_value(context.node).to_string(),
         };
         let number = |index: usize| self.number(&values[index]);
         Ok(match function {
@@ -1219,16 +1615,14 @@ impl Evaluator<'_> {
                     Some(Value::Nodes(nodes)) => nodes.first().copied(),
                     Some(_) => return Err(Invalid),
                 };
-                let name = node.map_or_else(String::new, |node| {
-                    let node = &self.document.nodes[node];
-                    match function {
-                        F::LocalName => node.local_name.clone(),
-                        F::NamespaceUri => node.namespace_uri.clone().unwrap_or_default(),
-                        _ => match &node.prefix {
-                            Some(prefix) => format!("{prefix}:{}", node.local_name),
-                            None => node.local_name.clone(),
-                        },
-                    }
+                let document = self.document;
+                let name = node.map_or_else(String::new, |node| match function {
+                    F::LocalName => document.local_name(node).into(),
+                    F::NamespaceUri => document.namespace_uri(node).unwrap_or_default().into(),
+                    _ => match document.prefix(node) {
+                        Some(prefix) => format!("{prefix}:{}", document.local_name(node)),
+                        None => document.local_name(node).into(),
+                    },
                 });
                 Value::String(name)
             }
@@ -1268,13 +1662,16 @@ impl Evaluator<'_> {
             F::Lang => Value::Boolean(self.lang(context.node, &string(0))),
             F::Number => Value::Number(match values.first() {
                 Some(value) => self.number(value),
-                None => string_to_number(&self.string_value(context.node)),
+                None => string_to_number(self.string_value(context.node)),
             }),
             F::Sum => match &values[0] {
                 // From positive zero: the sum of no node is 0.
-                Value::Nodes(nodes) => Value::Number(nodes.iter().fold(0.0, |sum, &node| {
-                    sum + string_to_number(&self.string_value(node))
-                })),
+                Value::Nodes(nodes) => {
+                    self.charge(nodes.len())?;
+                    Value::Number(nodes.iter().fold(0.0, |sum, &node| {
+                        sum + string_to_number(self.string_value(node))
+                    }))
+                }
                 _ => return Err(Invalid),
             },
             F::Floor => Value::Number(number(0).floor()),
