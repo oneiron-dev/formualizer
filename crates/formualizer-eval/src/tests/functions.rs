@@ -377,6 +377,31 @@ fn range_operator_composition_same_sheet() {
 }
 
 #[test]
+fn range_operator_value_reads_like_literal_range() {
+    crate::builtins::load_builtins();
+    let wb = TestWorkbook::new()
+        .with_cell_a1("Sheet1", "A1", LiteralValue::Int(1))
+        .with_cell_a1("Sheet1", "A2", LiteralValue::Int(5))
+        .with_cell_a1("Sheet1", "A3", LiteralValue::Int(9))
+        .with_cell_a1("Sheet1", "A4", LiteralValue::Int(13));
+    let ctx = interp(&wb);
+    let eval = |formula: &str| {
+        let ast = formualizer_parse::parser::parse(formula).unwrap();
+        ctx.evaluate_ast(&ast).unwrap().into_literal()
+    };
+    for (computed, literal, expected) in [
+        ("=SUM(INDEX(A1:A4,2):A4*1)", "=SUM(A2:A4*1)", 27.0),
+        ("=SUM(--(A1:INDEX(A1:A4,3)>=5))", "=SUM(--(A1:A3>=5))", 2.0),
+        ("=SUM(LEN(INDEX(A1:A4,2):A4))", "=SUM(LEN(A2:A4))", 4.0),
+        ("=SUM(INDEX(A1:A4,2):A4)", "=SUM(A2:A4)", 27.0),
+    ] {
+        assert_eq!(eval(computed), eval(literal), "{computed} vs {literal}");
+        assert_eq!(eval(computed), LiteralValue::Number(expected), "{computed}");
+    }
+    assert_eq!(eval("=INDEX(A1:A4,2):A4"), eval("=A2:A4"));
+}
+
+#[test]
 fn interpreter_evaluate_ast_as_reference_returns_reference_for_ast_reference() {
     let wb = TestWorkbook::new()
         .with_cell_a1("Sheet1", "A1", LiteralValue::Int(7))

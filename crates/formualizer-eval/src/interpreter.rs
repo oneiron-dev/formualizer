@@ -720,21 +720,17 @@ impl<'a> Interpreter<'a> {
                     return self.intersection_value(intersection);
                 }
                 if op == ":" {
-                    let lref =
-                        self.evaluate_arena_ast_as_reference(*left_id, data_store, sheet_registry)?;
-                    let rref = self.evaluate_arena_ast_as_reference(
-                        *right_id,
-                        data_store,
-                        sheet_registry,
-                    )?;
-                    return match crate::reference::combine_references(&lref, &rref) {
-                        Ok(_r) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                            ExcelError::new(ExcelErrorKind::Ref).with_message(
-                                "Reference produced by ':' cannot be used directly as a value",
-                            ),
-                        ))),
-                        Err(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
-                    };
+                    let range = self
+                        .evaluate_arena_ast_as_reference(*left_id, data_store, sheet_registry)
+                        .and_then(|lref| {
+                            let rref = self.evaluate_arena_ast_as_reference(
+                                *right_id,
+                                data_store,
+                                sheet_registry,
+                            )?;
+                            crate::reference::combine_references(&lref, &rref)
+                        });
+                    return self.range_value(range);
                 }
 
                 let left_calc = self.evaluate_arena_ast(*left_id, data_store, sheet_registry)?;
@@ -1055,6 +1051,19 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The value of a `:` range: its cells, read exactly like a literal range
+    /// of the same area, or the error that kept the range from forming.
+    fn range_value(
+        &self,
+        range: Result<ReferenceType, ExcelError>,
+    ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        match range {
+            Ok(reference) => self.eval_reference_to_calc(&reference),
+            Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+            Err(error) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error))),
+        }
+    }
+
     fn eval_reference(&self, reference: &ReferenceType) -> Result<LiteralValue, ExcelError> {
         self.eval_reference_to_calc(reference)
             .map(|cv| cv.into_literal())
@@ -1304,6 +1313,13 @@ impl<'a> Interpreter<'a> {
             });
             return self.intersection_value(intersection);
         }
+        if op == ":" {
+            let range = self.evaluate_ast_as_reference(left_node).and_then(|lref| {
+                let rref = self.evaluate_ast_as_reference(right_node)?;
+                crate::reference::combine_references(&lref, &rref)
+            });
+            return self.range_value(range);
+        }
         let left_calc = self.evaluate_ast(left_node)?;
         let left_format = left_calc.format_id();
         let left = left_calc.into_literal();
@@ -1340,16 +1356,6 @@ impl<'a> Interpreter<'a> {
             "&" => self
                 .concat(left, right)
                 .map(crate::traits::CalcValue::Scalar),
-            ":" => {
-                let left_ref = self.evaluate_ast_as_reference(left_node)?;
-                let right_ref = self.evaluate_ast_as_reference(right_node)?;
-                match crate::reference::combine_references(&left_ref, &right_ref) {
-                    Ok(_) => Err(ExcelError::new(ExcelErrorKind::Ref).with_message(
-                        "Reference produced by ':' cannot be used directly as a value",
-                    )),
-                    Err(error) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error))),
-                }
-            }
             _ => {
                 Err(ExcelError::new(ExcelErrorKind::NImpl)
                     .with_message(format!("Binary op '{op}'")))
