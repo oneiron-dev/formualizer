@@ -25,6 +25,17 @@ fn arg_byref_array() -> Vec<ArgSchema> {
             required: false,
             ..ArgSchema::number_lenient_scalar()
         },
+        // area_num (reference form) defaults to area 1
+        ArgSchema {
+            kinds: smallvec::smallvec![ArgKind::Number],
+            required: false,
+            by_ref: false,
+            shape: ShapeKind::Scalar,
+            coercion: CoercionPolicy::NumberStrict,
+            max: None,
+            repeating: None,
+            default: None,
+        },
     ]
 }
 
@@ -151,6 +162,28 @@ impl IndexFn {
         }
     }
 
+    /// Whether area_num selects the source's one area. A range or array is a
+    /// single area, so only area 1 (or an omitted area_num) selects it; any
+    /// other area, 0 included, lies outside the reference. area_num reads as
+    /// a number like the schema declares it (truncated; a blank is 0), so an
+    /// error area_num is the result in reference context as in value context
+    /// and text is `#VALUE!`. `None` for an array area_num.
+    fn first_area_selected<'a, 'b>(
+        args: &[ArgumentHandle<'a, 'b>],
+    ) -> Result<Option<bool>, ExcelError> {
+        let Some(area) = args.get(3).filter(|area| !area.is_omitted()) else {
+            return Ok(Some(true));
+        };
+        match area.value()? {
+            crate::traits::CalcValue::Range(_)
+            | crate::traits::CalcValue::Scalar(LiteralValue::Array(_)) => Ok(None),
+            value => {
+                let area = crate::coercion::to_number_strict(&value.into_literal())?;
+                Ok(Some(area.trunc() == 1.0))
+            }
+        }
+    }
+
     fn bounded_dimensions(base: &ReferenceType) -> Option<(u32, u32)> {
         match base {
             ReferenceType::Cell { .. } => Some((1, 1)),
@@ -221,6 +254,12 @@ impl IndexFn {
         } else {
             None
         };
+        match Self::first_area_selected(args) {
+            Ok(Some(true)) => {}
+            Ok(Some(false)) => return Some(Err(ExcelError::new(ExcelErrorKind::Ref))),
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
+        }
 
         // A structured reference is the area it selects on the table's own
         // sheet, read from the table's placement without reading a cell:
@@ -384,6 +423,8 @@ impl IndexFn {
 ///   broadcast element by element like any single-value parameter.
 /// - In a workbook formula entered without the array flag, a range `row_num` or `column_num`
 ///   is implicitly intersected with the formula cell (`#VALUE!` when they do not cross).
+/// - `area_num` (reference form) picks an area of the reference; a single range or array is
+///   area 1, so an omitted or `1` area selects it and any other area returns `#REF!`.
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -424,10 +465,10 @@ impl IndexFn {
 /// Name: INDEX
 /// Type: IndexFn
 /// Min args: 2
-/// Max args: 3
+/// Max args: 4
 /// Variadic: false
-/// Signature: INDEX(arg1: any@range, arg2: number@scalar, arg3?: number@scalar)
-/// Arg schema: arg1{kinds=any,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
+/// Signature: INDEX(arg1: any@range, arg2: number@scalar, arg3?: number@scalar, arg4?: number@scalar)
+/// Arg schema: arg1{kinds=any,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberStrict,max=None,repeating=None,default=false}
 /// Caps: PURE, RETURNS_REFERENCE
 /// [formualizer-docgen:schema:end]
 impl Function for IndexFn {
@@ -472,7 +513,7 @@ impl Function for IndexFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Option<Result<ReferenceType, ExcelError>> {
-        if args.len() < 2 {
+        if !(2..=4).contains(&args.len()) {
             return Some(Err(ExcelError::new(ExcelErrorKind::Value)));
         }
         let base = match args[0].resolve_reference_or_value() {
@@ -563,6 +604,18 @@ impl Function for IndexFn {
             };
             if row < 0 || col < 0 {
                 return Ok(ref_err());
+            }
+            match Self::first_area_selected(args) {
+                Ok(Some(true)) => {}
+                Ok(Some(false)) => return Ok(ref_err()),
+                Ok(None) => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                        ExcelError::new(ExcelErrorKind::Value),
+                    )));
+                }
+                Err(error) => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
+                }
             }
             // A position beyond the address space is past the array's end.
             let (Ok(row), Ok(col)) = (usize::try_from(row), usize::try_from(col)) else {
@@ -1675,6 +1728,54 @@ mod tests {
             LiteralValue::Error(err) => assert_eq!(err.kind, ExcelErrorKind::Ref),
             other => panic!("expected #REF!, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn index_area_num_selects_the_single_area() {
+        // INDEX(reference,row_num,column_num,area_num): a single range (or an
+        // array) is area 1; any other area lies outside it.
+        let wb = TestWorkbook::new()
+            .with_cell_a1("Sheet1", "A2", LiteralValue::Int(2))
+            .with_cell_a1("Sheet1", "B2", LiteralValue::Int(20))
+            .with_cell_a1("Sheet1", "B3", LiteralValue::Int(30))
+            .with_function(std::sync::Arc::new(IndexFn))
+            .with_function(std::sync::Arc::new(crate::builtins::math::aggregate::SumFn));
+        let value = |formula: &str| evaluate_formula(formula, &wb).unwrap();
+        let error_kind = |formula: &str| match value(formula) {
+            LiteralValue::Error(err) => err.kind,
+            other => panic!("{formula}: expected an error, got {other:?}"),
+        };
+
+        assert_eq!(as_number(&value("=INDEX(A1:B3,2,2,1)")), 20.0);
+        assert_eq!(as_number(&value("=INDEX(A1:B3,2,2,1.9)")), 20.0);
+        assert_eq!(as_number(&value("=INDEX(A1:B3,2,2,)")), 20.0);
+        assert_eq!(as_number(&value("=INDEX(B1:B3,3,,1)")), 30.0);
+        assert_eq!(as_number(&value("=SUM(INDEX(A1:B3,0,2,1))")), 50.0);
+        assert_eq!(as_number(&value("=SUM(INDEX(A1:B3,2,2,1):B3)")), 50.0);
+        assert_eq!(as_number(&value("=INDEX({1,2;3,4},2,2,1)")), 4.0);
+
+        assert_eq!(error_kind("=INDEX(A1:B3,2,2,2)"), ExcelErrorKind::Ref);
+        assert_eq!(error_kind("=INDEX(A1:B3,2,2,0)"), ExcelErrorKind::Ref);
+        assert_eq!(error_kind("=SUM(INDEX(A1:B3,2,2,2))"), ExcelErrorKind::Ref);
+        assert_eq!(error_kind("=INDEX({1,2;3,4},2,2,2)"), ExcelErrorKind::Ref);
+        // A blank area_num is area 0.
+        assert_eq!(error_kind("=INDEX(A1:B3,2,2,C1)"), ExcelErrorKind::Ref);
+        assert_eq!(error_kind("=SUM(INDEX(A1:B3,2,2,C1))"), ExcelErrorKind::Ref);
+        assert_eq!(error_kind("=INDEX(A1:B3,2,2,1/0)"), ExcelErrorKind::Div);
+        assert_eq!(
+            error_kind("=SUM(INDEX(A1:B3,2,2,1/0))"),
+            ExcelErrorKind::Div
+        );
+        assert_eq!(error_kind("=INDEX(A1:B3,2,2,\"x\")"), ExcelErrorKind::Value);
+        assert_eq!(
+            error_kind("=SUM(INDEX(A1:B3,2,2,\"x\"))"),
+            ExcelErrorKind::Value
+        );
+        assert_eq!(error_kind("=INDEX(A1:B3,1,1,1,1)"), ExcelErrorKind::Value);
+        assert_eq!(
+            error_kind("=SUM(INDEX(A1:B3,1,1,1,1))"),
+            ExcelErrorKind::Value
+        );
     }
 
     #[test]
