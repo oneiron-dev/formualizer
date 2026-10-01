@@ -2846,22 +2846,34 @@ fn clean_float(val: f64) -> f64 {
     }
 }
 
-/// Round to the 15 significant digits Excel keeps when it writes a number as
-/// text (IMSIN("4+3i") is "-7.61923172032141-6.548120040911i").
-fn round_significant_15(val: f64) -> f64 {
-    if val == 0.0 || !val.is_finite() {
-        return val;
+/// One part of a complex number as Excel writes it in text: at most 15
+/// significant digits (IMSIN("4+3i") is "-7.61923172032141-6.548120040911i"),
+/// whole numbers without a decimal point, and E notation once the integer
+/// part needs more than 15 digits ("1.79769313486232E+308").
+fn complex_part_text(val: f64) -> String {
+    if !val.is_finite() {
+        return format!("{val}");
     }
-    // Rounding up near f64::MAX can overflow; a finite part stays finite.
-    let rounded: f64 = format!("{val:.14e}").parse().unwrap_or(val);
-    if rounded.is_finite() { rounded } else { val }
+    if val == val.trunc() && val.abs() < 1e15 {
+        return format!("{}", val as i64);
+    }
+    let sci = format!("{val:.14e}");
+    let (mantissa, exponent) = sci.split_once('e').expect("scientific");
+    let exponent: i32 = exponent.parse().expect("exponent");
+    if exponent >= 15 {
+        // Kept as text: rounding up near f64::MAX would overflow an f64.
+        let mantissa = mantissa.trim_end_matches('0').trim_end_matches('.');
+        return format!("{mantissa}E+{exponent:02}");
+    }
+    // Below 1e15 the 15-digit decimal round-trips through f64 exactly.
+    format!("{}", sci.parse::<f64>().unwrap_or(val))
 }
 
 /// Format a complex number as a string
 fn format_complex(real: f64, imag: f64, suffix: char) -> String {
-    // Clean up floating point noise; each part keeps 15 significant digits
-    let real = round_significant_15(clean_float(real));
-    let imag = round_significant_15(clean_float(imag));
+    // Clean up floating point noise
+    let real = clean_float(real);
+    let imag = clean_float(imag);
 
     // Handle special cases for cleaner output
     let real_is_zero = real.abs() < 1e-15;
@@ -2870,53 +2882,24 @@ fn format_complex(real: f64, imag: f64, suffix: char) -> String {
     if real_is_zero && imag_is_zero {
         return "0".to_string();
     }
-
     if imag_is_zero {
         // Purely real
-        if real == real.trunc() && real.abs() < 1e15 {
-            return format!("{}", real as i64);
-        }
-        return format!("{}", real);
+        return complex_part_text(real);
     }
-
-    if real_is_zero {
-        // Purely imaginary
-        if (imag - 1.0).abs() < 1e-15 {
-            return format!("{}", suffix);
-        }
-        if (imag + 1.0).abs() < 1e-15 {
-            return format!("-{}", suffix);
-        }
-        if imag == imag.trunc() && imag.abs() < 1e15 {
-            return format!("{}{}", imag as i64, suffix);
-        }
-        return format!("{}{}", imag, suffix);
-    }
-
-    // Both parts are non-zero
-    let real_str = if real == real.trunc() && real.abs() < 1e15 {
-        format!("{}", real as i64)
-    } else {
-        format!("{}", real)
-    };
 
     let imag_str = if (imag - 1.0).abs() < 1e-15 {
-        format!("+{}", suffix)
+        suffix.to_string()
     } else if (imag + 1.0).abs() < 1e-15 {
-        format!("-{}", suffix)
-    } else if imag > 0.0 {
-        if imag == imag.trunc() && imag.abs() < 1e15 {
-            format!("+{}{}", imag as i64, suffix)
-        } else {
-            format!("+{}{}", imag, suffix)
-        }
-    } else if imag == imag.trunc() && imag.abs() < 1e15 {
-        format!("{}{}", imag as i64, suffix)
+        format!("-{suffix}")
     } else {
-        format!("{}{}", imag, suffix)
+        format!("{}{suffix}", complex_part_text(imag))
     };
-
-    format!("{}{}", real_str, imag_str)
+    if real_is_zero {
+        // Purely imaginary
+        return imag_str;
+    }
+    let sign = if imag_str.starts_with('-') { "" } else { "+" };
+    format!("{}{sign}{imag_str}", complex_part_text(real))
 }
 
 /// Coerce a LiteralValue to a complex number string
@@ -5762,8 +5745,17 @@ mod tests {
         // Short parts are unchanged.
         assert_eq!(format_complex(3.0, -4.0, 'i'), "3-4i");
         assert_eq!(format_complex(0.5, 0.0, 'j'), "0.5");
-        // Rounding up near f64::MAX must not turn a finite part into infinity.
-        let near_max = format_complex(1.7976931348623155e308, 0.0, 'i');
-        assert!(!near_max.contains("inf"), "{near_max}");
+        // Near f64::MAX the 15-digit part stays text in E notation (rounding
+        // it back into f64 would overflow to infinity).
+        assert_eq!(
+            format_complex(1.7976931348623155e308, 0.0, 'i'),
+            "1.79769313486232E+308"
+        );
+        assert_eq!(
+            format_complex(1.0, -1.7976931348623155e308, 'i'),
+            "1-1.79769313486232E+308i"
+        );
+        assert_eq!(format_complex(0.0, 2.5e20, 'j'), "2.5E+20j");
+        assert_eq!(format_complex(1e15, 0.0, 'i'), "1E+15");
     }
 }

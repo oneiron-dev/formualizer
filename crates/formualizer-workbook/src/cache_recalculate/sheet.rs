@@ -286,7 +286,9 @@ pub(super) fn scan(
                                 ));
                             }
                             cell.has_formula = true;
-                            cell.calc_always = matches!(node.value("ca"), Some("1" | "true"));
+                            // ca is an XML Schema boolean: surrounding whitespace collapses.
+                            cell.calc_always =
+                                matches!(node.value("ca").map(str::trim), Some("1" | "true"));
                             cell.formula_kind = node.value("t").unwrap_or("normal").to_owned();
                             if !matches!(cell.formula_kind.as_str(), "normal" | "shared" | "array")
                             {

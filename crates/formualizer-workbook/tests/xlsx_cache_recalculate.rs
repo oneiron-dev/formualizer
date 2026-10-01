@@ -754,9 +754,25 @@ fn calculate_always_arrays_mark_each_member_with_an_empty_formula() {
         assert!(sheet.contains(expected), "{expected} in {sheet}");
     }
     // The anchors are untouched; five members gain a marker, B3 also a value.
+    // cache_cells_changed counts patched caches only: the markers are not.
     assert!(sheet.contains("<f t=\"array\" ref=\"B1:B4\" ca=\"1\">"));
     assert_eq!(sheet.matches("<f ca=\"1\"/>").count(), 5);
-    assert_eq!(out.cache_cells_changed, 5);
+    assert_eq!(out.cache_cells_changed, 1);
+    // ca is an XML Schema boolean, so " true " is true as well.
+    let padded = pack(&with_metadata(
+        parts(&rows.replacen("ca=\"1\"", "ca=\" true \"", 1)),
+        XLDAPR,
+    ));
+    let padded_sheet = member(
+        &recalculate_xlsx_bytes(&padded, Default::default())
+            .unwrap()
+            .bytes,
+        SHEET,
+    );
+    assert!(
+        padded_sheet.contains("<c r=\"B2\"><f ca=\"1\"/><v>20</v></c>"),
+        "{padded_sheet}"
+    );
     // Excel's own markers are kept; recalculating again is an exact no-op.
     assert_eq!(
         recalculate_xlsx_bytes(&out.bytes, Default::default())

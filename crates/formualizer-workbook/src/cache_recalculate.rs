@@ -701,7 +701,8 @@ fn array_member_patches(
         if stale {
             cache_patches(data, &member.cell, &cache, patches);
         }
-        changed += usize::from(mark || stale);
+        // A marker alone is not a cache: only patched values count.
+        changed += usize::from(stale);
     }
     // Positions without a cell element cannot receive a value.
     for &index in results.keys() {
