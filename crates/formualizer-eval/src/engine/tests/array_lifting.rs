@@ -510,6 +510,29 @@ fn indirect_of_an_invalid_reference_is_ref_everywhere() {
 }
 
 #[test]
+fn each_indirect_array_element_reads_its_ref_text_like_a_single_call() {
+    // ERROR.TYPE: #DIV/0! is 2, #REF! is 4, #N/A is 7. An error element stays
+    // that error, a number or logical names no reference, text resolves.
+    assert_number(
+        "=SUMPRODUCT(IFERROR(ERROR.TYPE(N(INDIRECT({\"B1\";#N/A;5;TRUE;#DIV/0!}))),0))",
+        17.0,
+    );
+    assert_number(
+        "=SUMPRODUCT(IFERROR(N(INDIRECT({\"B1\";#N/A;5;\"B3\"})),0))",
+        4.0,
+    );
+    // The #N/A beyond a shorter array, in ref_text or in a1, is returned.
+    assert_number(
+        "=SUMPRODUCT(IFERROR(ERROR.TYPE(N(INDIRECT({\"B1\",\"B2\"},{TRUE,TRUE,TRUE}))),0))",
+        7.0,
+    );
+    assert_number(
+        "=SUMPRODUCT(IFERROR(ERROR.TYPE(N(INDIRECT({\"B1\",\"B2\",\"B3\"},{TRUE,TRUE}))),0))",
+        7.0,
+    );
+}
+
+#[test]
 fn only_n_and_t_read_an_array_of_references_as_values() {
     // An array of references has no value: other single-value parameters
     // see #VALUE!, as operators do.

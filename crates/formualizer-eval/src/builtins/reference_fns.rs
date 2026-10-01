@@ -852,7 +852,8 @@ pub struct IndirectFn;
 /// # Remarks
 /// - `a1_style` defaults to `TRUE` (A1 style parsing).
 /// - `a1_style=FALSE` (R1C1 parsing) is currently not implemented and returns `#N/IMPL!`.
-/// - Invalid or unresolved references return `#REF!`.
+/// - Invalid or unresolved references return `#REF!`; so does a number, logical or blank `ref_text`.
+/// - An error in `ref_text` or `a1_style` is returned unchanged.
 /// - The function is volatile because target references can change without direct dependency links.
 ///
 /// # Examples
@@ -967,20 +968,27 @@ fn indirect_text_reference(args: &[ArgumentHandle<'_, '_>]) -> Result<ReferenceT
         return Err(ExcelError::new(ExcelErrorKind::Value));
     }
 
+    // ref_text is read as text: an error value propagates unchanged, and a
+    // number, logical or blank becomes text that names no reference (#REF!).
     let ref_text = match args[0].value()?.into_literal() {
-        LiteralValue::Text(s) => s.to_string(),
-        _ => return Err(ExcelError::new(ExcelErrorKind::Value)),
+        LiteralValue::Text(s) => Some(s),
+        LiteralValue::Error(e) => return Err(e),
+        LiteralValue::Array(_) | LiteralValue::Pending => {
+            return Err(ExcelError::new(ExcelErrorKind::Value));
+        }
+        _ => None,
     };
 
+    // a1 is a logical argument: errors propagate, a blank cell is FALSE and
+    // "TRUE"/"FALSE" text converts.
     let a1_style = if args.len() >= 2 {
-        match args[1].value()?.into_literal() {
-            LiteralValue::Boolean(b) => b,
-            LiteralValue::Int(i) => i != 0,
-            LiteralValue::Number(n) => n != 0.0,
-            _ => return Err(ExcelError::new(ExcelErrorKind::Value)),
-        }
+        crate::coercion::to_logical(&args[1].value()?.into_literal())?
     } else {
         true
+    };
+
+    let Some(ref_text) = ref_text else {
+        return Err(ExcelError::new(ExcelErrorKind::Ref));
     };
 
     if !a1_style {

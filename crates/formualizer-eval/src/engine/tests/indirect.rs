@@ -91,6 +91,160 @@ fn indirect_invalid_ref_returns_ref_error() {
     }
 }
 
+fn error_kind(engine: &Engine<TestWorkbook>, row: u32, col: u32) -> Option<ExcelErrorKind> {
+    match engine.get_cell_value("Sheet1", row, col) {
+        Some(LiteralValue::Error(err)) => Some(err.kind),
+        _ => None,
+    }
+}
+
+#[test]
+fn indirect_propagates_error_in_ref_text() {
+    // Excel returns the error itself when ref_text evaluates to an error, in
+    // value and in reference contexts alike (it used to become #VALUE!).
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(5.0))
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 1, 2, parse("=NA()"))
+        .unwrap();
+    engine
+        .set_cell_value(
+            "Sheet1",
+            2,
+            2,
+            LiteralValue::Error(formualizer_common::ExcelError::new(ExcelErrorKind::Div)),
+        )
+        .unwrap();
+    let formulas = [
+        "=INDIRECT(NA())",
+        "=INDIRECT(1/0)",
+        "=INDIRECT(\"A\"&B1)",
+        "=INDIRECT(B2)",
+        "=SUM(INDIRECT(\"A\"&B1))",
+        "=INDIRECT(\"A\"&MATCH(9,A1:A1,0))",
+    ];
+    for (i, f) in formulas.iter().enumerate() {
+        engine
+            .set_cell_formula("Sheet1", 1, 3 + i as u32, parse(f))
+            .unwrap();
+    }
+    engine
+        .set_cell_formula("Sheet1", 2, 3, parse("=IFNA(INDIRECT(\"A\"&B1),\"none\")"))
+        .unwrap();
+
+    engine.evaluate_all().unwrap();
+
+    let expected = [
+        ExcelErrorKind::Na,
+        ExcelErrorKind::Div,
+        ExcelErrorKind::Na,
+        ExcelErrorKind::Div,
+        ExcelErrorKind::Na,
+        ExcelErrorKind::Na,
+    ];
+    for (i, kind) in expected.iter().enumerate() {
+        assert_eq!(
+            error_kind(&engine, 1, 3 + i as u32),
+            Some(*kind),
+            "{}",
+            formulas[i]
+        );
+    }
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 2, 3),
+        Some(LiteralValue::Text("none".to_string()))
+    );
+}
+
+#[test]
+fn indirect_non_text_ref_text_returns_ref_error() {
+    // A number, logical or blank ref_text becomes text that names no reference.
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(1.0))
+        .unwrap();
+    let formulas = [
+        "=INDIRECT(5)",
+        "=INDIRECT(TRUE)",
+        "=INDIRECT(A1)",
+        "=INDIRECT(B9)",
+        "=INDIRECT(\"\")",
+        "=SUM(INDIRECT(A1))",
+    ];
+    for (i, f) in formulas.iter().enumerate() {
+        engine
+            .set_cell_formula("Sheet1", 2, 1 + i as u32, parse(f))
+            .unwrap();
+    }
+
+    engine.evaluate_all().unwrap();
+
+    for (i, f) in formulas.iter().enumerate() {
+        assert_eq!(
+            error_kind(&engine, 2, 1 + i as u32),
+            Some(ExcelErrorKind::Ref),
+            "{f}"
+        );
+    }
+}
+
+#[test]
+fn indirect_a1_argument_is_coerced_as_logical() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+
+    engine
+        .define_name(
+            "MyValue",
+            NamedDefinition::Literal(LiteralValue::Number(77.0)),
+            NameScope::Workbook,
+        )
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(42.0))
+        .unwrap();
+    let formulas = [
+        "=INDIRECT(\"A1\",TRUE)",
+        "=INDIRECT(\"A1\",1)",
+        "=INDIRECT(\"A1\",\"TRUE\")",
+        "=SUM(INDIRECT(\"A1\",\"TRUE\"))",
+        // A blank a1 is FALSE; a defined name resolves in either style.
+        "=INDIRECT(\"MyValue\",B9)",
+    ];
+    for (i, f) in formulas.iter().enumerate() {
+        engine
+            .set_cell_formula("Sheet1", 2, 1 + i as u32, parse(f))
+            .unwrap();
+    }
+    engine
+        .set_cell_formula("Sheet1", 3, 1, parse("=INDIRECT(\"A1\",NA())"))
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 3, 2, parse("=INDIRECT(\"A1\",\"abc\")"))
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 3, 3, parse("=SUM(INDIRECT(\"A1\",NA()))"))
+        .unwrap();
+
+    engine.evaluate_all().unwrap();
+
+    let expected = [42.0, 42.0, 42.0, 42.0, 77.0];
+    for (i, n) in expected.iter().enumerate() {
+        assert_eq!(
+            engine.get_cell_value("Sheet1", 2, 1 + i as u32),
+            Some(LiteralValue::Number(*n)),
+            "{}",
+            formulas[i]
+        );
+    }
+    assert_eq!(error_kind(&engine, 3, 1), Some(ExcelErrorKind::Na));
+    assert_eq!(error_kind(&engine, 3, 2), Some(ExcelErrorKind::Value));
+    assert_eq!(error_kind(&engine, 3, 3), Some(ExcelErrorKind::Na));
+}
+
 #[test]
 fn indirect_retarget_parity_across_full_recalc_entrypoints() {
     let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
