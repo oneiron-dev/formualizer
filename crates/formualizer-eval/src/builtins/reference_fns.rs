@@ -368,6 +368,8 @@ impl IndexFn {
 /// - Non-numeric index arguments return `#VALUE!`.
 /// - An array `row_num` or `column_num` returns an array of the selected values, paired and
 ///   broadcast element by element like any single-value parameter.
+/// - In a workbook formula entered without the array flag, a range `row_num` or `column_num`
+///   is implicitly intersected with the formula cell (`#VALUE!` when they do not cross).
 ///
 /// # Examples
 /// ```yaml,sandbox

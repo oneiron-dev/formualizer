@@ -137,6 +137,128 @@ fn index_selects_one_value_per_array_row_or_column_number() {
     }
 }
 
+/// The values at `reads` after evaluating each formula at its (row, col)
+/// over the A1:C3 grid plus G1:G3 = 3,1,2 and E5:F5 = 2,1, as a workbook file
+/// stores them (legacy array semantics): `arrays` lists the (row, col, rows)
+/// of formulas entered with the array flag; every other formula is entered
+/// without it. Errors keep only their kind.
+fn file_values(
+    formulas: &[(u32, u32, &str)],
+    arrays: &[(u32, u32, u32)],
+    reads: &[(u32, u32)],
+) -> Vec<Option<LiteralValue>> {
+    let mut engine = engine();
+    for (row, col, value) in [
+        (1, 7, 3.0),
+        (2, 7, 1.0),
+        (3, 7, 2.0),
+        (5, 5, 2.0),
+        (5, 6, 1.0),
+    ] {
+        engine
+            .set_cell_value("Sheet1", row, col, LiteralValue::Number(value))
+            .unwrap();
+    }
+    for &(row, col, formula) in formulas {
+        engine
+            .set_cell_formula("Sheet1", row, col, parse(formula).unwrap())
+            .unwrap();
+    }
+    engine.use_legacy_array_semantics();
+    for &(row, col, rows) in arrays {
+        engine.declare_array_formula("Sheet1", row, col, rows, 1, false);
+    }
+    engine.evaluate_all().unwrap();
+    reads
+        .iter()
+        .map(
+            |&(row, col)| match engine.get_cell_value("Sheet1", row, col) {
+                Some(LiteralValue::Error(error)) => Some(LiteralValue::Error(error.kind.into())),
+                other => other,
+            },
+        )
+        .collect()
+}
+
+/// The values of formulas entered without the array flag.
+fn plain_formula_values(formulas: &[(u32, u32, &str)]) -> Vec<Option<LiteralValue>> {
+    let reads: Vec<(u32, u32)> = formulas.iter().map(|&(row, col, _)| (row, col)).collect();
+    file_values(formulas, &[], &reads)
+}
+
+#[test]
+fn index_intersects_a_range_selector_in_a_formula_without_the_array_flag() {
+    let number = |n: f64| Some(LiteralValue::Number(n));
+    let value_error = || Some(LiteralValue::Error(ExcelErrorKind::Value.into()));
+    let text = |t: &str| Some(LiteralValue::Text(t.into()));
+    // A column range picks the formula's row and a row range the formula's
+    // column; #VALUE! where they do not cross.
+    assert_eq!(
+        plain_formula_values(&[
+            (2, 8, "=INDEX($B$1:$B$3,G1:G3)"),
+            (3, 8, "=INDEX($B$1:$B$3,G1:G3)"),
+            (10, 8, "=INDEX($B$1:$B$3,G1:G3)"),
+            (10, 9, "=IFERROR(INDEX($B$1:$B$3,G1:G3),\"none\")"),
+            (10, 5, "=INDEX($B$1:$C$3,1,E5:F5)"),
+            (10, 6, "=INDEX($B$1:$C$3,1,E5:F5)"),
+            (10, 7, "=INDEX($B$1:$C$3,1,E5:F5)"),
+        ]),
+        vec![
+            number(1.0),
+            number(2.0),
+            value_error(),
+            text("none"),
+            number(45000.0),
+            number(1.0),
+            value_error(),
+        ]
+    );
+    // Inside a reference argument, and when INDEX is used as a reference.
+    assert_eq!(
+        plain_formula_values(&[
+            (2, 8, "=SUM(INDEX($B$1:$B$3,G1:G3))"),
+            (10, 8, "=SUM(INDEX($B$1:$B$3,G1:G3))"),
+            (3, 9, "=SUM(INDEX($B$1:$B$3,G1:G3):$B$3)"),
+        ]),
+        vec![number(1.0), value_error(), number(5.0)]
+    );
+    // A range given to MATCH's lookup value inside row_num intersects too:
+    // row 2 looks up G2 = 1, found at 2; row 11 crosses no row of G1:G3.
+    assert_eq!(
+        plain_formula_values(&[
+            (
+                2,
+                12,
+                "=IFERROR(INDEX($B$1:$B$3,MATCH(G1:G3,G1:G3,0)),\"none\")"
+            ),
+            (
+                11,
+                8,
+                "=IFERROR(INDEX($B$1:$B$3,MATCH(G1:G3,G1:G3,0)),\"none\")"
+            ),
+        ]),
+        vec![number(2.0), text("none")]
+    );
+    // An array is not a range: it is lifted, and a single cell shows its first
+    // element.
+    assert_eq!(
+        plain_formula_values(&[
+            (10, 8, "=INDEX($B$1:$B$3,{3;1;2})"),
+            (10, 9, "=SUM(INDEX($B$1:$B$3,{1;3}))"),
+        ]),
+        vec![number(3.0), number(4.0)]
+    );
+    // A formula entered with the array flag lifts over the range.
+    assert_eq!(
+        file_values(
+            &[(1, 10, "=INDEX($B$1:$B$3,G1:G3)")],
+            &[(1, 10, 3)],
+            &[(1, 10), (2, 10), (3, 10)],
+        ),
+        vec![number(3.0), number(1.0), number(2.0)]
+    );
+}
+
 #[test]
 fn concatenation_is_element_wise_over_arrays() {
     // A1:A3 & B1:B3 = "a1","b2","a3"
