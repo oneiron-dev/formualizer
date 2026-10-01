@@ -365,3 +365,109 @@ fn blank_elements_in_spilled_formula_results_finalize_to_zero() {
         assert_eq!(engine.get_cell_value("Sheet1", row, 3), None);
     }
 }
+
+#[test]
+fn lookup_blank_targets_stay_empty_until_published() {
+    // Excel's VLOOKUP and HLOOKUP return an empty target cell as an empty value:
+    // the formula cell shows 0, but VLOOKUP(..)&"" is "", and an array
+    // col_index_num leaves the empties out of MEDIAN and COUNT. A real 0 target
+    // still counts as 0.
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    let text = |s: &str| LiteralValue::Text(s.to_string());
+    let number = LiteralValue::Number;
+    // D1:F3 = A 0.25 0.5 / C <blank> <blank> / Z 0 0; D5:F7 is its transpose.
+    for (row, key, b, c) in [
+        (1, "A", Some(0.25), Some(0.5)),
+        (2, "C", None, None),
+        (3, "Z", Some(0.0), Some(0.0)),
+    ] {
+        engine.set_cell_value("Sheet1", row, 4, text(key)).unwrap();
+        engine
+            .set_cell_value("Sheet1", 5, 3 + row, text(key))
+            .unwrap();
+        if let (Some(b), Some(c)) = (b, c) {
+            engine.set_cell_value("Sheet1", row, 5, number(b)).unwrap();
+            engine.set_cell_value("Sheet1", row, 6, number(c)).unwrap();
+            engine
+                .set_cell_value("Sheet1", 6, 3 + row, number(b))
+                .unwrap();
+            engine
+                .set_cell_value("Sheet1", 7, 3 + row, number(c))
+                .unwrap();
+        }
+    }
+    engine.set_cell_value("Sheet1", 1, 8, number(0.44)).unwrap();
+
+    let cases: &[(&str, Expected)] = &[
+        ("=VLOOKUP(\"C\",D1:F3,2,FALSE)", Expected::Number(0.0)),
+        ("=VLOOKUP(\"C\",D1:F3,2,FALSE)&\"\"", Expected::Text("")),
+        (
+            "=VLOOKUP(\"C\",D1:F3,2,FALSE)=\"\"",
+            Expected::Boolean(true),
+        ),
+        ("=VLOOKUP(\"C\",D1:F3,2,FALSE)=0", Expected::Boolean(true)),
+        ("=LEN(VLOOKUP(\"C\",D1:F3,2,FALSE))", Expected::Number(0.0)),
+        (
+            "=MEDIAN(H1,VLOOKUP(\"C\",D1:F3,{2,3},FALSE))",
+            Expected::Number(0.44),
+        ),
+        (
+            "=IF(MEDIAN(H1,VLOOKUP(\"C\",D1:F3,{2,3},0))=H1,\"Pass\",\"Fail\")",
+            Expected::Text("Pass"),
+        ),
+        (
+            "=COUNT(VLOOKUP(\"C\",D1:F3,{2,3},FALSE))",
+            Expected::Number(0.0),
+        ),
+        ("=HLOOKUP(\"C\",D5:F7,2,FALSE)", Expected::Number(0.0)),
+        ("=HLOOKUP(\"C\",D5:F7,3,FALSE)&\"\"", Expected::Text("")),
+        (
+            "=MEDIAN(H1,HLOOKUP(\"C\",D5:F7,{2;3},FALSE))",
+            Expected::Number(0.44),
+        ),
+        // Unchanged: real zeros and numbers.
+        ("=VLOOKUP(\"Z\",D1:F3,2,FALSE)&\"\"", Expected::Text("0")),
+        (
+            "=MEDIAN(H1,VLOOKUP(\"Z\",D1:F3,{2,3},FALSE))",
+            Expected::Number(0.0),
+        ),
+        (
+            "=COUNT(VLOOKUP(\"Z\",D1:F3,{2,3},FALSE))",
+            Expected::Number(2.0),
+        ),
+        (
+            "=SUM(VLOOKUP(\"A\",D1:F3,{2,3},FALSE))",
+            Expected::Number(0.75),
+        ),
+        ("=HLOOKUP(\"Z\",D5:F7,2,FALSE)&\"\"", Expected::Text("0")),
+    ];
+    for (i, (formula, _)) in cases.iter().enumerate() {
+        engine
+            .set_cell_formula("Sheet1", 10 + i as u32, 1, parse(formula).unwrap())
+            .unwrap();
+    }
+    // A spilled lookup of empty targets still publishes zeros.
+    engine
+        .set_cell_formula(
+            "Sheet1",
+            40,
+            1,
+            parse("=VLOOKUP(\"C\",D1:F3,{2,3},FALSE)").unwrap(),
+        )
+        .unwrap();
+    engine.evaluate_all().unwrap();
+
+    for (i, (formula, expected)) in cases.iter().enumerate() {
+        assert_eq!(
+            engine.get_cell_value("Sheet1", 10 + i as u32, 1),
+            Some(expected_literal(*expected)),
+            "{formula}"
+        );
+    }
+    for col in 1..=2 {
+        assert_eq!(
+            engine.get_cell_value("Sheet1", 40, col),
+            Some(LiteralValue::Number(0.0))
+        );
+    }
+}

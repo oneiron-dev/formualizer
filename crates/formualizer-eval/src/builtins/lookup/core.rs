@@ -383,7 +383,8 @@ pub struct VLookupFn;
 /// - Numeric `range_lookup` values use logical coercion: zero is exact and nonzero is approximate.
 /// - If the lookup value is not found, returns `#N/A`; an error lookup value is returned as is.
 /// - If `col_index_num` is invalid, returns `#REF!` (or `#VALUE!` if non-numeric).
-/// - A matched empty target cell is materialized as numeric `0`.
+/// - A matched empty target cell returns an empty value, not `0`: the formula cell shows `0`, but
+///   `&""` gives `""` and an array index leaves it out of `MEDIAN`, `COUNT` or `AVERAGE`.
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -571,16 +572,13 @@ impl Function for VLookupFn {
 
                 match row_idx_opt {
                     Some(i) => {
+                        // An empty target cell stays empty, as in Excel: VLOOKUP(..)&"" is ""
+                        // and an array col_index_num leaves it out of MEDIAN or COUNT. A
+                        // formula cell still shows it as 0 (formula result finalization).
                         let target_col_idx = (col_index - 1) as usize;
-                        let v = rv.get_cell(i, target_col_idx);
-                        // Excel treats a direct reference to an empty cell as 0.
-                        // VLOOKUP/HLOOKUP return the referenced cell value, so match Excel by
-                        // materializing Empty as numeric 0. (Empty text "" remains Text(""))
-                        let v = match v {
-                            LiteralValue::Empty => LiteralValue::Number(0.0),
-                            other => other,
-                        };
-                        Ok(crate::traits::CalcValue::Scalar(v))
+                        Ok(crate::traits::CalcValue::Scalar(
+                            rv.get_cell(i, target_col_idx),
+                        ))
                     }
                     None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                         ExcelError::new(ExcelErrorKind::Na),
@@ -624,10 +622,6 @@ impl Function for VLookupFn {
                             .and_then(|r| r.get(target_col_idx))
                             .cloned()
                             .unwrap_or(LiteralValue::Empty);
-                        let val = match val {
-                            LiteralValue::Empty => LiteralValue::Number(0.0),
-                            other => other,
-                        };
                         Ok(crate::traits::CalcValue::Scalar(val))
                     }
                     None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -654,7 +648,8 @@ pub struct HLookupFn;
 /// - Numeric `range_lookup` values use logical coercion: zero is exact and nonzero is approximate.
 /// - If the lookup value is not found, returns `#N/A`; an error lookup value is returned as is.
 /// - If `row_index_num` is invalid, returns `#REF!` (or `#VALUE!` if non-numeric).
-/// - A matched empty target cell is materialized as numeric `0`.
+/// - A matched empty target cell returns an empty value, not `0`: the formula cell shows `0`, but
+///   `&""` gives `""` and an array index leaves it out of `MEDIAN`, `COUNT` or `AVERAGE`.
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -840,13 +835,11 @@ impl Function for HLookupFn {
 
                 match col_idx_opt {
                     Some(i) => {
+                        // An empty target cell stays empty, as in VLOOKUP.
                         let target_row_idx = (row_index - 1) as usize;
-                        let v = rv.get_cell(target_row_idx, i);
-                        let v = match v {
-                            LiteralValue::Empty => LiteralValue::Number(0.0),
-                            other => other,
-                        };
-                        Ok(crate::traits::CalcValue::Scalar(v))
+                        Ok(crate::traits::CalcValue::Scalar(
+                            rv.get_cell(target_row_idx, i),
+                        ))
                     }
                     None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                         ExcelError::new(ExcelErrorKind::Na),
@@ -889,10 +882,6 @@ impl Function for HLookupFn {
                             .and_then(|r| r.get(i))
                             .cloned()
                             .unwrap_or(LiteralValue::Empty);
-                        let val = match val {
-                            LiteralValue::Empty => LiteralValue::Number(0.0),
-                            other => other,
-                        };
                         Ok(crate::traits::CalcValue::Scalar(val))
                     }
                     None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -1233,9 +1222,9 @@ mod tests {
     }
 
     #[test]
-    fn vlookup_blank_target_cell_returns_zero() {
-        // Excel treats a direct reference to an empty cell as 0.
-        // VLOOKUP should therefore return 0 (not Empty) when the found cell is empty.
+    fn vlookup_blank_target_cell_returns_empty() {
+        // Excel's VLOOKUP returns an empty target as an empty value (VLOOKUP(..)&""
+        // is ""); only the formula cell shows it as 0, at result finalization.
         let wb = TestWorkbook::new()
             .with_function(Arc::new(VLookupFn))
             .with_cell_a1("Sheet1", "A1", LiteralValue::Int(1));
@@ -1262,7 +1251,7 @@ mod tests {
             .dispatch(&args, &ctx.function_context(None))
             .unwrap()
             .into_literal();
-        assert_eq!(v, LiteralValue::Number(0.0));
+        assert_eq!(v, LiteralValue::Empty);
     }
 
     #[test]
@@ -1482,7 +1471,7 @@ mod tests {
     }
 
     #[test]
-    fn hlookup_blank_target_cell_returns_zero() {
+    fn hlookup_blank_target_cell_returns_empty() {
         let wb = TestWorkbook::new()
             .with_function(Arc::new(HLookupFn))
             .with_cell_a1("Sheet1", "A1", LiteralValue::Int(1));
@@ -1509,7 +1498,7 @@ mod tests {
             .dispatch(&args, &ctx.function_context(None))
             .unwrap()
             .into_literal();
-        assert_eq!(v, LiteralValue::Number(0.0));
+        assert_eq!(v, LiteralValue::Empty);
     }
 
     #[test]

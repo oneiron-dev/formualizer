@@ -866,6 +866,32 @@ fn single_cell_array_formulas_evaluate_with_array_semantics() {
     );
 }
 #[test]
+fn lookup_of_empty_targets_stays_empty_inside_the_formula() {
+    // A1:C3 = A 0.25 0.5 / C <empty> <empty> / Z 0 0, H1 = 0.44. VLOOKUP with
+    // an array col_index_num leaves the empty targets out of MEDIAN and COUNT
+    // (array formulas, as Excel saves them), &"" reads them as "", and a cell
+    // whose result is an empty target, alone or in an array extent, shows 0.
+    let rows = "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>A</t></is></c><c r=\"B1\"><v>0.25</v></c><c r=\"C1\"><v>0.5</v></c>\
+        <c r=\"D1\" t=\"str\"><f t=\"array\" ref=\"D1\">IF(MEDIAN(H1,VLOOKUP(\"C\",$A$1:$C$3,{2,3},0))=H1,\"Pass\",\"Fail\")</f><v>Fail</v></c><c r=\"H1\"><v>0.44</v></c></row>\
+        <row r=\"2\"><c r=\"A2\" t=\"inlineStr\"><is><t>C</t></is></c><c r=\"D2\"><f t=\"array\" ref=\"D2\">COUNT(VLOOKUP(\"C\",$A$1:$C$3,{2,3},0))</f><v>2</v></c><c r=\"E2\"><f t=\"array\" ref=\"E2\">COUNT(VLOOKUP(\"Z\",$A$1:$C$3,{2,3},0))</f><v>9</v></c></row>\
+        <row r=\"3\"><c r=\"A3\" t=\"inlineStr\"><is><t>Z</t></is></c><c r=\"B3\"><v>0</v></c><c r=\"C3\"><v>0</v></c>\
+        <c r=\"D3\"><f t=\"array\" ref=\"D3:E3\">VLOOKUP(\"C\",$A$1:$C$3,{2,3},0)</f><v>9</v></c><c r=\"E3\"><v>9</v></c></row>\
+        <row r=\"4\"><c r=\"D4\" t=\"str\"><f>VLOOKUP(\"C\",$A$1:$C$3,2,0)&amp;\"x\"</f><v>0x</v></c><c r=\"E4\"><f>VLOOKUP(\"C\",$A$1:$C$3,3,0)</f><v>9</v></c><c r=\"F4\" t=\"str\"><f>HLOOKUP(0.25,$B$1:$C$2,2,0)&amp;\"x\"</f><v>0x</v></c></row>";
+    let out = recalculate_xlsx_bytes(&pack(&parts(rows)), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "=H1,\"Pass\",\"Fail\")</f><v>Pass</v>",
+        "COUNT(VLOOKUP(\"C\",$A$1:$C$3,{2,3},0))</f><v>0</v>",
+        "COUNT(VLOOKUP(\"Z\",$A$1:$C$3,{2,3},0))</f><v>2</v>",
+        "ref=\"D3:E3\">VLOOKUP(\"C\",$A$1:$C$3,{2,3},0)</f><v>0</v></c><c r=\"E3\"><v>0</v>",
+        "&amp;\"x\"</f><v>x</v></c><c r=\"E4\">",
+        "<f>VLOOKUP(\"C\",$A$1:$C$3,3,0)</f><v>0</v>",
+        "HLOOKUP(0.25,$B$1:$C$2,2,0)&amp;\"x\"</f><v>x</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected}: {sheet}");
+    }
+}
+#[test]
 fn misplaced_arrays_and_rich_value_metadata_stay_unsupported() {
     // A multi-cell array anchored away from its extent's top-left.
     let multi = "<row r=\"2\"><c r=\"B2\"><f t=\"array\" ref=\"A1:B2\">{1;2}</f><v>1</v></c></row>";

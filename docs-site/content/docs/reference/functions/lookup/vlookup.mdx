@@ -18,7 +18,8 @@ description: "VLOOKUP: Looks up a value in the first column of a table and retur
  - Numeric `range_lookup` values use logical coercion: zero is exact and nonzero is approximate.
  - If the lookup value is not found, returns `#N/A`; an error lookup value is returned as is.
  - If `col_index_num` is invalid, returns `#REF!` (or `#VALUE!` if non-numeric).
- - A matched empty target cell is materialized as numeric `0`.
+ - A matched empty target cell returns an empty value, not `0`: the formula cell shows `0`, but
+   `&amp;""` gives `""` and an array index leaves it out of `MEDIAN`, `COUNT` or `AVERAGE`.
 
 ## Examples
 
