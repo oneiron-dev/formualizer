@@ -439,7 +439,24 @@ impl DependencyGraph {
             position: i64,
             explicit_col: Option<i64>,
         ) -> Option<bool> {
-            let (sr, er, sc, ec) = graph.compressed_range_resolved_bounds(range_sheet, range)?;
+            // Take the bounds INDEX itself resolves. A whole column or row spans the
+            // full grid, so A:C is never a single row even when every used cell sits
+            // in one row; only other open ranges clamp to the used region.
+            let one_based = |index: Option<u32>| index.map(|index| index.saturating_add(1));
+            let (sr, er, sc, ec) = match crate::builtins::reference_fns::index_static_bounds(
+                one_based(range.0),
+                one_based(range.2),
+                one_based(range.1),
+                one_based(range.3),
+            ) {
+                Some((sr, sc, er, ec)) => (
+                    sr.saturating_sub(1),
+                    er.saturating_sub(1),
+                    sc.saturating_sub(1),
+                    ec.saturating_sub(1),
+                ),
+                None => graph.compressed_range_resolved_bounds(range_sheet, range)?,
+            };
             // Mirrors INDEX: an omitted column on a multi-row range selects the entire row.
             let (row, col) = match explicit_col {
                 Some(col) => (position, col),

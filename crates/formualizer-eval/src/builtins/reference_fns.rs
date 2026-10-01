@@ -80,6 +80,27 @@ fn arg_byref_reference() -> Vec<ArgSchema> {
 const EXCEL_MAX_ROW: u32 = 1_048_576;
 const EXCEL_MAX_COL: u32 = 16_384;
 
+/// The 1-based inclusive `(start_row, start_col, end_row, end_col)` INDEX gives
+/// a range without consulting the sheet: the declared bounds of a bounded
+/// range, and the full grid along the open axis of a whole column or row (A:A,
+/// 1:1), not just the cells in use, so INDEX(A:A,65536) is the blank cell
+/// A65536 and A:C is never a single row. `None` for any other open range, which
+/// is clamped to the used region. The graph's static INDEX self-loop classifier
+/// uses this too, so both see the same shape.
+pub(crate) fn index_static_bounds(
+    start_row: Option<u32>,
+    start_col: Option<u32>,
+    end_row: Option<u32>,
+    end_col: Option<u32>,
+) -> Option<(u32, u32, u32, u32)> {
+    match (start_row, start_col, end_row, end_col) {
+        (Some(sr), Some(sc), Some(er), Some(ec)) => Some((sr, sc, er, ec)),
+        (None, Some(sc), None, Some(ec)) => Some((1, sc, EXCEL_MAX_ROW, ec)),
+        (Some(sr), None, Some(er), None) => Some((sr, 1, er, EXCEL_MAX_COL)),
+        _ => None,
+    }
+}
+
 fn resolve_reference_bounds<'b>(
     ctx: &dyn FunctionContext<'b>,
     base: &ReferenceType,
@@ -93,22 +114,10 @@ fn resolve_reference_bounds<'b>(
             end_col,
             ..
         } => {
-            if let (Some(sr), Some(sc), Some(er), Some(ec)) =
-                (start_row, start_col, end_row, end_col)
+            if let Some((sr, sc, er, ec)) =
+                index_static_bounds(*start_row, *start_col, *end_row, *end_col)
             {
-                return Ok((sheet.clone(), *sr, *sc, *er, *ec));
-            }
-            // A whole column or row (A:A, 1:1) spans the full grid, not just the
-            // cells in use: INDEX(A:A,65536) is the blank cell A65536.
-            if start_row.is_none() && end_row.is_none() {
-                if let (Some(sc), Some(ec)) = (start_col, end_col) {
-                    return Ok((sheet.clone(), 1, *sc, EXCEL_MAX_ROW, *ec));
-                }
-            }
-            if start_col.is_none() && end_col.is_none() {
-                if let (Some(sr), Some(er)) = (start_row, end_row) {
-                    return Ok((sheet.clone(), *sr, 1, *er, EXCEL_MAX_COL));
-                }
+                return Ok((sheet.clone(), sr, sc, er, ec));
             }
             let rv = ctx.resolve_range_view(base, ctx.current_sheet())?;
             if rv.is_empty() {
@@ -1384,6 +1393,28 @@ mod tests {
             ),
             other => panic!("expected A2:B2, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn index_static_bounds_spans_full_grid_on_whole_axes() {
+        // A1:C3 keeps its declared bounds.
+        assert_eq!(
+            index_static_bounds(Some(1), Some(1), Some(3), Some(3)),
+            Some((1, 1, 3, 3))
+        );
+        // A:C spans every row, so it is never one row whatever cells are in use.
+        assert_eq!(
+            index_static_bounds(None, Some(1), None, Some(3)),
+            Some((1, 1, EXCEL_MAX_ROW, 3))
+        );
+        // 2:4 spans every column.
+        assert_eq!(
+            index_static_bounds(Some(2), None, Some(4), None),
+            Some((2, 1, 4, EXCEL_MAX_COL))
+        );
+        // Other open ranges clamp to the used region instead.
+        assert_eq!(index_static_bounds(Some(1), Some(1), None, Some(3)), None);
+        assert_eq!(index_static_bounds(None, None, None, None), None);
     }
 
     #[test]

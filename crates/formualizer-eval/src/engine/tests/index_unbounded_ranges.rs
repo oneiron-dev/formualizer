@@ -293,6 +293,56 @@ fn static_index_self_loop_omitted_column_selects_entire_row() {
 }
 
 #[test]
+fn static_index_self_loop_whole_columns_used_in_one_row_select_entire_row() {
+    // INDEX(A:C,1) is the entire row A1:C1, like INDEX(A:C,1,0): a whole column
+    // spans the full grid, so it is never a single row, even when every used
+    // cell of A:C sits in row 1. A formula in C1 reading it is circular.
+    for mode in [
+        FormulaPlaneMode::Off,
+        FormulaPlaneMode::AuthoritativeExperimental,
+    ] {
+        let mut engine = Engine::new(
+            TestWorkbook::new(),
+            EvalConfig::default().with_formula_plane_mode(mode),
+        );
+        for (col, value) in [(1, 1), (2, 2), (5, 1), (6, 2), (9, 1), (10, 2)] {
+            engine
+                .set_cell_value("Sheet1", 1, col, LiteralValue::Int(value))
+                .unwrap();
+        }
+        engine
+            .set_cell_formula("Sheet1", 1, 3, parse("=SUM(INDEX(A:C,1))").unwrap())
+            .unwrap();
+        engine
+            .set_cell_formula("Sheet1", 1, 7, parse("=SUM(INDEX(E:G,1,0))").unwrap())
+            .unwrap();
+        // A row of the whole columns that does not hold the formula is no loop.
+        engine
+            .set_cell_formula("Sheet1", 2, 11, parse("=SUM(INDEX(I:K,1))").unwrap())
+            .unwrap();
+        // A lone index on a single whole row still selects a column.
+        engine
+            .set_cell_value("Sheet1", 5, 2, LiteralValue::Int(7))
+            .unwrap();
+        engine
+            .set_cell_formula("Sheet1", 5, 1, parse("=INDEX(5:5,2)").unwrap())
+            .unwrap();
+
+        engine.evaluate_all().unwrap();
+        assert_number(&engine, "Sheet1", 2, 11, 3.0);
+        assert_number(&engine, "Sheet1", 5, 1, 7.0);
+        for (row, col) in [(1, 3), (1, 7)] {
+            match engine.get_cell_value("Sheet1", row, col) {
+                Some(LiteralValue::Error(error)) => {
+                    assert_eq!(error.kind, ExcelErrorKind::Circ, "{mode:?}")
+                }
+                other => panic!("{mode:?} Sheet1!R{row}C{col}: expected #CIRC!, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
 fn index_whole_columns_omitted_column_selects_entire_row() {
     let mut engine = new_engine();
     for col in 1..=3 {
