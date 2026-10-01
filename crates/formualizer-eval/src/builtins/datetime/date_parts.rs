@@ -121,6 +121,32 @@ fn yearfrac_us_30_360_days(start: NaiveDate, end: NaiveDate) -> i64 {
         + i64::from(ed as i32 - sd as i32)
 }
 
+/// YEARFRAC basis 1 (actual/actual) year length (`start <= end`). Excel does
+/// not prorate each calendar year: it divides the actual days by one length.
+/// A range of more than a year uses the average length of the calendar years
+/// it touches (MS-OI29500 18.17.7.352 d). A range of a year or less uses 366
+/// when both dates are in the same leap year or the range includes a 29
+/// February, and 365 otherwise (ODFF 1.2 4.11.7.7; Apache POI and LibreOffice
+/// agree).
+fn yearfrac_actual_year_length(start: NaiveDate, end: NaiveDate) -> f64 {
+    let (sy, ey) = (start.year(), end.year());
+    let more_than_a_year =
+        ey > sy + 1 || (ey == sy + 1 && (end.month(), end.day()) > (start.month(), start.day()));
+
+    if more_than_a_year {
+        let total: f64 = (sy..=ey).map(days_in_year).sum();
+        total / f64::from(ey - sy + 1)
+    } else if sy == ey {
+        days_in_year(sy)
+    } else if [sy, ey].into_iter().any(|y| {
+        NaiveDate::from_ymd_opt(y, 2, 29).is_some_and(|feb29| start <= feb29 && feb29 <= end)
+    }) {
+        366.0
+    } else {
+        365.0
+    }
+}
+
 /// Returns the number of whole days between two date serial values.
 ///
 /// # Remarks
@@ -308,7 +334,8 @@ impl Function for Days360Fn {
 ///
 /// # Remarks
 /// - Supported `basis` values: `0` (US 30/360), `1` (actual/actual), `2` (actual/360), `3` (actual/365), `4` (European 30/360).
-/// - If `start_date > end_date`, the result is negative.
+/// - Argument order does not matter: if `start_date > end_date` the dates are swapped, so the result is never negative.
+/// - Basis `1` divides the actual days by one year length: for a range of more than a year, the average length of the calendar years it touches; otherwise 366 if both dates fall in the same leap year or the range includes a 29 February, else 365.
 /// - Invalid `basis` values return `#NUM!`.
 /// - Serial dates are interpreted with the workbook's date system (Excel 1900 or Excel 1904).
 ///
@@ -418,38 +445,24 @@ impl Function for YearFracFn {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(0.0)));
         }
 
-        let (s, e, sign) = if start <= end {
-            (start, end, 1.0)
+        // Argument order does not matter: Excel counts from the earlier date.
+        let (s, e) = if start <= end {
+            (start, end)
         } else {
-            (end, start, -1.0)
+            (end, start)
         };
 
         let actual_days = (e - s).num_days() as f64;
         let frac = match basis {
             0 => yearfrac_us_30_360_days(s, e) as f64 / 360.0,
-            1 => {
-                if s.year() == e.year() {
-                    actual_days / days_in_year(s.year())
-                } else {
-                    let start_year_end = NaiveDate::from_ymd_opt(s.year() + 1, 1, 1).unwrap();
-                    let end_year_start = NaiveDate::from_ymd_opt(e.year(), 1, 1).unwrap();
-
-                    let mut out = (start_year_end - s).num_days() as f64 / days_in_year(s.year());
-                    for year in (s.year() + 1)..e.year() {
-                        out += 1.0;
-                    }
-                    out + (e - end_year_start).num_days() as f64 / days_in_year(e.year())
-                }
-            }
+            1 => actual_days / yearfrac_actual_year_length(s, e),
             2 => actual_days / 360.0,
             3 => actual_days / 365.0,
             4 => days_360_between(s, e, true) as f64 / 360.0,
             _ => unreachable!(),
         };
 
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            sign * frac,
-        )))
+        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(frac)))
     }
 }
 
@@ -1290,6 +1303,86 @@ mod tests {
         // Basis 4 (European 30/360) is unchanged.
         assert_eq!(days("DATE(2022,1,31)", "DATE(2022,2,28)", 4), 28.0);
         assert_eq!(days("DATE(2022,1,15)", "DATE(2022,3,31)", 4), 75.0);
+    }
+
+    fn eval_yearfrac(formula: &str) -> f64 {
+        use crate::interpreter::Interpreter;
+        use formualizer_parse::parser::parse;
+
+        let wb = TestWorkbook::new()
+            .with_function(Arc::new(YearFracFn))
+            .with_function(Arc::new(super::super::date_time::DateFn));
+        let engine = crate::engine::Engine::new(wb, crate::engine::EvalConfig::default());
+        let interpreter = Interpreter::new(&engine, "Sheet1");
+        match interpreter
+            .evaluate_ast(&parse(formula).unwrap())
+            .map(|v| v.into_literal())
+        {
+            Ok(LiteralValue::Number(n)) => n,
+            other => panic!("{formula} gave {other:?}"),
+        }
+    }
+
+    /// YEARFRAC does not depend on argument order: Excel swaps the dates so
+    /// the start is the earlier one, on every basis.
+    #[test]
+    fn yearfrac_reversed_dates_give_the_same_positive_fraction() {
+        for (a, b) in [
+            ("DATE(2022,8,31)", "DATE(2023,2,28)"),
+            ("DATE(2004,12,31)", "DATE(2005,1,1)"),
+            ("DATE(2003,12,30)", "DATE(2004,12,31)"),
+            ("DATE(2022,1,15)", "DATE(2022,3,31)"),
+        ] {
+            for basis in 0..=4 {
+                let forward = eval_yearfrac(&format!("=YEARFRAC({a},{b},{basis})"));
+                let reversed = eval_yearfrac(&format!("=YEARFRAC({b},{a},{basis})"));
+                assert!(forward > 0.0, "YEARFRAC({a},{b},{basis}) = {forward}");
+                assert_eq!(reversed, forward, "YEARFRAC({b},{a},{basis})");
+            }
+        }
+        let v = eval_yearfrac("=YEARFRAC(DATE(2023,2,28),DATE(2022,8,31),0)");
+        assert!((v - 178.0 / 360.0).abs() < 1e-12, "got {v}");
+        let v = eval_yearfrac("=YEARFRAC(DATE(2005,1,1),DATE(2004,12,31),1)");
+        assert!((v - 0.0027397260273972603).abs() < 1e-15, "got {v}");
+    }
+
+    /// YEARFRAC basis 1 divides actual days by one year length: the average
+    /// of the calendar years touched for a range of more than a year;
+    /// otherwise 366 for a single leap year or a range including 29 Feb, 365
+    /// otherwise.
+    #[test]
+    fn yearfrac_basis1_actual_actual_year_length() {
+        for (start, end, days, year_length) in [
+            // More than a year: average of the years touched.
+            ("DATE(2003,12,30)", "DATE(2004,12,31)", 367.0, 365.5),
+            ("DATE(2021,1,1)", "DATE(2024,7,1)", 1277.0, 365.25),
+            ("DATE(2019,6,1)", "DATE(2021,6,1)", 731.0, 1096.0 / 3.0),
+            ("DATE(2023,3,1)", "DATE(2024,3,2)", 367.0, 365.5),
+            // A year or less across a year end: 366 only with a 29 February.
+            ("DATE(2004,12,31)", "DATE(2005,1,1)", 1.0, 365.0),
+            ("DATE(2023,12,31)", "DATE(2024,1,1)", 1.0, 365.0),
+            ("DATE(2023,3,1)", "DATE(2024,2,28)", 364.0, 365.0),
+            ("DATE(2023,3,1)", "DATE(2024,2,29)", 365.0, 366.0),
+            ("DATE(2023,3,1)", "DATE(2024,3,1)", 366.0, 366.0),
+            ("DATE(2024,1,15)", "DATE(2025,1,10)", 361.0, 366.0),
+            ("DATE(2024,2,29)", "DATE(2025,2,28)", 365.0, 366.0),
+            ("DATE(2024,3,1)", "DATE(2025,2,28)", 364.0, 365.0),
+            ("DATE(2023,1,1)", "DATE(2024,1,1)", 365.0, 365.0),
+            // Within one calendar year: that year's length.
+            ("DATE(2024,3,1)", "DATE(2024,12,31)", 305.0, 366.0),
+            ("DATE(2023,1,1)", "DATE(2023,7,1)", 181.0, 365.0),
+        ] {
+            let formula = format!("=YEARFRAC({start},{end},1)");
+            let got = eval_yearfrac(&formula);
+            let want = days / year_length;
+            assert!(
+                (got - want).abs() < 1e-12,
+                "{formula}: got {got}, want {want}"
+            );
+        }
+        // Excel-computed (Apache POI yearfracExamples.xls).
+        let v = eval_yearfrac("=YEARFRAC(DATE(2003,12,30),DATE(2004,12,31),1)");
+        assert!((v - 1.0041039671682626).abs() < 1e-12, "got {v}");
     }
 
     fn eval_date_part_formula(system: crate::engine::DateSystem, formula: &str) -> LiteralValue {
