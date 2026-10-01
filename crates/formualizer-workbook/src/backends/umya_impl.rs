@@ -633,12 +633,12 @@ impl SpreadsheetReader for UmyaAdapter {
         };
         let filter_databases =
             super::row_visibility::filter_databases(&adapter.defined_names().unwrap_or_default());
-        adapter.filter_hidden_rows = super::row_visibility::scan_hidden_rows(
+        adapter.filter_hidden_rows = super::row_visibility::scan_sheets(
             Cursor::new(data.as_slice()),
             &filter_databases,
         )
         .into_iter()
-        .map(|(sheet, rows)| (sheet, rows.filter))
+        .map(|(sheet, scan)| (sheet, scan.hidden_rows.filter))
         .collect();
         Ok(adapter)
     }

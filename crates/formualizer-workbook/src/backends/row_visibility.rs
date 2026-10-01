@@ -10,11 +10,17 @@
 //!
 //! Shared by the xlsx backends: each passes its package bytes and defined
 //! names, so a saved file splits the same way whichever backend loads it.
+//!
+//! The same pass over each worksheet records the extent (`ref`) of every
+//! array formula, legacy or dynamic. The cells of that extent other than the
+//! anchor store the anchor's last result, not constants of their own; a
+//! backend that streams cell values reads them here so it does not have to
+//! read the worksheet twice.
 
 use crate::traits::{DefinedName, DefinedNameDefinition};
 use crate::xlsx_path::{local_attr, read_member};
 use quick_xml::Reader as XmlReader;
-use quick_xml::events::Event;
+use quick_xml::events::{BytesStart, Event};
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Seek};
 use zip::ZipArchive;
@@ -34,13 +40,26 @@ struct AutoFilter {
     criteria: bool,
 }
 
-/// What one worksheet or table part says about hidden rows and filters.
+/// What one worksheet or table part says about hidden rows and filters, and
+/// the extents of its array formulas.
 #[derive(Debug, Default)]
 struct PartScan {
     hidden: Vec<u32>,
     filter_mode: bool,
     auto_filter: Option<AutoFilter>,
     table_ids: Vec<String>,
+    arrays: Vec<CellRect>,
+}
+
+/// 1-based `(first row, first col, last row, last col)` of a cell range.
+pub(super) type CellRect = (u32, u32, u32, u32);
+
+/// What the worksheet pass reads from one sheet.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct SheetScan {
+    pub(super) hidden_rows: HiddenRows,
+    /// The `ref` of each array formula (`<f t="array">`), in file order.
+    pub(super) array_extents: Vec<CellRect>,
 }
 
 /// First and last row of each sheet's `_xlnm._FilterDatabase` name, which
@@ -58,12 +77,13 @@ pub(super) fn filter_databases(names: &[DefinedName]) -> HashMap<String, (u32, u
         .collect()
 }
 
-/// Hidden rows of every sheet that has any, keyed by sheet name.
-/// `filter_databases` maps a sheet to the rows of its `_xlnm._FilterDatabase`.
-pub(super) fn scan_hidden_rows<R: Read + Seek>(
+/// Hidden rows and array formula extents of every sheet that has any, keyed
+/// by sheet name. `filter_databases` maps a sheet to the rows of its
+/// `_xlnm._FilterDatabase`.
+pub(super) fn scan_sheets<R: Read + Seek>(
     reader: R,
     filter_databases: &HashMap<String, (u32, u32)>,
-) -> HashMap<String, HiddenRows> {
+) -> HashMap<String, SheetScan> {
     let Ok(mut archive) = ZipArchive::new(reader) else {
         return HashMap::new();
     };
@@ -72,7 +92,17 @@ pub(super) fn scan_hidden_rows<R: Read + Seek>(
         let Some(mut scan) = scan_part(&mut archive, &part) else {
             continue;
         };
+        let array_extents = std::mem::take(&mut scan.arrays);
         if scan.hidden.is_empty() {
+            if !array_extents.is_empty() {
+                out.insert(
+                    sheet,
+                    SheetScan {
+                        hidden_rows: HiddenRows::default(),
+                        array_extents,
+                    },
+                );
+            }
             continue;
         }
         // (first, last) rows of each applied filter; the first is its header.
@@ -102,7 +132,13 @@ pub(super) fn scan_hidden_rows<R: Read + Seek>(
                 .iter()
                 .any(|&(first, last)| first < *row && *row <= last)
         });
-        out.insert(sheet, HiddenRows { manual, filter });
+        out.insert(
+            sheet,
+            SheetScan {
+                hidden_rows: HiddenRows { manual, filter },
+                array_extents,
+            },
+        );
     }
     out
 }
@@ -243,6 +279,12 @@ fn scan_part<R: Read + Seek>(archive: &mut ZipArchive<R>, part: &str) -> Option<
                     scan.table_ids.push(id);
                 }
             }
+            // <worksheet><sheetData><row><c><f t="array" ref="B1:B3">
+            (4, b"f") if is_array_formula(&e) => {
+                if let Some(extent) = local_attr(&xml, &e, b"ref").and_then(|r| cell_rect(&r)) {
+                    scan.arrays.push(extent);
+                }
+            }
             _ => {}
         }
         if !empty {
@@ -252,16 +294,30 @@ fn scan_part<R: Read + Seek>(archive: &mut ZipArchive<R>, part: &str) -> Option<
     Some(scan)
 }
 
+/// Whether a `<f>` element is an array formula (`t="array"`). Compares the
+/// raw value so the many ordinary formulas cost no allocation.
+fn is_array_formula(f: &BytesStart<'_>) -> bool {
+    f.attributes()
+        .filter_map(Result::ok)
+        .any(|attr| attr.key.local_name().as_ref() == b"t" && attr.value.as_ref() == b"array")
+}
+
 fn is_true(value: Option<String>) -> bool {
     matches!(value.as_deref(), Some("1" | "true"))
 }
 
 /// First and last row of an A1 range such as `B2:H96`.
 fn row_span(reference: &str) -> Option<(u32, u32)> {
+    let (first, _, last, _) = cell_rect(reference)?;
+    Some((first, last))
+}
+
+/// The cells of an A1 range such as `B2:H96` or `C4`.
+fn cell_rect(reference: &str) -> Option<CellRect> {
     let (start, end) = reference.split_once(':').unwrap_or((reference, reference));
-    let row = |cell: &str| formualizer_common::coord::parse_a1_1based(cell.trim()).ok();
-    let (first, last) = (row(start)?.0, row(end)?.0);
-    Some((first.min(last), first.max(last)))
+    let cell = |cell: &str| formualizer_common::coord::parse_a1_1based(cell.trim()).ok();
+    let ((r1, c1, ..), (r2, c2, ..)) = (cell(start)?, cell(end)?);
+    Some((r1.min(r2), c1.min(c2), r1.max(r2), c1.max(c2)))
 }
 
 #[cfg(test)]
@@ -296,9 +352,10 @@ mod tests {
             .iter()
             .map(|&(sheet, first, last)| (sheet.to_string(), (first, last)))
             .collect();
-        scan_hidden_rows(Cursor::new(package(&parts)), &databases)
+        scan_sheets(Cursor::new(package(&parts)), &databases)
             .remove("Data")
             .unwrap_or_default()
+            .hidden_rows
     }
 
     /// Rows 1-7, with rows 1 (the filter header), 3, 4 and 7 hidden.
@@ -417,5 +474,35 @@ mod tests {
         let xml = r#"<worksheet><sheetData><row r="1048576" hidden="1"/><row hidden="1"/></sheetData></worksheet>"#;
         let rows = scan(xml, &[], &[]);
         assert_eq!(rows.manual, vec![1_048_576]);
+    }
+
+    #[test]
+    fn array_formula_extents_are_recorded_for_every_sheet_that_has_one() {
+        // A legacy array (B1:B3), a dynamic array (cm, D1:E2) and a one-cell
+        // array with an absolute ref, then formulas that are not arrays: a
+        // shared formula and a data table carry a ref too.
+        let xml = r#"<worksheet><sheetData><row r="1"><c r="B1"><f t="array" ref="B1:B3">C1:C3</f><v>1</v></c><c r="D1" cm="1"><f t="array" ref="D1:E2">C1:D2</f></c><c r="G1"><f t="array" ref="$G$1">C1:C3</f></c></row><row r="2"><c r="J2"><f t="shared" ref="J2:J4" si="0">C2</f></c><c r="K2"><f t="dataTable" ref="K2:K3" r1="A1"/></c><c r="L2"><f>C2</f></c></row></sheetData></worksheet>"#;
+        let mut parts = vec![
+            ("xl/workbook.xml", WORKBOOK),
+            ("xl/_rels/workbook.xml.rels", WORKBOOK_RELS),
+            ("xl/worksheets/sheet1.xml", xml),
+        ];
+        let scans = scan_sheets(Cursor::new(package(&parts)), &HashMap::new());
+        let data = &scans["Data"];
+        assert_eq!(
+            data.array_extents,
+            vec![(1, 2, 3, 2), (1, 4, 2, 5), (1, 7, 1, 7)]
+        );
+        assert_eq!(data.hidden_rows, HiddenRows::default());
+
+        // A sheet without arrays or hidden rows has no entry.
+        parts[2].1 = r#"<worksheet><sheetData><row r="1"><c r="A1"><f>1</f></c></row></sheetData></worksheet>"#;
+        assert!(scan_sheets(Cursor::new(package(&parts)), &HashMap::new()).is_empty());
+
+        // Hidden rows and arrays of one sheet come back together.
+        parts[2].1 = r#"<worksheet><sheetData><row r="1"><c r="A1"><f t="array" ref="A1:A2">B1:B2</f></c></row><row r="3" hidden="1"/></sheetData></worksheet>"#;
+        let scans = scan_sheets(Cursor::new(package(&parts)), &HashMap::new());
+        assert_eq!(scans["Data"].array_extents, vec![(1, 1, 2, 1)]);
+        assert_eq!(scans["Data"].hidden_rows.manual, vec![3]);
     }
 }

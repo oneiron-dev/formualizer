@@ -391,6 +391,68 @@ struct StreamWorksheetOptions {
     debug: bool,
     workbook_spool_usage: WorkbookSpoolUsage,
     shadow_relocation_comparator: Option<ShadowRelocationComparator>,
+    array_members: ArrayMembers,
+}
+
+/// The cells of a sheet's array formulas (legacy or dynamic), from each
+/// formula's `ref`. A cell of that extent other than the anchor stores the
+/// anchor's last result, not a constant of its own: loading it as a value
+/// would block the anchor's spill. Lookups follow the stream's row order.
+struct ArrayMembers {
+    /// 0-based inclusive `(first row, first col, last row, last col)` of each
+    /// extent, in ascending first-row order.
+    extents: Vec<(u32, u32, u32, u32)>,
+    /// Index of the first extent that starts below `row`.
+    next: usize,
+    /// Extents that cover `row`.
+    active: Vec<(u32, u32, u32, u32)>,
+    row: Option<u32>,
+}
+
+impl ArrayMembers {
+    /// From the 1-based extents a worksheet scan records.
+    fn new(extents: &[row_visibility::CellRect]) -> Self {
+        let mut extents: Vec<_> = extents
+            .iter()
+            .filter(|&&(r1, c1, _, _)| r1 > 0 && c1 > 0)
+            .map(|&(r1, c1, r2, c2)| (r1 - 1, c1 - 1, r2 - 1, c2 - 1))
+            .collect();
+        extents.sort_unstable();
+        Self {
+            extents,
+            next: 0,
+            active: Vec::new(),
+            row: None,
+        }
+    }
+
+    /// Whether the 0-based cell lies in an array formula's extent.
+    fn covers(&mut self, row: u32, col: u32) -> bool {
+        if self.extents.is_empty() {
+            return false;
+        }
+        if self.row != Some(row) {
+            if self.row.is_some_and(|last| row < last) {
+                // Rows out of order: restart the sweep.
+                self.next = 0;
+                self.active.clear();
+            }
+            self.active.retain(|&(_, _, last, _)| row <= last);
+            while let Some(&extent) = self.extents.get(self.next) {
+                if extent.0 > row {
+                    break;
+                }
+                if row <= extent.2 {
+                    self.active.push(extent);
+                }
+                self.next += 1;
+            }
+            self.row = Some(row);
+        }
+        self.active
+            .iter()
+            .any(|&(_, first, _, last)| (first..=last).contains(&col))
+    }
 }
 
 struct FormulaStaging {
@@ -542,7 +604,7 @@ pub struct CalamineAdapter {
     defined_names: OnceLock<Vec<DefinedName>>,
     external_link_targets: OnceLock<BTreeMap<u32, String>>,
     calc_settings: OnceLock<Option<CalcSettings>>,
-    hidden_rows: OnceLock<HashMap<String, row_visibility::HiddenRows>>,
+    sheet_scans: OnceLock<HashMap<String, row_visibility::SheetScan>>,
     load_stats: AdapterLoadStats,
     shadow_relocation_comparator: Option<ShadowRelocationComparator>,
     #[cfg(test)]
@@ -702,6 +764,7 @@ impl CalamineAdapter {
             debug,
             workbook_spool_usage,
             shadow_relocation_comparator,
+            mut array_members,
         } = options;
         let mut reader = workbook
             .worksheet_cells_reader(sheet)
@@ -927,6 +990,10 @@ impl CalamineAdapter {
             // Preserve existing KeepCachedValue behavior: a formula's cached
             // value is not handed to the value plane.
             if has_formula {
+                continue;
+            }
+            // Nor is an array formula member's: it is the anchor's result.
+            if array_members.covers(row0, col0) {
                 continue;
             }
             let Some(literal) = data_ref_to_literal(&record.value, engine.config.date_system)
@@ -1269,7 +1336,7 @@ impl CalamineAdapter {
             defined_names: OnceLock::new(),
             external_link_targets: OnceLock::new(),
             calc_settings: OnceLock::new(),
-            hidden_rows: OnceLock::new(),
+            sheet_scans: OnceLock::new(),
             load_stats: AdapterLoadStats::default(),
             shadow_relocation_comparator: None,
             #[cfg(test)]
@@ -1347,11 +1414,12 @@ impl CalamineAdapter {
         })
     }
 
-    /// Saved hidden rows of every sheet, split into manual and filter-hidden.
-    fn lazy_hidden_rows(&self) -> &HashMap<String, row_visibility::HiddenRows> {
-        self.hidden_rows.get_or_init(|| {
+    /// Saved hidden rows of every sheet, split into manual and filter-hidden,
+    /// and the extents of its array formulas.
+    fn lazy_sheet_scans(&self) -> &HashMap<String, row_visibility::SheetScan> {
+        self.sheet_scans.get_or_init(|| {
             let filter_databases = row_visibility::filter_databases(self.lazy_defined_names());
-            row_visibility::scan_hidden_rows(self.cancellable_reader(), &filter_databases)
+            row_visibility::scan_sheets(self.cancellable_reader(), &filter_databases)
         })
     }
 
@@ -1908,9 +1976,9 @@ impl SpreadsheetReader for CalamineAdapter {
 
     fn read_sheet(&mut self, sheet: &str) -> Result<SheetData, Self::Error> {
         let hidden_rows = self
-            .lazy_hidden_rows()
+            .lazy_sheet_scans()
             .get(sheet)
-            .cloned()
+            .map(|scan| scan.hidden_rows.clone())
             .unwrap_or_default();
         // Values
         let mut wb = self.workbook.write();
@@ -2037,6 +2105,11 @@ where
 
                 let shadow_relocation_comparator =
                     self.shadow_relocation_comparator.as_ref().map(Arc::clone);
+                let array_members = ArrayMembers::new(
+                    self.lazy_sheet_scans()
+                        .get(n)
+                        .map_or(&[], |scan| scan.array_extents.as_slice()),
+                );
                 #[cfg(test)]
                 let row_checkpoint_hook = self.stream_row_checkpoint_hook.as_deref();
                 let streamed = {
@@ -2054,6 +2127,7 @@ where
                                 files: workbook_spill_files_used,
                             },
                             shadow_relocation_comparator,
+                            array_members,
                         },
                         cancel.as_ref(),
                         #[cfg(test)]
@@ -2141,7 +2215,11 @@ where
                 }
                 self.loaded_sheets.insert(n.to_string());
 
-                let hidden_rows = self.lazy_hidden_rows().get(n).cloned().unwrap_or_default();
+                let hidden_rows = self
+                    .lazy_sheet_scans()
+                    .get(n)
+                    .map(|scan| scan.hidden_rows.clone())
+                    .unwrap_or_default();
                 for row in &hidden_rows.manual {
                     engine
                         .set_row_hidden(
@@ -2813,5 +2891,29 @@ mod tests {
         assert_eq!(data_ref_format(&time), Some(FormatId::TIME));
         assert_eq!(data_ref_format(&datetime), Some(FormatId::DATETIME));
         assert_eq!(data_ref_format(&duration), Some(FormatId::DURATION));
+    }
+
+    #[test]
+    fn array_members_cover_each_extent_in_stream_order_and_out_of_it() {
+        // 1-based: B1:B3, D2:E2, a one-cell array at G5 and A10:C1000.
+        let extents = [(10, 1, 1000, 3), (1, 2, 3, 2), (2, 4, 2, 5), (5, 7, 5, 7)];
+        let expected = |row: u32, col: u32| {
+            extents.iter().any(|&(r1, c1, r2, c2)| {
+                (r1..=r2).contains(&(row + 1)) && (c1..=c2).contains(&(col + 1))
+            })
+        };
+        let mut members = ArrayMembers::new(&extents);
+        // Row-major, as a worksheet streams.
+        for row in 0..1005 {
+            for col in 0..8 {
+                assert_eq!(members.covers(row, col), expected(row, col), "R{row}C{col}");
+            }
+        }
+        // Rows out of order, as a malformed worksheet may store them.
+        for (row, col) in [(1, 1), (999, 2), (0, 1), (4, 6), (1, 3), (1000, 0), (2, 1)] {
+            assert_eq!(members.covers(row, col), expected(row, col), "R{row}C{col}");
+        }
+        let mut none = ArrayMembers::new(&[]);
+        assert!(!none.covers(0, 0));
     }
 }
