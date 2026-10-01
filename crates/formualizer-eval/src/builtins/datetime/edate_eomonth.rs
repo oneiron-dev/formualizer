@@ -3,9 +3,10 @@
 use crate::args::ArgSchema;
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, FunctionContext};
-use chrono::{Datelike, NaiveDate};
+use chrono::NaiveDate;
 use formualizer_common::{
-    DateSystem, ExcelError, LiteralValue, date_to_serial_for, try_serial_to_date_for,
+    DateSystem, ExcelDateParts, ExcelError, LiteralValue, date_to_serial_for,
+    try_serial_to_display_date_parts_for,
 };
 use formualizer_macros::func_caps;
 
@@ -33,12 +34,82 @@ fn coerce_to_int(arg: &ArgumentHandle) -> Result<i32, ExcelError> {
         })
 }
 
+/// A month of Excel's calendar: the serial of its first day and its length.
+struct ExcelMonth {
+    first_serial: f64,
+    days: u32,
+}
+
+impl ExcelMonth {
+    /// Serial of `day` in this month. Day 0 is the day before the 1st, which
+    /// only arises from a start date of January 0, 1900 (serial 0).
+    fn serial_of_day(&self, day: u32) -> f64 {
+        self.first_serial + day as f64 - 1.0
+    }
+
+    fn last_day_serial(&self) -> f64 {
+        self.serial_of_day(self.days)
+    }
+}
+
+/// Excel calendar fields of a start-date serial (fraction dropped).
+///
+/// In the 1900 system serial 0 is January 0, 1900 and serial 60 is
+/// February 29, 1900, so month arithmetic starts from those fields rather
+/// than from the nearest real date.
+fn start_date_parts(system: DateSystem, serial: f64) -> Result<ExcelDateParts, ExcelError> {
+    try_serial_to_display_date_parts_for(system, serial)
+}
+
+/// The month `months` after the start date's month, in Excel's calendar.
+///
+/// Month lengths are measured in serials, so February 1900 has 29 days in the
+/// 1900 system (the leap-year compatibility day, serial 60). A month before
+/// the date system's first year or after 9999 is not an Excel date: #NUM!.
+fn shifted_month(
+    system: DateSystem,
+    start: ExcelDateParts,
+    months: i32,
+) -> Result<ExcelMonth, ExcelError> {
+    let index = start.year as i64 * 12 + (start.month as i64 - 1) + months as i64;
+    let year = index.div_euclid(12);
+    let month = (index.rem_euclid(12) + 1) as u32;
+    let first_year = match system {
+        DateSystem::Excel1900 => 1900,
+        DateSystem::Excel1904 => 1904,
+    };
+    if !(first_year..=9999).contains(&year) {
+        return Err(ExcelError::new_num());
+    }
+    let year = year as i32;
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let first_serial = first_of_month_serial(system, year, month)?;
+    let next_serial = first_of_month_serial(system, next_year, next_month)?;
+    Ok(ExcelMonth {
+        first_serial,
+        days: (next_serial - first_serial) as u32,
+    })
+}
+
+fn first_of_month_serial(system: DateSystem, year: i32, month: u32) -> Result<f64, ExcelError> {
+    NaiveDate::from_ymd_opt(year, month, 1)
+        .map(|date| date_to_serial_for(system, &date))
+        .ok_or_else(ExcelError::new_num)
+}
+
 /// Returns the serial date offset by a whole number of months from a start date.
 ///
 /// # Remarks
 /// - `months` is truncated to an integer before calculation.
 /// - If the target month has fewer days, the day is clamped to that month's last valid day.
 /// - Serials are interpreted and emitted with the workbook's date system (Excel 1900 or Excel 1904).
+/// - In the 1900 system the start date uses Excel's calendar: serial 0 is January 0, 1900 and
+///   February 1900 has 29 days (serial 60 is February 29, 1900).
+/// - A result before the date system's first year or after 9999 returns `#NUM!`.
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -108,24 +179,12 @@ impl Function for EdateFn {
         let start_serial = coerce_to_serial(&args[0], system)?;
         let months = coerce_to_int(&args[1])?;
 
-        let start_date = try_serial_to_date_for(system, start_serial)?;
+        let start = start_date_parts(system, start_serial)?;
+        let target = shifted_month(system, start, months)?;
 
-        // Calculate target year and month using Euclidean division
-        let total_months =
-            start_date.year() as i64 * 12 + start_date.month() as i64 + months as i64;
-        let tm = total_months - 1;
-        let target_year = tm.div_euclid(12) as i32;
-        let target_month = (tm.rem_euclid(12) + 1) as u32;
-
-        // Keep the same day, but handle month-end overflow
-        let max_day = last_day_of_month(target_year, target_month);
-        let target_day = start_date.day().min(max_day);
-
-        let target_date = NaiveDate::from_ymd_opt(target_year, target_month, target_day)
-            .ok_or_else(ExcelError::new_num)?;
-
+        // Keep the same day, clamped to the target month's last day.
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            date_to_serial_for(system, &target_date),
+            target.serial_of_day(start.day.min(target.days)),
         )))
     }
 }
@@ -136,6 +195,9 @@ impl Function for EdateFn {
 /// - `months` is truncated to an integer before offset calculation.
 /// - The returned date is always the month-end date for the target month.
 /// - Serials are interpreted and returned using the workbook's date system (Excel 1900 or Excel 1904).
+/// - In the 1900 system the start date uses Excel's calendar: serial 0 is January 0, 1900 and
+///   February 1900 ends on the 29th (serial 60).
+/// - A target month before the date system's first year or after 9999 returns `#NUM!`.
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -203,36 +265,13 @@ impl Function for EomonthFn {
         let start_serial = coerce_to_serial(&args[0], system)?;
         let months = coerce_to_int(&args[1])?;
 
-        let start_date = try_serial_to_date_for(system, start_serial)?;
-
-        // Calculate target year and month using Euclidean division
-        let total_months =
-            start_date.year() as i64 * 12 + start_date.month() as i64 + months as i64;
-        let tm = total_months - 1;
-        let target_year = tm.div_euclid(12) as i32;
-        let target_month = (tm.rem_euclid(12) + 1) as u32;
-
-        // Get the last day of the target month
-        let last_day = last_day_of_month(target_year, target_month);
-
-        let target_date = NaiveDate::from_ymd_opt(target_year, target_month, last_day)
-            .ok_or_else(ExcelError::new_num)?;
+        let start = start_date_parts(system, start_serial)?;
+        let target = shifted_month(system, start, months)?;
 
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            date_to_serial_for(system, &target_date),
+            target.last_day_serial(),
         )))
     }
-}
-
-/// Helper to get the last day of a month
-fn last_day_of_month(year: i32, month: u32) -> u32 {
-    // Try day 31, then 30, 29, 28
-    for day in (28..=31).rev() {
-        if NaiveDate::from_ymd_opt(year, month, day).is_some() {
-            return day;
-        }
-    }
-    28 // Fallback (should never reach here for valid months)
 }
 
 pub fn register_builtins() {
@@ -363,10 +402,139 @@ mod tests {
             .with_function(Arc::new(EomonthFn));
         let engine = Engine::new(wb, EvalConfig::default().with_date_system(system));
         let interpreter = Interpreter::new(&engine, "Sheet1");
-        interpreter
-            .evaluate_ast(&parse(formula).expect("formula should parse"))
-            .expect("formula should evaluate")
-            .into_literal()
+        match interpreter.evaluate_ast(&parse(formula).expect("formula should parse")) {
+            Ok(value) => value.into_literal(),
+            Err(e) => LiteralValue::Error(e),
+        }
+    }
+
+    fn assert_numbers(system: crate::engine::DateSystem, cases: &[(&str, f64)]) {
+        for &(formula, want) in cases {
+            assert_eq!(
+                eval_month_offset_formula(system, formula),
+                LiteralValue::Number(want),
+                "{formula} under {system:?}"
+            );
+        }
+    }
+
+    /// EOMONTH reads the start serial with Excel's 1900 calendar fields:
+    /// serial 0 is January 0, 1900 (so its month is January 1900), and
+    /// February 1900 has 29 days, ending on serial 60 (KB 214326).
+    #[test]
+    fn eomonth_uses_excel_1900_calendar_fields() {
+        use crate::engine::DateSystem;
+
+        assert_numbers(
+            DateSystem::Excel1900,
+            &[
+                ("=EOMONTH(0,0)", 31.0),
+                ("=EOMONTH(0.75,0)", 31.0),
+                ("=EOMONTH(0,1)", 60.0),
+                ("=EOMONTH(0,2)", 91.0),
+                ("=EOMONTH(0,12)", 397.0),
+                // A blank start cell is serial 0.
+                ("=EOMONTH(Z99,0)", 31.0),
+                ("=EOMONTH(Z99,1)", 60.0),
+                ("=EOMONTH(Z99,11)", 366.0),
+                // February 1900 ends on the 29th.
+                ("=EOMONTH(32,0)", 60.0),
+                ("=EOMONTH(59,0)", 60.0),
+                ("=EOMONTH(60,0)", 60.0),
+                ("=EOMONTH(31,1)", 60.0),
+                ("=EOMONTH(60,-1)", 31.0),
+                ("=EOMONTH(60,1)", 91.0),
+                ("=EOMONTH(60,12)", 425.0),
+                // Real dates either side are unchanged.
+                ("=EOMONTH(1,0)", 31.0),
+                ("=EOMONTH(61,0)", 91.0),
+                ("=EOMONTH(444,-3)", 366.0),
+                ("=EOMONTH(444,3)", 547.0),
+            ],
+        );
+    }
+
+    /// EDATE keeps the start date's Excel calendar day and clamps it to the
+    /// target month's length, where February 1900 has 29 days.
+    #[test]
+    fn edate_uses_excel_1900_calendar_fields() {
+        use crate::engine::DateSystem;
+
+        assert_numbers(
+            DateSystem::Excel1900,
+            &[
+                // February 29, 1900 is a start date in its own right.
+                ("=EDATE(60,0)", 60.0),
+                ("=EDATE(60.5,0)", 60.0),
+                ("=EDATE(60,-1)", 29.0),
+                ("=EDATE(60,1)", 89.0),
+                ("=EDATE(60,12)", 425.0),
+                // Day 29 or later in January lands on February 29, 1900.
+                ("=EDATE(29,1)", 60.0),
+                ("=EDATE(31,1)", 60.0),
+                ("=EDATE(59,0)", 59.0),
+                ("=EDATE(59,1)", 88.0),
+                ("=EDATE(61,-1)", 32.0),
+                // January 0, 1900 shifts to the day before each month's 1st.
+                ("=EDATE(0,0)", 0.0),
+                ("=EDATE(Z99,0)", 0.0),
+                ("=EDATE(0,1)", 31.0),
+                ("=EDATE(0,2)", 60.0),
+                ("=EDATE(0,12)", 366.0),
+                ("=EDATE(2.4,1)", 33.0),
+            ],
+        );
+    }
+
+    /// A shifted month before the date system's first year or after 9999 is
+    /// not an Excel date, so EDATE and EOMONTH return #NUM!.
+    #[test]
+    fn edate_eomonth_outside_excel_calendar_are_num() {
+        use crate::engine::DateSystem;
+        use formualizer_common::ExcelErrorKind;
+
+        for (system, formula) in [
+            (DateSystem::Excel1900, "=EOMONTH(0,-1)"),
+            (DateSystem::Excel1900, "=EOMONTH(1,-1)"),
+            (DateSystem::Excel1900, "=EDATE(0,-1)"),
+            (DateSystem::Excel1900, "=EDATE(1,-1)"),
+            (DateSystem::Excel1900, "=EDATE(31,-1)"),
+            (DateSystem::Excel1900, "=EDATE(2958465,1)"),
+            (DateSystem::Excel1900, "=EOMONTH(2958465,1)"),
+            (DateSystem::Excel1900, "=EDATE(-1,0)"),
+            (DateSystem::Excel1904, "=EOMONTH(0,-1)"),
+            (DateSystem::Excel1904, "=EDATE(0,-1)"),
+        ] {
+            let got = eval_month_offset_formula(system, formula);
+            assert!(
+                matches!(&got, LiteralValue::Error(e) if e.kind == ExcelErrorKind::Num),
+                "{formula} under {system:?}: {got:?}"
+            );
+        }
+
+        assert_numbers(
+            DateSystem::Excel1900,
+            &[
+                ("=EOMONTH(2958465,0)", 2958465.0),
+                ("=EDATE(2958465,0)", 2958465.0),
+            ],
+        );
+    }
+
+    /// The 1904 system has no pseudo-dates: serial 0 is 1904-01-01.
+    #[test]
+    fn edate_eomonth_1904_serial_zero_is_a_real_date() {
+        use crate::engine::DateSystem;
+
+        assert_numbers(
+            DateSystem::Excel1904,
+            &[
+                ("=EOMONTH(0,0)", 30.0),
+                ("=EOMONTH(0,1)", 59.0),
+                ("=EDATE(0,0)", 0.0),
+                ("=EDATE(0,1)", 31.0),
+            ],
+        );
     }
 
     /// EDATE round-trips serial -> date -> shifted date -> serial, so the

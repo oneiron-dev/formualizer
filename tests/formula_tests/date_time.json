@@ -413,8 +413,7 @@
       "formula": "=EDATE(0, 0)",
       "result": 0,
       "result_type": "int",
-      "description": "EDATE zero months from serial 0",
-      "skip": "EDATE(0,0) edge case not yet handled"
+      "description": "EDATE zero months from serial 0"
     },
     {
       "formula": "=EDATE(2.4, 1)",
@@ -432,8 +431,7 @@
       "formula": "=EOMONTH(444, -3)",
       "result": 366,
       "result_type": "int",
-      "description": "EOMONTH 3 months backward from serial 444",
-      "skip": "EOMONTH negative months edge case not yet handled"
+      "description": "EOMONTH 3 months backward from serial 444"
     },
     {
       "formula": "=EDATE(A1, 15)",
