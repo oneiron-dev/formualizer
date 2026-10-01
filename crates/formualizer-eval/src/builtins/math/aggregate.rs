@@ -6,9 +6,7 @@ use crate::function::Function;
 use crate::function_contract::FunctionDependencyContract;
 use crate::traits::{ArgumentHandle, FunctionContext};
 use arrow_array::Array;
-#[cfg(test)]
-use formualizer_common::ExcelErrorKind;
-use formualizer_common::{ExcelError, LiteralValue};
+use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
 
 /* ─────────────────────────── SUM() ──────────────────────────── */
@@ -150,8 +148,9 @@ pub struct CountFn;
 /// # Remarks
 /// - Text values inside ranges are ignored and not counted.
 /// - Blank cells and logical values in ranges are ignored.
-/// - Error values are not counted, whether supplied directly (`COUNT(1/0)` is 0)
-///   or found in a range or array.
+/// - Error values are not counted, whether supplied directly (`COUNT(1/0)` is 0),
+///   returned by a reference that fails (`COUNT(INDIRECT("x"))` is 0) or found
+///   in a range or array.
 ///
 /// # Examples
 ///
@@ -220,7 +219,16 @@ impl Function for CountFn {
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         let mut count: i64 = 0;
         for arg in args {
-            match resolve_aggregate_argument(arg, ctx)? {
+            // Excel: "Arguments that are error values or text that cannot be
+            // translated into numbers are not counted", however the error
+            // reaches COUNT: as a value (1/0), from a reference that fails
+            // (INDIRECT("x"), OFFSET(A1,-1,0)) or from the evaluation itself.
+            let argument = match resolve_aggregate_argument(arg, ctx) {
+                Ok(argument) => argument,
+                Err(error) if error.kind == ExcelErrorKind::Cancelled => return Err(error),
+                Err(_) => continue,
+            };
+            match argument {
                 AggregateArgument::Range(view) => {
                     for res in view.numbers_slices() {
                         let (_, _, num_cols) = res?;
@@ -229,12 +237,8 @@ impl Function for CountFn {
                         }
                     }
                 }
-                AggregateArgument::ReferenceError(e) => {
-                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
-                }
+                AggregateArgument::ReferenceError(_) => {}
                 AggregateArgument::Scalar(v) => {
-                    // Excel: "Arguments that are error values or text that
-                    // cannot be translated into numbers are not counted."
                     if !matches!(v, LiteralValue::Empty | LiteralValue::Error(_))
                         && coerce_num(&v).is_ok()
                     {
@@ -1273,6 +1277,54 @@ mod tests_count {
                 Some(LiteralValue::Number(*expected)),
                 "{formula}"
             );
+        }
+    }
+
+    /// INDIRECT and OFFSET return the error value #REF! for a reference that
+    /// does not exist: COUNT does not count it and COUNTA does, as for any
+    /// other error value, while SUM, AVERAGE and MAX still return it.
+    #[test]
+    fn errors_from_failing_references_follow_the_error_value_rules() {
+        use crate::engine::{Engine, EvalConfig};
+        use formualizer_parse::parser::parse;
+
+        let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+        for (row, value) in [(1, 1.0), (2, 2.0)] {
+            engine
+                .set_cell_value("Sheet1", row, 1, LiteralValue::Number(value))
+                .unwrap();
+        }
+        // A number, or the error kind for `None`.
+        let cases = [
+            ("=COUNT(INDIRECT(\"not a ref\"))", Some(0.0)),
+            ("=COUNT(1,INDIRECT(\"zz\"),2)", Some(2.0)),
+            ("=COUNT(OFFSET(A1,-1,0))", Some(0.0)),
+            ("=COUNT(A1:A2,INDIRECT(\"zz\"))", Some(2.0)),
+            ("=COUNT(INDIRECT(\"A1:A2\"))", Some(2.0)),
+            ("=COUNTA(INDIRECT(\"zz\"))", Some(1.0)),
+            ("=COUNTA(1,OFFSET(A1,-1,0))", Some(2.0)),
+            ("=COUNTA(A1:A2,INDIRECT(\"zz\"))", Some(3.0)),
+            ("=SUM(INDIRECT(\"zz\"))", None),
+            ("=SUM(1,OFFSET(A1,-1,0))", None),
+            ("=AVERAGE(INDIRECT(\"zz\"))", None),
+            ("=MAX(1,INDIRECT(\"zz\"))", None),
+        ];
+        for (row, (formula, _)) in cases.iter().enumerate() {
+            engine
+                .set_cell_formula("Sheet1", row as u32 + 1, 3, parse(formula).unwrap())
+                .unwrap();
+        }
+        engine.evaluate_all().unwrap();
+        for (row, (formula, expected)) in cases.iter().enumerate() {
+            match (engine.get_cell_value("Sheet1", row as u32 + 1, 3), expected) {
+                (Some(LiteralValue::Number(n)), Some(expected)) => {
+                    assert_eq!(n, *expected, "{formula}")
+                }
+                (Some(LiteralValue::Error(error)), None) => {
+                    assert_eq!(error.kind, ExcelErrorKind::Ref, "{formula}")
+                }
+                (value, _) => panic!("{formula}: {value:?}"),
+            }
         }
     }
 }

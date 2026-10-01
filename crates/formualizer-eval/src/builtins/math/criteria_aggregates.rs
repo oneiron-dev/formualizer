@@ -8,7 +8,7 @@ use crate::traits::{ArgumentHandle, FunctionContext};
 use arrow::compute::kernels::aggregate::sum_array;
 use arrow_array::types::Float64Type;
 use arrow_array::{Array as _, BooleanArray, Float64Array};
-use formualizer_common::{ExcelError, LiteralValue};
+use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
 
 #[cfg(test)]
@@ -1603,7 +1603,18 @@ impl Function for CountAFn {
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         let mut cnt = 0i64;
         for a in args {
-            match resolve_aggregate_argument(a, ctx)? {
+            // COUNTA counts error values, however the error reaches it: as a
+            // value, from a reference that fails (INDIRECT("x")) or from the
+            // evaluation itself.
+            let argument = match resolve_aggregate_argument(a, ctx) {
+                Ok(argument) => argument,
+                Err(error) if error.kind == ExcelErrorKind::Cancelled => return Err(error),
+                Err(_) => {
+                    cnt += 1;
+                    continue;
+                }
+            };
+            match argument {
                 AggregateArgument::Range(view) => {
                     for res in view.type_tags_slices() {
                         let (_, _, tag_cols) = res?;
@@ -1616,9 +1627,7 @@ impl Function for CountAFn {
                         }
                     }
                 }
-                AggregateArgument::ReferenceError(error) => {
-                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
-                }
+                AggregateArgument::ReferenceError(_) => cnt += 1,
                 AggregateArgument::Scalar(v) => {
                     if !matches!(v, LiteralValue::Empty) {
                         cnt += 1;

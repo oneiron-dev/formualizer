@@ -435,7 +435,7 @@ impl<'a> Interpreter<'a> {
                     DefaultFunctionContext::new_with_sheet(self.context, None, self.current_sheet);
 
                 self.with_arena_call_handles(
-                    fun.name(),
+                    fun.as_ref(),
                     args,
                     data_store,
                     sheet_registry,
@@ -505,12 +505,12 @@ impl<'a> Interpreter<'a> {
             }
         };
         let fctx = DefaultFunctionContext::new_with_sheet(self.context, None, self.current_sheet);
-        self.with_arena_call_handles(fun.name(), args, data_store, sheet_registry, |handles| {
+        self.with_arena_call_handles(fun.as_ref(), args, data_store, sheet_registry, |handles| {
             fun.eval_reference(handles, &fctx)
         })
     }
 
-    /// Run `f` on the argument handles of a call to the builtin `name`.
+    /// Run `f` on the argument handles of a call to the builtin `fun`.
     ///
     /// In a legacy formula each argument is evaluated in the context Excel
     /// gives its position ([`crate::lift::legacy_arg`]): a range in a
@@ -519,7 +519,7 @@ impl<'a> Interpreter<'a> {
     /// array, and the test of IF is a single value even inside an array.
     pub(crate) fn with_arena_call_handles<R>(
         &self,
-        name: &str,
+        fun: &dyn crate::function::Function,
         args: &[AstNodeId],
         data_store: &DataStore,
         sheet_registry: &SheetRegistry,
@@ -552,7 +552,7 @@ impl<'a> Interpreter<'a> {
             .enumerate()
             .map(|(index, &id)| {
                 use crate::lift::LegacyArg;
-                let arg = crate::lift::legacy_arg(name, index);
+                let arg = crate::lift::legacy_arg(fun, index);
                 let arg_context = match arg {
                     LegacyArg::Value | LegacyArg::Reference => context,
                     LegacyArg::ForcedValue | LegacyArg::Choice => LegacyContext::Value,
@@ -1084,7 +1084,7 @@ impl<'a> Interpreter<'a> {
                     );
 
                     return error_as_value(self.with_arena_call_handles(
-                        fun.name(),
+                        fun.as_ref(),
                         args,
                         data_store,
                         sheet_registry,
@@ -1450,10 +1450,13 @@ impl<'a> Interpreter<'a> {
                 sheet, row, col, ..
             } => {
                 let sheet_name = sheet.as_deref().unwrap_or(self.current_sheet);
-                match self
-                    .context
-                    .resolve_cell_reference(Some(sheet_name), *row, *col)
-                {
+                // A blank cell stays blank, as through a range (`@A4&"x"` is "x").
+                match self.context.resolve_cell_reference_value(
+                    Some(sheet_name),
+                    *row,
+                    *col,
+                    self.current_sheet,
+                ) {
                     Ok(v) => v,
                     Err(e) => LiteralValue::Error(e),
                 }

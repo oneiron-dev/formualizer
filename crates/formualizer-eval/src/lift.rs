@@ -19,9 +19,11 @@
 //! (`SUBTOTAL(9,OFFSET(A1,{0;1},0))` is `{A1;A2}`), and `N`/`T` read each
 //! reference's first cell (`N(OFFSET(A1,{0;1},0))` is `{N(A1);N(A2)}`).
 
+use crate::args::{ArgSchema, ShapeKind};
 use crate::engine::range_view::RangeView;
+use crate::function::Function;
 use crate::traits::{ArgumentHandle, CalcValue};
-use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
+use formualizer_common::{ArgKind, ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_parse::parser::{ASTNode, ASTNodeType, ReferenceType};
 
 /// Which parameter positions (0-based) take a single value.
@@ -211,15 +213,26 @@ pub(crate) enum LegacyArg {
     Array,
 }
 
-/// The legacy evaluation of argument `index` of the builtin `name`.
-pub(crate) fn legacy_arg(name: &str, index: usize) -> LegacyArg {
+/// The legacy evaluation of argument `index` of the builtin `fun`.
+///
+/// The parameters listed here follow Excel's parameter classes. Elsewhere the
+/// parameters `lift_spec` lists are single values and its other parameters
+/// take arrays or references; the parameters of a function without a
+/// `lift_spec` follow its argument schema ([`schema_arg`]).
+pub(crate) fn legacy_arg(fun: &dyn Function, index: usize) -> LegacyArg {
     use LegacyArg::*;
+    let name = fun.name();
     // The arguments before position `n` are `head`, the others `tail`.
     let split = |n: usize, head, tail| if index < n { head } else { tail };
     match name {
         "IF" | "CHOOSE" | "IFERROR" | "IFNA" => split(1, ForcedValue, Choice),
+        // INDEX's row and column, and the value VLOOKUP and HLOOKUP look up,
+        // are single values even inside an array argument: an array of them
+        // needs array entry.
         "INDEX" => split(1, Array, ForcedValue),
+        "VLOOKUP" | "HLOOKUP" if index == 0 => ForcedValue,
         "LOOKUP" | "FORECAST.LINEAR" => split(1, Value, Array),
+        "FORECAST.ETS" if matches!(index, 1 | 2) => Array,
         "SUMPRODUCT" | "MMULT" | "MDETERM" | "MINVERSE" | "FREQUENCY" | "SUMX2MY2" | "SUMX2PY2"
         | "SUMXMY2" | "CHISQ.TEST" | "CORREL" | "COVARIANCE.P" | "COVARIANCE.S" | "PEARSON"
         | "RSQ" | "SLOPE" | "INTERCEPT" | "STEYX" | "F.TEST" | "MODE.SNGL" | "MODE.MULT" => Array,
@@ -228,24 +241,78 @@ pub(crate) fn legacy_arg(name: &str, index: usize) -> LegacyArg {
         "IRR" | "MIRR" => split(1, Array, Value),
         // Forms 14 to 19 compute over an array expression.
         "AGGREGATE" => split(2, Value, Array),
-        // ROWS, COLUMNS and TRANSPOSE take an array.
-        "ROWS" | "COLUMNS" | "TRANSPOSE" => Array,
+        // ROWS and COLUMNS take a reference (or an array); TRANSPOSE an array.
+        "ROWS" | "COLUMNS" => Reference,
+        "TRANSPOSE" => Array,
         // The offsets, sizes and texts that address a reference are single values.
         "OFFSET" => split(1, Reference, Value),
         "INDIRECT" => Value,
         "NPV" => split(1, Value, Reference),
         // N and T take a reference.
         "N" | "T" => Reference,
-        // Functions that arrived with dynamic arrays have no legacy form.
+        // Parameters taking ranges, arrays or references whose schema declares
+        // a single value: logical and counted values, the numbers of GCD, LCM,
+        // MULTINOMIAL, IMSUM and IMPRODUCT, the references of ISREF, CELL,
+        // SHEET, ..., the databases, fields and criteria of the D functions,
+        // cash flows and dates, series coefficients and TEXTJOIN's delimiter,
+        // which may be a range of delimiters.
+        "AND" | "OR" | "XOR" | "COUNTA" | "COUNTBLANK" | "GCD" | "LCM" | "MULTINOMIAL"
+        | "IMSUM" | "IMPRODUCT" | "ISREF" | "ISFORMULA" | "FORMULATEXT" | "SHEET" | "SHEETS"
+        | "DAVERAGE" | "DCOUNT" | "DCOUNTA" | "DGET" | "DMAX" | "DMIN" | "DPRODUCT" | "DSTDEV"
+        | "DSTDEVP" | "DSUM" | "DVAR" | "DVARP" => Reference,
+        "CELL" | "XNPV" => split(1, Value, Reference),
+        "XIRR" => split(2, Reference, Value),
+        "SERIESSUM" => split(3, Value, Reference),
+        "TEXTJOIN" => {
+            if index == 1 {
+                Value
+            } else {
+                Reference
+            }
+        }
+        // The percentage trimmed is a single value.
+        "TRIMMEAN" => split(1, Reference, Value),
+        // Functions that arrived with dynamic arrays: the parameters that lift
+        // over an array are single values (dynamic-array Excel shows `@` before
+        // a range there in a formula saved without the array flag), and the
+        // others take arrays.
         "FILTER" | "SORT" | "SORTBY" | "UNIQUE" | "SEQUENCE" | "RANDARRAY" | "XLOOKUP"
         | "XMATCH" | "LET" | "LAMBDA" | "MAP" | "REDUCE" | "SCAN" | "BYROW" | "BYCOL"
         | "MAKEARRAY" | "TAKE" | "DROP" | "CHOOSECOLS" | "CHOOSEROWS" | "EXPAND" | "HSTACK"
         | "VSTACK" | "TOCOL" | "TOROW" | "WRAPCOLS" | "WRAPROWS" | "TEXTSPLIT" | "TEXTBEFORE"
-        | "TEXTAFTER" | "GROUPBY" | "PIVOTBY" | "ARRAYTOTEXT" | "VALUETOTEXT" => Array,
+        | "TEXTAFTER" | "GROUPBY" | "PIVOTBY" | "ARRAYTOTEXT" | "VALUETOTEXT" => {
+            match lift_spec(name) {
+                Some(spec) if spec.lifts(index) => Value,
+                _ => Array,
+            }
+        }
         _ => match lift_spec(name) {
             Some(spec) if spec.lifts(index) => Value,
-            _ => Reference,
+            Some(_) => Reference,
+            None => schema_arg(fun.arg_schema(), index),
         },
+    }
+}
+
+/// The legacy class of parameter `index` from an argument schema: a single
+/// value (scalar shape) is a value parameter, an array an array parameter,
+/// and a range or reference a reference parameter.
+fn schema_arg(schema: &[ArgSchema], index: usize) -> LegacyArg {
+    // The parameter `validate_and_prepare` checks the argument against.
+    let spec = match schema {
+        [only] => Some(only),
+        _ => schema
+            .get(index)
+            .or_else(|| schema.iter().find(|spec| spec.repeating.is_some())),
+    };
+    match spec {
+        Some(spec) if spec.by_ref || spec.kinds.contains(&ArgKind::Range) => LegacyArg::Reference,
+        Some(spec) => match spec.shape {
+            ShapeKind::Scalar => LegacyArg::Value,
+            ShapeKind::Array => LegacyArg::Array,
+            ShapeKind::Range => LegacyArg::Reference,
+        },
+        None => LegacyArg::Reference,
     }
 }
 

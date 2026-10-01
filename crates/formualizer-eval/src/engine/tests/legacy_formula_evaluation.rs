@@ -327,3 +327,106 @@ fn count_does_not_count_an_intersected_error() {
     // COUNTA does count the error value.
     assert_eq!(legacy(5, "=COUNTA(A1:A3*1)"), number(1.0));
 }
+
+fn text(s: &str) -> Option<LiteralValue> {
+    Some(LiteralValue::Text(s.into()))
+}
+
+#[test]
+fn single_value_parameters_of_dynamic_array_functions_intersect() {
+    // Dynamic-array Excel shows `@` before these ranges in a formula saved
+    // without the array flag: the looked-up value intersects (row 2: A2 = 0).
+    assert_eq!(legacy(2, "=XLOOKUP(A1:A3,A1:A3,B1:B3)"), number(20.0));
+    assert_eq!(legacy(2, "=SUM(XLOOKUP(A1:A3,A1:A3,B1:B3))"), number(20.0));
+    assert_eq!(legacy(2, "=SUM(XMATCH(A1:A3,A1:A3))"), number(2.0));
+    assert_eq!(
+        legacy(3, "=TEXTBEFORE(B1:B3&\"-x\",\"-\")&\"!\""),
+        text("30!")
+    );
+    assert_eq!(
+        error_kind(legacy(5, "=XLOOKUP(A1:A3,A1:A3,B1:B3)")),
+        ExcelErrorKind::Value
+    );
+    // The lookup and return arrays stay arrays, and inside an array argument
+    // the looked-up value lifts.
+    assert_eq!(
+        legacy(5, "=XLOOKUP(1,(A1:A3=0)*(B1:B3>10),B1:B3)"),
+        number(20.0)
+    );
+    assert_eq!(
+        legacy(5, "=SUMPRODUCT(XLOOKUP(A1:A3,A1:A3,B1:B3))"),
+        number(40.0)
+    );
+    assert_eq!(
+        evaluate(false, &[(2, 4, "=SUM(XLOOKUP(A1:A3,A1:A3,B1:B3))")]),
+        vec![number(40.0)]
+    );
+}
+
+#[test]
+fn scalar_parameters_follow_the_argument_schema() {
+    // Single-value parameters that `lift_spec` does not list intersect too.
+    assert_eq!(
+        legacy(2, "=SUM(T.DIST(B1:B3,5,TRUE))"),
+        legacy(2, "=T.DIST(B2,5,TRUE)")
+    );
+    assert_eq!(
+        error_kind(legacy(5, "=T.DIST(B1:B3,5,TRUE)")),
+        ExcelErrorKind::Value
+    );
+    assert_eq!(legacy(2, "=IFS(A1:A3,\"t\",TRUE,\"f\")"), text("f"));
+    assert_eq!(legacy(3, "=IFS(A1:A3,\"t\",TRUE,\"f\")"), text("t"));
+    assert_eq!(legacy(2, "=SUM(SWITCH(A1:A3,0,100,1,1))"), number(100.0));
+    assert_eq!(legacy(2, "=TRIMMEAN(B1:B3,A1:A3)"), number(20.0));
+    // Parameters that take ranges, arrays or references keep them whole.
+    assert_eq!(legacy(5, "=COUNTA(A1:A3)"), number(3.0));
+    assert_eq!(legacy(5, "=AND(A1:A3)"), Some(LiteralValue::Boolean(false)));
+    assert_eq!(legacy(5, "=OR(A1:A3)"), Some(LiteralValue::Boolean(true)));
+    assert_eq!(
+        legacy(5, "=ISREF(A1:A3)"),
+        Some(LiteralValue::Boolean(true))
+    );
+    assert_eq!(legacy(5, "=TEXTJOIN(\"-\",TRUE,B1:B3)"), text("10-20-30"));
+    assert_eq!(legacy(5, "=SUMIF(A1:A3,1,B1:B3)"), number(40.0));
+    assert_eq!(legacy(5, "=SUM(B1:B3)"), number(60.0));
+}
+
+#[test]
+fn lookup_values_of_vlookup_and_hlookup_are_single_values_inside_arrays() {
+    // Like INDEX's row and column, VLOOKUP's looked-up value is a single value
+    // even inside SUMPRODUCT: an array of them needs array entry.
+    assert_eq!(
+        error_kind(legacy(5, "=SUMPRODUCT(VLOOKUP(A1:A3,A1:B3,2,0))")),
+        ExcelErrorKind::Value
+    );
+    assert_eq!(
+        legacy(2, "=SUMPRODUCT(VLOOKUP(A1:A3,A1:B3,2,0))"),
+        number(20.0)
+    );
+    // MATCH's looked-up value still lifts there, and array formulas and
+    // engines without the declared semantics are unchanged.
+    assert_eq!(legacy(5, "=SUMPRODUCT(MATCH(A1:A3,A1:A3,0))"), number(4.0));
+    assert_eq!(
+        evaluate(false, &[(5, 4, "=SUMPRODUCT(VLOOKUP(A1:A3,A1:B3,2,0))")]),
+        vec![number(40.0)]
+    );
+}
+
+#[test]
+fn rows_and_columns_take_a_reference() {
+    // A range passes whole; an operand intersects (row 2).
+    assert_eq!(legacy(5, "=ROWS(A1:A3)"), number(3.0));
+    assert_eq!(legacy(5, "=COLUMNS(A1:B3)"), number(2.0));
+    assert_eq!(legacy(2, "=ROWS(A1:A3*1)"), number(1.0));
+    assert_eq!(legacy(5, "=ROWS(INDEX(A1:B3,0,1))"), number(3.0));
+}
+
+#[test]
+fn intersecting_a_single_blank_cell_keeps_it_blank() {
+    assert_eq!(legacy(4, "=@A4&\"x\""), text("x"));
+    assert_eq!(legacy(4, "=@A1:A4&\"x\""), text("x"));
+    assert_eq!(legacy(4, "=@A3&\"x\""), text("1x"));
+    assert_eq!(legacy(4, "=@A4+1"), number(1.0));
+    assert_eq!(legacy(4, "=@A4"), legacy(4, "=A4"));
+    assert_eq!(evaluate(false, &[(4, 4, "=@A4&\"x\"")]), vec![text("x")]);
+}

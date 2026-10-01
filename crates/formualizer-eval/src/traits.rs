@@ -756,7 +756,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                     self.interp.current_sheet(),
                 );
                 Some(self.interp.with_arena_call_handles(
-                    fun.name(),
+                    fun.as_ref(),
                     args,
                     data_store,
                     sheet_registry,
@@ -913,7 +913,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
             None,
             self.interp.current_sheet(),
         );
-        self.with_call_handles(fun.name(), |handles| match spec {
+        self.with_call_handles(fun.as_ref(), |handles| match spec {
             Some(spec) => {
                 crate::lift::lift_reference(spec, handles, |call| fun.eval_reference(call, &ctx))
             }
@@ -1017,7 +1017,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         }
     }
 
-    /// Run `f` on the argument handles of the call to the builtin `name`
+    /// Run `f` on the argument handles of the call to the builtin `fun`
     /// written as this argument. They are the handles the call itself is
     /// evaluated with: in a formula entered without the array flag each
     /// argument gets the context of its parameter class, so a range in a
@@ -1025,7 +1025,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
     /// the formula cell there and kept whole inside an array argument.
     fn with_call_handles<R>(
         &self,
-        name: &str,
+        fun: &dyn crate::function::Function,
         f: impl FnOnce(&[ArgumentHandle<'_, 'b>]) -> R,
     ) -> Option<R> {
         match self.expr {
@@ -1047,7 +1047,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                 let args = data_store.get_args(id)?;
                 Some(
                     self.interp
-                        .with_arena_call_handles(name, args, data_store, sheet_registry, f),
+                        .with_arena_call_handles(fun, args, data_store, sheet_registry, f),
                 )
             }
         }
