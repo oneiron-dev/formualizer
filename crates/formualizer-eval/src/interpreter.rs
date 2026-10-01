@@ -133,6 +133,20 @@ pub struct Interpreter<'a> {
     reference_col_delta: i64,
     disable_ast_planner: bool,
     parameter_bindings: Option<InterpreterParameterBindings<'a>>,
+    /// Set while evaluating a formula entered without the array flag (see
+    /// [`LegacyContext`]); `None` evaluates every expression as an array.
+    legacy: Option<LegacyContext>,
+}
+
+/// How a formula entered without the array flag evaluates the expression at
+/// hand. Excel evaluates such a formula as a value: a range in a single-value
+/// position is implicitly intersected with the formula cell, unless the
+/// position belongs to an argument that Excel evaluates as an array
+/// (SUMPRODUCT, INDEX's array, ...). See [`crate::lift::LegacyArg`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LegacyContext {
+    Value,
+    Array,
 }
 
 /// A function's error is its value: ISNUMBER(SEARCH("x",#REF!)) is FALSE and
@@ -159,6 +173,7 @@ impl<'a> Interpreter<'a> {
             reference_col_delta: 0,
             disable_ast_planner: false,
             parameter_bindings: None,
+            legacy: None,
         }
     }
 
@@ -176,6 +191,7 @@ impl<'a> Interpreter<'a> {
             reference_col_delta: 0,
             disable_ast_planner: false,
             parameter_bindings: None,
+            legacy: None,
         }
     }
 
@@ -197,6 +213,7 @@ impl<'a> Interpreter<'a> {
             reference_col_delta: self.reference_col_delta,
             disable_ast_planner: self.disable_ast_planner,
             parameter_bindings: self.parameter_bindings,
+            legacy: self.legacy,
         }
     }
 
@@ -210,6 +227,7 @@ impl<'a> Interpreter<'a> {
             reference_col_delta: self.reference_col_delta,
             disable_ast_planner: self.disable_ast_planner,
             parameter_bindings: self.parameter_bindings,
+            legacy: self.legacy,
         }
     }
 
@@ -226,7 +244,34 @@ impl<'a> Interpreter<'a> {
             reference_col_delta: self.reference_col_delta,
             disable_ast_planner: self.disable_ast_planner,
             parameter_bindings: Some(bindings),
+            legacy: self.legacy,
         }
+    }
+
+    /// Evaluate as the formula of a cell entered without the array flag.
+    pub(crate) fn as_legacy_formula(mut self) -> Self {
+        self.legacy = Some(LegacyContext::Value);
+        self
+    }
+
+    fn with_legacy_context(&self, legacy: Option<LegacyContext>) -> Self {
+        Self {
+            context: self.context,
+            current_sheet: self.current_sheet,
+            current_cell: self.current_cell,
+            local_env: self.local_env.clone(),
+            reference_row_delta: self.reference_row_delta,
+            reference_col_delta: self.reference_col_delta,
+            disable_ast_planner: self.disable_ast_planner,
+            parameter_bindings: self.parameter_bindings,
+            legacy,
+        }
+    }
+
+    /// Whether a legacy formula evaluates the expression at hand as a single
+    /// value (see [`LegacyContext`]).
+    pub(crate) fn in_legacy_value_context(&self) -> bool {
+        self.legacy == Some(LegacyContext::Value)
     }
 
     fn effective_reference<'r>(
@@ -386,18 +431,17 @@ impl<'a> Interpreter<'a> {
                     ExcelError::new(ExcelErrorKind::Value).with_message("Missing function args")
                 })?;
 
-                let handles: Vec<ArgumentHandle> = args
-                    .iter()
-                    .copied()
-                    .map(|arg_id| {
-                        ArgumentHandle::new_arena(arg_id, self, data_store, sheet_registry)
-                    })
-                    .collect();
-
                 let fctx =
                     DefaultFunctionContext::new_with_sheet(self.context, None, self.current_sheet);
 
-                fun.eval_reference(&handles, &fctx).ok_or_else(|| {
+                self.with_arena_call_handles(
+                    fun.name(),
+                    args,
+                    data_store,
+                    sheet_registry,
+                    |handles| fun.eval_reference(handles, &fctx),
+                )
+                .ok_or_else(|| {
                     ExcelError::new(ExcelErrorKind::Ref)
                         .with_message("Function does not return a reference")
                 })?
@@ -460,13 +504,204 @@ impl<'a> Interpreter<'a> {
                 ));
             }
         };
+        let fctx = DefaultFunctionContext::new_with_sheet(self.context, None, self.current_sheet);
+        self.with_arena_call_handles(fun.name(), args, data_store, sheet_registry, |handles| {
+            fun.eval_reference(handles, &fctx)
+        })
+    }
+
+    /// Run `f` on the argument handles of a call to the builtin `name`.
+    ///
+    /// In a legacy formula each argument is evaluated in the context Excel
+    /// gives its position ([`crate::lift::legacy_arg`]): a range in a
+    /// single-value position of a value context is implicitly intersected
+    /// with the formula cell, array positions evaluate their expression as an
+    /// array, and the test of IF is a single value even inside an array.
+    pub(crate) fn with_arena_call_handles<R>(
+        &self,
+        name: &str,
+        args: &[AstNodeId],
+        data_store: &DataStore,
+        sheet_registry: &SheetRegistry,
+        f: impl FnOnce(&[ArgumentHandle<'_, 'a>]) -> R,
+    ) -> R {
+        let Some(context) = self.legacy else {
+            let handles: Vec<ArgumentHandle> = args
+                .iter()
+                .map(|&id| ArgumentHandle::new_arena(id, self, data_store, sheet_registry))
+                .collect();
+            return f(&handles);
+        };
+        let other = self.with_legacy_context(Some(match context {
+            LegacyContext::Value => LegacyContext::Array,
+            LegacyContext::Array => LegacyContext::Value,
+        }));
+        let interp_for = |arg_context: LegacyContext| {
+            if arg_context == context { self } else { &other }
+        };
+        // Per argument: its context, the intersected value of a range in a
+        // single-value position, and the value of a reference-capable call
+        // already evaluated there.
+        type Position<'v> = (
+            LegacyContext,
+            Option<ASTNode>,
+            Option<Result<crate::traits::CalcValue<'v>, ExcelError>>,
+        );
+        let positions: Vec<Position<'a>> = args
+            .iter()
+            .enumerate()
+            .map(|(index, &id)| {
+                use crate::lift::LegacyArg;
+                let arg = crate::lift::legacy_arg(name, index);
+                let arg_context = match arg {
+                    LegacyArg::Value | LegacyArg::Reference => context,
+                    LegacyArg::ForcedValue | LegacyArg::Choice => LegacyContext::Value,
+                    LegacyArg::Array => LegacyContext::Array,
+                };
+                let single = matches!(arg, LegacyArg::Value | LegacyArg::ForcedValue);
+                let mut evaluated = None;
+                let intersected = if single && arg_context == LegacyContext::Value {
+                    match self.arena_range_reference(id, data_store, sheet_registry) {
+                        Ok(Some(reference)) => {
+                            Some(self.implicit_intersection_from_reference(&reference))
+                        }
+                        Ok(None) if self.arena_may_return_reference(id, data_store) => {
+                            // A range returned by INDEX, OFFSET, IF, ... intersects too.
+                            let value = interp_for(arg_context).evaluate_arena_ast(
+                                id,
+                                data_store,
+                                sheet_registry,
+                            );
+                            match value {
+                                Ok(crate::traits::CalcValue::Range(view))
+                                    if Self::is_sheet_range(&view) =>
+                                {
+                                    Some(self.eval_implicit_intersection_calc(
+                                        crate::traits::CalcValue::Range(view),
+                                    ))
+                                }
+                                other => {
+                                    evaluated = Some(other);
+                                    None
+                                }
+                            }
+                        }
+                        Ok(None) => None,
+                        Err(error) => Some(LiteralValue::Error(error)),
+                    }
+                } else {
+                    None
+                };
+                let intersected =
+                    intersected.map(|value| ASTNode::new(ASTNodeType::Literal(value), None));
+                (arg_context, intersected, evaluated)
+            })
+            .collect();
         let handles: Vec<ArgumentHandle> = args
             .iter()
-            .copied()
-            .map(|arg_id| ArgumentHandle::new_arena(arg_id, self, data_store, sheet_registry))
+            .zip(positions.iter())
+            .map(|(&id, (arg_context, intersected, evaluated))| {
+                let interp = interp_for(*arg_context);
+                match (intersected, evaluated) {
+                    (Some(node), _) => ArgumentHandle::new(node, interp),
+                    (None, Some(value)) => {
+                        ArgumentHandle::new_arena(id, interp, data_store, sheet_registry)
+                            .with_value(value.clone())
+                    }
+                    (None, None) => {
+                        ArgumentHandle::new_arena(id, interp, data_store, sheet_registry)
+                    }
+                }
+            })
             .collect();
-        let fctx = DefaultFunctionContext::new_with_sheet(self.context, None, self.current_sheet);
-        fun.eval_reference(&handles, &fctx)
+        f(&handles)
+    }
+
+    /// The reference written at `node_id` when it can span several cells (a
+    /// range, a whole row or column, a name or a table); `None` for anything
+    /// else, including single cells and LET/LAMBDA locals.
+    fn arena_range_reference(
+        &self,
+        node_id: AstNodeId,
+        data_store: &DataStore,
+        sheet_registry: &SheetRegistry,
+    ) -> Result<Option<ReferenceType>, ExcelError> {
+        let Some(AstNodeData::Reference { ref_type, .. }) = data_store.get_node(node_id) else {
+            return Ok(None);
+        };
+        if !matches!(
+            ref_type,
+            CompactRefType::Range { .. }
+                | CompactRefType::NamedRange(_)
+                | CompactRefType::Table { .. }
+        ) {
+            return Ok(None);
+        }
+        let reference = data_store.reconstruct_reference_type_for_eval(ref_type, sheet_registry);
+        let reference = self.effective_reference(&reference)?.into_owned();
+        if self.resolve_local_reference(&reference).is_some() {
+            return Ok(None);
+        }
+        // A name for a range intersects through that range; a name for a cell,
+        // a constant or a computed value evaluates as usual.
+        if let ReferenceType::NamedRange(name) = &reference {
+            let named = self
+                .context
+                .resolve_name_reference(name, self.current_sheet);
+            return Ok(match named {
+                Some(Ok(named)) if !matches!(named, ReferenceType::Cell { .. }) => Some(named),
+                _ => None,
+            });
+        }
+        Ok(Some(reference))
+    }
+
+    /// Whether a function call or reference operator at `node_id` may yield a
+    /// reference (INDEX, OFFSET, INDIRECT, IF, CHOOSE, `:`).
+    fn arena_may_return_reference(&self, node_id: AstNodeId, data_store: &DataStore) -> bool {
+        match data_store.get_node(node_id) {
+            Some(AstNodeData::Function { name_id, .. }) => self
+                .context
+                .function_capabilities("", data_store.resolve_ast_string(*name_id))
+                .is_some_and(|caps| caps.contains(crate::function::FnCaps::RETURNS_REFERENCE)),
+            Some(AstNodeData::BinaryOp { op_id, .. }) => {
+                matches!(data_store.resolve_ast_string(*op_id), ":" | " ")
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `view` is cells of a sheet spanning more than one cell, rather
+    /// than a computed array.
+    fn is_sheet_range(view: &crate::engine::range_view::RangeView<'_>) -> bool {
+        view.sheet_name() != "__tmp" && !view.is_empty() && view.dims() != (1, 1)
+    }
+
+    /// An operand of a value operator. In a legacy formula's value context a
+    /// range operand, or a function's range result, is implicitly intersected
+    /// with the formula cell; arrays stay arrays.
+    fn evaluate_arena_operand(
+        &self,
+        node_id: AstNodeId,
+        data_store: &DataStore,
+        sheet_registry: &SheetRegistry,
+    ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        if !self.in_legacy_value_context() {
+            return self.evaluate_arena_ast(node_id, data_store, sheet_registry);
+        }
+        if let Some(reference) = self.arena_range_reference(node_id, data_store, sheet_registry)? {
+            return Ok(crate::traits::CalcValue::Scalar(
+                self.implicit_intersection_from_reference(&reference),
+            ));
+        }
+        match self.evaluate_arena_ast(node_id, data_store, sheet_registry)? {
+            crate::traits::CalcValue::Range(view) if Self::is_sheet_range(&view) => {
+                Ok(crate::traits::CalcValue::Scalar(
+                    self.eval_implicit_intersection_calc(crate::traits::CalcValue::Range(view)),
+                ))
+            }
+            other => Ok(other),
+        }
     }
 
     /* ===================  public  =================== */
@@ -489,6 +724,7 @@ impl<'a> Interpreter<'a> {
             reference_col_delta: col_delta,
             disable_ast_planner: true,
             parameter_bindings: self.parameter_bindings,
+            legacy: self.legacy,
         };
         offset.evaluate_ast_uncached(node)
     }
@@ -526,6 +762,7 @@ impl<'a> Interpreter<'a> {
             reference_col_delta: col_delta,
             disable_ast_planner: true,
             parameter_bindings: self.parameter_bindings,
+            legacy: self.legacy,
         };
         offset.evaluate_arena_ast(node_id, data_store, sheet_registry)
     }
@@ -679,9 +916,13 @@ impl<'a> Interpreter<'a> {
                 }
             }
             AstNodeData::UnaryOp { op_id, expr_id } => {
-                let expr = self.evaluate_arena_ast(*expr_id, data_store, sheet_registry)?;
-
                 let op = data_store.resolve_ast_string(*op_id);
+                let expr = if op == "@" {
+                    self.evaluate_arena_ast(*expr_id, data_store, sheet_registry)?
+                } else {
+                    self.evaluate_arena_operand(*expr_id, data_store, sheet_registry)?
+                };
+
                 if op == "@" {
                     // Prefer reference-aware implicit intersection so we don't depend on
                     // RangeView absolute coordinates (important for lightweight test contexts).
@@ -741,10 +982,12 @@ impl<'a> Interpreter<'a> {
                     return self.range_value(range);
                 }
 
-                let left_calc = self.evaluate_arena_ast(*left_id, data_store, sheet_registry)?;
+                let left_calc =
+                    self.evaluate_arena_operand(*left_id, data_store, sheet_registry)?;
                 let left_format = left_calc.format_id();
                 let left = left_calc.into_literal();
-                let right_calc = self.evaluate_arena_ast(*right_id, data_store, sheet_registry)?;
+                let right_calc =
+                    self.evaluate_arena_operand(*right_id, data_store, sheet_registry)?;
                 let right_format = right_calc.format_id();
                 let right = right_calc.into_literal();
 
@@ -834,21 +1077,19 @@ impl<'a> Interpreter<'a> {
                 }
 
                 if let Some(fun) = self.context.get_function("", name) {
-                    let handles: Vec<ArgumentHandle> = args
-                        .iter()
-                        .copied()
-                        .map(|arg_id| {
-                            ArgumentHandle::new_arena(arg_id, self, data_store, sheet_registry)
-                        })
-                        .collect();
-
                     let fctx = DefaultFunctionContext::new_with_sheet(
                         self.context,
                         self.current_cell,
                         self.current_sheet,
                     );
 
-                    return error_as_value(fun.dispatch(&handles, &fctx));
+                    return error_as_value(self.with_arena_call_handles(
+                        fun.name(),
+                        args,
+                        data_store,
+                        sheet_registry,
+                        |handles| fun.dispatch(handles, &fctx),
+                    ));
                 }
 
                 if let Some(callable) = self.resolve_local_callable(name) {
@@ -872,6 +1113,11 @@ impl<'a> Interpreter<'a> {
         &self,
         node: &ASTNode,
     ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        // Tree formulas (LAMBDA bodies, names) are not cell formulas: they keep
+        // array evaluation even when invoked from a legacy formula.
+        if self.legacy.is_some() {
+            return self.with_legacy_context(None).evaluate_ast_uncached(node);
+        }
         if self.disable_ast_planner {
             return self.eval_tree_uncached(node);
         }
@@ -1222,18 +1468,14 @@ impl<'a> Interpreter<'a> {
             } => {
                 let sheet_name = sheet.as_deref().unwrap_or(self.current_sheet);
 
-                let (sr, sc, er, ec) = match (start_row, start_col, end_row, end_col) {
-                    (Some(sr), Some(sc), Some(er), Some(ec)) => (*sr, *sc, *er, *ec),
-                    _ => {
-                        // For open-ended/infinite ranges, fall back to the RangeView-based path.
-                        // This path may be less precise in minimal test contexts.
-                        let cv = match self.eval_reference_to_calc(reference) {
-                            Ok(cv) => cv,
-                            Err(e) => return LiteralValue::Error(e),
-                        };
-                        return self.eval_implicit_intersection_calc(cv);
-                    }
-                };
+                // A whole column or row (A:A, 3:3, A5:A) spans the sheet on its open
+                // axis, so it intersects every row or column of the sheet.
+                let (sr, sc, er, ec) = (
+                    start_row.unwrap_or(1),
+                    start_col.unwrap_or(1),
+                    end_row.unwrap_or(1_048_576),
+                    end_col.unwrap_or(16_384),
+                );
 
                 // Normalize bounds (A10:A1 is legal syntax; treat as swapped).
                 let (mut sr, mut er) = (sr, er);
@@ -1245,7 +1487,10 @@ impl<'a> Interpreter<'a> {
                     std::mem::swap(&mut sc, &mut ec);
                 }
 
-                let pick = if sc == ec {
+                let pick = if sr == er && sc == ec {
+                    // A single cell needs no intersection.
+                    (sr, sc)
+                } else if sc == ec {
                     // Column vector: intersect by row
                     if cur_r1 < sr || cur_r1 > er {
                         return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
@@ -1265,10 +1510,13 @@ impl<'a> Interpreter<'a> {
                     (cur_r1, cur_c1)
                 };
 
-                match self
-                    .context
-                    .resolve_cell_reference(Some(sheet_name), pick.0, pick.1)
-                {
+                // A blank cell stays blank (not 0) for the consumer to coerce.
+                match self.context.resolve_cell_reference_value(
+                    Some(sheet_name),
+                    pick.0,
+                    pick.1,
+                    self.current_sheet,
+                ) {
                     Ok(v) => v,
                     Err(e) => LiteralValue::Error(e),
                 }

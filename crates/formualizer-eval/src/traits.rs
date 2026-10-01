@@ -593,6 +593,21 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         self.interp
     }
 
+    /// This handle with its value already evaluated.
+    pub(crate) fn with_value(
+        self,
+        value: Result<crate::traits::CalcValue<'b>, ExcelError>,
+    ) -> Self {
+        let _ = self.cached_value.set(value);
+        self
+    }
+
+    /// Whether a formula entered without the array flag evaluates this
+    /// argument as a single value rather than as an array.
+    pub(crate) fn in_legacy_value_context(&self) -> bool {
+        self.interp.in_legacy_value_context()
+    }
+
     pub fn inline_array_literal(&self) -> Result<Option<Vec<Vec<LiteralValue>>>, ExcelError> {
         match &self.expr {
             ArgumentExpr::Ast(node) => match &node.node_type {
@@ -735,19 +750,18 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                             .with_message("Missing function args")));
                     }
                 };
-                let handles: Vec<_> = args
-                    .iter()
-                    .copied()
-                    .map(|arg_id| {
-                        ArgumentHandle::new_arena(arg_id, self.interp, data_store, sheet_registry)
-                    })
-                    .collect();
                 let ctx = DefaultFunctionContext::new_with_sheet(
                     self.interp.context,
                     None,
                     self.interp.current_sheet(),
                 );
-                Some(fun.resolve_reference_or_value(&handles, &ctx, &|| self.value()))
+                Some(self.interp.with_arena_call_handles(
+                    fun.name(),
+                    args,
+                    data_store,
+                    sheet_registry,
+                    |handles| fun.resolve_reference_or_value(handles, &ctx, &|| self.value()),
+                ))
             }
         }
     }
@@ -882,7 +896,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         if let Some(name) = self.name_reference() {
             return self.name_reference_array(name);
         }
-        let Some((name, handles)) = self.function_call() else {
+        let Some(name) = self.function_name() else {
             return Ok(None);
         };
         let spec = crate::lift::reference_array_spec(name);
@@ -891,12 +905,6 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         if (spec.is_none() && !branches) || !self.reads_as_error()? {
             return Ok(None);
         }
-        let Some(spec) = spec else {
-            return match selected_branch(name, &handles) {
-                Some(index) => handles[index].reference_array(),
-                None => Ok(None),
-            };
-        };
         let Some(fun) = self.interp.context.get_function("", name) else {
             return Ok(None);
         };
@@ -905,7 +913,16 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
             None,
             self.interp.current_sheet(),
         );
-        crate::lift::lift_reference(spec, &handles, |call| fun.eval_reference(call, &ctx))
+        self.with_call_handles(fun.name(), |handles| match spec {
+            Some(spec) => {
+                crate::lift::lift_reference(spec, handles, |call| fun.eval_reference(call, &ctx))
+            }
+            None => match selected_branch(name, handles) {
+                Some(index) => handles[index].reference_array(),
+                None => Ok(None),
+            },
+        })
+        .unwrap_or(Ok(None))
     }
 
     /// [`Self::reference_array`] evaluated with a LET scope's bindings.
@@ -984,38 +1001,54 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         }
     }
 
-    /// The function name and argument handles of a call written as this argument.
-    fn function_call(&self) -> Option<(&'a str, Vec<ArgumentHandle<'a, 'b>>)> {
+    /// The function name of a call written as this argument.
+    fn function_name(&self) -> Option<&'a str> {
+        match self.expr {
+            ArgumentExpr::Ast(node) => match &node.node_type {
+                ASTNodeType::Function { name, .. } => Some(name.as_str()),
+                _ => None,
+            },
+            ArgumentExpr::Arena { id, data_store, .. } => match data_store.get_node(id) {
+                Some(crate::engine::arena::AstNodeData::Function { name_id, .. }) => {
+                    Some(data_store.resolve_ast_string(*name_id))
+                }
+                _ => None,
+            },
+        }
+    }
+
+    /// Run `f` on the argument handles of the call to the builtin `name`
+    /// written as this argument. They are the handles the call itself is
+    /// evaluated with: in a formula entered without the array flag each
+    /// argument gets the context of its parameter class, so a range in a
+    /// single-value position (OFFSET's rows, IF's test) is intersected with
+    /// the formula cell there and kept whole inside an array argument.
+    fn with_call_handles<R>(
+        &self,
+        name: &str,
+        f: impl FnOnce(&[ArgumentHandle<'_, 'b>]) -> R,
+    ) -> Option<R> {
         match self.expr {
             ArgumentExpr::Ast(node) => {
-                let ASTNodeType::Function { name, args } = &node.node_type else {
+                let ASTNodeType::Function { args, .. } = &node.node_type else {
                     return None;
                 };
-                let handles = args
+                let handles: Vec<_> = args
                     .iter()
                     .map(|arg| ArgumentHandle::new(arg, self.interp))
                     .collect();
-                Some((name.as_str(), handles))
+                Some(f(&handles))
             }
             ArgumentExpr::Arena {
                 id,
                 data_store,
                 sheet_registry,
             } => {
-                let Some(crate::engine::arena::AstNodeData::Function { name_id, .. }) =
-                    data_store.get_node(id)
-                else {
-                    return None;
-                };
-                let handles = data_store
-                    .get_args(id)?
-                    .iter()
-                    .copied()
-                    .map(|arg_id| {
-                        ArgumentHandle::new_arena(arg_id, self.interp, data_store, sheet_registry)
-                    })
-                    .collect();
-                Some((data_store.resolve_ast_string(*name_id), handles))
+                let args = data_store.get_args(id)?;
+                Some(
+                    self.interp
+                        .with_arena_call_handles(name, args, data_store, sheet_registry, f),
+                )
             }
         }
     }

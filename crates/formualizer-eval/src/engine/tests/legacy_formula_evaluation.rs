@@ -1,0 +1,311 @@
+//! Formulas entered without the array flag, under the declared array semantics
+//! of a workbook file: Excel evaluates them as values throughout, not only in
+//! their final result.
+use crate::engine::{Engine, EvalConfig};
+use crate::test_workbook::TestWorkbook;
+use formualizer_common::{ExcelErrorKind, LiteralValue};
+use formualizer_parse::parser::parse;
+
+/// A1:A3 = {1;0;1}, B1:B3 = {10;20;30}; each formula is placed at its
+/// (row, col) and evaluated, with `legacy` selecting the file semantics.
+fn evaluate(legacy: bool, formulas: &[(u32, u32, &str)]) -> Vec<Option<LiteralValue>> {
+    let mut engine = Engine::new(
+        TestWorkbook::new(),
+        EvalConfig {
+            enable_parallel: false,
+            ..Default::default()
+        },
+    );
+    for (row, a, b) in [(1, 1.0, 10.0), (2, 0.0, 20.0), (3, 1.0, 30.0)] {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Number(a))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", row, 2, LiteralValue::Number(b))
+            .unwrap();
+    }
+    for &(row, col, formula) in formulas {
+        engine
+            .set_cell_formula("Sheet1", row, col, parse(formula).unwrap())
+            .unwrap();
+    }
+    if legacy {
+        engine.use_legacy_array_semantics();
+    }
+    engine.evaluate_all().unwrap();
+    formulas
+        .iter()
+        .map(|&(row, col, _)| engine.get_cell_value("Sheet1", row, col))
+        .collect()
+}
+
+fn legacy(row: u32, formula: &str) -> Option<LiteralValue> {
+    evaluate(true, &[(row, 4, formula)]).remove(0)
+}
+
+fn number(n: f64) -> Option<LiteralValue> {
+    Some(LiteralValue::Number(n))
+}
+
+fn error_kind(value: Option<LiteralValue>) -> ExcelErrorKind {
+    match value {
+        Some(LiteralValue::Error(error)) => error.kind,
+        other => panic!("expected an error, got {other:?}"),
+    }
+}
+
+#[test]
+fn operator_operands_intersect_with_the_formula_cell() {
+    assert_eq!(legacy(2, "=A1:A3*2"), number(0.0));
+    assert_eq!(legacy(3, "=SUM((A1:A3=1)*B1:B3)"), number(30.0));
+    assert_eq!(
+        legacy(2, "=IF(A:A=0,\"zero\",\"one\")"),
+        Some(LiteralValue::Text("zero".into()))
+    );
+    assert_eq!(
+        error_kind(legacy(5, "=SUM(A1:A3*B1:B3)")),
+        ExcelErrorKind::Value
+    );
+    // A horizontal range intersects the formula's column.
+    assert_eq!(
+        evaluate(true, &[(1, 5, "=1"), (1, 6, "=2"), (4, 6, "=E1:F1*10")])[2],
+        number(20.0)
+    );
+}
+
+#[test]
+fn if_tests_one_value_and_returns_its_whole_range() {
+    // Row 2: A2=0, so IF returns all of B1:B3 to MAX.
+    assert_eq!(legacy(2, "=MAX(IF(A1:A3=0,B1:B3))"), number(30.0));
+    assert_eq!(legacy(3, "=MAX(IF(A1:A3=0,B1:B3))"), number(0.0));
+    assert_eq!(
+        legacy(2, "=IF(A1:A3,\"yes\",\"no\")"),
+        Some(LiteralValue::Text("no".into()))
+    );
+}
+
+#[test]
+fn single_value_arguments_intersect() {
+    assert_eq!(legacy(2, "=SUMIF(A1:A3,A1:A3,B1:B3)"), number(20.0));
+    // No row of A1:A3 at row 5: the criterion is #VALUE!, which no cell matches.
+    assert_eq!(legacy(5, "=SUMIFS(B1:B3,A1:A3,A1:A3)"), number(0.0));
+    assert_eq!(
+        legacy(3, "=TEXT(B1:B3,\"0.0\")"),
+        Some(LiteralValue::Text("30.0".into()))
+    );
+}
+
+#[test]
+fn array_arguments_keep_array_evaluation() {
+    assert_eq!(legacy(5, "=SUMPRODUCT((A1:A3=1)*B1:B3)"), number(40.0));
+    assert_eq!(legacy(5, "=SUMPRODUCT(--(A1:A3=1))"), number(2.0));
+    assert_eq!(legacy(5, "=LOOKUP(2,1/(A1:A3=1),B1:B3)"), number(30.0));
+    assert_eq!(
+        legacy(5, "=MATCH(1,INDEX((A1:A3=1)*(B1:B3>15),0),0)"),
+        number(3.0)
+    );
+    assert_eq!(legacy(5, "=SUM(COUNTIF(A1:A3,{0,1}))"), number(3.0));
+    assert_eq!(legacy(5, "=SUM(B1:B3)"), number(60.0));
+}
+
+#[test]
+fn if_and_iferror_inside_an_array_argument_test_one_value() {
+    assert_eq!(
+        error_kind(legacy(5, "=SUMPRODUCT(IF(A1:A3=1,B1:B3,0))")),
+        ExcelErrorKind::Value
+    );
+    assert_eq!(legacy(5, "=SUMPRODUCT(IFERROR(1/A1:A3,0))"), number(0.0));
+    assert_eq!(
+        error_kind(legacy(5, "=MATCH(1,(A1:A3=1)*(B1:B3>=10),0)")),
+        ExcelErrorKind::Value
+    );
+}
+
+#[test]
+fn row_and_column_return_their_first_index_as_values() {
+    assert_eq!(legacy(5, "=SUM(ROW(A1:A3))"), number(1.0));
+    assert_eq!(legacy(5, "=SUM(COLUMN(A1:C1))"), number(1.0));
+    assert_eq!(legacy(5, "=SUMPRODUCT(ROW(A1:A3))"), number(6.0));
+    // Row 3 tests A3=1 and ROW gives 1, so SMALL has no second value.
+    assert_eq!(
+        error_kind(legacy(3, "=SMALL(IF(A1:A3=1,ROW(A1:A3)),2)")),
+        ExcelErrorKind::Num
+    );
+}
+
+#[test]
+fn array_formulas_and_undeclared_engines_evaluate_arrays() {
+    let mut engine = Engine::new(
+        TestWorkbook::new(),
+        EvalConfig {
+            enable_parallel: false,
+            ..Default::default()
+        },
+    );
+    for (row, a, b) in [(1, 1.0, 10.0), (2, 0.0, 20.0), (3, 1.0, 30.0)] {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Number(a))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", row, 2, LiteralValue::Number(b))
+            .unwrap();
+    }
+    engine
+        .set_cell_formula("Sheet1", 5, 4, parse("=SUM(A1:A3*B1:B3)").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 5, 5, parse("=MAX(IF(A1:A3=1,B1:B3))").unwrap())
+        .unwrap();
+    engine.use_legacy_array_semantics();
+    engine.declare_array_formula("Sheet1", 5, 4, 1, 1, false);
+    engine.declare_array_formula("Sheet1", 5, 5, 1, 1, true);
+    engine.evaluate_all().unwrap();
+    assert_eq!(engine.get_cell_value("Sheet1", 5, 4), number(40.0));
+    assert_eq!(engine.get_cell_value("Sheet1", 5, 5), number(30.0));
+
+    let values = evaluate(
+        false,
+        &[
+            (5, 4, "=SUM(A1:A3*B1:B3)"),
+            (2, 5, "=MAX(IF(A1:A3=0,B1:B3))"),
+        ],
+    );
+    assert_eq!(values, vec![number(40.0), number(20.0)]);
+}
+
+#[test]
+fn intersected_cells_keep_blanks_and_single_cells_need_no_intersection() {
+    // A4 is blank: it compares equal to "" and concatenates as "".
+    assert_eq!(
+        legacy(4, "=A1:A4&\"x\""),
+        Some(LiteralValue::Text("x".into()))
+    );
+    assert_eq!(
+        legacy(4, "=IF(A1:A4=\"\",\"blank\",\"value\")"),
+        Some(LiteralValue::Text("blank".into()))
+    );
+    assert_eq!(legacy(5, "=B3:B3+1"), number(31.0));
+}
+
+#[test]
+fn ranges_returned_by_functions_intersect_in_single_value_positions() {
+    assert_eq!(
+        legacy(2, "=IF(IF(TRUE,A1:A3),\"yes\",\"no\")"),
+        Some(LiteralValue::Text("no".into()))
+    );
+    assert_eq!(legacy(3, "=INDEX(B1:B3,0)+1"), number(31.0));
+    assert_eq!(legacy(5, "=SUM(INDEX(B1:B3,0))"), number(60.0));
+}
+
+#[test]
+fn reference_parameters_lift_over_arrays_of_references_next_to_intersections() {
+    // Inside SUMPRODUCT, ROW(A2:A4)-1 is {1;2;3}: OFFSET gives the array of
+    // references {A2;A3;A4} and SUBTOTAL counts each one (A4 is blank).
+    assert_eq!(
+        legacy(5, "=SUMPRODUCT(SUBTOTAL(3,OFFSET(A1,ROW(A2:A4)-1,0)))"),
+        number(2.0)
+    );
+    assert_eq!(
+        legacy(
+            5,
+            "=SUMPRODUCT(SUBTOTAL(9,OFFSET(B1,ROW(B1:B3)-1,0))*{1;10;100})"
+        ),
+        number(3210.0)
+    );
+    // The same formula intersects A1:A3 in the operand next to SUMPRODUCT
+    // (row 3: A3 = 1) and keeps lifting inside it.
+    assert_eq!(
+        legacy(
+            3,
+            "=SUMPRODUCT(SUBTOTAL(9,OFFSET(B1,ROW(B1:B3)-1,0)))+A1:A3*100"
+        ),
+        number(160.0)
+    );
+    // Outside an array argument ROW gives its first row, so there is one
+    // reference; an array constant still makes an array of references.
+    assert_eq!(
+        legacy(5, "=SUM(SUBTOTAL(9,OFFSET(B1,ROW(B1:B3)-1,0)))"),
+        number(10.0)
+    );
+    assert_eq!(
+        legacy(5, "=SUM(SUBTOTAL(9,OFFSET(B1,{0;1;2},0)))"),
+        number(60.0)
+    );
+    assert_eq!(
+        legacy(5, "=SUM(COUNTIF(OFFSET(A1,{0;1;2},0),1))"),
+        number(2.0)
+    );
+    // OFFSET's rows is a single value: a range there is intersected with the
+    // formula cell (row 2: A2 = 0, row 3: A3 = 1, row 5: #VALUE!), as when
+    // OFFSET is evaluated on its own, and kept whole inside SUMPRODUCT.
+    assert_eq!(legacy(2, "=SUBTOTAL(9,OFFSET(B1,A1:A3,0))"), number(10.0));
+    assert_eq!(legacy(3, "=SUBTOTAL(9,OFFSET(B1,A1:A3,0))"), number(20.0));
+    assert_eq!(
+        error_kind(legacy(5, "=SUBTOTAL(9,OFFSET(B1,A1:A3,0))")),
+        ExcelErrorKind::Value
+    );
+    assert_eq!(
+        legacy(5, "=SUMPRODUCT(SUBTOTAL(9,OFFSET(B1,A1:A3,0)))"),
+        number(50.0)
+    );
+    // IF tests one value (row 3: A3 = 1) and passes the selected array of
+    // references on; row 2 selects B1.
+    let branch = "=SUMPRODUCT(SUBTOTAL(9,IF(A1:A3,OFFSET(B1,{0;1;2},0),B1)))";
+    assert_eq!(legacy(3, branch), number(60.0));
+    assert_eq!(legacy(2, branch), number(10.0));
+    // N reads each reference's first cell, and a range by its top-left cell
+    // rather than by intersection.
+    assert_eq!(
+        legacy(5, "=SUMPRODUCT(N(OFFSET(B1,ROW(B1:B3)-1,0)))"),
+        number(60.0)
+    );
+    assert_eq!(legacy(3, "=N(B2:B3)"), number(20.0));
+    // Array formulas and engines without the declared semantics are unchanged.
+    assert_eq!(
+        evaluate(
+            false,
+            &[
+                (5, 4, "=SUM(SUBTOTAL(9,OFFSET(B1,ROW(B1:B3)-1,0)))"),
+                (5, 5, "=SUMPRODUCT(SUBTOTAL(9,OFFSET(B1,A1:A3,0)))"),
+            ],
+        ),
+        vec![number(60.0), number(50.0)]
+    );
+    let mut engine = Engine::new(
+        TestWorkbook::new(),
+        EvalConfig {
+            enable_parallel: false,
+            ..Default::default()
+        },
+    );
+    for (row, a, b) in [(1, 1.0, 10.0), (2, 0.0, 20.0), (3, 1.0, 30.0)] {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Number(a))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", row, 2, LiteralValue::Number(b))
+            .unwrap();
+    }
+    for (col, formula) in [
+        (4, "=SUM(SUBTOTAL(9,OFFSET(B1,ROW(B1:B3)-1,0)))"),
+        (5, "=SUM(SUBTOTAL(9,OFFSET(B1,A1:A3,0)))"),
+    ] {
+        engine
+            .set_cell_formula("Sheet1", 5, col, parse(formula).unwrap())
+            .unwrap();
+    }
+    engine.use_legacy_array_semantics();
+    engine.declare_array_formula("Sheet1", 5, 4, 1, 1, false);
+    engine.declare_array_formula("Sheet1", 5, 5, 1, 1, true);
+    engine.evaluate_all().unwrap();
+    assert_eq!(engine.get_cell_value("Sheet1", 5, 4), number(60.0));
+    assert_eq!(engine.get_cell_value("Sheet1", 5, 5), number(50.0));
+}
+
+#[test]
+fn lambda_bodies_keep_array_evaluation() {
+    assert_eq!(
+        legacy(5, "=LAMBDA(x,SUMPRODUCT(ROW(A1:A3)))(0)"),
+        number(6.0)
+    );
+}

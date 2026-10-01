@@ -107,6 +107,7 @@ mod arrow_canonical_611;
 mod effects_603;
 
 mod implicit_intersection_103;
+mod legacy_formula_evaluation;
 
 mod arrow_bulk_update;
 mod arrow_chunk_growth;

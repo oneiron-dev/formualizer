@@ -156,6 +156,13 @@ impl Function for RowFn {
             },
         };
 
+        // Unless evaluated as an array, a formula entered without the array
+        // flag takes the first row only.
+        let last = if args[0].in_legacy_value_context() {
+            first
+        } else {
+            last
+        };
         Ok(index_sequence(first, last, true, ctx))
     }
 }
@@ -449,6 +456,13 @@ impl Function for ColumnFn {
             },
         };
 
+        // Unless evaluated as an array, a formula entered without the array
+        // flag takes the first column only.
+        let last = if args[0].in_legacy_value_context() {
+            first
+        } else {
+            last
+        };
         Ok(index_sequence(first, last, false, ctx))
     }
 }

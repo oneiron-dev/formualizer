@@ -188,6 +188,67 @@ pub(crate) fn reference_array_spec(name: &str) -> Option<ReferenceArraySpec> {
     }
 }
 
+/// How a formula entered without the array flag (a legacy formula) evaluates
+/// an argument position, following Excel's value, reference and array
+/// parameter classes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LegacyArg {
+    /// A single value: in a value context a range here is implicitly
+    /// intersected with the formula cell. Nested expressions keep the
+    /// caller's context.
+    Value,
+    /// A single value even inside an array context (IF's test, CHOOSE's
+    /// index, IFERROR's value, INDEX's row and column).
+    ForcedValue,
+    /// A reference or value: a range passes whole and nested expressions
+    /// keep the caller's context (SUM, MATCH's lookup array, ...).
+    Reference,
+    /// The results of IF, CHOOSE and IFERROR: a range passes whole and
+    /// nested expressions are evaluated as values even inside an array context.
+    Choice,
+    /// An array: nested expressions are evaluated as arrays without
+    /// array entry (SUMPRODUCT, INDEX's array, LOOKUP's vectors, ...).
+    Array,
+}
+
+/// The legacy evaluation of argument `index` of the builtin `name`.
+pub(crate) fn legacy_arg(name: &str, index: usize) -> LegacyArg {
+    use LegacyArg::*;
+    // The arguments before position `n` are `head`, the others `tail`.
+    let split = |n: usize, head, tail| if index < n { head } else { tail };
+    match name {
+        "IF" | "CHOOSE" | "IFERROR" | "IFNA" => split(1, ForcedValue, Choice),
+        "INDEX" => split(1, Array, ForcedValue),
+        "LOOKUP" | "FORECAST.LINEAR" => split(1, Value, Array),
+        "SUMPRODUCT" | "MMULT" | "MDETERM" | "MINVERSE" | "FREQUENCY" | "SUMX2MY2" | "SUMX2PY2"
+        | "SUMXMY2" | "CHISQ.TEST" | "CORREL" | "COVARIANCE.P" | "COVARIANCE.S" | "PEARSON"
+        | "RSQ" | "SLOPE" | "INTERCEPT" | "STEYX" | "F.TEST" | "MODE.SNGL" | "MODE.MULT" => Array,
+        "TREND" | "GROWTH" => split(3, Array, Value),
+        "LINEST" | "LOGEST" | "T.TEST" => split(2, Array, Value),
+        "IRR" | "MIRR" => split(1, Array, Value),
+        // Forms 14 to 19 compute over an array expression.
+        "AGGREGATE" => split(2, Value, Array),
+        // ROWS, COLUMNS and TRANSPOSE take an array.
+        "ROWS" | "COLUMNS" | "TRANSPOSE" => Array,
+        // The offsets, sizes and texts that address a reference are single values.
+        "OFFSET" => split(1, Reference, Value),
+        "INDIRECT" => Value,
+        "NPV" => split(1, Value, Reference),
+        // N and T take a reference.
+        "N" | "T" => Reference,
+        // Functions that arrived with dynamic arrays have no legacy form.
+        "FILTER" | "SORT" | "SORTBY" | "UNIQUE" | "SEQUENCE" | "RANDARRAY" | "XLOOKUP"
+        | "XMATCH" | "LET" | "LAMBDA" | "MAP" | "REDUCE" | "SCAN" | "BYROW" | "BYCOL"
+        | "MAKEARRAY" | "TAKE" | "DROP" | "CHOOSECOLS" | "CHOOSEROWS" | "EXPAND" | "HSTACK"
+        | "VSTACK" | "TOCOL" | "TOROW" | "WRAPCOLS" | "WRAPROWS" | "TEXTSPLIT" | "TEXTBEFORE"
+        | "TEXTAFTER" | "GROUPBY" | "PIVOTBY" | "ARRAYTOTEXT" | "VALUETOTEXT" => Array,
+        _ => match lift_spec(name) {
+            Some(spec) if spec.lifts(index) => Value,
+            _ => Reference,
+        },
+    }
+}
+
 /// The rows of a multi-cell array value; `None` for scalars and single cells.
 pub(crate) fn array_rows(value: &CalcValue<'_>) -> Option<Vec<Vec<LiteralValue>>> {
     match value {

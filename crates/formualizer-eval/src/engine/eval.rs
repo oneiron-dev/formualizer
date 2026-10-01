@@ -5210,6 +5210,26 @@ where
         }
     }
 
+    /// The interpreter for the formula at `cell`: under the declared array
+    /// semantics a formula without an array declaration evaluates as a legacy
+    /// (implicitly intersecting) formula throughout, not only in its result.
+    pub(crate) fn formula_interpreter<'c>(
+        &self,
+        context: &'c dyn crate::traits::EvaluationContext,
+        sheet: &'c str,
+        cell: CellRef,
+    ) -> Interpreter<'c> {
+        let interpreter = Interpreter::new_with_cell(context, sheet, cell);
+        match &self.array_formula_shapes {
+            Some(shapes)
+                if !shapes.contains_key(&(cell.sheet_id, cell.coord.row(), cell.coord.col())) =>
+            {
+                interpreter.as_legacy_formula()
+            }
+            _ => interpreter,
+        }
+    }
+
     /// Whether a name's formula is reference-shaped: a reference, a `:` range
     /// or a call to a function that can return a reference (OFFSET, INDEX).
     fn yields_reference(&self, ast: &formualizer_parse::parser::ASTNode) -> bool {
@@ -20226,7 +20246,7 @@ where
             .graph
             .get_cell_ref(vertex_id)
             .expect("cell ref for vertex");
-        let interpreter = Interpreter::new_with_cell(self, sheet_name, cell_ref);
+        let interpreter = self.formula_interpreter(self, sheet_name, cell_ref);
 
         let result =
             interpreter.evaluate_arena_ast(ast_id, self.graph.data_store(), self.graph.sheet_reg());
@@ -26330,7 +26350,7 @@ where
             .graph
             .get_cell_ref(vertex_id)
             .expect("cell ref for vertex");
-        let interpreter = Interpreter::new_with_cell(self, sheet_name, cell_ref);
+        let interpreter = self.formula_interpreter(self, sheet_name, cell_ref);
 
         interpreter
             .evaluate_arena_ast(ast_id, self.graph.data_store(), self.graph.sheet_reg())
@@ -28901,7 +28921,7 @@ where
                     .graph
                     .get_cell_ref(vertex_id)
                     .expect("cell ref for vertex");
-                let interpreter = Interpreter::new_with_cell(ctx, sheet_name, cell_ref);
+                let interpreter = self.formula_interpreter(ctx, sheet_name, cell_ref);
                 interpreter
                     .evaluate_arena_ast(ast_id, self.graph.data_store(), self.graph.sheet_reg())
                     .map(|cv| {

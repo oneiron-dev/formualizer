@@ -1161,6 +1161,62 @@ fn formulas_without_the_array_flag_take_the_implicit_intersection() {
     }
 }
 #[test]
+fn formulas_without_the_array_flag_intersect_inside_the_formula() {
+    // A legacy formula intersects a range or a name for one in a single-value
+    // position with its own row (IF's test, an operator operand), ROW gives
+    // its first row, and SUMPRODUCT still evaluates its argument as an array;
+    // the same text entered as an array does not intersect.
+    let mut p = parts(
+        "<row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"B1\"><v>10</v></c></row>\
+         <row r=\"2\"><c r=\"A2\"><v>0</v></c><c r=\"B2\"><v>20</v></c><c r=\"C2\"><f>MAX(IF(A1:A3=0,B1:B3))</f><v>0</v></c><c r=\"D2\"><f t=\"array\" ref=\"D2\">MAX(IF(A1:A3=0,B1:B3))</f><v>0</v></c><c r=\"E2\" t=\"str\"><f>IF(Flags=0,\"zero\",\"one\")</f><v></v></c></row>\
+         <row r=\"3\"><c r=\"A3\"><v>1</v></c><c r=\"B3\"><v>30</v></c><c r=\"C3\"><f>SUM(ROW(A1:A3))</f><v>0</v></c><c r=\"D3\"><f t=\"array\" ref=\"D3\">SUM(ROW(A1:A3))</f><v>0</v></c></row>\
+         <row r=\"5\"><c r=\"C5\"><f>SUMPRODUCT((A1:A3=1)*B1:B3)</f><v>0</v></c><c r=\"D5\"><f>SUM((A1:A3=1)*B1:B3)</f><v>0</v></c></row>",
+    );
+    let wb = p.get_mut("xl/workbook.xml").unwrap();
+    *wb = wb.replace(
+        "</workbook>",
+        "<definedNames><definedName name=\"Flags\">Sheet1!$A$1:$A$3</definedName></definedNames></workbook>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<f>MAX(IF(A1:A3=0,B1:B3))</f><v>30</v>",
+        "<f>IF(Flags=0,\"zero\",\"one\")</f><v>zero</v>",
+        "<f t=\"array\" ref=\"D2\">MAX(IF(A1:A3=0,B1:B3))</f><v>20</v>",
+        "<f>SUM(ROW(A1:A3))</f><v>1</v>",
+        "<f t=\"array\" ref=\"D3\">SUM(ROW(A1:A3))</f><v>6</v>",
+        "<f>SUMPRODUCT((A1:A3=1)*B1:B3)</f><v>40</v>",
+        "<c r=\"D5\" t=\"e\"><f>SUM((A1:A3=1)*B1:B3)</f><v>#VALUE!</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected}: {sheet}");
+    }
+}
+#[test]
+fn formulas_without_the_array_flag_lift_reference_parameters_over_arrays_of_references() {
+    // Inside SUMPRODUCT OFFSET with ROW(B1:B3)-1 is an array of references
+    // that SUBTOTAL evaluates once per reference, while the operand next to
+    // SUMPRODUCT intersects A1:A3 with row 3; outside an array argument ROW
+    // gives its first row, and OFFSET's rows intersects a range.
+    let p = parts(
+        "<row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"B1\"><v>10</v></c></row>\
+         <row r=\"2\"><c r=\"A2\"><v>0</v></c><c r=\"B2\"><v>20</v></c><c r=\"C2\"><f>SUBTOTAL(9,OFFSET(B1,A1:A3,0))</f><v>0</v></c></row>\
+         <row r=\"3\"><c r=\"A3\"><v>1</v></c><c r=\"B3\"><v>30</v></c><c r=\"C3\"><f>SUMPRODUCT(SUBTOTAL(9,OFFSET(B1,ROW(B1:B3)-1,0))*{1;10;100})+A1:A3*5</f><v>0</v></c><c r=\"D3\"><f>SUM(SUBTOTAL(9,OFFSET(B1,ROW(B1:B3)-1,0)))</f><v>0</v></c><c r=\"E3\"><f t=\"array\" ref=\"E3\">SUM(SUBTOTAL(9,OFFSET(B1,ROW(B1:B3)-1,0)))</f><v>0</v></c></row>\
+         <row r=\"5\"><c r=\"C5\"><f>SUMPRODUCT(SUBTOTAL(3,OFFSET(A1,ROW(A2:A4)-1,0)))</f><v>0</v></c><c r=\"D5\"><f>SUMPRODUCT(N(OFFSET(B1,ROW(B1:B3)-1,0)))</f><v>0</v></c></row>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<f>SUBTOTAL(9,OFFSET(B1,A1:A3,0))</f><v>10</v>",
+        "<f>SUMPRODUCT(SUBTOTAL(9,OFFSET(B1,ROW(B1:B3)-1,0))*{1;10;100})+A1:A3*5</f><v>3215</v>",
+        "<f>SUM(SUBTOTAL(9,OFFSET(B1,ROW(B1:B3)-1,0)))</f><v>10</v>",
+        "<f t=\"array\" ref=\"E3\">SUM(SUBTOTAL(9,OFFSET(B1,ROW(B1:B3)-1,0)))</f><v>60</v>",
+        "<f>SUMPRODUCT(SUBTOTAL(3,OFFSET(A1,ROW(A2:A4)-1,0)))</f><v>2</v>",
+        "<f>SUMPRODUCT(N(OFFSET(B1,ROW(B1:B3)-1,0)))</f><v>60</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected}: {sheet}");
+    }
+}
+#[test]
 fn formulas_reading_array_members_see_the_array_result() {
     let p = parts(
         "<row r=\"1\"><c r=\"A1\"><f>C3*10</f><v>0</v></c><c r=\"B1\"><f>D3+1</f><v>0</v></c></row>\

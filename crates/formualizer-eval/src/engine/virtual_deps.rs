@@ -14,8 +14,6 @@ use formualizer_parse::parser::{ReferenceType, TableReference};
 use rustc_hash::FxHashSet;
 use std::sync::Mutex;
 
-use crate::interpreter::Interpreter;
-
 pub struct DynamicRefCollector<'a, R: EvaluationContext> {
     pub engine: &'a Engine<R>,
     pub current_sheet: &'a str,
@@ -462,7 +460,7 @@ impl DynamicRefVirtualDepProvider {
             .graph
             .get_cell_ref(v)
             .unwrap_or_else(|| engine.graph.make_cell_ref(sheet_name, 0, 0));
-        let interpreter = Interpreter::new_with_cell(&collector, sheet_name, cell_ref);
+        let interpreter = engine.formula_interpreter(&collector, sheet_name, cell_ref);
         let _ = interpreter.evaluate_arena_ast(
             ast_id,
             engine.graph.data_store(),
