@@ -106,6 +106,38 @@ fn mismatched_lifted_shapes_pad_with_na() {
 }
 
 #[test]
+fn index_selects_one_value_per_array_row_or_column_number() {
+    assert_number("=SUM(INDEX(B1:B3,{1;3}))", 4.0);
+    assert_number("=SUM(INDEX({10;20;30},{1;3}))", 40.0);
+    assert_number("=ROWS(INDEX(B1:B3,{1;3;2}))", 3.0);
+    assert_number("=COLUMNS(INDEX(B1:B3,{1,3}))", 2.0);
+    assert_number("=SUM(INDEX(B1:C3,{1;2},1))", 3.0);
+    assert_number("=SUM(INDEX(B1:B3,MATCH({\"b\";\"a\"},A1:A3,0)))", 3.0);
+    // A row array and a column array broadcast; equal shapes pair up.
+    assert_number("=SUM(INDEX(B1:C3,{1;2},{1,2}))", 90103.0);
+    assert_number("=COUNT(INDEX(B1:C3,{1,3},{1,2}))", 1.0);
+    // Each element stands alone: out of range is #REF!, an error stays.
+    assert_number("=SUM(IFERROR(INDEX(B1:B3,{1;4}),100))", 101.0);
+    assert_number("=SUM(--ISNA(INDEX(B1:B3,IF({TRUE;FALSE},1,NA()))))", 1.0);
+    let mut engine = engine();
+    assert_eq!(
+        eval(&mut engine, "=INDEX(A1:A3,{2;1})"),
+        LiteralValue::Text("b".into())
+    );
+    match eval(&mut engine, "=INDEX(B1:B3,{4;1})") {
+        LiteralValue::Error(e) => assert_eq!(e.kind, ExcelErrorKind::Ref),
+        other => panic!("expected #REF!, got {other:?}"),
+    }
+    // Single-value selections are unchanged.
+    assert_number("=INDEX(B1:B3,2)", 2.0);
+    assert_number("=SUM(INDEX(B1:C3,0,1))", 6.0);
+    match eval(&mut engine, "=INDEX(B1:B3,4)") {
+        LiteralValue::Error(e) => assert_eq!(e.kind, ExcelErrorKind::Ref),
+        other => panic!("expected #REF!, got {other:?}"),
+    }
+}
+
+#[test]
 fn concatenation_is_element_wise_over_arrays() {
     // A1:A3 & B1:B3 = "a1","b2","a3"
     assert_number("=MATCH(\"b2\",A1:A3&B1:B3,0)", 2.0);

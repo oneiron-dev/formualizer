@@ -366,6 +366,8 @@ impl IndexFn {
 ///   (both `0` selects the whole range), matching Excel.
 /// - Negative or out-of-bounds indexes return `#REF!`.
 /// - Non-numeric index arguments return `#VALUE!`.
+/// - An array `row_num` or `column_num` returns an array of the selected values, paired and
+///   broadcast element by element like any single-value parameter.
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -435,6 +437,16 @@ impl Function for IndexFn {
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         if let Some(value) = Self::precise_dispatch(self, args, ctx) {
             return Ok(value);
+        }
+        // An array row_num or column_num selects one value per element:
+        // INDEX(B1:B6,{1;3;6}) is {B1;B3;B6}, with #REF! for an element out of range.
+        if let Some(lifted) = crate::lift::lift_call(self.name(), args, |call| {
+            match Self::precise_dispatch(self, call, ctx) {
+                Some(value) => Ok(value),
+                None => self.validated_dispatch(call, ctx),
+            }
+        })? {
+            return Ok(lifted);
         }
         self.validated_dispatch(args, ctx)
     }

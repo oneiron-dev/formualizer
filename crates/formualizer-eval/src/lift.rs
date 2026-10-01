@@ -101,6 +101,7 @@ pub(crate) fn lift_spec(name: &str) -> Option<Lift> {
         "XMATCH" => Lift::Only(&[0, 2, 3]),
         "XLOOKUP" => Lift::Only(&[0, 4, 5]),
         "LOOKUP" => Lift::Only(&[0]),
+        "INDEX" => Lift::Only(&[1, 2]),
         "ADDRESS" => Lift::All,
         // Aggregates over an array with a single-value parameter.
         "LARGE" | "SMALL" | "PERCENTILE.INC" | "PERCENTILE.EXC" | "QUARTILE.INC"
