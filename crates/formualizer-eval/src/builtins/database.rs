@@ -84,6 +84,8 @@ fn resolve_field_index(
             }
             Ok((*i - 1) as usize)
         }
+        // An error passed as the field is the result, as in Excel.
+        LiteralValue::Error(e) => Err(e.clone()),
         _ => Err(ExcelError::new_value().with_message("Field must be text or number")),
     }
 }
@@ -208,6 +210,10 @@ fn eval_d_function<'a, 'b>(
                     arr,
                     crate::engine::DateSystem::Excel1900,
                 )
+            } else if let LiteralValue::Error(e) = val {
+                // An error passed in place of the database (`#NAME?` from an
+                // unknown function) is the result, as in Excel.
+                return Ok(CalcValue::Scalar(LiteralValue::Error(e)));
             } else {
                 return Ok(CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new_value().with_message("Database must be a range or array"),
@@ -241,6 +247,10 @@ fn eval_d_function<'a, 'b>(
                     arr,
                     crate::engine::DateSystem::Excel1900,
                 )
+            } else if let LiteralValue::Error(e) = val {
+                // An error passed in place of the criteria (`#NAME?` from an
+                // unknown function) is the result, as in Excel.
+                return Ok(CalcValue::Scalar(LiteralValue::Error(e)));
             } else {
                 return Ok(CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new_value().with_message("Criteria must be a range or array"),
@@ -371,6 +381,10 @@ fn eval_d_stat_function<'a, 'b>(
                     arr,
                     crate::engine::DateSystem::Excel1900,
                 )
+            } else if let LiteralValue::Error(e) = val {
+                // An error passed in place of the database (`#NAME?` from an
+                // unknown function) is the result, as in Excel.
+                return Ok(CalcValue::Scalar(LiteralValue::Error(e)));
             } else {
                 return Ok(CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new_value().with_message("Database must be a range or array"),
@@ -404,6 +418,10 @@ fn eval_d_stat_function<'a, 'b>(
                     arr,
                     crate::engine::DateSystem::Excel1900,
                 )
+            } else if let LiteralValue::Error(e) = val {
+                // An error passed in place of the criteria (`#NAME?` from an
+                // unknown function) is the result, as in Excel.
+                return Ok(CalcValue::Scalar(LiteralValue::Error(e)));
             } else {
                 return Ok(CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new_value().with_message("Criteria must be a range or array"),
@@ -500,6 +518,10 @@ fn eval_dget<'a, 'b>(
                     arr,
                     crate::engine::DateSystem::Excel1900,
                 )
+            } else if let LiteralValue::Error(e) = val {
+                // An error passed in place of the database (`#NAME?` from an
+                // unknown function) is the result, as in Excel.
+                return Ok(CalcValue::Scalar(LiteralValue::Error(e)));
             } else {
                 return Ok(CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new_value().with_message("Database must be a range or array"),
@@ -533,6 +555,10 @@ fn eval_dget<'a, 'b>(
                     arr,
                     crate::engine::DateSystem::Excel1900,
                 )
+            } else if let LiteralValue::Error(e) = val {
+                // An error passed in place of the criteria (`#NAME?` from an
+                // unknown function) is the result, as in Excel.
+                return Ok(CalcValue::Scalar(LiteralValue::Error(e)));
             } else {
                 return Ok(CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new_value().with_message("Criteria must be a range or array"),
@@ -597,6 +623,10 @@ fn eval_dcounta<'a, 'b>(
                     arr,
                     crate::engine::DateSystem::Excel1900,
                 )
+            } else if let LiteralValue::Error(e) = val {
+                // An error passed in place of the database (`#NAME?` from an
+                // unknown function) is the result, as in Excel.
+                return Ok(CalcValue::Scalar(LiteralValue::Error(e)));
             } else {
                 return Ok(CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new_value().with_message("Database must be a range or array"),
@@ -630,6 +660,10 @@ fn eval_dcounta<'a, 'b>(
                     arr,
                     crate::engine::DateSystem::Excel1900,
                 )
+            } else if let LiteralValue::Error(e) = val {
+                // An error passed in place of the criteria (`#NAME?` from an
+                // unknown function) is the result, as in Excel.
+                return Ok(CalcValue::Scalar(LiteralValue::Error(e)));
             } else {
                 return Ok(CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new_value().with_message("Criteria must be a range or array"),

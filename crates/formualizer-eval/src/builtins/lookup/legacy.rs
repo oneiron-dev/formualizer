@@ -200,6 +200,13 @@ impl Function for LookupFn {
         // --- Materialise lookup vector / array ---
         let lookup_data = materialise_range(&args[1], ctx)?;
         let (l_rows, l_cols) = dims(&lookup_data);
+        // The result vector is resolved before the search, so an error passed in
+        // its place is the result whether or not the lookup value is found.
+        let result_data = if has_result_vector {
+            Some(materialise_range(&args[2], ctx)?)
+        } else {
+            None
+        };
 
         // Determine search orientation and build the search slice.
         let (search_vec, is_row_search) = if has_result_vector {
@@ -231,8 +238,7 @@ impl Function for LookupFn {
         };
 
         // --- Retrieve result ---
-        if has_result_vector {
-            let result_data = materialise_range(&args[2], ctx)?;
+        if let Some(result_data) = result_data {
             let (r_rows, r_cols) = dims(&result_data);
             let result_vec = flatten_1d_vec(&result_data, r_rows, r_cols);
             let val = result_vec
@@ -270,7 +276,10 @@ impl Function for LookupFn {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Materialise a range argument into a 2-D Vec grid.
+/// Materialise a range argument into a 2-D Vec grid. An error passed in place
+/// of the vector (`#NAME?` from an unknown function, `#N/A`) is not a 1x1 vector
+/// to search: Excel returns it as the result, so it comes back as `Err` and the
+/// caller propagates it.
 fn materialise_range<'a, 'b>(
     arg: &ArgumentHandle<'a, 'b>,
     ctx: &dyn FunctionContext<'b>,
@@ -290,6 +299,7 @@ fn materialise_range<'a, 'b>(
     } else {
         let v = arg.value()?.into_literal();
         match v {
+            LiteralValue::Error(e) => Err(e),
             LiteralValue::Array(rows) => Ok(rows),
             other => Ok(vec![vec![other]]),
         }

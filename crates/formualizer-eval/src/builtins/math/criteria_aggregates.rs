@@ -1808,6 +1808,11 @@ impl Function for CountBlankFn {
                     return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
                 }
                 AggregateArgument::Scalar(v) => match v {
+                    // An error passed in place of the range (`#NAME?` from an
+                    // unknown function) is the result, not a cell to count.
+                    LiteralValue::Error(error) => {
+                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
+                    }
                     LiteralValue::Empty => cnt += 1,
                     LiteralValue::Text(s) if s.is_empty() => cnt += 1,
                     _ => {}

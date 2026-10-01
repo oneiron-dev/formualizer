@@ -441,6 +441,27 @@ fn range_lookup_is_approximate<'a, 'b>(
     crate::coercion::to_logical(&args[3].value()?.into_literal())
 }
 
+/// The `table_array` of VLOOKUP or HLOOKUP: a reference, or else an array value
+/// (a plain scalar is a 1x1 table).
+enum LookupTable {
+    Reference(formualizer_parse::parser::ReferenceType),
+    Values(Vec<Vec<LiteralValue>>),
+}
+
+/// Resolves a `table_array` argument. An error passed in its place (`#NAME?`
+/// from an unknown function, `#DIV/0!`) is not a table to search: Excel returns
+/// it as the result, so it comes back as `Err` and the caller propagates it.
+fn lookup_table(arg: &ArgumentHandle<'_, '_>) -> Result<LookupTable, ExcelError> {
+    if let Ok(table_ref) = arg.as_reference_or_eval() {
+        return Ok(LookupTable::Reference(table_ref));
+    }
+    match arg.value()?.into_literal() {
+        LiteralValue::Error(e) => Err(e),
+        LiteralValue::Array(rows) => Ok(LookupTable::Values(rows)),
+        other => Ok(LookupTable::Values(vec![vec![other]])),
+    }
+}
+
 #[derive(Debug)]
 pub struct VLookupFn;
 /// Looks up a value in the first column of a table and returns a value from another column.
@@ -575,9 +596,12 @@ impl Function for VLookupFn {
             )));
         }
         let lookup_value = args[0].value()?.into_literal();
+        if let LiteralValue::Error(e) = lookup_value {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+        }
 
-        // Try to get table as reference, fall back to array literal
-        let table_ref_opt = args[1].as_reference_or_eval().ok();
+        // A reference, or an array value; an error in its place is the result.
+        let table = lookup_table(&args[1])?;
         let col_index = match args[2].value()?.into_literal() {
             LiteralValue::Int(i) => i,
             LiteralValue::Number(n) => n as i64,
@@ -594,108 +618,105 @@ impl Function for VLookupFn {
         }
         let approximate = range_lookup_is_approximate(args, true)?;
         // Handle both cell references and array literals
-        if let Some(table_ref) = table_ref_opt {
-            let current_sheet = ctx.current_sheet();
-            let rv = ctx.resolve_range_view(&table_ref, current_sheet)?;
-            let (rows, cols) = rv.dims();
-            if col_index as usize > cols {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                    ExcelError::new(ExcelErrorKind::Ref),
-                )));
-            }
-
-            let first_col_view = rv.sub_view(0, 0, rows, 1);
-            let row_idx_opt = if !approximate {
-                let wildcard_mode = matches!(lookup_value, LiteralValue::Text(ref s) if s.contains('*') || s.contains('?') || s.contains('~'));
-                if !wildcard_mode
-                    && let Some(index) = ctx.get_lookup_index(&rv, LookupAxis::ColumnInView(0))
-                {
-                    index.find_first_exact(&lookup_value)
-                } else {
-                    super::lookup_utils::find_exact_index_in_view(
-                        &first_col_view,
-                        &lookup_value,
-                        wildcard_mode,
-                        ctx.date_system(),
-                    )?
+        match table {
+            LookupTable::Reference(table_ref) => {
+                let current_sheet = ctx.current_sheet();
+                let rv = ctx.resolve_range_view(&table_ref, current_sheet)?;
+                let (rows, cols) = rv.dims();
+                if col_index as usize > cols {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                        ExcelError::new(ExcelErrorKind::Ref),
+                    )));
                 }
-            } else {
-                // Fallback for approximate mode (requires materializing first column for now)
-                let mut first_col: Vec<LiteralValue> = Vec::new();
-                first_col_view.for_each_row(&mut |row| {
-                    first_col.push(row[0].clone());
-                    Ok(())
-                })?;
-                if first_col.is_empty() {
-                    None
+
+                let first_col_view = rv.sub_view(0, 0, rows, 1);
+                let row_idx_opt = if !approximate {
+                    let wildcard_mode = matches!(lookup_value, LiteralValue::Text(ref s) if s.contains('*') || s.contains('?') || s.contains('~'));
+                    if !wildcard_mode
+                        && let Some(index) = ctx.get_lookup_index(&rv, LookupAxis::ColumnInView(0))
+                    {
+                        index.find_first_exact(&lookup_value)
+                    } else {
+                        super::lookup_utils::find_exact_index_in_view(
+                            &first_col_view,
+                            &lookup_value,
+                            wildcard_mode,
+                            ctx.date_system(),
+                        )?
+                    }
+                } else {
+                    // Fallback for approximate mode (requires materializing first column for now)
+                    let mut first_col: Vec<LiteralValue> = Vec::new();
+                    first_col_view.for_each_row(&mut |row| {
+                        first_col.push(row[0].clone());
+                        Ok(())
+                    })?;
+                    if first_col.is_empty() {
+                        None
+                    } else {
+                        binary_search_match(&first_col, &lookup_value, 1, ctx.date_system())?
+                    }
+                };
+
+                match row_idx_opt {
+                    Some(i) => {
+                        let target_col_idx = (col_index - 1) as usize;
+                        let v = rv.get_cell(i, target_col_idx);
+                        // Excel treats a direct reference to an empty cell as 0.
+                        // VLOOKUP/HLOOKUP return the referenced cell value, so match Excel by
+                        // materializing Empty as numeric 0. (Empty text "" remains Text(""))
+                        let v = match v {
+                            LiteralValue::Empty => LiteralValue::Number(0.0),
+                            other => other,
+                        };
+                        Ok(crate::traits::CalcValue::Scalar(v))
+                    }
+                    None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                        ExcelError::new(ExcelErrorKind::Na),
+                    ))),
+                }
+            }
+            LookupTable::Values(table) => {
+                if table.is_empty() {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                        ExcelError::new(ExcelErrorKind::Na),
+                    )));
+                }
+                let width = table.first().map(|r| r.len()).unwrap_or(0);
+                if col_index as usize > width {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                        ExcelError::new(ExcelErrorKind::Ref),
+                    )));
+                }
+
+                // First column values for lookup
+                let first_col: Vec<LiteralValue> =
+                    table.iter().filter_map(|r| r.first().cloned()).collect();
+                let row_idx_opt = if !approximate {
+                    let wildcard_mode = matches!(lookup_value, LiteralValue::Text(ref s) if s.contains('*') || s.contains('?') || s.contains('~'));
+                    find_exact_index(&first_col, &lookup_value, wildcard_mode, ctx.date_system())
                 } else {
                     binary_search_match(&first_col, &lookup_value, 1, ctx.date_system())?
-                }
-            };
+                };
 
-            match row_idx_opt {
-                Some(i) => {
-                    let target_col_idx = (col_index - 1) as usize;
-                    let v = rv.get_cell(i, target_col_idx);
-                    // Excel treats a direct reference to an empty cell as 0.
-                    // VLOOKUP/HLOOKUP return the referenced cell value, so match Excel by
-                    // materializing Empty as numeric 0. (Empty text "" remains Text(""))
-                    let v = match v {
-                        LiteralValue::Empty => LiteralValue::Number(0.0),
-                        other => other,
-                    };
-                    Ok(crate::traits::CalcValue::Scalar(v))
+                match row_idx_opt {
+                    Some(i) => {
+                        let target_col_idx = (col_index - 1) as usize;
+                        let val = table
+                            .get(i)
+                            .and_then(|r| r.get(target_col_idx))
+                            .cloned()
+                            .unwrap_or(LiteralValue::Empty);
+                        let val = match val {
+                            LiteralValue::Empty => LiteralValue::Number(0.0),
+                            other => other,
+                        };
+                        Ok(crate::traits::CalcValue::Scalar(val))
+                    }
+                    None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                        ExcelError::new(ExcelErrorKind::Na),
+                    ))),
                 }
-                None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                    ExcelError::new(ExcelErrorKind::Na),
-                ))),
-            }
-        } else {
-            // Handle array literal
-            let v = args[1].value()?.into_literal();
-            let table: Vec<Vec<LiteralValue>> = match v {
-                LiteralValue::Array(rows) => rows,
-                other => vec![vec![other]],
-            };
-            if table.is_empty() {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                    ExcelError::new(ExcelErrorKind::Na),
-                )));
-            }
-            let width = table.first().map(|r| r.len()).unwrap_or(0);
-            if col_index as usize > width {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                    ExcelError::new(ExcelErrorKind::Ref),
-                )));
-            }
-
-            // First column values for lookup
-            let first_col: Vec<LiteralValue> =
-                table.iter().filter_map(|r| r.first().cloned()).collect();
-            let row_idx_opt = if !approximate {
-                let wildcard_mode = matches!(lookup_value, LiteralValue::Text(ref s) if s.contains('*') || s.contains('?') || s.contains('~'));
-                find_exact_index(&first_col, &lookup_value, wildcard_mode, ctx.date_system())
-            } else {
-                binary_search_match(&first_col, &lookup_value, 1, ctx.date_system())?
-            };
-
-            match row_idx_opt {
-                Some(i) => {
-                    let target_col_idx = (col_index - 1) as usize;
-                    let val = table
-                        .get(i)
-                        .and_then(|r| r.get(target_col_idx))
-                        .cloned()
-                        .unwrap_or(LiteralValue::Empty);
-                    let val = match val {
-                        LiteralValue::Empty => LiteralValue::Number(0.0),
-                        other => other,
-                    };
-                    Ok(crate::traits::CalcValue::Scalar(val))
-                }
-                None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                    ExcelError::new(ExcelErrorKind::Na),
-                ))),
             }
         }
     }
@@ -835,9 +856,12 @@ impl Function for HLookupFn {
             )));
         }
         let lookup_value = args[0].value()?.into_literal();
+        if let LiteralValue::Error(e) = lookup_value {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+        }
 
-        // Try to get table as reference, fall back to array literal
-        let table_ref_opt = args[1].as_reference_or_eval().ok();
+        // A reference, or an array value; an error in its place is the result.
+        let table = lookup_table(&args[1])?;
         let row_index = match args[2].value()?.into_literal() {
             LiteralValue::Int(i) => i,
             LiteralValue::Number(n) => n as i64,
@@ -854,100 +878,97 @@ impl Function for HLookupFn {
         }
         let approximate = range_lookup_is_approximate(args, true)?;
         // Handle both cell references and array literals
-        if let Some(table_ref) = table_ref_opt {
-            let current_sheet = ctx.current_sheet();
-            let rv = ctx.resolve_range_view(&table_ref, current_sheet)?;
-            let (rows, cols) = rv.dims();
-            if row_index as usize > rows {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                    ExcelError::new(ExcelErrorKind::Ref),
-                )));
-            }
-            let first_row_view = rv.sub_view(0, 0, 1, cols);
-            let col_idx_opt = if approximate {
-                let mut first_row: Vec<LiteralValue> = Vec::with_capacity(cols);
-                first_row_view.for_each_row(&mut |row| {
-                    if first_row.is_empty() {
-                        first_row.extend_from_slice(row);
-                    }
-                    Ok(())
-                })?;
-                binary_search_match(&first_row, &lookup_value, 1, ctx.date_system())?
-            } else {
-                let wildcard_mode = matches!(lookup_value, LiteralValue::Text(ref s) if s.contains('*') || s.contains('?') || s.contains('~'));
-                if !wildcard_mode
-                    && let Some(index) = ctx.get_lookup_index(&rv, LookupAxis::RowInView(0))
-                {
-                    index.find_first_exact(&lookup_value)
+        match table {
+            LookupTable::Reference(table_ref) => {
+                let current_sheet = ctx.current_sheet();
+                let rv = ctx.resolve_range_view(&table_ref, current_sheet)?;
+                let (rows, cols) = rv.dims();
+                if row_index as usize > rows {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                        ExcelError::new(ExcelErrorKind::Ref),
+                    )));
+                }
+                let first_row_view = rv.sub_view(0, 0, 1, cols);
+                let col_idx_opt = if approximate {
+                    let mut first_row: Vec<LiteralValue> = Vec::with_capacity(cols);
+                    first_row_view.for_each_row(&mut |row| {
+                        if first_row.is_empty() {
+                            first_row.extend_from_slice(row);
+                        }
+                        Ok(())
+                    })?;
+                    binary_search_match(&first_row, &lookup_value, 1, ctx.date_system())?
                 } else {
-                    super::lookup_utils::find_exact_index_in_view(
-                        &first_row_view,
-                        &lookup_value,
-                        wildcard_mode,
-                        ctx.date_system(),
-                    )?
-                }
-            };
+                    let wildcard_mode = matches!(lookup_value, LiteralValue::Text(ref s) if s.contains('*') || s.contains('?') || s.contains('~'));
+                    if !wildcard_mode
+                        && let Some(index) = ctx.get_lookup_index(&rv, LookupAxis::RowInView(0))
+                    {
+                        index.find_first_exact(&lookup_value)
+                    } else {
+                        super::lookup_utils::find_exact_index_in_view(
+                            &first_row_view,
+                            &lookup_value,
+                            wildcard_mode,
+                            ctx.date_system(),
+                        )?
+                    }
+                };
 
-            match col_idx_opt {
-                Some(i) => {
-                    let target_row_idx = (row_index - 1) as usize;
-                    let v = rv.get_cell(target_row_idx, i);
-                    let v = match v {
-                        LiteralValue::Empty => LiteralValue::Number(0.0),
-                        other => other,
-                    };
-                    Ok(crate::traits::CalcValue::Scalar(v))
+                match col_idx_opt {
+                    Some(i) => {
+                        let target_row_idx = (row_index - 1) as usize;
+                        let v = rv.get_cell(target_row_idx, i);
+                        let v = match v {
+                            LiteralValue::Empty => LiteralValue::Number(0.0),
+                            other => other,
+                        };
+                        Ok(crate::traits::CalcValue::Scalar(v))
+                    }
+                    None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                        ExcelError::new(ExcelErrorKind::Na),
+                    ))),
                 }
-                None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                    ExcelError::new(ExcelErrorKind::Na),
-                ))),
             }
-        } else {
-            // Handle array literal
-            let v = args[1].value()?.into_literal();
-            let table: Vec<Vec<LiteralValue>> = match v {
-                LiteralValue::Array(rows) => rows,
-                other => vec![vec![other]],
-            };
-            if table.is_empty() {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                    ExcelError::new(ExcelErrorKind::Na),
-                )));
-            }
-            let height = table.len();
-            if row_index as usize > height {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                    ExcelError::new(ExcelErrorKind::Ref),
-                )));
-            }
-
-            // First row values for lookup
-            let first_row: Vec<LiteralValue> = table.first().cloned().unwrap_or_default();
-            let col_idx_opt = if approximate {
-                binary_search_match(&first_row, &lookup_value, 1, ctx.date_system())?
-            } else {
-                let wildcard_mode = matches!(lookup_value, LiteralValue::Text(ref s) if s.contains('*') || s.contains('?') || s.contains('~'));
-                find_exact_index(&first_row, &lookup_value, wildcard_mode, ctx.date_system())
-            };
-
-            match col_idx_opt {
-                Some(i) => {
-                    let target_row_idx = (row_index - 1) as usize;
-                    let val = table
-                        .get(target_row_idx)
-                        .and_then(|r| r.get(i))
-                        .cloned()
-                        .unwrap_or(LiteralValue::Empty);
-                    let val = match val {
-                        LiteralValue::Empty => LiteralValue::Number(0.0),
-                        other => other,
-                    };
-                    Ok(crate::traits::CalcValue::Scalar(val))
+            LookupTable::Values(table) => {
+                if table.is_empty() {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                        ExcelError::new(ExcelErrorKind::Na),
+                    )));
                 }
-                None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                    ExcelError::new(ExcelErrorKind::Na),
-                ))),
+                let height = table.len();
+                if row_index as usize > height {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                        ExcelError::new(ExcelErrorKind::Ref),
+                    )));
+                }
+
+                // First row values for lookup
+                let first_row: Vec<LiteralValue> = table.first().cloned().unwrap_or_default();
+                let col_idx_opt = if approximate {
+                    binary_search_match(&first_row, &lookup_value, 1, ctx.date_system())?
+                } else {
+                    let wildcard_mode = matches!(lookup_value, LiteralValue::Text(ref s) if s.contains('*') || s.contains('?') || s.contains('~'));
+                    find_exact_index(&first_row, &lookup_value, wildcard_mode, ctx.date_system())
+                };
+
+                match col_idx_opt {
+                    Some(i) => {
+                        let target_row_idx = (row_index - 1) as usize;
+                        let val = table
+                            .get(target_row_idx)
+                            .and_then(|r| r.get(i))
+                            .cloned()
+                            .unwrap_or(LiteralValue::Empty);
+                        let val = match val {
+                            LiteralValue::Empty => LiteralValue::Number(0.0),
+                            other => other,
+                        };
+                        Ok(crate::traits::CalcValue::Scalar(val))
+                    }
+                    None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                        ExcelError::new(ExcelErrorKind::Na),
+                    ))),
+                }
             }
         }
     }

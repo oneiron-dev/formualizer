@@ -272,7 +272,12 @@ impl Function for RankEqFn {
                 ExcelError::new_na(),
             )));
         }
-        let target = match coerce_num(&args[0].value()?.into_literal()) {
+        // An error in `number` or `order` is the result, as in Excel.
+        let t0 = args[0].value()?.into_literal();
+        if let LiteralValue::Error(e) = t0 {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+        }
+        let target = match coerce_num(&t0) {
             Ok(n) => n,
             Err(_) => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -282,7 +287,11 @@ impl Function for RankEqFn {
         };
         // optional order arg at end if 3 args
         let order = if args.len() >= 3 {
-            coerce_num(&args[2].value()?.into_literal()).unwrap_or(0.0)
+            let ord = args[2].value()?.into_literal();
+            if let LiteralValue::Error(e) = ord {
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+            }
+            coerce_num(&ord).unwrap_or(0.0)
         } else {
             0.0
         };
@@ -388,7 +397,11 @@ impl Function for RankAvgFn {
                 ExcelError::new_na(),
             )));
         }
+        // An error in `number` or `order` is the result, as in Excel.
         let t0 = scalar_like_value(&args[0])?;
+        if let LiteralValue::Error(e) = t0 {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+        }
         let target = match coerce_num(&t0) {
             Ok(n) => n,
             Err(_) => {
@@ -399,6 +412,9 @@ impl Function for RankAvgFn {
         };
         let order = if args.len() >= 3 {
             let ord = scalar_like_value(&args[2])?;
+            if let LiteralValue::Error(e) = ord {
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+            }
             coerce_num(&ord).unwrap_or(0.0)
         } else {
             0.0
@@ -506,7 +522,12 @@ impl Function for LARGE {
                 ExcelError::new_num(),
             )));
         }
-        let k = match coerce_num(&args.last().unwrap().value()?.into_literal()) {
+        // An error in `k` is the result; only a numeric `k` out of range is #NUM!.
+        let kv = args.last().unwrap().value()?.into_literal();
+        if let LiteralValue::Error(e) = kv {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+        }
+        let k = match coerce_num(&kv) {
             Ok(n) => n,
             Err(_) => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -607,7 +628,12 @@ impl Function for SMALL {
                 ExcelError::new_num(),
             )));
         }
-        let k = match coerce_num(&args.last().unwrap().value()?.into_literal()) {
+        // An error in `k` is the result; only a numeric `k` out of range is #NUM!.
+        let kv = args.last().unwrap().value()?.into_literal();
+        if let LiteralValue::Error(e) = kv {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+        }
+        let k = match coerce_num(&kv) {
             Ok(n) => n,
             Err(_) => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -1372,7 +1398,11 @@ impl Function for PercentileInc {
                 ExcelError::new_num(),
             )));
         }
+        // An error in `k` is the result; only a numeric `k` out of range is #NUM!.
         let pv = scalar_like_value(args.last().unwrap())?;
+        if let LiteralValue::Error(e) = pv {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+        }
         let p = match coerce_num(&pv) {
             Ok(n) => n,
             Err(_) => {
@@ -1468,7 +1498,11 @@ impl Function for PercentileExc {
                 ExcelError::new_num(),
             )));
         }
+        // An error in `k` is the result; only a numeric `k` out of range is #NUM!.
         let pv = scalar_like_value(args.last().unwrap())?;
+        if let LiteralValue::Error(e) = pv {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+        }
         let p = match coerce_num(&pv) {
             Ok(n) => n,
             Err(_) => {
@@ -1567,7 +1601,11 @@ impl Function for QuartileInc {
                 ExcelError::new_num(),
             )));
         }
+        // An error in `quart` is the result; only a numeric `quart` out of range is #NUM!.
         let qv = scalar_like_value(args.last().unwrap())?;
+        if let LiteralValue::Error(e) = qv {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+        }
         let q = match coerce_num(&qv) {
             Ok(n) => n,
             Err(_) => {
@@ -1692,7 +1730,11 @@ impl Function for QuartileExc {
                 ExcelError::new_num(),
             )));
         }
+        // An error in `quart` is the result; only a numeric `quart` out of range is #NUM!.
         let qv = scalar_like_value(args.last().unwrap())?;
+        if let LiteralValue::Error(e) = qv {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+        }
         let q = match coerce_num(&qv) {
             Ok(n) => n,
             Err(_) => {
@@ -7444,8 +7486,13 @@ impl Function for PercentRankIncFn {
             )));
         }
 
-        // Get x value (the value to find the rank of)
-        let x = match coerce_num(&scalar_like_value(&args[1])?) {
+        // Get x value (the value to find the rank of). An error in `x` or
+        // `significance` is the result, as in Excel.
+        let xv = scalar_like_value(&args[1])?;
+        if let LiteralValue::Error(e) = xv {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+        }
+        let x = match coerce_num(&xv) {
             Ok(n) => n,
             Err(_) => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -7456,7 +7503,11 @@ impl Function for PercentRankIncFn {
 
         // Get optional significance (default 3)
         let significance = if args.len() > 2 {
-            match coerce_num(&scalar_like_value(&args[2])?) {
+            let sv = scalar_like_value(&args[2])?;
+            if let LiteralValue::Error(e) = sv {
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+            }
+            match coerce_num(&sv) {
                 Ok(n) => {
                     let s = n as i32;
                     if s < 1 {
@@ -7586,8 +7637,13 @@ impl Function for PercentRankExcFn {
             )));
         }
 
-        // Get x value (the value to find the rank of)
-        let x = match coerce_num(&scalar_like_value(&args[1])?) {
+        // Get x value (the value to find the rank of). An error in `x` or
+        // `significance` is the result, as in Excel.
+        let xv = scalar_like_value(&args[1])?;
+        if let LiteralValue::Error(e) = xv {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+        }
+        let x = match coerce_num(&xv) {
             Ok(n) => n,
             Err(_) => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -7598,7 +7654,11 @@ impl Function for PercentRankExcFn {
 
         // Get optional significance (default 3)
         let significance = if args.len() > 2 {
-            match coerce_num(&scalar_like_value(&args[2])?) {
+            let sv = scalar_like_value(&args[2])?;
+            if let LiteralValue::Error(e) = sv {
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+            }
+            match coerce_num(&sv) {
                 Ok(n) => {
                     let s = n as i32;
                     if s < 1 {

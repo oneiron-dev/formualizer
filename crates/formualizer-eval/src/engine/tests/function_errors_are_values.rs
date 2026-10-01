@@ -66,6 +66,12 @@ fn sequence_defaults_and_date_range() {
 /// Evaluates `formula` in C1 after A1:A3 = 100, 100, =FOOBARFN() and
 /// B1:B3 = 1, 2, 4, so A3 holds the #NAME? an unknown function produces.
 fn eval_with_unknown_fn_data(formula: &str) -> LiteralValue {
+    eval_with_unknown_fn_data_at(1, formula, false)
+}
+
+/// [`eval_with_unknown_fn_data`] with the formula in row `row` of column C,
+/// under the declared array semantics of a workbook file when `legacy` is set.
+fn eval_with_unknown_fn_data_at(row: u32, formula: &str, legacy: bool) -> LiteralValue {
     let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
     for (row, value) in [(1, 100.0), (2, 100.0)] {
         engine
@@ -81,10 +87,13 @@ fn eval_with_unknown_fn_data(formula: &str) -> LiteralValue {
             .unwrap();
     }
     engine
-        .set_cell_formula("Sheet1", 1, 3, parse(formula).unwrap())
+        .set_cell_formula("Sheet1", row, 3, parse(formula).unwrap())
         .unwrap();
+    if legacy {
+        engine.use_legacy_array_semantics();
+    }
     engine.evaluate_all().unwrap();
-    engine.get_cell_value("Sheet1", 1, 3).unwrap()
+    engine.get_cell_value("Sheet1", row, 3).unwrap()
 }
 
 fn assert_name_error(formula: &str) {
@@ -154,5 +163,176 @@ fn unknown_function_still_yields_name_error() {
         "=ENCODEURL(\"a b\")",
     ] {
         assert_name_error(formula);
+    }
+}
+
+fn assert_error_kind(formula: &str, kind: ExcelErrorKind) {
+    match eval_with_unknown_fn_data(formula) {
+        LiteralValue::Error(e) => assert_eq!(e.kind, kind, "{formula}"),
+        other => panic!("{formula}: expected {kind:?}, got {other:?}"),
+    }
+}
+
+/// An error passed as a table, vector or range argument is the result: it is not
+/// a 1x1 table to look up in or a cell to count, so IFNA/ISNA do not mistake it
+/// for a lookup miss.
+#[test]
+fn error_in_table_or_range_argument_is_the_result() {
+    for (formula, kind) in [
+        ("=VLOOKUP(1,FOOBARFN(),1,FALSE)", ExcelErrorKind::Name),
+        ("=HLOOKUP(1,FOOBARFN(),1,FALSE)", ExcelErrorKind::Name),
+        ("=VLOOKUP(1,FOOBARFN(),1,TRUE)", ExcelErrorKind::Name),
+        (
+            "=IFNA(VLOOKUP(1,FOOBARFN(),1,FALSE),\"x\")",
+            ExcelErrorKind::Name,
+        ),
+        ("=VLOOKUP(1,1/0,1,FALSE)", ExcelErrorKind::Div),
+        ("=IFNA(HLOOKUP(1,1/0,1,FALSE),\"x\")", ExcelErrorKind::Div),
+        // An error lookup value is the result in both match modes.
+        ("=VLOOKUP(FOOBARFN(),A1:B3,2,TRUE)", ExcelErrorKind::Name),
+        ("=HLOOKUP(FOOBARFN(),A1:B3,1,TRUE)", ExcelErrorKind::Name),
+        ("=LOOKUP(100,A1:A2,FOOBARFN())", ExcelErrorKind::Name),
+        // ... whether or not the lookup value is found.
+        ("=LOOKUP(1,A1:A2,FOOBARFN())", ExcelErrorKind::Name),
+        ("=LOOKUP(100,FOOBARFN())", ExcelErrorKind::Name),
+        ("=LOOKUP(100,FOOBARFN(),B1:B2)", ExcelErrorKind::Name),
+        ("=LOOKUP(100,A1:A2,NA())", ExcelErrorKind::Na),
+        ("=COUNTBLANK(FOOBARFN())", ExcelErrorKind::Name),
+        ("=COUNTBLANK(1/0)", ExcelErrorKind::Div),
+    ] {
+        assert_error_kind(formula, kind);
+    }
+    for (formula, expected) in [
+        (
+            "=ISNA(VLOOKUP(1,FOOBARFN(),1,FALSE))",
+            LiteralValue::Boolean(false),
+        ),
+        (
+            "=ISNA(LOOKUP(100,A1:A2,FOOBARFN()))",
+            LiteralValue::Boolean(false),
+        ),
+        (
+            "=IFERROR(COUNTBLANK(FOOBARFN()),-1)",
+            LiteralValue::Number(-1.0),
+        ),
+        // Tables, vectors and ranges that are not errors still work, and an
+        // error cell inside a range is data, not the result.
+        ("=VLOOKUP(100,A1:B3,2,FALSE)", LiteralValue::Number(1.0)),
+        ("=VLOOKUP(1,{1,2},2,FALSE)", LiteralValue::Number(2.0)),
+        ("=HLOOKUP(1,{1,2;3,4},2,FALSE)", LiteralValue::Number(3.0)),
+        ("=LOOKUP(100,A1:A2,B1:B2)", LiteralValue::Number(2.0)),
+        ("=LOOKUP(2,{1,2,3},{10,20,30})", LiteralValue::Number(20.0)),
+        ("=COUNTBLANK(A1:A3)", LiteralValue::Number(0.0)),
+        ("=COUNTBLANK(A3)", LiteralValue::Number(0.0)),
+        ("=COUNTBLANK(A1:A4)", LiteralValue::Number(1.0)),
+    ] {
+        assert_eq!(eval_with_unknown_fn_data(formula), expected, "{formula}");
+    }
+}
+
+/// An error in a scalar argument (`k`, `number`, `quart`, a database or field,
+/// `ref_text`) keeps its kind: only a usable value out of range gets the
+/// function's own error code.
+#[test]
+fn error_in_scalar_argument_keeps_its_kind() {
+    for (formula, kind) in [
+        ("=LARGE(B1:B3,FOOBARFN())", ExcelErrorKind::Name),
+        ("=LARGE(B1:B3,NA())", ExcelErrorKind::Na),
+        ("=SMALL(B1:B3,NA())", ExcelErrorKind::Na),
+        ("=PERCENTILE(B1:B3,NA())", ExcelErrorKind::Na),
+        ("=PERCENTILE.INC(B1:B3,FOOBARFN())", ExcelErrorKind::Name),
+        ("=PERCENTILE.EXC(B1:B3,NA())", ExcelErrorKind::Na),
+        ("=QUARTILE(B1:B3,NA())", ExcelErrorKind::Na),
+        ("=QUARTILE.INC(B1:B3,FOOBARFN())", ExcelErrorKind::Name),
+        ("=QUARTILE.EXC(B1:B3,NA())", ExcelErrorKind::Na),
+        ("=PERCENTRANK(B1:B3,NA())", ExcelErrorKind::Na),
+        ("=PERCENTRANK.INC(B1:B3,FOOBARFN())", ExcelErrorKind::Name),
+        ("=PERCENTRANK.EXC(B1:B3,NA())", ExcelErrorKind::Na),
+        ("=PERCENTRANK.INC(B1:B3,2,NA())", ExcelErrorKind::Na),
+        ("=PERCENTRANK.EXC(B1:B3,2,FOOBARFN())", ExcelErrorKind::Name),
+        ("=RANK(FOOBARFN(),B1:B3)", ExcelErrorKind::Name),
+        ("=RANK.EQ(FOOBARFN(),B1:B3)", ExcelErrorKind::Name),
+        ("=RANK.EQ(1/0,B1:B3)", ExcelErrorKind::Div),
+        ("=RANK.AVG(FOOBARFN(),B1:B3)", ExcelErrorKind::Name),
+        ("=RANK.EQ(2,B1:B3,NA())", ExcelErrorKind::Na),
+        ("=RANK.AVG(2,B1:B3,FOOBARFN())", ExcelErrorKind::Name),
+        ("=DSUM(FOOBARFN(),1,A1:A2)", ExcelErrorKind::Name),
+        ("=DSUM(A1:B2,FOOBARFN(),A1:A2)", ExcelErrorKind::Name),
+        ("=DSUM(A1:B2,1,FOOBARFN())", ExcelErrorKind::Name),
+        ("=DAVERAGE(NA(),1,A1:A2)", ExcelErrorKind::Na),
+        ("=DSTDEV(A1:B2,NA(),A1:A2)", ExcelErrorKind::Na),
+        ("=DGET(A1:B2,1,NA())", ExcelErrorKind::Na),
+        ("=DCOUNTA(FOOBARFN(),1,A1:A2)", ExcelErrorKind::Name),
+        ("=INDIRECT(FOOBARFN())", ExcelErrorKind::Name),
+        ("=INDIRECT(NA())", ExcelErrorKind::Na),
+        ("=INDIRECT(\"B2\",NA())", ExcelErrorKind::Na),
+        ("=SUM(INDIRECT(FOOBARFN()))", ExcelErrorKind::Name),
+        // A numeric argument out of range keeps the function's own code.
+        ("=LARGE(B1:B3,4)", ExcelErrorKind::Num),
+        ("=SMALL(B1:B3,0)", ExcelErrorKind::Num),
+        ("=PERCENTILE.INC(B1:B3,2)", ExcelErrorKind::Num),
+        ("=QUARTILE.INC(B1:B3,5)", ExcelErrorKind::Num),
+        ("=RANK.EQ(3,B1:B3)", ExcelErrorKind::Na),
+    ] {
+        assert_error_kind(formula, kind);
+    }
+    for (formula, expected) in [
+        (
+            "=ERROR.TYPE(LARGE(B1:B3,FOOBARFN()))",
+            LiteralValue::Number(5.0),
+        ),
+        (
+            "=ISNA(RANK.EQ(FOOBARFN(),B1:B3))",
+            LiteralValue::Boolean(false),
+        ),
+        (
+            "=IFNA(SMALL(B1:B3,NA()),\"x\")",
+            LiteralValue::Text("x".into()),
+        ),
+        ("=LARGE(B1:B3,2)", LiteralValue::Number(2.0)),
+        ("=RANK.EQ(4,B1:B3)", LiteralValue::Number(1.0)),
+        ("=INDIRECT(\"B2\")", LiteralValue::Number(2.0)),
+    ] {
+        assert_eq!(eval_with_unknown_fn_data(formula), expected, "{formula}");
+    }
+}
+
+/// In a formula without the array flag, a range in a single-value position is
+/// implicitly intersected first; the error that gives (#VALUE! off the range's
+/// rows, or an error cell) is the argument, so it is the result too.
+#[test]
+fn error_arguments_in_formulas_without_the_array_flag() {
+    for (row, formula, expected) in [
+        (5, "=ISERROR(FOOBARFN(A1:A3))", LiteralValue::Boolean(true)),
+        (
+            5,
+            "=SUMIFS(B1:B2,A1:A2,\"<=\"&EOM(A1:A2,0))",
+            LiteralValue::Number(0.0),
+        ),
+        (
+            2,
+            "=VLOOKUP(A1:A3,A1:B3,2,FALSE)",
+            LiteralValue::Number(1.0),
+        ),
+        (2, "=LARGE(B1:B3,B1:B3)", LiteralValue::Number(2.0)),
+    ] {
+        assert_eq!(
+            eval_with_unknown_fn_data_at(row, formula, true),
+            expected,
+            "{formula} in row {row}"
+        );
+    }
+    for (row, formula, kind) in [
+        (5, "=COUNTBLANK(FOOBARFN(A1:A3))", ExcelErrorKind::Name),
+        (3, "=VLOOKUP(A1:A3,A1:B3,2,FALSE)", ExcelErrorKind::Name),
+        (5, "=VLOOKUP(A1:A3,A1:B3,2,FALSE)", ExcelErrorKind::Value),
+        (5, "=LARGE(B1:B3,B1:B3)", ExcelErrorKind::Value),
+        (5, "=RANK.EQ(B1:B3,B1:B3)", ExcelErrorKind::Value),
+        (3, "=RANK.EQ(A1:A3,B1:B3)", ExcelErrorKind::Name),
+    ] {
+        match eval_with_unknown_fn_data_at(row, formula, true) {
+            LiteralValue::Error(e) => assert_eq!(e.kind, kind, "{formula} in row {row}"),
+            other => panic!("{formula} in row {row}: expected {kind:?}, got {other:?}"),
+        }
     }
 }
