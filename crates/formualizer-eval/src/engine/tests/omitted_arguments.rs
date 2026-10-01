@@ -304,6 +304,50 @@ fn omitted_lazy_branch_does_not_evaluate_the_unselected_error() {
 }
 
 #[test]
+fn selected_omitted_if_branch_is_blank_until_published() {
+    // Excel (SpreadsheetBench 57137): =IF(FALSE,"not ",)&"ok" is "ok". The
+    // selected empty slot is a blank, like an empty cell, not the number 0.
+    let cases = [
+        ("=IF(FALSE,\"not \",)&\"ok\"", Expected::Text("ok")),
+        ("=IF(TRUE,,1)&\"ok\"", Expected::Text("ok")),
+        ("=IF(1=2,\"x\",)&\"\"", Expected::Text("")),
+        (
+            "=INDEX(IF({TRUE,FALSE},\"a\",)&\"x\",1,2)",
+            Expected::Text("x"),
+        ),
+        ("=IF(FALSE,1,)+1", Expected::Number(1.0)),
+        ("=LEN(IF(FALSE,1,))", Expected::Number(0.0)),
+        // Unchanged: the published result, a supplied branch, an absent branch.
+        ("=IF(FALSE,1,)", Expected::Number(0.0)),
+        ("=IF(TRUE,\"not \",)&\"ok\"", Expected::Text("not ok")),
+        ("=IF(FALSE,\"not \",0)&\"ok\"", Expected::Text("0ok")),
+        ("=IF(FALSE,\"not \")&\"ok\"", Expected::Text("FALSEok")),
+        ("=CHOOSE(1,,5)", Expected::Number(0.0)),
+    ];
+    for (formula, expected) in cases {
+        assert_expected(formula, "excel: omitted IF branch", expected);
+    }
+
+    // A cell holding the omitted branch publishes 0, which a reader sees as 0.
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("=IF(FALSE,1,)").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 1, 2, parse("=A1&\"x\"").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 1),
+        Some(LiteralValue::Number(0.0))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 2),
+        Some(LiteralValue::Text("0x".into()))
+    );
+}
+
+#[test]
 fn offset_omitted_dimensions_retain_source_dimensions() {
     let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
     for (row, col, value) in [(1, 1, 1), (1, 2, 2), (2, 1, 3), (2, 2, 4)] {

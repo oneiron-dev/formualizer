@@ -378,6 +378,8 @@ pub struct IfFn;
 /// - A blank condition is treated as FALSE.
 /// - Text `"TRUE"`/`"FALSE"` (any case) are logical; other text conditions return `#VALUE!`.
 /// - With only two arguments, the FALSE branch defaults to logical `FALSE`.
+/// - A selected empty argument slot (`IF(FALSE,1,)`) is a blank: `""` inside `&`,
+///   `0` in arithmetic and as the cell's result.
 /// - An array condition selects element-wise between the (broadcast) branches.
 ///
 /// # Examples
@@ -486,14 +488,27 @@ impl Function for IfFn {
         };
 
         if b {
-            args[1].value()
+            if_branch_value(&args[1])
         } else if let Some(arg) = args.get(2) {
-            arg.value()
+            if_branch_value(arg)
         } else {
             Ok(crate::traits::CalcValue::Scalar(LiteralValue::Boolean(
                 false,
             )))
         }
+    }
+}
+
+/// The value of a selected IF branch. An empty argument slot, as in
+/// `IF(FALSE,1,)`, is a blank like an empty cell: `""` to `&`, 0 to arithmetic,
+/// and 0 once published as the cell's result.
+fn if_branch_value<'b>(
+    arg: &ArgumentHandle<'_, 'b>,
+) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+    if arg.is_omitted() {
+        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Empty))
+    } else {
+        arg.value()
     }
 }
 
@@ -521,7 +536,7 @@ fn if_over_array<'b>(
     let branch = |index: usize| -> Vec<Vec<LiteralValue>> {
         let value = match args.get(index) {
             None => return vec![vec![LiteralValue::Boolean(false)]],
-            Some(arg) => match arg.value() {
+            Some(arg) => match if_branch_value(arg) {
                 Ok(value) => value,
                 Err(error) => return vec![vec![LiteralValue::Error(error)]],
             },
@@ -569,14 +584,15 @@ fn try_resolve_if_reference_or_value<'b>(
             )));
         }
     };
-    if selected {
-        args[1].resolve_reference_or_value().map(Some)
-    } else if let Some(arg) = args.get(2) {
-        arg.resolve_reference_or_value().map(Some)
-    } else {
-        Ok(Some(FunctionResolution::Value(
+    let branch = if selected { args.get(1) } else { args.get(2) };
+    match branch {
+        Some(arg) if arg.is_omitted() => Ok(Some(FunctionResolution::Value(
+            crate::traits::CalcValue::Scalar(LiteralValue::Empty),
+        ))),
+        Some(arg) => arg.resolve_reference_or_value().map(Some),
+        None => Ok(Some(FunctionResolution::Value(
             crate::traits::CalcValue::Scalar(LiteralValue::Boolean(false)),
-        )))
+        ))),
     }
 }
 
