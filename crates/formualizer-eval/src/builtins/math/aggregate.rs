@@ -1985,7 +1985,9 @@ impl Function for AggregateFn {
         }
 
         // 12 MEDIAN and 13 MODE.SNGL take references; 14-19 are the array
-        // form AGGREGATE(function_num, options, array, k).
+        // form AGGREGATE(function_num, options, array, k). A multi-cell k is
+        // lifted before this call, one call per element, like
+        // LARGE(array,{1,2}) (see `lift::value_lift_spec`).
         let (data_args, form, k) = if function_num <= 13 {
             (args, ArgumentForm::Reference, None)
         } else {
@@ -1994,16 +1996,10 @@ impl Function for AggregateFn {
                     ExcelError::new_value(),
                 )));
             }
-            let k = match args[3].value()?.into_literal() {
-                LiteralValue::Error(e) => {
-                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
-                }
-                other => match coerce_num(&other) {
-                    Ok(k) => k,
-                    Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
-                },
-            };
-            (&args[..3], ArgumentForm::Array, Some(k))
+            match aggregate_k(args[3].value()?.into_literal()) {
+                Ok(k) => (&args[..3], ArgumentForm::Array, Some(k)),
+                Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+            }
         };
         let collected = match AggregateCollector::collect_args(
             data_args,
@@ -2023,6 +2019,21 @@ impl Function for AggregateFn {
             Ok(n) => LiteralValue::Number(n),
             Err(e) => LiteralValue::Error(e),
         }))
+    }
+}
+
+/// The k (or quart) of AGGREGATE's array form: an error is the result, and a
+/// one-cell array is its value.
+fn aggregate_k(k: LiteralValue) -> Result<f64, ExcelError> {
+    match k {
+        LiteralValue::Error(e) => Err(e),
+        LiteralValue::Array(rows) => {
+            match rows.into_iter().next().and_then(|r| r.into_iter().next()) {
+                Some(cell) => aggregate_k(cell),
+                None => Err(ExcelError::new_value()),
+            }
+        }
+        other => coerce_num(&other),
     }
 }
 
@@ -2364,6 +2375,59 @@ mod tests_subtotal_aggregate {
             ],
         );
         assert_error_kind(strict, ExcelErrorKind::Na);
+    }
+
+    #[test]
+    fn aggregate_array_form_lifts_array_k() {
+        let wb = TestWorkbook::new().with_function(std::sync::Arc::new(AggregateFn));
+        let ctx = interp(&wb);
+        // Each result cell as text: numbers as is, errors by kind.
+        let call = |f: i64, option: i64, k: Vec<Vec<LiteralValue>>| -> Vec<Vec<String>> {
+            let k = LiteralValue::Array(k);
+            let args = vec![LiteralValue::Int(f), LiteralValue::Int(option), data(), k];
+            let cells = match aggregate(&ctx, args) {
+                LiteralValue::Array(rows) => rows,
+                other => vec![vec![other]],
+            };
+            cells
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|cell| match cell {
+                            LiteralValue::Number(n) => n.to_string(),
+                            LiteralValue::Error(e) => e.kind.to_string(),
+                            other => format!("{other:?}"),
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        let int = LiteralValue::Int;
+        // LARGE(data,{1,2}) and SMALL(data,{1;2}): one result per k, in k's shape.
+        assert_eq!(call(14, 6, vec![vec![int(1), int(2)]]), [["8", "5"]]);
+        assert_eq!(
+            call(15, 6, vec![vec![int(1)], vec![int(2)]]),
+            [["3"], ["3"]]
+        );
+        assert_eq!(call(17, 6, vec![vec![int(0), int(4)]]), [["3", "8"]]);
+        // Each element is checked on its own: a bad k is that element's error.
+        assert_eq!(
+            call(
+                14,
+                6,
+                vec![vec![
+                    int(1),
+                    int(9),
+                    LiteralValue::Error(ExcelError::new_div()),
+                    LiteralValue::Text("x".into()),
+                ]]
+            ),
+            [["8", "#NUM!", "#DIV/0!", "#VALUE!"]]
+        );
+        // A data error that is not ignored is each element's result.
+        assert_eq!(call(14, 4, vec![vec![int(1), int(2)]]), [["#N/A", "#N/A"]]);
+        // A 1x1 array k is a scalar k.
+        assert_eq!(call(14, 6, vec![vec![int(2)]]), [["5"]]);
     }
 }
 
