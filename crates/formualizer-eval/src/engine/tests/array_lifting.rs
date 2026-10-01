@@ -623,3 +623,44 @@ fn subtotal_aggregate_and_rank_parameters_lift() {
     assert_number("=SUM(_xlfn.RANK.EQ(B2,OFFSET(B1,0,0,{2,3})))", 3.0);
     assert_number("=SUM(_xlfn.RANK.AVG(B2,OFFSET(B1,0,0,{2,3}),1))", 4.0);
 }
+
+#[test]
+fn row_and_column_of_a_computed_array_keep_errors_and_give_value_otherwise() {
+    // Excel (SpreadsheetBench 42354): COLUMN of the computed array
+    // IF(D1:F1<>"~N/A",D1:F1) is {#N/A,#VALUE!,#N/A} for {#N/A,44635,#N/A}, so
+    // MATCH(3,ERROR.TYPE(...),0) finds the first non-error cell.
+    let mut engine = engine();
+    let na = LiteralValue::Error(formualizer_common::ExcelError::new_na());
+    engine.set_cell_value("Sheet1", 1, 4, na.clone()).unwrap();
+    engine
+        .set_cell_value("Sheet1", 1, 5, LiteralValue::Number(44635.0))
+        .unwrap();
+    engine.set_cell_value("Sheet1", 1, 6, na).unwrap();
+    let column_types = "ERROR.TYPE(COLUMN(IF(D1:F1<>\"~N/A\",D1:F1)))";
+    assert_eq!(
+        eval(
+            &mut engine,
+            &format!("=SUMPRODUCT({column_types}*{{1,10,100}})")
+        ),
+        LiteralValue::Number(737.0)
+    );
+    assert_eq!(
+        eval(
+            &mut engine,
+            &format!("=INDEX(D1:F1,MATCH(3,{column_types},0))")
+        ),
+        LiteralValue::Number(44635.0)
+    );
+    // ROW lifts the same way over a vertical array: {#N/A;#VALUE!;#VALUE!}.
+    assert_number("=SUM(ERROR.TYPE(ROW(IF(B1:B3>1,B1:B3,NA()))))", 13.0);
+    // A computed scalar: an error passes through, any other value is #VALUE!.
+    assert_number("=ERROR.TYPE(COLUMN(1+1))", 3.0);
+    assert_number("=ERROR.TYPE(ROW(1/0))", 2.0);
+
+    // References keep their positions.
+    assert_number("=SUM(COLUMN(D1:F1))", 15.0);
+    assert_number("=SUM(ROW(IF(TRUE,B1:B3)))", 6.0);
+    assert_number("=COLUMN(INDEX(A1:C3,1,2))", 2.0);
+    assert_number("=COLUMN(A1:C3 B1:B3)", 2.0);
+    assert_number("=ROWS(IF(B1:B3>1,B1:B3))", 3.0);
+}

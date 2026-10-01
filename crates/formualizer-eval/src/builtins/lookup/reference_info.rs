@@ -9,7 +9,7 @@
 //! Without arguments, ROW and COLUMN return the current cell's position
 
 use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
-use crate::function::Function;
+use crate::function::{Function, FunctionResolution};
 use crate::function_contract::{FunctionContextDependence, FunctionSemanticContract};
 use crate::traits::{ArgumentHandle, FunctionContext};
 use formualizer_common::{ArgKind, ExcelError, ExcelErrorKind, LiteralValue};
@@ -28,6 +28,8 @@ pub struct RowFn;
 /// - Without arguments, it uses the row of the formula cell.
 /// - Full-column references such as `A:A` return `1`.
 /// - Invalid references return an error (`#REF!`/`#VALUE!` depending on context).
+/// - A computed value instead of a reference (`IF(A1:C1<>"",A1:C1)` in an array
+///   formula) gives, element by element, the element's error or `#VALUE!`.
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -73,6 +75,17 @@ impl Function for RowFn {
     }
 
     func_caps!(PURE);
+
+    // The argument may be a computed array rather than a reference; see
+    // `non_reference_result`.
+    fn dispatch<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+    ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        let result = self.dispatch_scalar(args, ctx)?;
+        Ok(non_reference_result(args, result, ctx))
+    }
 
     fn semantic_contract(&self, arity: usize) -> Option<FunctionSemanticContract> {
         let mut contract = FunctionSemanticContract::trusted_builtin_default(None);
@@ -328,6 +341,8 @@ pub struct ColumnFn;
 /// - Without arguments, it uses the column of the formula cell.
 /// - Full-row references such as `5:5` return `1`.
 /// - Invalid references return an error (`#REF!`/`#VALUE!` depending on context).
+/// - A computed value instead of a reference (`IF(A1:C1<>"",A1:C1)` in an array
+///   formula) gives, element by element, the element's error or `#VALUE!`.
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -373,6 +388,17 @@ impl Function for ColumnFn {
     }
 
     func_caps!(PURE);
+
+    // The argument may be a computed array rather than a reference; see
+    // `non_reference_result`.
+    fn dispatch<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+    ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        let result = self.dispatch_scalar(args, ctx)?;
+        Ok(non_reference_result(args, result, ctx))
+    }
 
     fn semantic_contract(&self, arity: usize) -> Option<FunctionSemanticContract> {
         let mut contract = FunctionSemanticContract::trusted_builtin_default(None);
@@ -464,6 +490,43 @@ impl Function for ColumnFn {
             last
         };
         Ok(index_sequence(first, last, false, ctx))
+    }
+}
+
+/// ROW/COLUMN of a computed value instead of a reference, as in the array
+/// formula `COLUMN(IF(A1:C1<>"",A1:C1))`: Excel applies the function to each
+/// element of the value, so an error element keeps its error and any other
+/// element is #VALUE!. `result` is the reference path's result, an error
+/// whenever the argument is not a reference.
+fn non_reference_result<'b>(
+    args: &[ArgumentHandle<'_, 'b>],
+    result: crate::traits::CalcValue<'b>,
+    ctx: &dyn FunctionContext<'b>,
+) -> crate::traits::CalcValue<'b> {
+    let [arg] = args else {
+        return result;
+    };
+    if !matches!(
+        result,
+        crate::traits::CalcValue::Scalar(LiteralValue::Error(_))
+    ) {
+        return result;
+    }
+    let Ok(FunctionResolution::Value(value)) = arg.resolve_reference_or_value() else {
+        return result;
+    };
+    let element = |value: LiteralValue| match value {
+        LiteralValue::Error(error) => LiteralValue::Error(error),
+        _ => LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)),
+    };
+    match value.into_literal() {
+        LiteralValue::Array(rows) => crate::lift::array_result(
+            rows.into_iter()
+                .map(|row| row.into_iter().map(element).collect())
+                .collect(),
+            ctx.date_system(),
+        ),
+        other => crate::traits::CalcValue::Scalar(element(other)),
     }
 }
 
