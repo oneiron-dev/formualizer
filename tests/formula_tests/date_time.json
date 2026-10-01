@@ -248,8 +248,7 @@
       "formula": "=DAY(0)",
       "result": 0,
       "result_type": "int",
-      "description": "DAY of serial 0",
-      "skip": "DAY(0) edge case not yet handled"
+      "description": "DAY of serial 0"
     },
     {
       "formula": "=DAY(50)",
@@ -261,8 +260,7 @@
       "formula": "=DAY(60)",
       "result": 29,
       "result_type": "int",
-      "description": "DAY of serial 60 (phantom Feb 29)",
-      "skip": "Phantom leap day edge case not yet handled"
+      "description": "DAY of serial 60 (phantom Feb 29)"
     },
     {
       "formula": "=DAY(100)",
@@ -274,8 +272,7 @@
       "formula": "=MONTH(0.7)",
       "result": 1,
       "result_type": "int",
-      "description": "MONTH of fractional serial near zero",
-      "skip": "MONTH(0.7) edge case not yet handled"
+      "description": "MONTH of fractional serial near zero"
     },
     {
       "formula": "=HOUR(0.4006770833)",

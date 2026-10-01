@@ -5,8 +5,8 @@ use crate::function::Function;
 use crate::traits::{ArgumentHandle, FunctionContext};
 use chrono::{Datelike, NaiveDate, Timelike};
 use formualizer_common::{
-    DateSystem, ExcelError, ExcelErrorKind, LiteralValue, try_serial_to_date_for,
-    try_serial_to_datetime_for,
+    DateSystem, ExcelDateParts, ExcelError, ExcelErrorKind, LiteralValue, try_serial_to_date_for,
+    try_serial_to_datetime_for, try_serial_to_display_date_parts_for,
 };
 use formualizer_macros::func_caps;
 
@@ -23,6 +23,16 @@ fn coerce_to_serial(arg: &ArgumentHandle, system: DateSystem) -> Result<f64, Exc
 fn coerce_to_date(arg: &ArgumentHandle, system: DateSystem) -> Result<NaiveDate, ExcelError> {
     let serial = coerce_to_serial(arg, system)?;
     try_serial_to_date_for(system, serial)
+}
+
+/// The calendar fields Excel shows for a date argument: in the 1900 system
+/// serial 0 is January 0, 1900 and serial 60 the phantom February 29, 1900.
+fn coerce_to_date_parts(
+    arg: &ArgumentHandle,
+    system: DateSystem,
+) -> Result<ExcelDateParts, ExcelError> {
+    let serial = coerce_to_serial(arg, system)?;
+    try_serial_to_display_date_parts_for(system, serial)
 }
 
 fn days_in_year(year: i32) -> f64 {
@@ -553,10 +563,9 @@ impl Function for YearFn {
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         let system = ctx.date_system();
-        let serial = coerce_to_serial(&args[0], system)?;
-        let date = try_serial_to_date_for(system, serial)?;
+        let date = coerce_to_date_parts(&args[0], system)?;
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Int(
-            date.year() as i64,
+            date.year as i64,
         )))
     }
 }
@@ -627,10 +636,9 @@ impl Function for MonthFn {
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         let system = ctx.date_system();
-        let serial = coerce_to_serial(&args[0], system)?;
-        let date = try_serial_to_date_for(system, serial)?;
+        let date = coerce_to_date_parts(&args[0], system)?;
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Int(
-            date.month() as i64,
+            date.month as i64,
         )))
     }
 }
@@ -701,10 +709,9 @@ impl Function for DayFn {
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         let system = ctx.date_system();
-        let serial = coerce_to_serial(&args[0], system)?;
-        let date = try_serial_to_date_for(system, serial)?;
+        let date = coerce_to_date_parts(&args[0], system)?;
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Int(
-            date.day() as i64,
+            date.day as i64,
         )))
     }
 }
@@ -1258,6 +1265,55 @@ mod tests {
                 eval_date_part_formula(system, &format!("=DAY({serial})")),
                 LiteralValue::Int(15),
                 "DAY({serial}) under {system:?}"
+            );
+        }
+    }
+
+    /// In the 1900 system serial 0 is the pseudo-date January 0, 1900 and
+    /// serial 60 the phantom February 29, 1900; YEAR/MONTH/DAY report those
+    /// fields, as Excel displays them.
+    #[test]
+    fn year_month_day_of_excel_1900_pseudo_dates() {
+        use crate::engine::DateSystem;
+
+        for (formula, want) in [
+            ("=YEAR(0)", 1900),
+            ("=MONTH(0)", 1),
+            ("=DAY(0)", 0),
+            ("=MONTH(FALSE)", 1),
+            ("=DAY(0.75)", 0),
+            ("=YEAR(60)", 1900),
+            ("=MONTH(60)", 2),
+            ("=DAY(60)", 29),
+            // Their neighbours are real dates and keep their fields.
+            ("=YEAR(1)", 1900),
+            ("=MONTH(1)", 1),
+            ("=DAY(1)", 1),
+            ("=MONTH(59)", 2),
+            ("=DAY(59)", 28),
+            ("=MONTH(61)", 3),
+            ("=DAY(61)", 1),
+        ] {
+            assert_eq!(
+                eval_date_part_formula(DateSystem::Excel1900, formula),
+                LiteralValue::Int(want),
+                "{formula}"
+            );
+        }
+
+        // In the 1904 system serial 0 is the real date 1904-01-01 and serial
+        // 60 is 1904-03-01.
+        for (formula, want) in [
+            ("=YEAR(0)", 1904),
+            ("=MONTH(0)", 1),
+            ("=DAY(0)", 1),
+            ("=MONTH(60)", 3),
+            ("=DAY(60)", 1),
+        ] {
+            assert_eq!(
+                eval_date_part_formula(DateSystem::Excel1904, formula),
+                LiteralValue::Int(want),
+                "{formula} under 1904"
             );
         }
     }
