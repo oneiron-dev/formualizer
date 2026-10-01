@@ -27362,13 +27362,18 @@ where
                     .graph
                     .resolve_table_entry(&tref.name)
                     .ok_or_else(|| ExcelError::new(ExcelErrorKind::Ref))?;
+                // The upper-left cell of the area the specifier selects:
+                // `Table[]`, `Table[#Data]` and `Table[Col]` start at the first
+                // data row, only `[#All]` and `[#Headers]` at the header.
+                let (row0, col0, _, _) = crate::engine::graph::tables::structured_reference_area(
+                    &table.geometry(),
+                    tref.specifier.as_ref(),
+                )?;
+                let sheet_id = table.sheet_id();
                 ReferenceInfo {
-                    first_sheet_index: self
-                        .graph
-                        .sheet_reg()
-                        .active_position_by_id(table.range.start.sheet_id),
+                    first_sheet_index: self.graph.sheet_reg().active_position_by_id(sheet_id),
                     sheet_count: Some(1),
-                    first_cell: Some(table.range.start),
+                    first_cell: Some(CellRef::new(sheet_id, Coord::new(row0, col0, true, true))),
                 }
             }
             ReferenceType::External(_) => return Err(ExcelError::new(ExcelErrorKind::Ref)),

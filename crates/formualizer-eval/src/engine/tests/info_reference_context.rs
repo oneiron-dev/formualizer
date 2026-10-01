@@ -108,7 +108,22 @@ fn inspect_reference_covers_cells_ranges_names_tables_and_3d_without_materializi
         )
         .unwrap()
         .unwrap();
+    // The bare table name is its data body, so the upper-left cell is the
+    // first data row under the header; only [#All] starts at the header.
     assert_eq!(info.first_sheet_index, Some(2));
+    assert_eq!(info.first_cell, Some(abs_cell_ref(data, 11, 2)));
+    let info = engine
+        .inspect_reference(
+            &ReferenceType::Table(formualizer_parse::parser::TableReference {
+                name: "SalesTable".into(),
+                specifier: Some(formualizer_parse::parser::TableSpecifier::SpecialItem(
+                    formualizer_parse::parser::SpecialItem::All,
+                )),
+            }),
+            "Sheet1",
+        )
+        .unwrap()
+        .unwrap();
     assert_eq!(info.first_cell, Some(abs_cell_ref(data, 10, 2)));
 
     let three_d = ReferenceType::Range3D {

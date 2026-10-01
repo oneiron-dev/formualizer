@@ -2417,17 +2417,8 @@ impl DependencyGraph {
             let Some(table) = self.resolve_table_entry(&tref.name) else {
                 return Ok(false);
             };
-            let geometry = tables::TableGeometry {
-                start_row: table.range.start.coord.row(),
-                start_col: table.range.start.coord.col(),
-                end_row: table.range.end.coord.row(),
-                end_col: table.range.end.coord.col(),
-                header_row: table.header_row,
-                totals_row: table.totals_row,
-                headers: &table.headers,
-            };
             let Some(area) = tables::static_structured_area(
-                &geometry,
+                &table.geometry(),
                 tref.specifier.as_ref(),
                 cell.coord.row(),
             )?

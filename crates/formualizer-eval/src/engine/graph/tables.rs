@@ -31,6 +31,19 @@ impl TableEntry {
             .iter()
             .position(|h| h.to_lowercase() == header_key)
     }
+
+    /// The table's placement, for resolving structured references.
+    pub(crate) fn geometry(&self) -> TableGeometry<'_> {
+        TableGeometry {
+            start_row: self.range.start.coord.row(),
+            start_col: self.range.start.coord.col(),
+            end_row: self.range.end.coord.row(),
+            end_col: self.range.end.coord.col(),
+            header_row: self.header_row,
+            totals_row: self.totals_row,
+            headers: &self.headers,
+        }
+    }
 }
 
 impl DependencyGraph {
@@ -255,7 +268,21 @@ pub(crate) fn structured_dependency_area(
     table: &TableGeometry<'_>,
     specifier: Option<&formualizer_parse::parser::TableSpecifier>,
 ) -> Option<(u32, u32, u32, u32)> {
-    structured_area(table, specifier, None).ok()
+    structured_reference_area(table, specifier).ok()
+}
+
+/// The 0-based area `(r1, c1, r2, c2)` a structured reference selects when
+/// read outside any formula row. `Table[]`, `Table[#Data]` and the bare table
+/// name are the data body and `Table[Col]` is that column's data cells, so the
+/// area's upper-left cell (what CELL, ISFORMULA and FORMULATEXT read) is the
+/// first data cell, not the header. A specifier that does not resolve (an
+/// unknown column, `#Headers` on a table without a header row) is #REF!;
+/// `#This Row`, which needs the formula's row, is #VALUE!.
+pub(crate) fn structured_reference_area(
+    table: &TableGeometry<'_>,
+    specifier: Option<&formualizer_parse::parser::TableSpecifier>,
+) -> Result<(u32, u32, u32, u32), ExcelError> {
+    structured_area(table, specifier, None)
 }
 
 fn structured_area(
@@ -276,11 +303,14 @@ fn structured_area(
             None => (lo, hi),
         });
     };
+    // Column names match case-insensitively, as `TableEntry::col_index` does
+    // when the reference is read.
     let column = |name: &str| {
+        let key = name.trim().to_lowercase();
         table
             .headers
             .iter()
-            .position(|h| h.eq_ignore_ascii_case(name.trim()))
+            .position(|h| h.to_lowercase() == key)
             .map(|i| table.start_col + i as u32)
             .ok_or_else(reference_error)
     };

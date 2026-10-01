@@ -257,6 +257,130 @@ fn empty_brackets_are_the_data_body() {
     assert_eq!(eval(&mut engine, 8, 4, "=ROWS(Sales)"), n(3.0));
 }
 
+/// CELL reads the upper-left cell of the area a structured reference
+/// selects: the first data cell for `Sales[]`, `Sales[#Data]`, the bare name
+/// and columns, the header row only for `[#All]` and `[#Headers]`.
+#[test]
+fn cell_reads_the_first_cell_of_the_selected_area() {
+    let mut engine = engine();
+    for (row, formula, expected) in [
+        (1, r#"=CELL("address",Sales[])"#, "$A$2"),
+        (2, r#"=CELL("address",Sales[ ])"#, "$A$2"),
+        (3, r#"=CELL("address",Sales[#Data])"#, "$A$2"),
+        (4, r#"=CELL("address",Sales)"#, "$A$2"),
+        (5, r#"=CELL("address",Sales[Qty])"#, "$B$2"),
+        (6, r#"=CELL("address",Sales[[Item]:[Qty]])"#, "$A$2"),
+        (7, r#"=CELL("address",Sales[#All])"#, "$A$1"),
+        (8, r#"=CELL("address",Sales[#Headers])"#, "$A$1"),
+        (9, r#"=CELL("address",Sales[#Totals])"#, "$A$5"),
+    ] {
+        assert_eq!(
+            eval(&mut engine, row, 6, formula),
+            LiteralValue::Text(expected.into()),
+            "{formula}"
+        );
+    }
+    for (row, formula, expected) in [
+        (10, r#"=CELL("row",Sales[])"#, 2),
+        (11, r#"=CELL("row",Sales[qty])"#, 2),
+        (12, r#"=CELL("col",Sales[Qty])"#, 2),
+        (13, r#"=CELL("row",Sales[#Totals])"#, 5),
+    ] {
+        match eval(&mut engine, row, 6, formula) {
+            LiteralValue::Int(actual) => assert_eq!(actual, expected, "{formula}"),
+            LiteralValue::Number(actual) => assert_eq!(actual, expected as f64, "{formula}"),
+            other => panic!("{formula}: expected {expected}, got {other:?}"),
+        }
+    }
+    // An unknown column is a #REF! reference, as when it is read.
+    match eval(&mut engine, 14, 6, r#"=CELL("address",Sales[Nope])"#) {
+        LiteralValue::Error(error) => assert_eq!(error.kind, ExcelErrorKind::Ref),
+        other => panic!("CELL over an unknown column: expected #REF!, got {other:?}"),
+    }
+}
+
+/// ISFORMULA and FORMULATEXT read the first data cell of `F[]`, `F[#Data]`
+/// and a column, where the formulas are, not the header cell.
+#[test]
+fn isformula_and_formulatext_read_the_first_data_cell() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    engine
+        .set_cell_value("Sheet1", 1, 12, LiteralValue::Text("Äh".into()))
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 2, 12, parse("=1+1").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 3, 12, parse("=2+2").unwrap())
+        .unwrap();
+    let sheet = engine.sheet_id("Sheet1").unwrap();
+    let range = RangeRef::new(
+        CellRef::new(sheet, Coord::from_excel(1, 12, true, true)),
+        CellRef::new(sheet, Coord::from_excel(3, 12, true, true)),
+    );
+    engine
+        .define_table("F", range, true, vec!["Äh".into()], false)
+        .unwrap();
+
+    let yes = LiteralValue::Boolean(true);
+    let no = LiteralValue::Boolean(false);
+    assert_eq!(eval(&mut engine, 1, 1, "=ISFORMULA(F[])"), yes);
+    assert_eq!(eval(&mut engine, 2, 1, "=ISFORMULA(F[#Data])"), yes);
+    assert_eq!(eval(&mut engine, 3, 1, "=ISFORMULA(F)"), yes);
+    // Column names match case-insensitively beyond ASCII, as when read.
+    assert_eq!(eval(&mut engine, 4, 1, "=ISFORMULA(F[äH])"), yes);
+    assert_eq!(eval(&mut engine, 5, 1, "=ISFORMULA(F[#All])"), no);
+    assert_eq!(eval(&mut engine, 6, 1, "=ISFORMULA(F[#Headers])"), no);
+    assert_eq!(
+        eval(&mut engine, 7, 1, "=FORMULATEXT(F[])"),
+        LiteralValue::Text("=1+1".into())
+    );
+    assert_eq!(
+        eval(&mut engine, 8, 1, "=FORMULATEXT(F[Äh])"),
+        LiteralValue::Text("=1+1".into())
+    );
+    match eval(&mut engine, 9, 1, "=FORMULATEXT(F[#All])") {
+        LiteralValue::Error(error) => assert_eq!(error.kind, ExcelErrorKind::Na),
+        other => panic!("FORMULATEXT of the header cell: expected #N/A, got {other:?}"),
+    }
+}
+
+/// Without a header row the data body starts on the table's first row.
+#[test]
+fn cell_on_a_table_without_a_header_row_starts_at_its_first_row() {
+    let mut engine = engine();
+    let sheet = engine.sheet_id("Sheet1").unwrap();
+    for row in 1..=3 {
+        engine
+            .set_cell_value("Sheet1", row, 8, LiteralValue::Number(row as f64))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", row, 9, LiteralValue::Number(10.0 * row as f64))
+            .unwrap();
+    }
+    let range = RangeRef::new(
+        CellRef::new(sheet, Coord::from_excel(1, 8, true, true)),
+        CellRef::new(sheet, Coord::from_excel(3, 9, true, true)),
+    );
+    engine
+        .define_table(
+            "NoHdr",
+            range,
+            false,
+            vec!["Column1".into(), "Column2".into()],
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        eval(&mut engine, 1, 6, r#"=CELL("address",NoHdr[])"#),
+        LiteralValue::Text("$H$1".into())
+    );
+    assert_eq!(
+        eval(&mut engine, 2, 6, r#"=CELL("address",NoHdr[Column2])"#),
+        LiteralValue::Text("$I$1".into())
+    );
+}
+
 #[test]
 fn this_row_outside_the_table_body_is_a_value_error() {
     let mut engine = engine();
