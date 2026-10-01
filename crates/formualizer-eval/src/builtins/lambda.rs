@@ -165,7 +165,18 @@ impl Function for LetFn {
             };
 
             let bound = args[pair_idx + 1].value_with_env(env.clone())?;
-            env = env.with_binding(&name, binding_from_calc_value(bound));
+            // An array of references reads as an error; bind its references.
+            let references = match bound {
+                CalcValue::Scalar(LiteralValue::Error(_)) => {
+                    args[pair_idx + 1].reference_array_with_env(env.clone())?
+                }
+                _ => None,
+            };
+            let binding = match references {
+                Some(references) => LocalBinding::References(Arc::new(references)),
+                None => binding_from_calc_value(bound),
+            };
+            env = env.with_binding(&name, binding);
         }
 
         args[args.len() - 1].value_with_env(env)

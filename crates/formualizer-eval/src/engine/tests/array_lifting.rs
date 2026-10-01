@@ -2,6 +2,7 @@
 //! receives a multi-cell range or array, and IF/IFERROR/IFNA select
 //! element-wise over array values.
 
+use crate::engine::named_range::{NameScope, NamedDefinition};
 use crate::engine::{Engine, EvalConfig};
 use crate::test_workbook::TestWorkbook;
 use formualizer_common::{ExcelErrorKind, LiteralValue};
@@ -169,9 +170,8 @@ fn reference_parameters_lift_over_offset_with_array_offsets() {
         0.0,
     );
     assert_number("=SUM(COUNTIFS(OFFSET(A1,{0;1;2},0),\"a\"))", 2.0);
-    // A single-value parameter reads each reference.
+    // N reads each reference.
     assert_number("=SUMPRODUCT(N(OFFSET(B1,{0;1;2},0)))", 6.0);
-    assert_number("=SUMPRODUCT(--ISNUMBER(OFFSET(B1,{0;1},{0,1,2})))", 4.0);
     // INDIRECT with an array of addresses is an array of references too.
     assert_number("=SUMPRODUCT(N(INDIRECT(\"B\"&{1,2,3})))", 6.0);
     assert_number("=SUM(COUNTIF(INDIRECT({\"A1:A3\",\"A2\"}),\"a\"))", 2.0);
@@ -204,4 +204,245 @@ fn single_offset_references_are_not_lifted() {
     assert_error("=OFFSET(B1,-1,0)", ExcelErrorKind::Ref);
     assert_error("=OFFSET(B1,\"x\",0)", ExcelErrorKind::Value);
     assert_error("=OFFSET(B1,NA(),0)", ExcelErrorKind::Na);
+}
+
+fn assert_text(formula: &str, expected: &str) {
+    let mut engine = engine();
+    match eval(&mut engine, formula) {
+        LiteralValue::Text(text) => assert_eq!(text, expected, "{formula}"),
+        other => panic!("{formula} = {other:?}, expected {expected:?}"),
+    }
+}
+
+#[test]
+fn offset_past_the_sheet_edge_is_ref_per_element() {
+    // Each off-grid reference is #REF! in its own position (100 here); the
+    // others still evaluate.
+    assert_number(
+        "=SUMPRODUCT(IFERROR(SUBTOTAL(9,OFFSET(B1,{0;1048576},0)),100))",
+        101.0,
+    );
+    assert_number(
+        "=SUMPRODUCT(IFERROR(SUBTOTAL(9,OFFSET(B1,{0;1},{0;16384})),100))",
+        101.0,
+    );
+    assert_number(
+        "=SUMPRODUCT(IFERROR(SUBTOTAL(9,OFFSET(B1,0,0,{1;1048577})),100))",
+        101.0,
+    );
+    assert_number(
+        "=SUMPRODUCT(IFERROR(SUBTOTAL(9,OFFSET(B1,0,0,1,{1;16384})),100))",
+        101.0,
+    );
+    assert_number(
+        "=SUMPRODUCT(IFERROR(N(OFFSET(B1,{0;1},{0;1E+300})),100))",
+        101.0,
+    );
+    // The scalar path: no wrapped cast, no panic.
+    for formula in [
+        "=OFFSET(B1,1048576,0)",
+        "=OFFSET(B1,0,16384)",
+        "=OFFSET(B1,4294967296,0)",
+        "=OFFSET(B1,-4294967296,0)",
+        "=OFFSET(B1,1E+300,0)",
+        "=OFFSET(B1,-1E+300,0)",
+        "=SUM(OFFSET(B1,0,0,1048577))",
+        "=SUM(OFFSET(B1,0,0,1,16384))",
+        "=SUM(OFFSET(B1,0,0,1E+300))",
+        "=SUM(OFFSET(B1:B3,1048574,0))",
+    ] {
+        assert_error(formula, ExcelErrorKind::Ref);
+    }
+    // The last row and column are still on the sheet.
+    assert_number("=ROW(OFFSET(B1,1048575,0))", 1_048_576.0);
+    assert_number("=COLUMN(OFFSET(A1,0,16383))", 16_384.0);
+    assert_number("=ROWS(OFFSET(B1,0,0,1048576))", 1_048_576.0);
+    assert_number("=COLUMNS(OFFSET(A1,0,0,1,16384))", 16_384.0);
+}
+
+#[test]
+fn offset_sizes_and_offsets_are_numeric_parameters() {
+    // D1:D3 are blank: a blank offset is 0.
+    assert_number("=OFFSET(B1,D1,0)", 1.0);
+    assert_number("=OFFSET(B1,0,D1)", 1.0);
+    assert_number("=SUMPRODUCT(SUBTOTAL(9,OFFSET(B1,D1:D3,0)))", 3.0);
+    // Logicals and numeric text convert; a fraction truncates.
+    assert_number("=OFFSET(B1,TRUE,0)", 2.0);
+    assert_number("=OFFSET(B1,\"1\",0)", 2.0);
+    assert_number("=OFFSET(B1,1.9,0)", 2.0);
+    assert_number("=SUM(OFFSET(B1,0,0,\"2\"))", 3.0);
+    assert_number("=SUM(OFFSET(B1,0,0,TRUE))", 1.0);
+    assert_number("=SUM(OFFSET(B1,0,0,3,FALSE+1))", 6.0);
+    // Other text is #VALUE!, from a literal or a cell (C3 is "x").
+    assert_error("=OFFSET(B1,\"x\",0)", ExcelErrorKind::Value);
+    assert_error("=OFFSET(B1,C3,0)", ExcelErrorKind::Value);
+    assert_error("=SUM(OFFSET(B1,0,0,C3))", ExcelErrorKind::Value);
+    // An omitted height or width keeps the reference's size; 0 is #REF!.
+    assert_number("=SUM(OFFSET(B1:B2,1,0))", 5.0);
+    assert_number("=SUM(OFFSET(B1:B2,1,0,,))", 5.0);
+    assert_error("=SUM(OFFSET(B1,0,0,0))", ExcelErrorKind::Ref);
+    assert_error("=SUM(OFFSET(B1,0,0,1,0))", ExcelErrorKind::Ref);
+    assert_error("=SUM(OFFSET(B1,0,0,D1))", ExcelErrorKind::Ref);
+}
+
+#[test]
+fn n_and_t_read_the_first_cell_of_each_reference() {
+    // N(OFFSET(B1,{0;1},0,2)) is {N(B1:B2);N(B2:B3)} = {1;2}.
+    assert_number("=SUMPRODUCT(N(OFFSET(B1,{0;1},0,2)))", 3.0);
+    assert_number("=SUMPRODUCT(--(T(OFFSET(A2,{0;1},0,2))=\"b\"))", 1.0);
+    // T(A1) is "a", T(A2:A3) is T(A2), "b".
+    assert_number(
+        "=SUMPRODUCT(--(T(INDIRECT({\"A1\";\"A2:A3\"}))=\"b\"))",
+        1.0,
+    );
+    // A range reference is read whole: N(B1:B2) is N(B1).
+    assert_number("=N(B2:B3)", 2.0);
+    assert_number("=SUMPRODUCT(N(B1:B2))", 1.0);
+    assert_number("=SUMPRODUCT(N(B1:C3))", 1.0);
+    assert_text("=T(A2:A3)", "b");
+    assert_number("=SUMPRODUCT(LEN(T(A1:A3)))", 1.0);
+    // An array value is still lifted.
+    assert_number("=SUMPRODUCT(N(B1:B3>1))", 2.0);
+    assert_number("=SUMPRODUCT(N({1;2;3}))", 6.0);
+    assert_number("=SUMPRODUCT(LEN(T({\"ab\",1,\"c\"})))", 3.0);
+}
+
+#[test]
+fn indirect_of_an_invalid_reference_is_ref_everywhere() {
+    // ERROR.TYPE: #REF! is 4, #NAME? would be 5.
+    for formula in [
+        "=ERROR.TYPE(INDIRECT(\"nosuchname\"))",
+        "=ERROR.TYPE(INDIRECT(\"XFE1\"))",
+        "=ERROR.TYPE(INDIRECT(\"B1048577\"))",
+        "=ERROR.TYPE(N(INDIRECT(\"nosuchname\")))",
+        "=ERROR.TYPE(SUBTOTAL(9,INDIRECT(\"nosuchname\")))",
+        "=ERROR.TYPE(SUBTOTAL(9,INDIRECT(\"XFE1\")))",
+        "=ERROR.TYPE(COUNTIF(INDIRECT(\"nosuchname\"),1))",
+        "=ERROR.TYPE(SUMIF(INDIRECT(\"B1048577\"),1))",
+        "=ERROR.TYPE(SUM(INDIRECT(\"nosuchname\")))",
+    ] {
+        assert_number(formula, 4.0);
+    }
+    // Lifted: value and reference positions alike.
+    assert_number(
+        "=SUMPRODUCT(ERROR.TYPE(N(INDIRECT({\"nosuchname\";\"XFE1\";\"B1048577\"}))))",
+        12.0,
+    );
+    assert_number(
+        "=SUMPRODUCT(IFERROR(ERROR.TYPE(SUBTOTAL(9,INDIRECT({\"B1\";\"nosuchname\"}))),0))",
+        4.0,
+    );
+    assert_number(
+        "=SUMPRODUCT(IFERROR(ERROR.TYPE(COUNTIF(INDIRECT({\"A1:A3\";\"XFE1\"}),\"a\")),0))",
+        4.0,
+    );
+    // A defined name still resolves.
+    let mut engine = engine();
+    engine
+        .define_name(
+            "Amounts",
+            NamedDefinition::Formula {
+                ast: parse("=Sheet1!$B$1:$B$3").unwrap(),
+                dependencies: Vec::new(),
+                range_deps: Vec::new(),
+            },
+            NameScope::Workbook,
+        )
+        .unwrap();
+    assert_eq!(
+        eval(&mut engine, "=SUBTOTAL(9,INDIRECT(\"Amounts\"))"),
+        LiteralValue::Number(6.0)
+    );
+}
+
+#[test]
+fn only_n_and_t_read_an_array_of_references_as_values() {
+    // An array of references has no value: other single-value parameters
+    // see #VALUE!, as operators do.
+    for formula in [
+        "=SUMPRODUCT(ABS(OFFSET(B1,{0;1;2},0)))",
+        "=SUMPRODUCT(LEN(OFFSET(A1,{0;1;2},0)))",
+        "=SUM(VLOOKUP(OFFSET(A1,{0;1},0),A1:B3,2,0))",
+        "=SUMPRODUCT(-OFFSET(B1,{0;1;2},0))",
+        "=SUMPRODUCT(OFFSET(B1,{0;1;2},0)+0)",
+    ] {
+        assert_error(formula, ExcelErrorKind::Value);
+    }
+    assert_number("=SUMPRODUCT(--ISNUMBER(OFFSET(B1,{0;1},{0,1,2})))", 0.0);
+    assert_number("=SUMPRODUCT(--ISERROR(OFFSET(B1,{0;1},0)))", 1.0);
+    // Reference parameters still evaluate once per reference.
+    assert_number("=SUMPRODUCT(COUNTIF(OFFSET(A1,{0;1;2},0),\"a\"))", 2.0);
+}
+
+#[test]
+fn arrays_of_references_are_recognised_by_value() {
+    // OFFSET's own reference parameter.
+    assert_number(
+        "=SUMPRODUCT(SUBTOTAL(9,OFFSET(OFFSET(B1,{0;1},0),0,0)))",
+        3.0,
+    );
+    assert_number("=SUMPRODUCT(N(OFFSET(OFFSET(B1,{0;1},0),1,0)))", 5.0);
+    // The branch IF or CHOOSE selects.
+    assert_number("=SUMPRODUCT(SUBTOTAL(9,IF(1,OFFSET(B1,{0;1;2},0))))", 6.0);
+    assert_number("=SUMPRODUCT(SUBTOTAL(9,IF(0,B1,OFFSET(B1,{0;1},0))))", 3.0);
+    assert_number(
+        "=SUMPRODUCT(SUBTOTAL(9,CHOOSE(2,B1,OFFSET(B1,{0;1;2},0))))",
+        6.0,
+    );
+    assert_number("=SUMPRODUCT(N(IF(TRUE,OFFSET(B1,{0;1},0))))", 3.0);
+    // A LET binding.
+    assert_number(
+        "=LET(r,OFFSET(B1,{0;1;2},0),SUMPRODUCT(SUBTOTAL(9,r)))",
+        6.0,
+    );
+    assert_number("=LET(r,OFFSET(B1,{0;1;2},0),SUMPRODUCT(N(r)))", 6.0);
+    assert_error("=LET(r,OFFSET(B1,{0;1;2},0),r)", ExcelErrorKind::Value);
+    assert_number("=LET(r,B1:B3,SUM(r))", 6.0);
+    // A defined name whose formula is a lifted OFFSET or INDIRECT.
+    let mut engine = engine();
+    for (name, formula) in [
+        ("Refs", "=OFFSET(Sheet1!$B$1,{0;1;2},0)"),
+        ("Cells", "=INDIRECT(\"Sheet1!B\"&{1;2})"),
+    ] {
+        engine
+            .define_name(
+                name,
+                NamedDefinition::Formula {
+                    ast: parse(formula).unwrap(),
+                    dependencies: Vec::new(),
+                    range_deps: Vec::new(),
+                },
+                NameScope::Workbook,
+            )
+            .unwrap();
+    }
+    for (formula, expected) in [
+        ("=SUMPRODUCT(SUBTOTAL(9,Refs))", 6.0),
+        ("=SUMPRODUCT(N(Refs))", 6.0),
+        ("=SUM(COUNTIF(Refs,\">1\"))", 2.0),
+        ("=SUMPRODUCT(N(Cells))", 3.0),
+    ] {
+        assert_eq!(
+            eval(&mut engine, formula),
+            LiteralValue::Number(expected),
+            "{formula}"
+        );
+    }
+}
+
+#[test]
+fn subtotal_aggregate_and_rank_parameters_lift() {
+    // The function number lifts like any single-value parameter.
+    assert_number("=SUM(SUBTOTAL({9,4},B1:B3))", 9.0);
+    assert_number("=SUM(SUBTOTAL({9;4},OFFSET(B1,{0,1},0)))", 6.0);
+    assert_number("=SUM(_xlfn.AGGREGATE({9,4},6,B1:B3))", 9.0);
+    assert_number("=SUM(_xlfn.AGGREGATE(9,{4,6},B1:B3))", 12.0);
+    // k of the array form; in the reference form the 4th argument is a ref.
+    assert_number("=SUM(_xlfn.AGGREGATE(14,6,B1:B3,{1,2}))", 5.0);
+    assert_number("=SUM(_xlfn.AGGREGATE({14,15},6,B1:B3,{1,1}))", 4.0);
+    assert_number("=_xlfn.AGGREGATE(9,4,B1:B3,B1:B2)", 9.0);
+    // RANK's ref is a reference parameter.
+    assert_number("=SUM(RANK(B1,OFFSET(B1,0,0,{2,3})))", 5.0);
+    assert_number("=SUM(_xlfn.RANK.EQ(B2,OFFSET(B1,0,0,{2,3})))", 3.0);
+    assert_number("=SUM(_xlfn.RANK.AVG(B2,OFFSET(B1,0,0,{2,3}),1))", 4.0);
 }

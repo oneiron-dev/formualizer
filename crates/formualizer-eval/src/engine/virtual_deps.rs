@@ -228,6 +228,15 @@ impl<'a, R: EvaluationContext> EvaluationContext for DynamicRefCollector<'a, R> 
         self.engine.is_value_name(name, current_sheet)
     }
 
+    fn resolve_name_reference_array(
+        &self,
+        name: &str,
+        current_sheet: &str,
+    ) -> Option<Result<Vec<Vec<Result<ReferenceType, ExcelError>>>, ExcelError>> {
+        self.engine
+            .resolve_name_reference_array(name, current_sheet)
+    }
+
     fn workbook_file_name(&self) -> Option<String> {
         self.engine.workbook_file_name()
     }

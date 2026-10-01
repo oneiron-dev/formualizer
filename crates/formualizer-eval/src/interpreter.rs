@@ -65,6 +65,11 @@ pub(crate) fn probe_range_dimensions<C: EvaluationContext + ?Sized>(
 pub enum LocalBinding {
     Value(LiteralValue),
     Callable(Arc<dyn crate::traits::CustomCallable>),
+    /// An array of references (`LET(r,OFFSET(A1,{0;1},0),...)`). It has no
+    /// value of its own (`#VALUE!`); reference parameters and N/T read each
+    /// reference (see `ArgumentHandle::reference_array`).
+    #[allow(clippy::type_complexity)]
+    References(Arc<Vec<Vec<Result<ReferenceType, ExcelError>>>>),
 }
 
 #[derive(Clone, Default)]
@@ -253,6 +258,9 @@ impl<'a> Interpreter<'a> {
         match self.local_env.lookup(name)? {
             LocalBinding::Value(v) => Some(crate::traits::CalcValue::Scalar(v)),
             LocalBinding::Callable(c) => Some(crate::traits::CalcValue::Callable(c)),
+            LocalBinding::References(_) => Some(crate::traits::CalcValue::Scalar(
+                LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)),
+            )),
         }
     }
 
@@ -262,7 +270,7 @@ impl<'a> Interpreter<'a> {
         }
         match self.local_env.lookup(name)? {
             LocalBinding::Callable(c) => Some(c),
-            LocalBinding::Value(_) => None,
+            LocalBinding::Value(_) | LocalBinding::References(_) => None,
         }
     }
 

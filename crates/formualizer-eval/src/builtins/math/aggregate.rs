@@ -1123,7 +1123,7 @@ mod computed_array_tests {
         );
         assert_exact_error_value(
             evaluate(&wb, "=SUM(INDIRECT(\"not a reference\"))"),
-            ExcelErrorKind::Name,
+            ExcelErrorKind::Ref,
             None,
         );
     }

@@ -110,12 +110,12 @@ fn genuine_reference_errors_are_still_preserved() {
             "=SUM(FILTER(OFFSET(A1,-1,0),{TRUE}))",
             ExcelErrorKind::Ref,
         ),
-        // INDIRECT reports an unresolvable name as #NAME?; the point is that
-        // the failure still propagates instead of being masked.
+        // INDIRECT of text that is not a reference is #REF!; the point is
+        // that the failure still propagates instead of being masked.
         (
             3,
             "=COUNT(TRANSPOSE(INDIRECT(\"not a reference\")))",
-            ExcelErrorKind::Name,
+            ExcelErrorKind::Ref,
         ),
     ];
     for (row, formula, _) in cases {

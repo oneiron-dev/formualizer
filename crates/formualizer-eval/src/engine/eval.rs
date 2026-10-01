@@ -27109,6 +27109,30 @@ where
         }
     }
 
+    fn resolve_name_reference_array(
+        &self,
+        name: &str,
+        current_sheet: &str,
+    ) -> Option<Result<Vec<Vec<Result<ReferenceType, ExcelError>>>, ExcelError>> {
+        let current_id = self.graph.sheet_id(current_sheet)?;
+        let named = self.graph.resolve_name_entry(name, current_id)?;
+        let NamedDefinition::Formula { ast, .. } = &named.definition else {
+            return None;
+        };
+        if !self.yields_reference(ast) {
+            return None;
+        }
+        let sheet_id = match named.scope {
+            NameScope::Sheet(id) => id,
+            NameScope::Workbook => current_id,
+        };
+        let sheet = self.graph.sheet_name(sheet_id);
+        let cell_ref = self.graph.make_cell_ref(sheet, 0, 0);
+        let interpreter = Interpreter::new_with_cell(self, sheet, cell_ref);
+        let formula = crate::traits::ArgumentHandle::new(ast, &interpreter);
+        Self::in_named_formula(|| formula.reference_array()).transpose()
+    }
+
     fn clock(&self) -> &dyn crate::timezone::ClockProvider {
         &self.clock
     }

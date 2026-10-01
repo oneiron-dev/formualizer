@@ -403,6 +403,15 @@ impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
         self.engine.is_value_name(name, current_sheet)
     }
 
+    fn resolve_name_reference_array(
+        &self,
+        name: &str,
+        current_sheet: &str,
+    ) -> Option<Result<Vec<Vec<Result<ReferenceType, ExcelError>>>, ExcelError>> {
+        self.engine
+            .resolve_name_reference_array(name, current_sheet)
+    }
+
     /* ── intercept-and-record ── */
 
     fn resolve_range_view<'c>(

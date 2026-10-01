@@ -13,9 +13,11 @@
 //! inferred from argument schemas.
 //!
 //! A reference-returning function lifted the same way (`OFFSET(A1,{0;1},0)`)
-//! returns an array of references. It has no value of its own; a function
-//! taking a reference or a single value there is evaluated once per
-//! reference instead (`SUBTOTAL(9,OFFSET(A1,{0;1},0))` is `{A1;A2}`).
+//! returns an array of references. It has no value of its own (`#VALUE!`, as
+//! for operators and single-value parameters); a function taking a reference
+//! there is evaluated once per reference instead
+//! (`SUBTOTAL(9,OFFSET(A1,{0;1},0))` is `{A1;A2}`), and `N`/`T` read each
+//! reference's first cell (`N(OFFSET(A1,{0;1},0))` is `{N(A1);N(A2)}`).
 
 use crate::engine::range_view::RangeView;
 use crate::traits::{ArgumentHandle, CalcValue};
@@ -104,32 +106,83 @@ pub(crate) fn lift_spec(name: &str) -> Option<Lift> {
         "PERCENTRANK.INC" | "PERCENTRANK.EXC" => Lift::Only(&[1, 2]),
         "RANK.EQ" | "RANK.AVG" => Lift::Only(&[0, 2]),
         "COUNTIF" | "SUMIF" | "AVERAGEIF" => Lift::Only(&[1]),
+        // The function number (and AGGREGATE's options; see `value_lift_spec`
+        // for the k of its array form).
+        "SUBTOTAL" => Lift::Only(&[0]),
+        "AGGREGATE" => Lift::Only(&[0, 1]),
         "COUNTIFS" => Lift::Every { start: 1, step: 2 },
         "SUMIFS" | "AVERAGEIFS" | "MAXIFS" | "MINIFS" => Lift::Every { start: 2, step: 2 },
         _ => return None,
     })
 }
 
-/// Excel's reference parameters of builtins that are evaluated once per
-/// reference of an array of references. Their single-value parameters
-/// (criteria) lift over it as well, as do those of every `lift_spec` builtin.
+/// The parameters of builtins taking a reference that are evaluated once per
+/// reference of an array of references (SUBTOTAL's refs, SUMIF's range and
+/// sum_range, RANK's ref, ...). Positions that `lift_spec` lists take single
+/// values instead and lift over arrays only.
 fn reference_lift_spec(name: &str) -> Option<Lift> {
     Some(match name {
-        "SUBTOTAL" => Lift::Every { start: 1, step: 1 },
-        "AGGREGATE" => Lift::Every { start: 2, step: 1 },
-        "SUMIF" | "COUNTIF" | "AVERAGEIF" | "SUMIFS" | "COUNTIFS" | "AVERAGEIFS" | "MAXIFS"
-        | "MINIFS" | "COUNTBLANK" => Lift::All,
+        "SUBTOTAL" | "AGGREGATE" | "SUMIF" | "COUNTIF" | "AVERAGEIF" | "SUMIFS" | "COUNTIFS"
+        | "AVERAGEIFS" | "MAXIFS" | "MINIFS" | "COUNTBLANK" | "RANK.EQ" | "RANK.AVG" => Lift::All,
         _ => return None,
     })
 }
 
-/// The single-value parameters of the reference-returning builtins, which
-/// return an array of references when lifted.
-pub(crate) fn reference_array_spec(name: &str) -> Option<Lift> {
+/// Builtins whose single parameter takes a reference and reads its first
+/// cell (N, T). A range reference is passed whole (`N(B1:B2)` is `N(B1)`);
+/// an array value and an array of references are lifted, and these are the
+/// only single-value parameters that read an array of references.
+fn reads_first_cell(name: &str) -> bool {
+    matches!(name, "N" | "T")
+}
+
+/// The single-value parameters of `name` for these arguments: `lift_spec`,
+/// plus the k of AGGREGATE's array form, AGGREGATE(14..19,options,array,k).
+fn value_lift_spec(name: &str, args: &[ArgumentHandle<'_, '_>]) -> Option<Lift> {
+    if name == "AGGREGATE" && args.len() == 4 && aggregate_array_form(&args[0]) {
+        return Some(Lift::Only(&[0, 1, 3]));
+    }
+    lift_spec(name)
+}
+
+/// Whether AGGREGATE's function number (each element of an array of them)
+/// selects the array form, 14 (LARGE) to 19 (QUARTILE.EXC).
+fn aggregate_array_form(function_num: &ArgumentHandle<'_, '_>) -> bool {
+    let array_form = |value: &LiteralValue| match value {
+        LiteralValue::Number(n) => (14.0..20.0).contains(n),
+        LiteralValue::Int(i) => (14..=19).contains(i),
+        _ => false,
+    };
+    match function_num.value() {
+        Ok(value) => match array_rows(&value) {
+            Some(rows) => rows.iter().flatten().all(array_form),
+            None => array_form(&value.into_literal()),
+        },
+        Err(_) => false,
+    }
+}
+
+/// The parameters of the reference-returning builtins that lift over an
+/// array, so that the call returns an array of references: single-value
+/// parameters (`values`) lift over an array value, and reference parameters
+/// (`references`, OFFSET's reference) over an array of references.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReferenceArraySpec {
+    values: Lift,
+    references: Option<Lift>,
+}
+
+pub(crate) fn reference_array_spec(name: &str) -> Option<ReferenceArraySpec> {
     if name.eq_ignore_ascii_case("OFFSET") {
-        Some(Lift::Only(&[1, 2, 3, 4]))
+        Some(ReferenceArraySpec {
+            values: Lift::Only(&[1, 2, 3, 4]),
+            references: Some(Lift::Only(&[0])),
+        })
     } else if name.eq_ignore_ascii_case("INDIRECT") {
-        Some(Lift::All)
+        Some(ReferenceArraySpec {
+            values: Lift::All,
+            references: None,
+        })
     } else {
         None
     }
@@ -208,8 +261,8 @@ pub(crate) fn array_result<'b>(
     CalcValue::Range(RangeView::from_owned_rows(rows, date_system))
 }
 
-/// Evaluate `call` once per element when a lifted parameter holds an array,
-/// or a lifted or reference parameter holds an array of references.
+/// Evaluate `call` once per element when a single-value parameter holds an
+/// array, or a reference parameter holds an array of references.
 /// Returns `None` when no such argument is a multi-cell array.
 pub(crate) fn lift_call<'a, 'b, F>(
     name: &str,
@@ -219,30 +272,36 @@ pub(crate) fn lift_call<'a, 'b, F>(
 where
     F: for<'x> Fn(&[ArgumentHandle<'x, 'b>]) -> Result<CalcValue<'b>, ExcelError>,
 {
-    let values = lift_spec(name);
-    let Some(references) = reference_lift_spec(name).or(values) else {
+    let values = value_lift_spec(name, args);
+    let references = reference_lift_spec(name);
+    if values.is_none() && references.is_none() {
         return Ok(None);
-    };
+    }
     let mut arrays = Vec::new();
     for (index, arg) in args.iter().enumerate() {
-        if !references.lifts(index) || arg.is_omitted() {
+        if arg.is_omitted() {
             continue;
         }
-        if values.is_some_and(|spec| spec.lifts(index)) {
-            let Ok(value) = arg.value() else {
-                return Ok(None);
-            };
-            if let Some(rows) = array_rows(&value) {
-                arrays.push((index, literal_nodes(rows)));
-                continue;
+        let elements = if values.is_some_and(|spec| spec.lifts(index)) {
+            if reads_first_cell(name) {
+                match first_cell_elements(arg)? {
+                    Lifted::Elements(elements) => elements,
+                    Lifted::Unavailable => return Ok(None),
+                }
+            } else {
+                // An array of references has no value here (#VALUE!).
+                let Ok(value) = arg.value() else {
+                    return Ok(None);
+                };
+                array_rows(&value).map(literal_nodes)
             }
-            // An array of references has no value; it reads as an error.
-            if !matches!(value, CalcValue::Scalar(LiteralValue::Error(_))) {
-                continue;
-            }
-        }
-        if let Some(refs) = arg.reference_array()? {
-            arrays.push((index, reference_nodes(refs)));
+        } else if references.is_some_and(|spec| spec.lifts(index)) {
+            arg.reference_array()?.map(reference_nodes)
+        } else {
+            None
+        };
+        if let Some(elements) = elements {
+            arrays.push((index, elements));
         }
     }
     let lifted = each_element(args, &arrays, |handles| match call(handles) {
@@ -253,11 +312,42 @@ where
     Ok(lifted.map(|rows| array_result(rows, args[0].date_system())))
 }
 
-/// The references of a reference-returning call whose single-value
-/// parameters (`spec`) hold an array, one per element of their broadcast
-/// shape. Returns `None` when none of them is a multi-cell array.
+enum Lifted {
+    /// The elements to evaluate once each, if the argument is lifted.
+    Elements(Option<Vec<Vec<ASTNode>>>),
+    /// The argument cannot be read; keep the unlifted call.
+    Unavailable,
+}
+
+/// The elements N or T lift over: those of an array value, or the
+/// references of an array of references. A reference is read whole.
+fn first_cell_elements(arg: &ArgumentHandle<'_, '_>) -> Result<Lifted, ExcelError> {
+    use crate::function::FunctionResolution;
+    let error = match arg.resolve_reference_or_value() {
+        Ok(FunctionResolution::Reference(_)) => return Ok(Lifted::Elements(None)),
+        Ok(FunctionResolution::Value(value)) => {
+            if let Some(rows) = array_rows(&value) {
+                return Ok(Lifted::Elements(Some(literal_nodes(rows))));
+            }
+            matches!(value, CalcValue::Scalar(LiteralValue::Error(_)))
+        }
+        Ok(FunctionResolution::ReferenceError(_)) => true,
+        Err(error) if error.kind == ExcelErrorKind::Cancelled => return Err(error),
+        Err(_) => return Ok(Lifted::Unavailable),
+    };
+    // An array of references reads as an error.
+    Ok(Lifted::Elements(if error {
+        arg.reference_array()?.map(reference_nodes)
+    } else {
+        None
+    }))
+}
+
+/// The references of a reference-returning call whose parameters (`spec`)
+/// hold an array or an array of references, one per element of their
+/// broadcast shape. Returns `None` when none of them does.
 pub(crate) fn lift_reference<'a, 'b, F>(
-    spec: Lift,
+    spec: ReferenceArraySpec,
     args: &[ArgumentHandle<'a, 'b>],
     call: F,
 ) -> Result<Option<ReferenceArray>, ExcelError>
@@ -266,14 +356,22 @@ where
 {
     let mut arrays = Vec::new();
     for (index, arg) in args.iter().enumerate() {
-        if !spec.lifts(index) || arg.is_omitted() {
+        if arg.is_omitted() {
             continue;
         }
-        let Ok(value) = arg.value() else {
-            return Ok(None);
-        };
-        if let Some(rows) = array_rows(&value) {
-            arrays.push((index, literal_nodes(rows)));
+        if spec.values.lifts(index) {
+            let Ok(value) = arg.value() else {
+                return Ok(None);
+            };
+            if let Some(rows) = array_rows(&value) {
+                arrays.push((index, literal_nodes(rows)));
+            }
+        } else if spec
+            .references
+            .is_some_and(|references| references.lifts(index))
+            && let Some(references) = arg.reference_array()?
+        {
+            arrays.push((index, reference_nodes(references)));
         }
     }
     each_element(args, &arrays, |handles| match call(handles) {

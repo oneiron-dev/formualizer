@@ -45,7 +45,13 @@ fn arg_byref_array() -> Vec<ArgSchema> {
     ]
 }
 
+/// OFFSET(reference, rows, cols, [height], [width]): the offsets and sizes
+/// are numeric parameters, so numeric text converts like any number argument.
 fn arg_byref_reference() -> Vec<ArgSchema> {
+    let optional_number = || ArgSchema {
+        required: false,
+        ..ArgSchema::number_lenient_scalar()
+    };
     vec![
         ArgSchema {
             kinds: smallvec::smallvec![ArgKind::Range],
@@ -57,30 +63,10 @@ fn arg_byref_reference() -> Vec<ArgSchema> {
             repeating: None,
             default: None,
         },
-        number_strict_scalar(),
-        number_strict_scalar(),
-        ArgSchema {
-            // height optional
-            kinds: smallvec::smallvec![ArgKind::Number],
-            required: false,
-            by_ref: false,
-            shape: ShapeKind::Scalar,
-            coercion: CoercionPolicy::NumberStrict,
-            max: None,
-            repeating: None,
-            default: None,
-        },
-        ArgSchema {
-            // width optional
-            kinds: smallvec::smallvec![ArgKind::Number],
-            required: false,
-            by_ref: false,
-            shape: ShapeKind::Scalar,
-            coercion: CoercionPolicy::NumberStrict,
-            max: None,
-            repeating: None,
-            default: None,
-        },
+        ArgSchema::number_lenient_scalar(),
+        ArgSchema::number_lenient_scalar(),
+        optional_number(),
+        optional_number(),
     ]
 }
 
@@ -625,8 +611,10 @@ pub struct OffsetFn;
 /// # Remarks
 /// - `rows` and `cols` shift from the top-left of `reference`.
 /// - If omitted, `height` and `width` default to the original reference size.
-/// - Non-positive target coordinates or dimensions return `#REF!`.
-/// - Non-numeric offset/size inputs return `#VALUE!`.
+/// - A target that starts before row/column 1, a height or width below 1, or a resized
+///   reference that reaches past row 1,048,576 or column 16,384 returns `#REF!`.
+/// - Offsets and sizes are numbers: a blank cell is 0, logicals and numeric text convert,
+///   and other text returns `#VALUE!`.
 /// - In value context, a 1x1 result returns a scalar; larger results spill as an array.
 /// - An array offset/size returns an array of references, one per element: reference
 ///   parameters such as SUBTOTAL's or SUMIF's evaluate once per reference, and `N`
@@ -664,7 +652,7 @@ pub struct OffsetFn;
 ///   - q: "What defaults are used when height and width are omitted?"
 ///     a: "OFFSET keeps the source reference size, then applies the row/column shift to that same-sized block."
 ///   - q: "When does OFFSET return #REF!?"
-///     a: "It returns #REF! if the shifted start goes to row/column <= 0 or if requested height/width are non-positive."
+///     a: "It returns #REF! if the shifted start goes to row/column <= 0, if requested height/width are non-positive, or if the result reaches past the last row or column of the sheet."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: OFFSET
@@ -673,7 +661,7 @@ pub struct OffsetFn;
 /// Max args: 5
 /// Variadic: false
 /// Signature: OFFSET(arg1: range@range, arg2: number@scalar, arg3: number@scalar, arg4?: number@scalar, arg5?: number@scalar)
-/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberStrict,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberStrict,max=None,repeating=None,default=false}; arg4{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberStrict,max=None,repeating=None,default=false}; arg5{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberStrict,max=None,repeating=None,default=false}
+/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg5{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
 /// Caps: PURE, VOLATILE, RETURNS_REFERENCE, DYNAMIC_DEPENDENCY
 /// [formualizer-docgen:schema:end]
 impl Function for OffsetFn {
@@ -698,65 +686,7 @@ impl Function for OffsetFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Option<Result<ReferenceType, ExcelError>> {
-        if args.len() < 3 {
-            return Some(Err(ExcelError::new(ExcelErrorKind::Value)));
-        }
-        let base = match args[0].as_reference_or_eval() {
-            Ok(r) => r,
-            Err(e) => return Some(Err(e)),
-        };
-        let dr = match offset_number(&args[1]) {
-            Ok(n) => n,
-            Err(e) => return Some(Err(e)),
-        };
-        let dc = match offset_number(&args[2]) {
-            Ok(n) => n,
-            Err(e) => return Some(Err(e)),
-        };
-
-        // Unbounded ranges (e.g. B:B, 2:2) are clamped to the used region
-        // instead of erroring.
-        let (sheet, sr, sc, er, ec) = match resolve_reference_bounds(ctx, &base) {
-            Ok(bounds) => bounds,
-            Err(e) => return Some(Err(e)),
-        };
-
-        let nsr = (sr as i64) + dr;
-        let nsc = (sc as i64) + dc;
-        let height = if args.len() >= 4 && !args[3].is_omitted() {
-            match offset_number(&args[3]) {
-                Ok(n) => n,
-                Err(e) => return Some(Err(e)),
-            }
-        } else {
-            (er as i64) - (sr as i64) + 1
-        };
-        let width = if args.len() >= 5 && !args[4].is_omitted() {
-            match offset_number(&args[4]) {
-                Ok(n) => n,
-                Err(e) => return Some(Err(e)),
-            }
-        } else {
-            (ec as i64) - (sc as i64) + 1
-        };
-
-        if nsr <= 0 || nsc <= 0 || height <= 0 || width <= 0 {
-            return Some(Err(ExcelError::new(ExcelErrorKind::Ref)));
-        }
-        let ner = nsr + height - 1;
-        let nec = nsc + width - 1;
-
-        if height == 1 && width == 1 {
-            Some(Ok(ReferenceType::cell(sheet, nsr as u32, nsc as u32)))
-        } else {
-            Some(Ok(ReferenceType::range(
-                sheet,
-                Some(nsr as u32),
-                Some(nsc as u32),
-                Some(ner as u32),
-                Some(nec as u32),
-            )))
-        }
+        Some(offset_reference(args, ctx))
     }
 
     fn eval<'a, 'b, 'c>(
@@ -791,14 +721,68 @@ impl Function for OffsetFn {
     }
 }
 
-/// An OFFSET offset or size: a number, or the argument's own error. An array
-/// is lifted by the caller (`ArgumentHandle::reference_array`) and is #VALUE! here.
+/// The reference OFFSET returns. A reference whose rows/cols offset or
+/// height/width reach past the edge of the sheet (row 1 to 1,048,576, column 1
+/// to 16,384) is `#REF!`, as is a height or width below 1.
+fn offset_reference<'b>(
+    args: &[ArgumentHandle<'_, 'b>],
+    ctx: &dyn FunctionContext<'b>,
+) -> Result<ReferenceType, ExcelError> {
+    if args.len() < 3 {
+        return Err(ExcelError::new(ExcelErrorKind::Value));
+    }
+    let base = args[0].as_reference_or_eval()?;
+    let rows = offset_number(&args[1])?;
+    let cols = offset_number(&args[2])?;
+
+    // A whole column or row (B:B, 2:2) spans the full grid; other open-ended
+    // ranges are clamped to the used region.
+    let (sheet, sr, sc, er, ec) = resolve_reference_bounds(ctx, &base)?;
+
+    // An omitted height or width keeps the reference's own size.
+    let size = |index: usize, own: i64| match args.get(index) {
+        Some(arg) if !arg.is_omitted() => offset_number(arg),
+        _ => Ok(own),
+    };
+    let height = size(3, i64::from(er) - i64::from(sr) + 1)?;
+    let width = size(4, i64::from(ec) - i64::from(sc) + 1)?;
+
+    let off_grid = || ExcelError::new(ExcelErrorKind::Ref);
+    if height < 1 || width < 1 {
+        return Err(off_grid());
+    }
+    let top = i64::from(sr).checked_add(rows).ok_or_else(off_grid)?;
+    let left = i64::from(sc).checked_add(cols).ok_or_else(off_grid)?;
+    let bottom = top.checked_add(height - 1).ok_or_else(off_grid)?;
+    let right = left.checked_add(width - 1).ok_or_else(off_grid)?;
+    let on_grid = |first: i64, last: i64, max: u32| first >= 1 && last <= i64::from(max);
+    if !on_grid(top, bottom, EXCEL_MAX_ROW) || !on_grid(left, right, EXCEL_MAX_COL) {
+        return Err(off_grid());
+    }
+    // Every bound is now within 1..=1,048,576.
+    let (top, left, bottom, right) = (top as u32, left as u32, bottom as u32, right as u32);
+    Ok(if height == 1 && width == 1 {
+        ReferenceType::cell(sheet, top, left)
+    } else {
+        ReferenceType::range(sheet, Some(top), Some(left), Some(bottom), Some(right))
+    })
+}
+
+/// An OFFSET offset or size, which is a numeric parameter: a blank is 0,
+/// logicals and numeric text convert like any number argument, other text is
+/// `#VALUE!` and an error is itself. The number truncates toward zero
+/// (saturating, so a huge offset is off the sheet). An array is lifted by the
+/// caller (`ArgumentHandle::reference_array`) and is `#VALUE!` here.
 fn offset_number(arg: &ArgumentHandle<'_, '_>) -> Result<i64, ExcelError> {
     match arg.value()?.into_literal() {
-        LiteralValue::Number(n) => Ok(n as i64),
-        LiteralValue::Int(i) => Ok(i),
         LiteralValue::Error(e) => Err(e),
-        _ => Err(ExcelError::new(ExcelErrorKind::Value)),
+        LiteralValue::Array(_) => Err(ExcelError::new(ExcelErrorKind::Value)),
+        value => crate::coercion::to_serial_lenient_in_year(
+            &value,
+            arg.date_system(),
+            Some(arg.current_year()),
+        )
+        .map(|n| n.trunc() as i64),
     }
 }
 
@@ -900,89 +884,12 @@ impl Function for IndirectFn {
     fn eval_reference<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Option<Result<ReferenceType, ExcelError>> {
-        if args.is_empty() {
-            return Some(Err(ExcelError::new(ExcelErrorKind::Value)));
-        }
-
-        let ref_text = match args[0].value() {
-            Ok(cv) => match cv.into_literal() {
-                LiteralValue::Text(s) => s.to_string(),
-                _ => return Some(Err(ExcelError::new(ExcelErrorKind::Value))),
-            },
-            Err(e) => return Some(Err(e)),
-        };
-
-        let a1_style = if args.len() >= 2 {
-            match args[1].value() {
-                Ok(cv) => match cv.into_literal() {
-                    LiteralValue::Boolean(b) => b,
-                    LiteralValue::Int(i) => i != 0,
-                    LiteralValue::Number(n) => n != 0.0,
-                    _ => return Some(Err(ExcelError::new(ExcelErrorKind::Value))),
-                },
-                Err(e) => return Some(Err(e)),
-            }
-        } else {
-            true
-        };
-
-        if !a1_style {
-            // The A1/R1C1 flag does not apply to defined names or tables (they are
-            // neither A1 nor R1C1 syntax). Excel resolves `INDIRECT(name, FALSE)`
-            // exactly like `INDIRECT(name)`, so handle those before refusing R1C1.
-            // Real R1C1 cell/range text remains unsupported.
-            return match formualizer_parse::parser::ReferenceType::from_string(&ref_text) {
-                Ok(ReferenceType::NamedRange(name)) => Some(Ok(ReferenceType::NamedRange(name))),
-                Ok(ReferenceType::Table(tref)) => Some(Ok(ReferenceType::Table(tref))),
-                _ => Some(Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
-                    "INDIRECT with R1C1 style (second argument FALSE) is not yet supported",
-                ))),
-            };
-        }
-
-        let parsed = formualizer_parse::parser::ReferenceType::parse_sheet_ref(&ref_text);
-
-        match parsed {
-            Ok(formualizer_common::SheetRef::Cell(cell)) => {
-                let sheet = match cell.sheet {
-                    formualizer_common::SheetLocator::Current => None,
-                    formualizer_common::SheetLocator::Name(name) => Some(name.to_string()),
-                    formualizer_common::SheetLocator::Id(_) => None,
-                };
-                Some(Ok(ReferenceType::Cell {
-                    sheet,
-                    row: cell.coord.row() + 1,
-                    col: cell.coord.col() + 1,
-                    row_abs: cell.coord.row_abs(),
-                    col_abs: cell.coord.col_abs(),
-                }))
-            }
-            Ok(formualizer_common::SheetRef::Range(range)) => {
-                let sheet = match range.sheet {
-                    formualizer_common::SheetLocator::Current => None,
-                    formualizer_common::SheetLocator::Name(name) => Some(name.to_string()),
-                    formualizer_common::SheetLocator::Id(_) => None,
-                };
-                Some(Ok(ReferenceType::Range {
-                    sheet,
-                    start_row: range.start_row.map(|b| b.index + 1),
-                    start_col: range.start_col.map(|b| b.index + 1),
-                    end_row: range.end_row.map(|b| b.index + 1),
-                    end_col: range.end_col.map(|b| b.index + 1),
-                    start_row_abs: range.start_row.map(|b| b.abs).unwrap_or(false),
-                    start_col_abs: range.start_col.map(|b| b.abs).unwrap_or(false),
-                    end_row_abs: range.end_row.map(|b| b.abs).unwrap_or(false),
-                    end_col_abs: range.end_col.map(|b| b.abs).unwrap_or(false),
-                }))
-            }
-            Err(_) => match formualizer_parse::parser::ReferenceType::from_string(&ref_text) {
-                Ok(ReferenceType::NamedRange(name)) => Some(Ok(ReferenceType::NamedRange(name))),
-                Ok(ReferenceType::Table(tref)) => Some(Ok(ReferenceType::Table(tref))),
-                _ => Some(Err(ExcelError::new(ExcelErrorKind::Ref))),
-            },
-        }
+        Some(
+            indirect_text_reference(args)
+                .and_then(|reference| indirect_reference_exists(reference, ctx)),
+        )
     }
 
     fn eval<'a, 'b, 'c>(
@@ -1021,6 +928,112 @@ impl Function for IndirectFn {
                 ExcelError::new(ExcelErrorKind::Ref),
             ))),
         }
+    }
+}
+
+/// The reference INDIRECT's text spells (A1 style), before checking that it exists.
+fn indirect_text_reference(args: &[ArgumentHandle<'_, '_>]) -> Result<ReferenceType, ExcelError> {
+    if args.is_empty() {
+        return Err(ExcelError::new(ExcelErrorKind::Value));
+    }
+
+    let ref_text = match args[0].value()?.into_literal() {
+        LiteralValue::Text(s) => s.to_string(),
+        _ => return Err(ExcelError::new(ExcelErrorKind::Value)),
+    };
+
+    let a1_style = if args.len() >= 2 {
+        match args[1].value()?.into_literal() {
+            LiteralValue::Boolean(b) => b,
+            LiteralValue::Int(i) => i != 0,
+            LiteralValue::Number(n) => n != 0.0,
+            _ => return Err(ExcelError::new(ExcelErrorKind::Value)),
+        }
+    } else {
+        true
+    };
+
+    if !a1_style {
+        // The A1/R1C1 flag does not apply to defined names or tables (they are
+        // neither A1 nor R1C1 syntax). Excel resolves `INDIRECT(name, FALSE)`
+        // exactly like `INDIRECT(name)`, so handle those before refusing R1C1.
+        // Real R1C1 cell/range text remains unsupported.
+        return match ReferenceType::from_string(&ref_text) {
+            Ok(reference @ (ReferenceType::NamedRange(_) | ReferenceType::Table(_))) => {
+                Ok(reference)
+            }
+            _ => Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
+                "INDIRECT with R1C1 style (second argument FALSE) is not yet supported",
+            )),
+        };
+    }
+
+    let sheet_name = |sheet: formualizer_common::SheetLocator<'_>| match sheet {
+        formualizer_common::SheetLocator::Current => None,
+        formualizer_common::SheetLocator::Name(name) => Some(name.to_string()),
+        formualizer_common::SheetLocator::Id(_) => None,
+    };
+    match ReferenceType::parse_sheet_ref(&ref_text) {
+        Ok(formualizer_common::SheetRef::Cell(cell)) => Ok(ReferenceType::Cell {
+            sheet: sheet_name(cell.sheet),
+            row: cell.coord.row() + 1,
+            col: cell.coord.col() + 1,
+            row_abs: cell.coord.row_abs(),
+            col_abs: cell.coord.col_abs(),
+        }),
+        Ok(formualizer_common::SheetRef::Range(range)) => Ok(ReferenceType::Range {
+            sheet: sheet_name(range.sheet),
+            start_row: range.start_row.map(|b| b.index + 1),
+            start_col: range.start_col.map(|b| b.index + 1),
+            end_row: range.end_row.map(|b| b.index + 1),
+            end_col: range.end_col.map(|b| b.index + 1),
+            start_row_abs: range.start_row.map(|b| b.abs).unwrap_or(false),
+            start_col_abs: range.start_col.map(|b| b.abs).unwrap_or(false),
+            end_row_abs: range.end_row.map(|b| b.abs).unwrap_or(false),
+            end_col_abs: range.end_col.map(|b| b.abs).unwrap_or(false),
+        }),
+        Err(_) => match ReferenceType::from_string(&ref_text) {
+            Ok(reference @ (ReferenceType::NamedRange(_) | ReferenceType::Table(_))) => {
+                Ok(reference)
+            }
+            _ => Err(ExcelError::new(ExcelErrorKind::Ref)),
+        },
+    }
+}
+
+/// INDIRECT's reference when it exists: an address past row 1,048,576 or
+/// column 16,384, or a name or table that is not defined, is `#REF!` (not
+/// `#NAME?`) wherever INDIRECT is used.
+fn indirect_reference_exists(
+    reference: ReferenceType,
+    ctx: &dyn FunctionContext<'_>,
+) -> Result<ReferenceType, ExcelError> {
+    let off_grid = |row: Option<u32>, col: Option<u32>| {
+        row.is_some_and(|row| row == 0 || row > EXCEL_MAX_ROW)
+            || col.is_some_and(|col| col == 0 || col > EXCEL_MAX_COL)
+    };
+    let exists = match &reference {
+        ReferenceType::Cell { row, col, .. } => !off_grid(Some(*row), Some(*col)),
+        ReferenceType::Range {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            ..
+        } => !off_grid(*start_row, *start_col) && !off_grid(*end_row, *end_col),
+        ReferenceType::NamedRange(_) | ReferenceType::Table(_) => {
+            match ctx.resolve_range_view(&reference, ctx.current_sheet()) {
+                Err(error) if error.kind == ExcelErrorKind::Cancelled => return Err(error),
+                Err(error) => error.kind != ExcelErrorKind::Name,
+                Ok(_) => true,
+            }
+        }
+        _ => true,
+    };
+    if exists {
+        Ok(reference)
+    } else {
+        Err(ExcelError::new(ExcelErrorKind::Ref))
     }
 }
 
@@ -1567,5 +1580,36 @@ mod tests {
             eval("=OFFSET(A1,{0;1},0)"),
             LiteralValue::Error(e) if e.kind == ExcelErrorKind::Value
         ));
+    }
+
+    #[test]
+    fn offset_and_indirect_off_the_sheet_are_ref_and_offsets_coerce() {
+        crate::builtins::load_builtins();
+        let wb = TestWorkbook::new()
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Int(1))
+            .with_cell_a1("Sheet1", "A2", LiteralValue::Int(2))
+            .with_cell_a1("Sheet1", "A3", LiteralValue::Int(4));
+        let eval = |formula: &str| evaluate_formula(formula, &wb).unwrap();
+        let is_ref = |value: LiteralValue| matches!(value, LiteralValue::Error(e) if e.kind == ExcelErrorKind::Ref);
+        assert!(is_ref(eval("=OFFSET(A1,1048576,0)")));
+        assert!(is_ref(eval("=OFFSET(A1,0,0,1,16385)")));
+        assert!(is_ref(eval("=OFFSET(A1,4294967296,0)")));
+        assert_eq!(
+            eval("=SUMPRODUCT(IFERROR(SUBTOTAL(9,OFFSET(A1,{0;1048576},0)),100))"),
+            LiteralValue::Number(101.0)
+        );
+        // Offsets are numbers: logicals and numeric text convert.
+        assert_eq!(eval("=OFFSET(A1,TRUE,0)"), LiteralValue::Number(2.0));
+        assert_eq!(eval("=OFFSET(A1,\"2\",0)"), LiteralValue::Number(4.0));
+        // N reads the first cell of each reference.
+        assert_eq!(
+            eval("=SUMPRODUCT(N(OFFSET(A1,{0;1},0,2)))"),
+            LiteralValue::Number(3.0)
+        );
+        assert_eq!(
+            eval("=SUMPRODUCT(SUBTOTAL(9,IF(1,OFFSET(A1,{0;1},0))))"),
+            LiteralValue::Number(3.0)
+        );
+        assert!(is_ref(eval("=SUBTOTAL(9,INDIRECT(\"XFE1\"))")));
     }
 }

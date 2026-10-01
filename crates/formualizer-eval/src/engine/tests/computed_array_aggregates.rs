@@ -73,7 +73,8 @@ fn arena_computed_array_aggregates_match_off_and_authoritative_modes() {
         off.get_cell_value("Sheet1", 11, 2),
         Some(LiteralValue::Error(error)) if error.kind == ExcelErrorKind::Value
     ));
-    for (row, kind) in [(12, ExcelErrorKind::Ref), (13, ExcelErrorKind::Name)] {
+    // INDIRECT of text that is not a reference is #REF!, like OFFSET off the sheet.
+    for (row, kind) in [(12, ExcelErrorKind::Ref), (13, ExcelErrorKind::Ref)] {
         let Some(LiteralValue::Error(error)) = off.get_cell_value("Sheet1", row, 2) else {
             panic!("expected an error value at B{row}");
         };

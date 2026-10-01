@@ -329,6 +329,28 @@ impl<'a, 'b> Clone for ArgumentHandle<'a, 'b> {
     }
 }
 
+/// The argument IF or CHOOSE selects with a single condition or index.
+fn selected_branch(name: &str, args: &[ArgumentHandle<'_, '_>]) -> Option<usize> {
+    let selector = args.first()?.value().ok()?.into_literal();
+    if name.eq_ignore_ascii_case("IF") {
+        if !(2..=3).contains(&args.len()) {
+            return None;
+        }
+        if crate::builtins::logical::if_condition(selector).ok()? {
+            Some(1)
+        } else {
+            (args.len() == 3).then_some(2)
+        }
+    } else {
+        let index = match selector {
+            LiteralValue::Number(n) => n as i64,
+            LiteralValue::Int(i) => i,
+            _ => return None,
+        };
+        (index >= 1 && (index as usize) < args.len()).then_some(index as usize)
+    }
+}
+
 impl<'a, 'b> ArgumentHandle<'a, 'b> {
     /// A handle for a literal element, evaluated by the same interpreter.
     /// Used when a scalar parameter is lifted over an array argument.
@@ -848,59 +870,33 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         }
     }
 
-    /// The references this argument evaluates to when it is a reference-returning
-    /// call lifted over an array (`OFFSET(A1,{0;1},0)`): an array of references,
-    /// one per element. `None` for any other argument.
+    /// The references this argument evaluates to when it is an array of
+    /// references: a reference-returning call lifted over an array
+    /// (`OFFSET(A1,{0;1},0)`, also as OFFSET's own reference), the branch IF or
+    /// CHOOSE selects, a LET binding or a defined name holding one. Such an
+    /// argument has no value of its own (it reads as `#VALUE!`). `None` for
+    /// any other argument.
     pub(crate) fn reference_array(
         &self,
     ) -> Result<Option<crate::lift::ReferenceArray>, ExcelError> {
-        let (name, spec, handles): (&str, _, Vec<ArgumentHandle<'a, 'b>>) = match &self.expr {
-            ArgumentExpr::Ast(node) => {
-                let ASTNodeType::Function { name, args } = &node.node_type else {
-                    return Ok(None);
-                };
-                let Some(spec) = crate::lift::reference_array_spec(name) else {
-                    return Ok(None);
-                };
-                let handles = args
-                    .iter()
-                    .map(|arg| ArgumentHandle::new(arg, self.interp))
-                    .collect();
-                (name, spec, handles)
-            }
-            ArgumentExpr::Arena {
-                id,
-                data_store,
-                sheet_registry,
-            } => {
-                let Some(crate::engine::arena::AstNodeData::Function { name_id, .. }) =
-                    data_store.get_node(*id)
-                else {
-                    return Ok(None);
-                };
-                let name = data_store.resolve_ast_string(*name_id);
-                let (Some(spec), Some(args)) = (
-                    crate::lift::reference_array_spec(name),
-                    data_store.get_args(*id),
-                ) else {
-                    return Ok(None);
-                };
-                let handles = args
-                    .iter()
-                    .copied()
-                    .map(|arg_id| {
-                        ArgumentHandle::new_arena(arg_id, self.interp, data_store, sheet_registry)
-                    })
-                    .collect();
-                (name, spec, handles)
-            }
-        };
-        // Only a call that fails to resolve to a single reference can be one.
-        match self.resolve_reference_or_value() {
-            Ok(crate::function::FunctionResolution::ReferenceError(_)) => {}
-            Err(error) if error.kind == ExcelErrorKind::Cancelled => return Err(error),
-            _ => return Ok(None),
+        if let Some(name) = self.name_reference() {
+            return self.name_reference_array(name);
         }
+        let Some((name, handles)) = self.function_call() else {
+            return Ok(None);
+        };
+        let spec = crate::lift::reference_array_spec(name);
+        let branches = name.eq_ignore_ascii_case("IF") || name.eq_ignore_ascii_case("CHOOSE");
+        // Only a call that fails to resolve to a single reference can be one.
+        if (spec.is_none() && !branches) || !self.reads_as_error()? {
+            return Ok(None);
+        }
+        let Some(spec) = spec else {
+            return match selected_branch(name, &handles) {
+                Some(index) => handles[index].reference_array(),
+                None => Ok(None),
+            };
+        };
         let Some(fun) = self.interp.context.get_function("", name) else {
             return Ok(None);
         };
@@ -910,6 +906,118 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
             self.interp.current_sheet(),
         );
         crate::lift::lift_reference(spec, &handles, |call| fun.eval_reference(call, &ctx))
+    }
+
+    /// [`Self::reference_array`] evaluated with a LET scope's bindings.
+    pub(crate) fn reference_array_with_env(
+        &self,
+        env: crate::interpreter::LocalEnv,
+    ) -> Result<Option<crate::lift::ReferenceArray>, ExcelError> {
+        let scoped = self.interp.with_local_env(env);
+        let handle = match self.expr {
+            ArgumentExpr::Ast(node) => ArgumentHandle::new(node, &scoped),
+            ArgumentExpr::Arena {
+                id,
+                data_store,
+                sheet_registry,
+            } => ArgumentHandle::new_arena(id, &scoped, data_store, sheet_registry),
+        };
+        handle.reference_array()
+    }
+
+    /// The array of references a LET binding or a defined name holds.
+    fn name_reference_array(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::lift::ReferenceArray>, ExcelError> {
+        if let Some(binding) = self.interp.resolve_local_name(name) {
+            return Ok(match binding {
+                crate::interpreter::LocalBinding::References(references) => {
+                    Some(references.as_ref().clone())
+                }
+                _ => None,
+            });
+        }
+        if !self.reads_as_error()? {
+            return Ok(None);
+        }
+        match self
+            .interp
+            .context
+            .resolve_name_reference_array(name, self.interp.current_sheet())
+        {
+            Some(Ok(references)) => Ok(Some(references)),
+            Some(Err(error)) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+            _ => Ok(None),
+        }
+    }
+
+    /// Whether this argument resolves to neither a reference nor a value
+    /// other than an error, as an array of references does.
+    fn reads_as_error(&self) -> Result<bool, ExcelError> {
+        use crate::function::FunctionResolution;
+        match self.resolve_reference_or_value() {
+            Ok(FunctionResolution::ReferenceError(_))
+            | Ok(FunctionResolution::Value(CalcValue::Scalar(LiteralValue::Error(_)))) => Ok(true),
+            Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+            _ => Ok(false),
+        }
+    }
+
+    /// The name of a defined name or LET binding written as this argument.
+    fn name_reference(&self) -> Option<&'a str> {
+        match self.expr {
+            ArgumentExpr::Ast(node) => match &node.node_type {
+                ASTNodeType::Reference {
+                    reference: ReferenceType::NamedRange(name),
+                    ..
+                } => Some(name.as_str()),
+                _ => None,
+            },
+            ArgumentExpr::Arena { id, data_store, .. } => match data_store.get_node(id) {
+                Some(crate::engine::arena::AstNodeData::Reference {
+                    ref_type: crate::engine::arena::CompactRefType::NamedRange(name_id),
+                    ..
+                }) => Some(data_store.resolve_ast_string(*name_id)),
+                _ => None,
+            },
+        }
+    }
+
+    /// The function name and argument handles of a call written as this argument.
+    fn function_call(&self) -> Option<(&'a str, Vec<ArgumentHandle<'a, 'b>>)> {
+        match self.expr {
+            ArgumentExpr::Ast(node) => {
+                let ASTNodeType::Function { name, args } = &node.node_type else {
+                    return None;
+                };
+                let handles = args
+                    .iter()
+                    .map(|arg| ArgumentHandle::new(arg, self.interp))
+                    .collect();
+                Some((name.as_str(), handles))
+            }
+            ArgumentExpr::Arena {
+                id,
+                data_store,
+                sheet_registry,
+            } => {
+                let Some(crate::engine::arena::AstNodeData::Function { name_id, .. }) =
+                    data_store.get_node(id)
+                else {
+                    return None;
+                };
+                let handles = data_store
+                    .get_args(id)?
+                    .iter()
+                    .copied()
+                    .map(|arg_id| {
+                        ArgumentHandle::new_arena(arg_id, self.interp, data_store, sheet_registry)
+                    })
+                    .collect();
+                Some((data_store.resolve_ast_string(*name_id), handles))
+            }
+        }
     }
 
     pub(crate) fn resolve_reference_or_value(
@@ -1821,6 +1929,19 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
         _name: &str,
         _current_sheet: &str,
     ) -> Option<Result<ReferenceType, ExcelError>> {
+        None
+    }
+
+    /// The array of references a name defined by a reference-returning formula
+    /// lifted over an array (`OFFSET($B$1,{0;1;2},0)`) holds, one reference
+    /// (or the error in its place) per element. `None` when `name` is not such
+    /// a name.
+    #[allow(clippy::type_complexity)]
+    fn resolve_name_reference_array(
+        &self,
+        _name: &str,
+        _current_sheet: &str,
+    ) -> Option<Result<Vec<Vec<Result<ReferenceType, ExcelError>>>, ExcelError>> {
         None
     }
 

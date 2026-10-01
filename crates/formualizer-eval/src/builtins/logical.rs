@@ -499,7 +499,7 @@ impl Function for IfFn {
 
 /// IF condition coercion: logical, number (non-zero is TRUE), blank is FALSE,
 /// and the text "TRUE"/"FALSE" in any case. Other text is `#VALUE!`.
-fn if_condition(condition: LiteralValue) -> Result<bool, ExcelError> {
+pub(crate) fn if_condition(condition: LiteralValue) -> Result<bool, ExcelError> {
     match condition {
         LiteralValue::Boolean(b) => Ok(b),
         LiteralValue::Number(n) => Ok(n != 0.0),

@@ -1164,6 +1164,29 @@ impl Function for NaFn {
     }
 }
 
+/// The value N and T read. Their parameter takes a reference, and a
+/// multi-cell reference reads its top-left cell: `N(B1:B2)` is `N(B1)`, and
+/// each reference of `N(OFFSET(B1,{0;1},0,2))` reads its own first cell. An
+/// array value is lifted per element before it gets here.
+fn top_left_value(arg: &ArgumentHandle<'_, '_>) -> Result<LiteralValue, ExcelError> {
+    let top_left = |view: &crate::engine::range_view::RangeView<'_>| {
+        let (rows, cols) = view.dims();
+        if rows == 0 || cols == 0 {
+            LiteralValue::Empty
+        } else {
+            view.get_cell(0, 0)
+        }
+    };
+    Ok(match arg.resolve_once()? {
+        crate::traits::ResolvedArgument::Range(view) => top_left(&view),
+        crate::traits::ResolvedArgument::Value(crate::traits::CalcValue::Range(view)) => {
+            top_left(&view)
+        }
+        crate::traits::ResolvedArgument::Value(value) => value.into_literal(),
+        crate::traits::ResolvedArgument::ReferenceError(error) => LiteralValue::Error(error),
+    })
+}
+
 #[derive(Debug)]
 pub struct NFn; // N(value)
 /// Converts a value to its numeric representation.
@@ -1231,7 +1254,7 @@ impl Function for NFn {
                 ExcelError::new_value(),
             )));
         }
-        let v = args[0].value()?.into_literal();
+        let v = top_left_value(&args[0])?;
         match v {
             LiteralValue::Int(i) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Int(i))),
             LiteralValue::Number(n) => {
@@ -1259,10 +1282,7 @@ impl Function for NFn {
             }
             LiteralValue::Text(_) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Int(0))),
             LiteralValue::Empty => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Int(0))),
-            LiteralValue::Array(_) => {
-                // Array-to-scalar implicit intersection is not implemented here; returns 0.
-                Ok(crate::traits::CalcValue::Scalar(LiteralValue::Int(0)))
-            }
+            LiteralValue::Array(_) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Int(0))),
             LiteralValue::Error(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
             LiteralValue::Pending => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Int(0))),
         }
@@ -1335,7 +1355,7 @@ impl Function for TFn {
                 ExcelError::new_value(),
             )));
         }
-        let v = args[0].value()?.into_literal();
+        let v = top_left_value(&args[0])?;
         match v {
             LiteralValue::Text(s) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(s))),
             LiteralValue::Error(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
