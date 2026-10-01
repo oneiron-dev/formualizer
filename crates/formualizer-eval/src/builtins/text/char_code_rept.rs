@@ -20,37 +20,28 @@ fn scalar_like_value(arg: &ArgumentHandle<'_, '_>) -> Result<LiteralValue, Excel
     })
 }
 
-/// Characters 128-255 of the Macintosh character set, which Excel for Mac
-/// uses for CHAR and CODE (Apple's current table: 0xDB is the euro sign).
-const MAC_ROMAN_HIGH: [char; 128] = [
-    '\u{00C4}', '\u{00C5}', '\u{00C7}', '\u{00C9}', '\u{00D1}', '\u{00D6}', '\u{00DC}', '\u{00E1}',
-    '\u{00E0}', '\u{00E2}', '\u{00E4}', '\u{00E3}', '\u{00E5}', '\u{00E7}', '\u{00E9}', '\u{00E8}',
-    '\u{00EA}', '\u{00EB}', '\u{00ED}', '\u{00EC}', '\u{00EE}', '\u{00EF}', '\u{00F1}', '\u{00F3}',
-    '\u{00F2}', '\u{00F4}', '\u{00F6}', '\u{00F5}', '\u{00FA}', '\u{00F9}', '\u{00FB}', '\u{00FC}',
-    '\u{2020}', '\u{00B0}', '\u{00A2}', '\u{00A3}', '\u{00A7}', '\u{2022}', '\u{00B6}', '\u{00DF}',
-    '\u{00AE}', '\u{00A9}', '\u{2122}', '\u{00B4}', '\u{00A8}', '\u{2260}', '\u{00C6}', '\u{00D8}',
-    '\u{221E}', '\u{00B1}', '\u{2264}', '\u{2265}', '\u{00A5}', '\u{00B5}', '\u{2202}', '\u{2211}',
-    '\u{220F}', '\u{03C0}', '\u{222B}', '\u{00AA}', '\u{00BA}', '\u{03A9}', '\u{00E6}', '\u{00F8}',
-    '\u{00BF}', '\u{00A1}', '\u{00AC}', '\u{221A}', '\u{0192}', '\u{2248}', '\u{2206}', '\u{00AB}',
-    '\u{00BB}', '\u{2026}', '\u{00A0}', '\u{00C0}', '\u{00C3}', '\u{00D5}', '\u{0152}', '\u{0153}',
-    '\u{2013}', '\u{2014}', '\u{201C}', '\u{201D}', '\u{2018}', '\u{2019}', '\u{00F7}', '\u{25CA}',
-    '\u{00FF}', '\u{0178}', '\u{2044}', '\u{20AC}', '\u{2039}', '\u{203A}', '\u{FB01}', '\u{FB02}',
-    '\u{2021}', '\u{00B7}', '\u{201A}', '\u{201E}', '\u{2030}', '\u{00C2}', '\u{00CA}', '\u{00C1}',
-    '\u{00CB}', '\u{00C8}', '\u{00CD}', '\u{00CE}', '\u{00CF}', '\u{00CC}', '\u{00D3}', '\u{00D4}',
-    '\u{F8FF}', '\u{00D2}', '\u{00DA}', '\u{00DB}', '\u{00D9}', '\u{0131}', '\u{02C6}', '\u{02DC}',
-    '\u{00AF}', '\u{02D8}', '\u{02D9}', '\u{02DA}', '\u{00B8}', '\u{02DD}', '\u{02DB}', '\u{02C7}',
+/// Characters 128-159 of Windows-1252, the ANSI code page Excel for Windows
+/// uses for CHAR and CODE; 160-255 are the Latin-1 characters of the same
+/// code. The five codes Windows-1252 leaves undefined (0x81, 0x8D, 0x8F, 0x90,
+/// 0x9D) read as the C1 control of the same code, as Windows converts them.
+const WINDOWS_1252_80_9F: [char; 32] = [
+    '\u{20AC}', '\u{0081}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}', '\u{2021}',
+    '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{008D}', '\u{017D}', '\u{008F}',
+    '\u{0090}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}', '\u{2013}', '\u{2014}',
+    '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}', '\u{0153}', '\u{009D}', '\u{017E}', '\u{0178}',
 ];
 
 #[derive(Debug)]
 pub struct CharFn;
 /// Returns the character represented by a numeric code.
 ///
-/// `CHAR` follows Excel for Mac, which reads codes `1..255` in the Macintosh character set.
+/// `CHAR` follows Excel for Windows, which reads codes `1..255` in the Windows-1252 code page.
 ///
 /// # Remarks
 /// - Input is truncated to an integer code.
 /// - Valid code range is `1` through `255`; outside this range returns `#VALUE!`.
-/// - Codes 128-255 map through the Macintosh character set (`CHAR(160)` is a dagger).
+/// - Codes 128-255 map through Windows-1252 (`CHAR(128)` is the euro sign, `CHAR(160)` a
+///   non-breaking space); its five undefined codes return the C1 control of the same code.
 /// - Errors are propagated unchanged.
 ///
 /// # Examples
@@ -74,7 +65,7 @@ pub struct CharFn;
 ///   - UNICODE
 /// faq:
 ///   - q: "Which character set does CHAR use for codes 128-255?"
-///     a: "The Macintosh character set, as Excel for Mac does: CHAR(160) is a dagger and CHAR(202) a non-breaking space."
+///     a: "Windows-1252, as Excel for Windows does: CHAR(128) is the euro sign and CHAR(160) a non-breaking space."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: CHAR
@@ -117,11 +108,10 @@ impl Function for CharFn {
             )));
         }
 
-        // Excel for Mac reads codes through the Macintosh character set.
-        let unicode_char = if code < 128 {
-            char::from(code as u8)
-        } else {
-            MAC_ROMAN_HIGH[code as usize - 128]
+        // Excel for Windows reads codes through Windows-1252.
+        let unicode_char = match code {
+            0x80..=0x9F => WINDOWS_1252_80_9F[code as usize - 0x80],
+            _ => char::from(code as u8),
         };
 
         Ok(CalcValue::Scalar(LiteralValue::Text(
@@ -135,14 +125,14 @@ impl Function for CharFn {
 pub struct CodeFn;
 /// Returns the numeric code of the first character in text.
 ///
-/// `CODE` follows Excel for Mac and reports Macintosh character set codes.
+/// `CODE` follows Excel for Windows and reports Windows-1252 codes.
 ///
 /// # Remarks
 /// - Only the first character is inspected.
 /// - Empty text returns `#VALUE!`.
 /// - Text-like coercion is applied to non-text scalar inputs.
-/// - Characters 128-255 of the Macintosh character set map back to their codes; other
-///   characters report 63, the code of the "?" they convert to.
+/// - Characters 128-255 of Windows-1252 map back to their codes; other characters report
+///   63, the code of the "?" they convert to.
 ///
 /// # Examples
 ///
@@ -213,15 +203,14 @@ impl Function for CodeFn {
 
         let first_char = s.chars().next().unwrap();
 
-        // The Macintosh character set code; characters outside it read as
-        // the "?" they convert to.
-        let code = if (first_char as u32) < 128 {
-            first_char as i64
-        } else {
-            MAC_ROMAN_HIGH
+        // The Windows-1252 code; characters outside it read as the "?" they
+        // convert to.
+        let code = match first_char as u32 {
+            cp @ (0x00..=0x7F | 0xA0..=0xFF) => cp as i64,
+            _ => WINDOWS_1252_80_9F
                 .iter()
                 .position(|&c| c == first_char)
-                .map_or(63, |i| i as i64 + 128)
+                .map_or(63, |i| i as i64 + 0x80),
         };
 
         Ok(CalcValue::Scalar(LiteralValue::Int(code)))
@@ -450,25 +439,49 @@ mod tests {
     }
 
     #[test]
-    fn char_and_code_use_the_macintosh_character_set() {
+    fn char_and_code_use_windows_1252() {
         use formualizer_parse::parser::parse;
         let wb = TestWorkbook::new()
             .with_function(std::sync::Arc::new(CharFn))
             .with_function(std::sync::Arc::new(CodeFn));
         let ctx = interp(&wb);
         let eval = |f: &str| ctx.evaluate_ast(&parse(f).unwrap()).unwrap().into_literal();
-        assert_eq!(eval("=CHAR(160)"), LiteralValue::Text("\u{2020}".into()));
-        assert_eq!(eval("=CHAR(202)"), LiteralValue::Text("\u{a0}".into()));
-        assert_eq!(eval("=CHAR(142)"), LiteralValue::Text("\u{e9}".into()));
-        assert_eq!(eval("=CHAR(219)"), LiteralValue::Text("\u{20ac}".into()));
-        assert_eq!(eval("=CODE(\"\u{e9}\")"), LiteralValue::Int(142));
-        assert_eq!(eval("=CODE(\"\u{2020}\")"), LiteralValue::Int(160));
+        let text = |s: &str| LiteralValue::Text(s.into());
+        assert_eq!(eval("=CHAR(65)"), text("A"));
+        assert_eq!(eval("=CHAR(128)"), text("\u{20ac}"));
+        assert_eq!(eval("=CHAR(150)"), text("\u{2013}"));
+        assert_eq!(eval("=CHAR(160)"), text("\u{a0}"));
+        assert_eq!(eval("=CHAR(169)"), text("\u{a9}"));
+        assert_eq!(eval("=CHAR(233)"), text("\u{e9}"));
+        assert_eq!(eval("=CHAR(255.9)"), text("\u{ff}"));
+        // Undefined in Windows-1252: the C1 control of the same code.
+        assert_eq!(eval("=CHAR(129)"), text("\u{81}"));
+        assert_eq!(eval("=CHAR(157)"), text("\u{9d}"));
+        assert_eq!(eval("=CODE(\"\u{20ac}\")"), LiteralValue::Int(128));
+        assert_eq!(eval("=CODE(\"\u{2020}\")"), LiteralValue::Int(134));
+        assert_eq!(eval("=CODE(\"\u{a0}x\")"), LiteralValue::Int(160));
+        assert_eq!(eval("=CODE(\"\u{e9}\")"), LiteralValue::Int(233));
+        // Outside Windows-1252, with no best-fit substitute.
         assert_eq!(eval("=CODE(\"\u{3042}\")"), LiteralValue::Int(63));
+        assert_eq!(eval("=CODE(\"\u{2011}\")"), LiteralValue::Int(63));
+        assert_eq!(eval("=CODE(\"\u{80}\")"), LiteralValue::Int(63));
         for code in 1..=255 {
             assert_eq!(
                 eval(&format!("=CODE(CHAR({code}))")),
                 LiteralValue::Int(code),
                 "CHAR({code}) round trip"
+            );
+        }
+        for f in [
+            "=CHAR(0)",
+            "=CHAR(0.5)",
+            "=CHAR(256)",
+            "=CHAR(-1)",
+            "=CODE(\"\")",
+        ] {
+            assert!(
+                matches!(eval(f), LiteralValue::Error(ref e) if e.kind == ExcelErrorKind::Value),
+                "{f} is #VALUE!"
             );
         }
     }
