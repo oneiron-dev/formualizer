@@ -277,3 +277,49 @@ fn expanded_formula_range_propagates_later_error_and_concatenate_stays_scalar() 
     }
     assert_text(&engine, 3, 5, "first!");
 }
+
+#[test]
+fn numbers_become_text_with_15_significant_digits() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    // A date-time serial loaded from a date-formatted cell.
+    set_value(&mut engine, 1, 1, LiteralValue::Number(44468.756944444445));
+    let cases = [
+        ("=A1&\"\"", "44468.7569444444"),
+        ("=RIGHT(A1,8)", "69444444"),
+        ("=LEFT(1/3,5)", "0.333"),
+        ("=MID(2/3,13,5)", "66667"),
+        ("=CONCAT(0.1+0.2,\"|\",1/3)", "0.3|0.333333333333333"),
+        ("=CONCATENATE(-1/3)", "-0.333333333333333"),
+        ("=TEXTJOIN(\",\",TRUE,1/7,2.5)", "0.142857142857143,2.5"),
+        ("=SUBSTITUTE(1/3,\"3\",\"x\")", "0.xxxxxxxxxxxxxxx"),
+        ("=2^53&\"\"", "9007199254740990"),
+        ("=1.2345678901234567E+19&\"\"", "12345678901234600000"),
+        ("=1.2345678901234568E+20&\"\"", "1.23456789012346E+20"),
+        ("=1.23456789E-5&\"\"", "0.0000123456789"),
+        ("=1.2345678901234568E-5&\"\"", "1.23456789012346E-05"),
+        ("=2E-50&\"\"", "2E-50"),
+        // Unchanged: short numbers keep their plain digits.
+        ("=123.45&\"\"", "123.45"),
+        ("=-5&\"\"", "-5"),
+        ("=0.5&\"\"", "0.5"),
+        ("=TEXT(1/3,\"General\")", "0.333333333"),
+    ];
+    for (row, (formula, _)) in cases.iter().enumerate() {
+        set_formula(&mut engine, row as u32 + 1, 3, formula);
+    }
+    set_formula(&mut engine, 1, 4, "=LEN(2/3)");
+
+    engine.evaluate_all().expect("evaluate formulas");
+
+    for (row, (formula, expected)) in cases.iter().enumerate() {
+        assert_eq!(
+            engine.get_cell_value("Sheet1", row as u32 + 1, 3),
+            Some(LiteralValue::Text((*expected).into())),
+            "{formula}"
+        );
+    }
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 4),
+        Some(LiteralValue::Number(17.0))
+    );
+}

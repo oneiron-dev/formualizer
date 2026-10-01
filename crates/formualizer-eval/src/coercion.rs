@@ -233,11 +233,54 @@ pub fn to_logical(value: &LiteralValue) -> Result<bool, ExcelError> {
     }
 }
 
+/// Excel's text for a number used where text is needed (`&`, CONCAT, LEFT,
+/// TEXTJOIN, ...), whatever the cell's display format. It keeps 15
+/// significant digits (14 from 1E+99 up and below 1E-98) and writes the
+/// number out in full up to 20 integer digits, or below 1 while that takes
+/// at most 20 characters; beyond that it uses E notation
+/// (`0.333333333333333`, `1234567890123460`, `1.23456789012346E-05`,
+/// `1.23456789012346E+20`). Zero has no sign, and subnormal values read as 0.
+pub fn number_to_text(n: f64) -> String {
+    if !n.is_finite() {
+        return n.to_string();
+    }
+    if n.abs() < f64::MIN_POSITIVE {
+        return "0".into();
+    }
+    let split = |sci: String| {
+        let (mantissa, exponent) = sci.split_once('e').expect("scientific");
+        let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+        (digits, exponent.parse::<i32>().expect("exponent"))
+    };
+    let (mut digits, mut exponent) = split(format!("{:.14e}", n.abs()));
+    if exponent.abs() > 98 {
+        (digits, exponent) = split(format!("{:.13e}", n.abs()));
+    }
+    let digits = digits.trim_end_matches('0');
+    let sign = if n < 0.0 { "-" } else { "" };
+    let leading_zeros = (-exponent - 1).max(0) as usize;
+    if exponent > 19 || (exponent < 0 && 2 + leading_zeros + digits.len() > 20) {
+        let (head, tail) = digits.split_at(1);
+        let point = if tail.is_empty() { "" } else { "." };
+        let esign = if exponent < 0 { '-' } else { '+' };
+        return format!("{sign}{head}{point}{tail}E{esign}{:02}", exponent.abs());
+    }
+    if exponent < 0 {
+        return format!("{sign}0.{}{digits}", "0".repeat(leading_zeros));
+    }
+    let int_len = exponent as usize + 1;
+    if digits.len() > int_len {
+        format!("{sign}{}.{}", &digits[..int_len], &digits[int_len..])
+    } else {
+        format!("{sign}{digits}{}", "0".repeat(int_len - digits.len()))
+    }
+}
+
 /// Invariant textification for comparisons/concatenation.
 pub fn to_text_invariant(value: &LiteralValue) -> String {
     match value {
         LiteralValue::Text(s) => s.clone(),
-        LiteralValue::Number(n) => n.to_string(),
+        LiteralValue::Number(n) => number_to_text(*n),
         LiteralValue::Int(i) => i.to_string(),
         LiteralValue::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.into(),
         LiteralValue::Error(e) => e.to_string(),
@@ -248,7 +291,7 @@ pub fn to_text_invariant(value: &LiteralValue) -> String {
         LiteralValue::Date(_)
         | LiteralValue::DateTime(_)
         | LiteralValue::Time(_)
-        | LiteralValue::Duration(_) => value.as_serial_number().unwrap_or(0.0).to_string(),
+        | LiteralValue::Duration(_) => number_to_text(value.as_serial_number().unwrap_or(0.0)),
         other => format!("{other:?}"),
     }
 }
@@ -369,6 +412,50 @@ mod tests {
         assert!(to_logical(&LiteralValue::Text("TRUE".into())).unwrap());
         assert!(to_logical(&LiteralValue::Text("true".into())).unwrap());
         assert!(to_logical(&LiteralValue::Text(" True ".into())).is_err());
+    }
+
+    #[test]
+    fn number_to_text_keeps_15_significant_digits() {
+        // Excel's own renderings, as tabulated by Apache POI's
+        // NumberToTextConverter.
+        for (n, text) in [
+            (0.0, "0"),
+            (-0.0, "0"),
+            (1.0, "1"),
+            (1.0001, "1.0001"),
+            (756.0, "756"),
+            (123.45678901234568, "123.456789012346"),
+            (1234567.8901234567, "1234567.89012346"),
+            (1.2345678901234568E-5, "1.23456789012346E-05"),
+            (1.2345678901234567E-4, "0.000123456789012346"),
+            (1.23456789E-5, "0.0000123456789"),
+            (5.6789012345E-8, "0.000000056789012345"),
+            (5.67890123456E-8, "5.67890123456E-08"),
+            (9.999999999999123E-98, "9.99999999999912E-98"),
+            (1.0000000000001235E-99, "1.0000000000001E-99"),
+            (2.0E-50, "2E-50"),
+            (1.2345678901234568E13, "12345678901234.6"),
+            (1.2345678901234567E14, "123456789012346"),
+            (1.2345678901234568E15, "1234567890123460"),
+            (1.2345678901234567E19, "12345678901234600000"),
+            (1.2345678901234568E20, "1.23456789012346E+20"),
+            (-1.2345678901234567E19, "-12345678901234600000"),
+            (-1.2345678901234568E20, "-1.23456789012346E+20"),
+            (1.2345678901234576E100, "1.2345678901235E+100"),
+            (1.7976931348623157E308, "1.7976931348623E+308"),
+            (2.2250738585072014E-308, "2.2250738585072E-308"),
+            (2.225073858507201E-308, "0"),
+            (123499.9999999999, "123500"),
+            (9.999999999999999E20, "1E+21"),
+            (999999.9999999999, "1000000"),
+            (9.999999999999999E-19, "0.000000000000000001"),
+            (9.999999999999999E-20, "1E-19"),
+            (-9.999999999999999E-9, "-0.00000001"),
+            (100.6666666666667, "100.666666666667"),
+            (0.1 + 0.2, "0.3"),
+        ] {
+            assert_eq!(number_to_text(n), text, "{n:e}");
+        }
     }
 
     #[test]
