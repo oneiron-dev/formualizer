@@ -7,8 +7,12 @@
 //! is set, or any worksheet or table AutoFilter that holds criteria. Every
 //! other hidden row was hidden by hand (Hide Rows or a collapsed outline).
 //! SUBTOTAL 1-11 skips only filtered rows; 101-111 skip both kinds.
+//!
+//! Shared by the xlsx backends: each passes its package bytes and defined
+//! names, so a saved file splits the same way whichever backend loads it.
 
-use super::external_links::{local_attr, read_member};
+use crate::traits::{DefinedName, DefinedNameDefinition};
+use crate::xlsx_path::{local_attr, read_member};
 use quick_xml::Reader as XmlReader;
 use quick_xml::events::Event;
 use std::collections::HashMap;
@@ -37,6 +41,21 @@ struct PartScan {
     filter_mode: bool,
     auto_filter: Option<AutoFilter>,
     table_ids: Vec<String>,
+}
+
+/// First and last row of each sheet's `_xlnm._FilterDatabase` name, which
+/// holds the range of an Advanced Filter (it leaves no `<autoFilter>`).
+pub(super) fn filter_databases(names: &[DefinedName]) -> HashMap<String, (u32, u32)> {
+    names
+        .iter()
+        .filter(|name| name.name.eq_ignore_ascii_case("_xlnm._FilterDatabase"))
+        .filter_map(|name| match &name.definition {
+            DefinedNameDefinition::Range { address } => {
+                Some((address.sheet.clone(), (address.start_row, address.end_row)))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Hidden rows of every sheet that has any, keyed by sheet name.

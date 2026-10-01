@@ -32,8 +32,8 @@ use zip::ZipArchive;
 mod compressed_evidence;
 mod external_links;
 mod formula_replay;
-mod row_visibility;
 
+use super::row_visibility;
 use compressed_evidence::{EvidenceRecord, MonotonicFormulaEvidence};
 use formula_replay::{
     CalamineDeferredFormulaReplay, FormulaReplaySpool, FormulaSpoolLimits,
@@ -1352,19 +1352,7 @@ impl CalamineAdapter {
     /// Saved hidden rows of every sheet, split into manual and filter-hidden.
     fn lazy_hidden_rows(&self) -> &HashMap<String, row_visibility::HiddenRows> {
         self.hidden_rows.get_or_init(|| {
-            // An Advanced Filter leaves no <autoFilter>; its range is the
-            // sheet's _xlnm._FilterDatabase name.
-            let filter_databases = self
-                .lazy_defined_names()
-                .iter()
-                .filter(|name| name.name.eq_ignore_ascii_case("_xlnm._FilterDatabase"))
-                .filter_map(|name| match &name.definition {
-                    DefinedNameDefinition::Range { address } => {
-                        Some((address.sheet.clone(), (address.start_row, address.end_row)))
-                    }
-                    _ => None,
-                })
-                .collect();
+            let filter_databases = row_visibility::filter_databases(self.lazy_defined_names());
             row_visibility::scan_hidden_rows(self.cancellable_reader(), &filter_databases)
         })
     }

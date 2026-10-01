@@ -23,7 +23,7 @@ pub mod transaction;
 mod wasm_runtime_wasmtime;
 pub mod workbook;
 pub mod worksheet;
-#[cfg(any(feature = "umya3", feature = "calamine"))]
+#[cfg(any(feature = "umya", feature = "umya3", feature = "calamine"))]
 pub(crate) mod xlsx_path;
 
 #[cfg(feature = "csv")]

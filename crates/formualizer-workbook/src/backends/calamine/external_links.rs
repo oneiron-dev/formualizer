@@ -5,39 +5,14 @@
 //! part keeps the linked sheet names and the values Excel last read from them.
 
 use super::CalamineAdapter;
+use crate::xlsx_path::{local_attr, read_member};
 use formualizer_common::{ExcelError, LiteralValue};
 use formualizer_eval::engine::external_book::ExternalBook;
 use quick_xml::Reader as XmlReader;
-use quick_xml::events::{BytesStart, Event};
+use quick_xml::events::Event;
 use std::collections::BTreeMap;
 use std::io::{BufReader, Read, Seek};
 use zip::ZipArchive;
-
-pub(super) fn read_member<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
-    name: &str,
-) -> Option<Vec<u8>> {
-    let mut entry = archive.by_name(name).ok()?;
-    let mut bytes = Vec::new();
-    entry.read_to_end(&mut bytes).ok()?;
-    Some(bytes)
-}
-
-pub(super) fn local_attr<R>(
-    xml: &XmlReader<R>,
-    start: &BytesStart<'_>,
-    local: &[u8],
-) -> Option<String> {
-    start
-        .attributes()
-        .filter_map(Result::ok)
-        .find(|attr| attr.key.local_name().as_ref() == local)
-        .and_then(|attr| {
-            attr.decode_and_unescape_value(xml.decoder())
-                .ok()
-                .map(|v| v.into_owned())
-        })
-}
 
 /// Resolve a workbook relationship target to a package member name.
 fn member_name(target: &str) -> String {

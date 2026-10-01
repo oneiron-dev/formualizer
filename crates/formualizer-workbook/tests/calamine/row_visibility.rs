@@ -1,12 +1,10 @@
 use crate::common::build_workbook;
+use crate::common::saved_filters::{cases, filtered_xlsx};
 use formualizer_eval::engine::ingest::EngineLoadStream;
 use formualizer_eval::engine::{Engine, EvalConfig, RowVisibilitySource};
 use formualizer_workbook::{
     CalamineAdapter, LiteralValue, LoadStrategy, SpreadsheetReader, Workbook, WorkbookConfig,
 };
-use std::io::{Cursor, Write};
-use zip::ZipWriter;
-use zip::write::SimpleFileOptions;
 
 #[test]
 fn calamine_hidden_rows_load_as_manually_hidden() {
@@ -41,41 +39,6 @@ fn calamine_hidden_rows_load_as_manually_hidden() {
         engine.is_row_hidden("Sheet1", 2, Some(RowVisibilitySource::Manual)),
         Some(false)
     );
-}
-
-/// One sheet "Data": header in A1, 10/20/30/40 in A2:A5 and 100 in A7.
-/// Rows 3, 4 and 7 are hidden; the formulas sit in row 9.
-fn filtered_xlsx(sheet_pr: &str, after_data: &str) -> Vec<u8> {
-    let sheet = format!(
-        r#"<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">{sheet_pr}<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>h</t></is></c></row><row r="2"><c r="A2"><v>10</v></c></row><row r="3" hidden="1"><c r="A3"><v>20</v></c></row><row r="4" hidden="1"><c r="A4"><v>30</v></c></row><row r="5"><c r="A5"><v>40</v></c></row><row r="7" hidden="1"><c r="A7"><v>100</v></c></row><row r="9"><c r="A9"><f>SUBTOTAL(9,A2:A7)</f></c><c r="B9"><f>SUBTOTAL(109,A2:A7)</f></c><c r="C9"><f>SUBTOTAL(3,A1:A7)</f></c><c r="D9"><f>SUM(A2:A7)</f></c></row></sheetData>{after_data}</worksheet>"#
-    );
-    let parts = [
-        (
-            "[Content_Types].xml",
-            r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#,
-        ),
-        (
-            "_rels/.rels",
-            r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
-        ),
-        (
-            "xl/workbook.xml",
-            r#"<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
-        ),
-        (
-            "xl/_rels/workbook.xml.rels",
-            r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#,
-        ),
-        ("xl/worksheets/sheet1.xml", sheet.as_str()),
-    ];
-    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
-    for (name, xml) in parts {
-        writer
-            .start_file(name, SimpleFileOptions::default())
-            .unwrap();
-        writer.write_all(xml.as_bytes()).unwrap();
-    }
-    writer.finish().unwrap().into_inner()
 }
 
 fn evaluate_row_9(bytes: Vec<u8>) -> Vec<f64> {
@@ -114,4 +77,17 @@ fn calamine_autofilter_hidden_rows_are_skipped_by_every_subtotal() {
 fn calamine_hidden_rows_under_an_unfiltered_autofilter_stay_manual() {
     let bytes = filtered_xlsx("", r#"<autoFilter ref="A1:A5"/>"#);
     assert_eq!(evaluate_row_9(bytes), vec![200.0, 50.0, 6.0, 200.0]);
+}
+
+/// The umya backend asserts the same split for the same packages
+/// (tests/umya/row_visibility.rs).
+#[test]
+fn calamine_splits_saved_hidden_rows_by_filter() {
+    for case in cases() {
+        let mut adapter = CalamineAdapter::open_bytes(case.bytes.clone()).expect(case.name);
+        let sheet = adapter.read_sheet("Data").expect(case.name);
+        assert_eq!(sheet.row_hidden_filter, case.filter, "{}", case.name);
+        assert_eq!(sheet.row_hidden_manual, case.manual, "{}", case.name);
+        assert_eq!(evaluate_row_9(case.bytes), case.row_9, "{}", case.name);
+    }
 }

@@ -51,6 +51,11 @@ pub struct UmyaAdapter {
     // Workbook `<calcPr>` settings (spec §9). umya neither reads nor exposes
     // these, so we parse `xl/workbook.xml` straight from the zip.
     calc_settings: Option<crate::traits::CalcSettings>,
+
+    // Rows an applied filter hid when the package was saved, by sheet name.
+    // A saved row records no cause for being hidden, so the zip is classified
+    // by the rule the calamine backend uses (see `row_visibility`).
+    filter_hidden_rows: HashMap<String, Vec<u32>>,
 }
 
 impl UmyaAdapter {
@@ -67,6 +72,7 @@ impl UmyaAdapter {
             table_header_rows: HashMap::new(),
             table_header_rows_available: false,
             calc_settings: None,
+            filter_hidden_rows: HashMap::new(),
         }
     }
 
@@ -614,7 +620,7 @@ impl SpreadsheetReader for UmyaAdapter {
             );
         }
 
-        Ok(Self {
+        let mut adapter = Self {
             workbook: RwLock::new(sheet),
             date_system: formualizer_eval::engine::DateSystem::Excel1900,
             lazy: false,
@@ -623,7 +629,18 @@ impl SpreadsheetReader for UmyaAdapter {
             table_header_rows,
             table_header_rows_available,
             calc_settings,
-        })
+            filter_hidden_rows: HashMap::new(),
+        };
+        let filter_databases =
+            super::row_visibility::filter_databases(&adapter.defined_names().unwrap_or_default());
+        adapter.filter_hidden_rows = super::row_visibility::scan_hidden_rows(
+            Cursor::new(data.as_slice()),
+            &filter_databases,
+        )
+        .into_iter()
+        .map(|(sheet, rows)| (sheet, rows.filter))
+        .collect();
+        Ok(adapter)
     }
 
     fn read_range(
@@ -682,7 +699,14 @@ impl SpreadsheetReader for UmyaAdapter {
                 },
             );
         }
-        let mut row_hidden_manual: Vec<u32> = ws
+        // A hidden row is filter-hidden when an applied filter hid it in the
+        // saved package; any other hidden row was hidden by hand.
+        let filtered = self
+            .filter_hidden_rows
+            .get(sheet)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let (mut row_hidden_filter, mut row_hidden_manual): (Vec<u32>, Vec<u32>) = ws
             .get_row_dimensions_to_hashmap()
             .iter()
             .filter_map(|(row, row_dim)| {
@@ -692,8 +716,9 @@ impl SpreadsheetReader for UmyaAdapter {
                     None
                 }
             })
-            .collect();
+            .partition(|row| filtered.binary_search(row).is_ok());
         row_hidden_manual.sort_unstable();
+        row_hidden_filter.sort_unstable();
 
         let dims = cells_map.keys().fold((0u32, 0u32), |mut acc, (r, c)| {
             if *r > acc.0 {
@@ -713,7 +738,7 @@ impl SpreadsheetReader for UmyaAdapter {
             merged_cells: vec![],
             hidden: false,
             row_hidden_manual,
-            row_hidden_filter: vec![],
+            row_hidden_filter,
         })
     }
 

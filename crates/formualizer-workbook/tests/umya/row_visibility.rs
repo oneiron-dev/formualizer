@@ -1,4 +1,5 @@
 use crate::common::build_workbook;
+use crate::common::saved_filters::{cases, filtered_xlsx};
 use formualizer_eval::engine::ingest::EngineLoadStream;
 use formualizer_eval::engine::{Engine, EvalConfig, RowVisibilitySource};
 use formualizer_workbook::{
@@ -205,5 +206,86 @@ fn umya_hidden_rows_aggregate_phase1_full_matrix_end_to_end() {
             );
             col += 1;
         }
+    }
+}
+
+fn evaluate_row_9(bytes: Vec<u8>) -> Vec<f64> {
+    let adapter = UmyaAdapter::open_bytes(bytes).expect("open xlsx");
+    let mut wb =
+        Workbook::from_reader(adapter, LoadStrategy::EagerAll, WorkbookConfig::ephemeral())
+            .expect("load workbook");
+    wb.evaluate_all().expect("evaluate");
+    (1..=4)
+        .map(|col| match wb.get_value("Data", 9, col) {
+            Some(LiteralValue::Number(n)) => n,
+            Some(LiteralValue::Int(i)) => i as f64,
+            other => panic!("expected a number in column {col}, got {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn umya_autofilter_hidden_rows_are_skipped_by_every_subtotal() {
+    let bytes = filtered_xlsx(
+        r#"<sheetPr filterMode="1"/>"#,
+        r#"<autoFilter ref="A1:A5"><filterColumn colId="0"><filters><filter val="10"/><filter val="40"/></filters></filterColumn></autoFilter>"#,
+    );
+
+    let mut adapter = UmyaAdapter::open_bytes(bytes.clone()).expect("open xlsx");
+    let sheet = adapter.read_sheet("Data").expect("read sheet");
+    assert_eq!(sheet.row_hidden_filter, vec![3, 4]);
+    assert_eq!(sheet.row_hidden_manual, vec![7]);
+
+    let ctx = formualizer_eval::test_workbook::TestWorkbook::new();
+    let mut engine: Engine<_> = Engine::new(ctx, EvalConfig::default());
+    adapter
+        .stream_into_engine(&mut engine)
+        .expect("stream into engine");
+    assert_eq!(
+        engine.is_row_hidden("Data", 3, Some(RowVisibilitySource::Filter)),
+        Some(true)
+    );
+    assert_eq!(
+        engine.is_row_hidden("Data", 3, Some(RowVisibilitySource::Manual)),
+        Some(false)
+    );
+    assert_eq!(
+        engine.is_row_hidden("Data", 7, Some(RowVisibilitySource::Manual)),
+        Some(true)
+    );
+
+    // SUBTOTAL(9) keeps the manually hidden 100 but not the filtered 20 and
+    // 30; SUBTOTAL(109) drops all three; SUM ignores visibility.
+    assert_eq!(evaluate_row_9(bytes), vec![150.0, 50.0, 4.0, 200.0]);
+}
+
+/// The same packages and expectations as the calamine backend's
+/// calamine_splits_saved_hidden_rows_by_filter, checked against that backend
+/// directly when it is built.
+#[test]
+fn umya_splits_saved_hidden_rows_like_calamine() {
+    for case in cases() {
+        let mut adapter = UmyaAdapter::open_bytes(case.bytes.clone()).expect(case.name);
+        let sheet = adapter.read_sheet("Data").expect(case.name);
+        assert_eq!(sheet.row_hidden_filter, case.filter, "{}", case.name);
+        assert_eq!(sheet.row_hidden_manual, case.manual, "{}", case.name);
+        #[cfg(feature = "calamine")]
+        {
+            let mut calamine =
+                formualizer_workbook::CalamineAdapter::open_bytes(case.bytes.clone())
+                    .expect(case.name);
+            let other = calamine.read_sheet("Data").expect(case.name);
+            assert_eq!(
+                other.row_hidden_filter, sheet.row_hidden_filter,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                other.row_hidden_manual, sheet.row_hidden_manual,
+                "{}",
+                case.name
+            );
+        }
+        assert_eq!(evaluate_row_9(case.bytes), case.row_9, "{}", case.name);
     }
 }

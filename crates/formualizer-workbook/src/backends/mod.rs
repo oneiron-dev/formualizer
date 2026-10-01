@@ -29,6 +29,10 @@ mod formula_cache;
 #[cfg(any(feature = "umya", feature = "umya3"))]
 pub use formula_cache::{FormulaCacheUpdate, FormulaCacheUpdateRef};
 
+// Saved hidden rows split into filter-hidden and manual, for every xlsx backend.
+#[cfg(any(feature = "calamine", feature = "umya", feature = "umya3"))]
+mod row_visibility;
+
 #[cfg(feature = "csv")]
 pub mod csv;
 
