@@ -556,6 +556,69 @@ fn vlookup_with_error_lookup_value() {
 }
 
 #[test]
+fn error_lookup_value_is_the_result_cold_warm_and_approximate() {
+    // Excel returns an error lookup_value as the VLOOKUP/HLOOKUP result before
+    // any search; #N/A is only a real miss. The cached exact-match index (built
+    // from the fourth lookup over a range) and the approximate search gave #N/A.
+    let mut engine = vlookup_engine_with_formula_rows(EvalConfig::default(), 6);
+    formula(&mut engine, "Sheet1", 5, 1, "=SQRT(-1)");
+    formula(&mut engine, "Sheet1", 6, 1, "=1/0");
+    // G20:BX21, wide enough for the HLOOKUP index cache.
+    for offset in 0..70 {
+        let key = (offset + 1) as f64;
+        number(&mut engine, "Sheet1", 20, 7 + offset, key);
+        number(&mut engine, "Sheet1", 21, 7 + offset, key * 10.0);
+    }
+    for row in 1..=6 {
+        let hlookup = format!("=HLOOKUP(A{row}, $G$20:$BX$21, 2, FALSE)");
+        let approximate = format!("=VLOOKUP(A{row}, $D$1:$E${TABLE_ROWS}, 2, TRUE)");
+        formula(&mut engine, "Sheet1", row, 3, &hlookup);
+        formula(&mut engine, "Sheet1", row, 6, &approximate);
+    }
+    formula(
+        &mut engine,
+        "Sheet1",
+        8,
+        3,
+        "=VLOOKUP(1/0, {1,2;3,4}, 2, FALSE)",
+    );
+    formula(
+        &mut engine,
+        "Sheet1",
+        9,
+        3,
+        "=HLOOKUP(SQRT(-1), {1,2;3,4}, 2)",
+    );
+
+    let check = |engine: &Engine<TestWorkbook>| {
+        let error_kind = |row, col| match engine.get_cell_value("Sheet1", row, col) {
+            Some(LiteralValue::Error(e)) => e.kind,
+            other => panic!("R{row}C{col}: expected an error, got {other:?}"),
+        };
+        for col in [2, 3, 6] {
+            for row in 1..=4 {
+                assert_eq!(
+                    engine.get_cell_value("Sheet1", row, col),
+                    Some(LiteralValue::Number(row as f64 * 10.0)),
+                    "R{row}C{col}"
+                );
+            }
+            assert_eq!(error_kind(5, col), ExcelErrorKind::Num, "R5C{col}");
+            assert_eq!(error_kind(6, col), ExcelErrorKind::Div, "R6C{col}");
+        }
+        assert_eq!(error_kind(8, 3), ExcelErrorKind::Div);
+        assert_eq!(error_kind(9, 3), ExcelErrorKind::Num);
+    };
+    engine.evaluate_all().unwrap();
+    check(&engine);
+    mark_all_formulas_dirty_without_edit(&mut engine);
+    engine.evaluate_all().unwrap();
+    let warm = engine.last_lookup_index_cache_report();
+    assert_eq!(warm.hits, 8, "{warm:?}");
+    check(&engine);
+}
+
+#[test]
 fn vlookup_against_table_with_errors_in_lookup_column() {
     single_formula_parity(
         |engine| {

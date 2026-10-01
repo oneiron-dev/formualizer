@@ -379,7 +379,7 @@ pub struct VLookupFn;
 /// - In exact mode, a blank candidate never matches. A blank lookup value matches a real numeric zero, but not blank, text, or boolean candidates.
 /// - Approximate matching expects the first column sorted ascending but, like Excel, does not check it: it bisects the column as written (a whole column is 1,048,576 rows), so unsorted data gives whichever row the search reaches, or `#N/A`.
 /// - Numeric `range_lookup` values use logical coercion: zero is exact and nonzero is approximate.
-/// - If the lookup value is not found, returns `#N/A`.
+/// - If the lookup value is not found, returns `#N/A`; an error lookup value is returned as is.
 /// - If `col_index_num` is invalid, returns `#REF!` (or `#VALUE!` if non-numeric).
 /// - A matched empty target cell is materialized as numeric `0`.
 ///
@@ -500,6 +500,8 @@ impl Function for VLookupFn {
             )));
         }
         let lookup_value = args[0].value()?.into_literal();
+        // An error lookup value is the result, before any search (the cached
+        // exact-match index and the approximate search would report #N/A).
         if let LiteralValue::Error(e) = lookup_value {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
         }
@@ -648,7 +650,7 @@ pub struct HLookupFn;
 /// - In exact mode, a blank candidate never matches. A blank lookup value matches a real numeric zero, but not blank, text, or boolean candidates.
 /// - Approximate matching expects the first row sorted ascending but, like Excel, does not check it: it bisects the row as written, so unsorted data gives whichever column the search reaches, or `#N/A`.
 /// - Numeric `range_lookup` values use logical coercion: zero is exact and nonzero is approximate.
-/// - If the lookup value is not found, returns `#N/A`.
+/// - If the lookup value is not found, returns `#N/A`; an error lookup value is returned as is.
 /// - If `row_index_num` is invalid, returns `#REF!` (or `#VALUE!` if non-numeric).
 /// - A matched empty target cell is materialized as numeric `0`.
 ///
@@ -769,6 +771,8 @@ impl Function for HLookupFn {
             )));
         }
         let lookup_value = args[0].value()?.into_literal();
+        // An error lookup value is the result, before any search (the cached
+        // exact-match index and the approximate search would report #N/A).
         if let LiteralValue::Error(e) = lookup_value {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
         }
