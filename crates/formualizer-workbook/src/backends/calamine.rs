@@ -797,8 +797,14 @@ impl CalamineAdapter {
             max_row_seen = max_row_seen.max(row);
             max_col_seen = max_col_seen.max(col);
 
-            let has_formula = record.formula.is_some();
-            if let Some(metadata) = record.formula {
+            // An empty <f> carries no formula: Excel writes <f ca="1"/> into
+            // each member of an array formula that is calculated always.
+            let formula = record.formula.filter(|metadata| match metadata {
+                XlsxFormulaMetadata::Normal { formula } => !formula.trim().is_empty(),
+                _ => true,
+            });
+            let has_formula = formula.is_some();
+            if let Some(metadata) = formula {
                 if u64::try_from(value_cells_observed)
                     .unwrap_or(u64::MAX)
                     .saturating_add(u64::try_from(formula_count).unwrap_or(u64::MAX))

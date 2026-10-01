@@ -466,6 +466,33 @@ fn formula_roles_xlsx() -> Vec<u8> {
     })
 }
 
+fn calculate_always_array_xlsx(marked: bool) -> Vec<u8> {
+    let mut book = umya_spreadsheet::new_file();
+    let sheet = book.get_sheet_by_name_mut("Sheet1").unwrap();
+    for row in 1..=3 {
+        sheet.get_cell_mut((1, row)).set_value_number(row);
+        sheet.get_cell_mut((2, row)).set_value_number(row * 10);
+    }
+    let mut original = Vec::new();
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut original).unwrap();
+    rewrite_sheet_xml(original, |xml| {
+        let marker = if marked { "<f ca=\"1\"/>" } else { "" };
+        let xml = xml
+            .replace(
+                "<c r=\"B1\"><v>10</v>",
+                "<c r=\"B1\"><f t=\"array\" ref=\"B1:B3\" ca=\"1\">OFFSET(A1,0,0,3)*10</f><v>10</v>",
+            )
+            .replace("<c r=\"B2\"><v>", &format!("<c r=\"B2\">{marker}<v>"))
+            .replace("<c r=\"B3\"><v>", &format!("<c r=\"B3\">{marker}<v>"));
+        assert!(xml.contains("OFFSET(A1,0,0,3)*10</f>"));
+        assert_eq!(
+            xml.matches("<f ca=\"1\"/>").count(),
+            if marked { 2 } else { 0 }
+        );
+        xml
+    })
+}
+
 fn duplicate_formula_literal_xlsx(formula_first: bool) -> Vec<u8> {
     let mut book = umya_spreadsheet::new_file();
     book.get_sheet_by_name_mut("Sheet1")
@@ -1821,6 +1848,32 @@ fn calamine_classifies_array_and_data_table_tags_as_normal() {
             },
         ]
     );
+}
+
+#[test]
+fn empty_calculate_always_member_formulas_are_not_formulas() {
+    // Excel writes an empty <f ca="1"/> into each member of an array formula
+    // that is calculated always; the member loads as it does without it.
+    let load = |marked| {
+        let adapter = CalamineAdapter::open_bytes(calculate_always_array_xlsx(marked)).unwrap();
+        let mut workbook =
+            Workbook::from_reader(adapter, LoadStrategy::EagerAll, WorkbookConfig::ephemeral())
+                .unwrap();
+        workbook.evaluate_all().unwrap();
+        (1..=3)
+            .map(|row| {
+                (
+                    workbook.get_formula("Sheet1", row, 2),
+                    workbook.get_value("Sheet1", row, 2),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let marked = load(true);
+    assert!(marked[0].0.is_some());
+    assert_eq!(marked[1].0, None);
+    assert_eq!(marked[2].0, None);
+    assert_eq!(marked, load(false));
 }
 
 #[test]

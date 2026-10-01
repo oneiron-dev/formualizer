@@ -725,6 +725,79 @@ fn multi_cell_array_formulas_write_results_into_their_extent() {
     // A formula inside another array formula's extent is not a member.
     let rows = "<row r=\"1\"><c r=\"A1\"><f t=\"array\" ref=\"A1:A2\">{1;2}</f><v>1</v></c></row><row r=\"2\"><c r=\"A2\"><f>1</f><v>2</v></c></row>";
     reject(&parts(rows));
+    for member in ["<f ca=\"1\">1</f>", "<f t=\"shared\" si=\"0\"/>"] {
+        reject(&parts(&rows.replace("<f>1</f>", member)));
+    }
+}
+#[test]
+fn calculate_always_arrays_mark_each_member_with_an_empty_formula() {
+    // Excel writes an empty <f ca="1"/> before the cache of every member of
+    // an array formula whose anchor is calculated always (ca="1"), whatever
+    // the member holds: B1:B4 is a legacy CSE array ("" , 20, 30, #N/A),
+    // C1:C3 a dynamic array. D1:D3 is not calculated always: no member <f>.
+    let rows = "<row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"B1\" t=\"str\"><f t=\"array\" ref=\"B1:B4\" ca=\"1\">IF(A1:A3&gt;1,A1:A3*10+0*TODAY(),&quot;&quot;)</f><v></v></c><c r=\"C1\" cm=\"1\"><f ca=\"1\" t=\"array\" ref=\"C1:C3\">OFFSET(A1,0,0,3)*2</f><v>2</v></c><c r=\"D1\"><f t=\"array\" ref=\"D1:D3\">A1:A3*3</f><v>3</v></c></row>\
+        <row r=\"2\"><c r=\"A2\"><v>2</v></c><c r=\"B2\"><v>20</v></c><c r=\"C2\"><v>4</v></c><c r=\"D2\"><v>6</v></c></row>\
+        <row r=\"3\"><c r=\"A3\"><v>3</v></c><c r=\"B3\"><v>0</v></c><c r=\"C3\"><v>6</v></c><c r=\"D3\"><v>9</v></c></row>\
+        <row r=\"4\"><c r=\"B4\" t=\"e\"><v>#N/A</v></c></row>";
+    let input = pack(&with_metadata(parts(rows), XLDAPR));
+    let out = recalculate_xlsx_bytes(&input, Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<c r=\"B2\"><f ca=\"1\"/><v>20</v></c>",
+        "<c r=\"B3\"><f ca=\"1\"/><v>30</v></c>",
+        "<c r=\"B4\" t=\"e\"><f ca=\"1\"/><v>#N/A</v></c>",
+        "<c r=\"C2\"><f ca=\"1\"/><v>4</v></c>",
+        "<c r=\"C3\"><f ca=\"1\"/><v>6</v></c>",
+        "<c r=\"D2\"><v>6</v></c>",
+        "<c r=\"D3\"><v>9</v></c>",
+    ] {
+        assert!(sheet.contains(expected), "{expected} in {sheet}");
+    }
+    // The anchors are untouched; five members gain a marker, B3 also a value.
+    assert!(sheet.contains("<f t=\"array\" ref=\"B1:B4\" ca=\"1\">"));
+    assert_eq!(sheet.matches("<f ca=\"1\"/>").count(), 5);
+    assert_eq!(out.cache_cells_changed, 5);
+    // Excel's own markers are kept; recalculating again is an exact no-op.
+    assert_eq!(
+        recalculate_xlsx_bytes(&out.bytes, Default::default())
+            .unwrap()
+            .bytes,
+        out.bytes
+    );
+    // A member without a cache receives its value after the marker; a member
+    // left without one keeps it.
+    let rows = "<row r=\"1\"><c r=\"A1\"><f t=\"array\" ref=\"A1:A3\" ca=\"true\">ROW(INDIRECT(&quot;C1:C3&quot;))</f><v>1</v></c></row>\
+        <row r=\"2\"><c r=\"A2\"><f ca=\"1\"></f></c></row><row r=\"3\"><c r=\"A3\"><v>3</v></c></row>";
+    let sheet = member(
+        &recalculate_xlsx_bytes(&pack(&parts(rows)), Default::default())
+            .unwrap()
+            .bytes,
+        SHEET,
+    );
+    assert!(
+        sheet.contains("<c r=\"A2\"><f ca=\"1\"></f><v>2</v></c>"),
+        "{sheet}"
+    );
+    assert!(
+        sheet.contains("<c r=\"A3\"><f ca=\"1\"/><v>3</v></c>"),
+        "{sheet}"
+    );
+    // A namespace-prefixed worksheet gets a prefixed marker.
+    let mut p = parts("");
+    p.insert(
+        SHEET.into(),
+        format!("<x:worksheet xmlns:x=\"{MAIN}\"><x:sheetData><x:row r=\"1\"><x:c r=\"A1\"><x:f t=\"array\" ref=\"A1:A2\" ca=\"1\">{{1;2}}+0*RAND()</x:f><x:v>1</x:v></x:c></x:row><x:row r=\"2\"><x:c r=\"A2\"><x:v>2</x:v></x:c></x:row></x:sheetData></x:worksheet>"),
+    );
+    let sheet = member(
+        &recalculate_xlsx_bytes(&pack(&p), Default::default())
+            .unwrap()
+            .bytes,
+        SHEET,
+    );
+    assert!(
+        sheet.contains("<x:c r=\"A2\"><x:f ca=\"1\"/><x:v>2</x:v></x:c>"),
+        "{sheet}"
+    );
 }
 #[test]
 fn multiple_changed_members_relocate_growing_and_shrinking_payloads() {

@@ -235,12 +235,7 @@ fn cache_patches(xml: &[u8], cell: &sheet::Cell, value: &Cache, patches: &mut Ve
             replacement: Vec::new(),
         });
     }
-    let prefix = cell
-        .qualified
-        .rsplit_once(':')
-        .map(|(p, _)| format!("{p}:"))
-        .unwrap_or_default();
-    let name = format!("{prefix}v");
+    let name = child(cell, "v");
     let text = value.text();
     let replacement = if let Some(v) = &cell.value {
         let mut out = if v.empty {
@@ -273,6 +268,13 @@ fn cache_patches(xml: &[u8], cell: &sheet::Cell, value: &Cache, patches: &mut Ve
             .unwrap_or(cell.formula_end..cell.formula_end),
         replacement,
     });
+}
+/// A cell child's qualified name, in the cell's namespace prefix.
+fn child(cell: &sheet::Cell, local: &str) -> String {
+    match cell.qualified.rsplit_once(':') {
+        Some((prefix, _)) => format!("{prefix}:{local}"),
+        None => local.to_owned(),
+    }
 }
 fn apply_patches(bytes: &[u8], mut patches: Vec<Patch>, limit: usize) -> Result<Vec<u8>, IoError> {
     patches.sort_by_key(|p| p.span.start);
@@ -641,6 +643,8 @@ pub fn recalculate_xlsx_bytes(
 /// array formula. A dynamic array's members outside its current spill are
 /// blank. A legacy (CSE) array fills its whole extent: a one-row or
 /// one-column result repeats and positions beyond the result are #N/A.
+/// Excel writes an empty `<f ca="1"/>` before the cache of each member of an
+/// array formula that is calculated always (`ca` on the anchor's formula).
 fn array_member_patches(
     engine: &Engine<WBResolver>,
     sheet: &package::Sheet,
@@ -684,10 +688,20 @@ fn array_member_patches(
         seen.insert((member.cell.row, member.cell.col));
         let value = value_at(member.anchor, member.cell.row, member.cell.col);
         let cache = Cache::from_value(value, engine.config.date_system)?;
-        if !cache.matches(&member.cell) {
-            changed += 1;
+        let mark = scan.cells[member.anchor].calc_always && !member.marked;
+        if mark {
+            // <f> is the cell's first child; it precedes an inserted <v>.
+            let open = member.cell.open_end;
+            patches.push(Patch {
+                span: open..open,
+                replacement: format!("<{} ca=\"1\"/>", child(&member.cell, "f")).into_bytes(),
+            });
+        }
+        let stale = !cache.matches(&member.cell);
+        if stale {
             cache_patches(data, &member.cell, &cache, patches);
         }
+        changed += usize::from(mark || stale);
     }
     // Positions without a cell element cannot receive a value.
     for &index in results.keys() {

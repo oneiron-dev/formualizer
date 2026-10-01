@@ -37,13 +37,18 @@ pub(super) struct Cell {
     pub array_extent: Option<(u32, u32, u32, u32)>,
     has_formula: bool,
     pub dynamic_array: bool,
+    /// The formula is calculated always (`ca`).
+    pub calc_always: bool,
 }
 /// A value cell inside a multi-cell array formula's extent; `anchor` indexes
-/// the formula cell in [`Scan::cells`].
+/// the formula cell in [`Scan::cells`]. `marked`: the member holds the empty
+/// `<f>` (no formula text) that Excel writes into each member of an array
+/// formula that is calculated always.
 #[derive(Debug)]
 pub(super) struct Member {
     pub anchor: usize,
     pub cell: Cell,
+    pub marked: bool,
 }
 #[derive(Debug, Default)]
 pub(super) struct Scan {
@@ -264,6 +269,7 @@ pub(super) fn scan(
                             array_extent: None,
                             has_formula: false,
                             dynamic_array,
+                            calc_always: false,
                         });
                     }
                 }
@@ -280,6 +286,7 @@ pub(super) fn scan(
                                 ));
                             }
                             cell.has_formula = true;
+                            cell.calc_always = matches!(node.value("ca"), Some("1" | "true"));
                             cell.formula_kind = node.value("t").unwrap_or("normal").to_owned();
                             if !matches!(cell.formula_kind.as_str(), "normal" | "shared" | "array")
                             {
@@ -400,16 +407,27 @@ pub(super) fn scan(
                         })
                         .map(|extent| extent.4);
                     if let Some(anchor) = array_anchor {
-                        if cell.has_formula {
+                        let marked = cell.has_formula;
+                        if marked
+                            && (cell.formula_kind != "normal"
+                                || !cell.formula_text.trim().is_empty())
+                        {
                             return Err(unsupported(
                                 "formula inside an array formula extent",
                                 "worksheet",
                             ));
                         }
                         // Its cache is written after the anchor is evaluated;
-                        // a missing <v> goes right after the opening tag.
-                        cell.formula_end = cell.open_end;
-                        members.push(Member { anchor, cell });
+                        // a missing <v> goes right after the opening tag (or
+                        // its empty <f>).
+                        if !marked {
+                            cell.formula_end = cell.open_end;
+                        }
+                        members.push(Member {
+                            anchor,
+                            cell,
+                            marked,
+                        });
                         return Ok(());
                     }
                     if !cell.has_formula
