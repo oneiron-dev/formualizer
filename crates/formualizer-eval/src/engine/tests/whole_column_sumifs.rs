@@ -124,3 +124,72 @@ fn sumifs_whole_columns_empty_vs_populated() {
         LiteralValue::Number(300.0)
     );
 }
+
+#[test]
+fn ifs_ranges_of_different_shapes_are_value_error() {
+    // Excel: every range of SUMIFS/COUNTIFS/AVERAGEIFS must have the same rows and
+    // columns, whether or not any row matches. A whole column is 1,048,576 rows tall
+    // however much of it is used; SUMIF still resizes its sum range.
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    for (row, tag, amount) in [(1, "A", 10.0), (2, "C", 20.0), (3, "B", 30.0)] {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Text(tag.into()))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", row, 2, LiteralValue::Number(amount))
+            .unwrap();
+    }
+    for col in 6..=7 {
+        engine
+            .set_cell_value("Sheet1", 10, col, LiteralValue::Text("A".into()))
+            .unwrap();
+    }
+    let eval = |engine: &mut Engine<TestWorkbook>, formula: &str| {
+        engine
+            .set_cell_formula("Sheet1", 1, 10, parse(formula).unwrap())
+            .unwrap();
+        engine.evaluate_cell("Sheet1", 1, 10).unwrap();
+        engine.get_cell_value("Sheet1", 1, 10).unwrap()
+    };
+    for formula in [
+        "=SUMIFS(B1:B3,A1:A3,\"A\",F10:G10,\"A\")",
+        "=SUMIFS(B1:B3,A1:A3,\"Z\",F10:G10,\"A\")",
+        "=SUMIFS(B1:B3,A1:A2,\"A\")",
+        "=SUMIFS(B1:B3,F10,\"A\")",
+        "=SUMIFS(B1:B3,A:A,\"A\")",
+        "=COUNTIFS(A1:A3,\"A\",F10:G10,\"A\")",
+        "=COUNTIFS(A1:A3,\"A\",B1:C3,\">0\")",
+        "=COUNTIFS(A:A,\"A\",B1:B3,\">0\")",
+        "=COUNTIFS(A1:A3,\"<>0\",A1:A4,\"<>0\")",
+        "=AVERAGEIFS(B1:B3,A1:A3,\"A\",F10:G10,\"A\")",
+    ] {
+        match eval(&mut engine, formula) {
+            LiteralValue::Error(e) => {
+                assert_eq!(
+                    e.kind,
+                    formualizer_common::ExcelErrorKind::Value,
+                    "{formula}"
+                )
+            }
+            other => panic!("{formula}: expected #VALUE!, got {other:?}"),
+        }
+    }
+    for (formula, expected) in [
+        ("=SUMIFS(B1:B3,A1:A3,\"A\")", 10.0),
+        ("=SUMIFS(B1:B3,A2:A4,\"C\",B1:B3,\">0\")", 10.0),
+        ("=SUMIFS(B:B,A:A,\"B\")", 30.0),
+        ("=COUNTIFS(F10:G10,\"A\",F10:G10,\"A\")", 2.0),
+        // COUNTIFS counts the blank rows past the stored ones in ranges of the
+        // same shape, also whole columns used to different heights.
+        ("=COUNTIFS(A1:A4,\"<>A\",B1:B4,\"<>0\")", 3.0),
+        ("=COUNTIFS(A:A,\"<>A\",F:F,\"<>0\")", 1_048_575.0),
+        ("=SUMIF(A1:A3,\"A\",F10:G10)", 0.0),
+        ("=SUMIF(A1:A3,\"B\",B1)", 30.0),
+    ] {
+        assert_eq!(
+            eval(&mut engine, formula),
+            LiteralValue::Number(expected),
+            "{formula}"
+        );
+    }
+}

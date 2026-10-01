@@ -238,6 +238,34 @@ pub(crate) fn closed_workbook_range(
         .any(|(i, arg)| is_range_position(i) && arg.is_external_reference())
 }
 
+/// A range argument's Excel dimensions. A whole column or row keeps its full
+/// height or width: the engine trims such a view to the used region, and two
+/// whole columns trimmed differently are still the same shape.
+fn declared_dims(
+    arg: &ArgumentHandle<'_, '_>,
+    view: &crate::engine::range_view::RangeView<'_>,
+) -> Result<(u64, u64), ExcelError> {
+    use formualizer_parse::parser::ReferenceType;
+    if let crate::function::FunctionResolution::Reference(ReferenceType::Range {
+        start_row,
+        end_row,
+        start_col,
+        end_col,
+        ..
+    }) = arg.resolve_reference_or_value()?
+    {
+        let span = |first: Option<u32>, last: Option<u32>, max: u32| {
+            first.unwrap_or(1).abs_diff(last.unwrap_or(max)) as u64 + 1
+        };
+        return Ok((
+            span(start_row, end_row, 1_048_576),
+            span(start_col, end_col, 16_384),
+        ));
+    }
+    let (rows, cols) = view.dims();
+    Ok((rows as u64, cols as u64))
+}
+
 fn eval_if_family<'a, 'b>(
     args: &[ArgumentHandle<'a, 'b>],
     ctx: &dyn FunctionContext<'b>,
@@ -321,6 +349,9 @@ fn eval_if_family<'a, 'b>(
         }
     } else {
         // Multi criteria: IFS(target_range, crit_range1, crit1, ...) or COUNTIFS(crit_range1, crit1, ...)
+        // Excel requires every range of the IFS functions to have the same rows and
+        // columns, or the result is #VALUE! (SUMIF/AVERAGEIF resize instead, above).
+        let mut shapes = Vec::new();
         if agg_type == AggregationType::Count {
             if args.len() < 2 || !args.len().is_multiple_of(2) {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -345,8 +376,12 @@ fn eval_if_family<'a, 'b>(
                     AggregateArgument::Scalar(value) => (None, Some(value)),
                 };
 
-                // Broadcast semantics: treat 1x1 criteria ranges as scalar criteria.
+                // The logical extent is the range's Excel shape (a whole column
+                // at its full height), which every criteria range must share.
                 if let Some((rows, cols)) = logical_dims {
+                    shapes.push((rows, cols));
+                    // A 1x1 criteria range (only beside other 1x1 ranges) reads as
+                    // its one value.
                     if rows == 1 && cols == 1 {
                         val = Some(
                             rv.as_ref()
@@ -373,11 +408,15 @@ fn eval_if_family<'a, 'b>(
                 )));
             }
             (sum_view, sum_scalar) = resolve_range_or_scalar!(&args[0]);
+            if let Some(ref view) = sum_view {
+                shapes.push(declared_dims(&args[0], view)?);
+            }
             for i in (1..args.len()).step_by(2) {
                 let (mut rv, mut val) = resolve_range_or_scalar!(&args[i]);
 
                 // Broadcast semantics: treat 1x1 criteria ranges as scalar criteria.
                 if let Some(ref view) = rv {
+                    shapes.push(declared_dims(&args[i], view)?);
                     let (r, c) = view.dims();
                     if r == 1 && c == 1 {
                         val = Some(view.as_1x1().unwrap_or(LiteralValue::Empty));
@@ -388,6 +427,12 @@ fn eval_if_family<'a, 'b>(
                 let pred = crate::args::parse_criteria(&args[i + 1].value()?.into_literal())?;
                 crit_specs.push((rv, pred, val));
             }
+        }
+        if shapes.windows(2).any(|pair| pair[0] != pair[1]) {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                ExcelError::new_value()
+                    .with_message("Ranges must all have the same number of rows and columns"),
+            )));
         }
     }
 
@@ -1272,7 +1317,8 @@ pub struct SumIfsFn; // SUMIFS(sum_range, criteria_range1, criteria1, ...)
 /// # Remarks
 /// - The first argument is always the sum target range.
 /// - Criteria are supplied in `(criteria_range, criteria)` pairs.
-/// - Criteria ranges are broadcast/padded according to engine matching rules.
+/// - Every criteria range must have the same rows and columns as the sum range, or the result
+///   is `#VALUE!`.
 ///
 /// # Examples
 ///
@@ -1314,7 +1360,7 @@ pub struct SumIfsFn; // SUMIFS(sum_range, criteria_range1, criteria1, ...)
 ///   - q: "How are multiple SUMIFS criteria combined?"
 ///     a: "All criteria pairs are applied with logical AND; every condition must match."
 ///   - q: "What if criteria range sizes differ?"
-///     a: "Ranges are broadcast/padded under engine rules instead of strict Excel-size rejection."
+///     a: "SUMIFS returns #VALUE!, as in Excel; only SUMIF resizes its sum range."
 /// ```
 ///
 /// [formualizer-docgen:schema:start]
@@ -2317,7 +2363,7 @@ mod tests {
     }
 
     #[test]
-    fn sumifs_mismatched_ranges_now_pad_with_empty() {
+    fn sumifs_mismatched_ranges_are_value_error() {
         let wb = TestWorkbook::new().with_function(std::sync::Arc::new(SumIfsFn));
         let ctx = interp(&wb);
         // sum_range: 2x2
@@ -2325,7 +2371,7 @@ mod tests {
             vec![LiteralValue::Int(1), LiteralValue::Int(2)],
             vec![LiteralValue::Int(3), LiteralValue::Int(4)],
         ]));
-        // criteria_range: 3x2 (different rows - extra row will match against padded empty values)
+        // criteria_range: 3x2 (one row more than sum_range)
         let crit_range = lit(LiteralValue::Array(vec![
             vec![LiteralValue::Int(1), LiteralValue::Int(1)],
             vec![LiteralValue::Int(1), LiteralValue::Int(1)],
@@ -2339,17 +2385,21 @@ mod tests {
             ArgumentHandle::new(&crit, &ctx),
         ];
         let f = ctx.context.get_function("", "SUMIFS").unwrap();
-        // With padding, sum_range gets padded with empties for row 3
-        // Rows 1-2 match criteria (all 1s), row 3 has empties which don't match =1
-        // So we sum: 1 + 2 + 3 + 4 = 10
-        assert_eq!(
-            f.dispatch(&args, &ctx.function_context(None)).unwrap(),
-            LiteralValue::Number(10.0)
-        );
+        // Excel: every range of SUMIFS must have the same rows and columns.
+        assert_value_error(f.dispatch(&args, &ctx.function_context(None)).unwrap());
+    }
+
+    fn assert_value_error(value: crate::traits::CalcValue<'_>) {
+        match value.into_literal() {
+            LiteralValue::Error(e) => {
+                assert_eq!(e.kind, formualizer_common::ExcelErrorKind::Value)
+            }
+            other => panic!("expected #VALUE!, got {other:?}"),
+        }
     }
 
     #[test]
-    fn countifs_mismatched_ranges_pad_and_broadcast() {
+    fn countifs_mismatched_ranges_are_value_error() {
         let wb = TestWorkbook::new().with_function(std::sync::Arc::new(CountIfsFn));
         let ctx = interp(&wb);
         // criteria_range1: 2x1 -> [1,1]
@@ -2374,15 +2424,12 @@ mod tests {
             ArgumentHandle::new(&c2, &ctx),
         ];
         let f = ctx.context.get_function("", "COUNTIFS").unwrap();
-        // Union rows = 3; row3 has r1=Empty (padded), which doesn't match =1; expect 2
-        assert_eq!(
-            f.dispatch(&args, &ctx.function_context(None)).unwrap(),
-            LiteralValue::Number(2.0)
-        );
+        // Excel: each criteria range must match criteria_range1's rows and columns.
+        assert_value_error(f.dispatch(&args, &ctx.function_context(None)).unwrap());
     }
 
     #[test]
-    fn averageifs_mismatched_ranges_pad() {
+    fn averageifs_mismatched_ranges_are_value_error() {
         let wb = TestWorkbook::new().with_function(std::sync::Arc::new(AverageIfsFn));
         let ctx = interp(&wb);
         // avg_range: 2x1 -> [10,20]
@@ -2403,11 +2450,8 @@ mod tests {
             ArgumentHandle::new(&c1, &ctx),
         ];
         let f = ctx.context.get_function("", "AVERAGEIFS").unwrap();
-        // Only first two rows match; expect (10+20)/2 = 15
-        assert_eq!(
-            f.dispatch(&args, &ctx.function_context(None)).unwrap(),
-            LiteralValue::Number(15.0)
-        );
+        // Excel: each criteria range must have average_range's size and shape.
+        assert_value_error(f.dispatch(&args, &ctx.function_context(None)).unwrap());
     }
 
     #[test]

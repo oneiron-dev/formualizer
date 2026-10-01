@@ -156,7 +156,7 @@ fn sumifs_arrow_fastpath_parity_small() {
 }
 
 #[test]
-fn sumifs_arrow_fastpath_broadcasts_1x1_text_criteria_range() {
+fn sumifs_arrow_fastpath_rejects_1x1_text_criteria_range() {
     let config = arrow_eval_config();
     let mut engine = Engine::new(TestWorkbook::new(), config.clone());
 
@@ -206,11 +206,15 @@ fn sumifs_arrow_fastpath_broadcasts_1x1_text_criteria_range() {
     };
 
     assert_eq!(got_fast, got_slow);
-    assert_eq!(got_fast, LiteralValue::Number(100.0));
+    // Excel: a 1x1 criteria range next to a 4-row range is a shape mismatch, #VALUE!.
+    assert!(
+        matches!(&got_fast, LiteralValue::Error(e) if e.kind == formualizer_common::ExcelErrorKind::Value),
+        "{got_fast:?}"
+    );
 }
 
 #[test]
-fn sumifs_arrow_fastpath_broadcasts_1x1_numeric_criteria_range() {
+fn sumifs_arrow_fastpath_rejects_1x1_numeric_criteria_range() {
     let config = arrow_eval_config();
     let mut engine = Engine::new(TestWorkbook::new(), config.clone());
 
@@ -219,7 +223,6 @@ fn sumifs_arrow_fastpath_broadcasts_1x1_numeric_criteria_range() {
     ab.add_sheet(sheet, 2, 8);
 
     // Col1 is sum range. Col2 is a 1x1 criteria_range value at row 1.
-    // With broadcast semantics, if B1 matches the predicate, include all sums.
     for i in 0..4u32 {
         let sum = LiteralValue::Int(((i + 1) * 10) as i64);
         let crit_range_cell = if i == 0 {
@@ -261,11 +264,15 @@ fn sumifs_arrow_fastpath_broadcasts_1x1_numeric_criteria_range() {
     };
 
     assert_eq!(got_fast, got_slow);
-    assert_eq!(got_fast, LiteralValue::Number(100.0));
+    // Excel: a 1x1 criteria range next to a 4-row range is a shape mismatch, #VALUE!.
+    assert!(
+        matches!(&got_fast, LiteralValue::Error(e) if e.kind == formualizer_common::ExcelErrorKind::Value),
+        "{got_fast:?}"
+    );
 }
 
 #[test]
-fn countifs_arrow_fastpath_broadcasts_1x1_numeric_criteria_range() {
+fn countifs_arrow_fastpath_rejects_1x1_numeric_criteria_range() {
     let config = arrow_eval_config();
     let mut engine = Engine::new(TestWorkbook::new(), config.clone());
 
@@ -320,7 +327,11 @@ fn countifs_arrow_fastpath_broadcasts_1x1_numeric_criteria_range() {
     };
 
     assert_eq!(got_fast, got_slow);
-    assert_eq!(got_fast, LiteralValue::Number(2.0));
+    // Excel: a 1x1 criteria range next to a 4-row range is a shape mismatch, #VALUE!.
+    assert!(
+        matches!(&got_fast, LiteralValue::Error(e) if e.kind == formualizer_common::ExcelErrorKind::Value),
+        "{got_fast:?}"
+    );
 }
 
 #[test]
