@@ -341,7 +341,7 @@ pub fn recalculate_xlsx_bytes(
     options: XlsxRecalculateOptions,
 ) -> Result<XlsxRecalculateResult, IoError> {
     let mut archive = package::admit(bytes, &options)?;
-    let (sheets, date_system) = package::discover(&mut archive, &options)?;
+    let (sheets, date_system, extension) = package::discover(&mut archive, &options)?;
     let mut plans = Vec::new();
     let mut observed = 0;
     let mut logical_cells = 0u64;
@@ -432,10 +432,13 @@ pub fn recalculate_xlsx_bytes(
     let mut config = options.eval_config.clone();
     config.date_system = date_system;
     // The package was saved to a file, so CELL("filename") names one; a host
-    // that knows the file's name sets it in `eval_config`.
+    // that knows the file's name sets it in `eval_config` (the file API sets
+    // the input file's). Otherwise the placeholder name carries the extension
+    // Excel saves this kind of package under: workbook.xlsm for a
+    // macro-enabled workbook, workbook.xltx for a template, and so on.
     config
         .workbook_file_name
-        .get_or_insert_with(|| "workbook.xlsx".to_string());
+        .get_or_insert_with(|| format!("workbook.{extension}"));
     // Excel spills any array that fits the grid; the package cell limit is
     // the only bound here (the default 10,000-cell cap refused SEQUENCE(30000)).
     config.spill.max_spill_cells = config
@@ -761,13 +764,21 @@ fn define_tables(
 /// Native bounded snapshot + same-directory temporary + atomic replace. This
 /// is not CAS against unrelated writers; callers retain their source authority.
 /// Symlink destinations are rejected. No failure/cancellation publishes bytes.
+/// CELL("filename") names the input file (`[Budget.xlsm]Sheet1`) unless
+/// `eval_config.workbook_file_name` gives another name.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn recalculate_xlsx_file(
     input: &Path,
     output: Option<&Path>,
-    options: XlsxRecalculateOptions,
+    mut options: XlsxRecalculateOptions,
 ) -> Result<XlsxRecalculateResult, IoError> {
     checkpoint(&options.cancel)?;
+    if options.eval_config.workbook_file_name.is_none() {
+        options.eval_config.workbook_file_name = input
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned);
+    }
     let mut source = Vec::new();
     std::fs::File::open(input)?
         .take((options.limits.max_input_bytes as u64).saturating_add(1))

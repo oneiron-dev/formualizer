@@ -21,7 +21,7 @@ fn parts(rows: &str) -> BTreeMap<String, String> {
         ("custom/opaque.bin","do not touch".to_owned()),
     ].into_iter().map(|(k,v)|(k.to_owned(),v)).collect()
 }
-fn pack(parts: &BTreeMap<String, String>) -> Vec<u8> {
+fn pack(parts: &BTreeMap<String, impl AsRef<[u8]>>) -> Vec<u8> {
     let mut z = ZipWriter::new(Cursor::new(Vec::new()));
     z.set_comment("archive-comment");
     let options = zip::write::SimpleFileOptions::default()
@@ -29,7 +29,7 @@ fn pack(parts: &BTreeMap<String, String>) -> Vec<u8> {
         .last_modified_time(zip::DateTime::from_date_and_time(2020, 1, 2, 3, 4, 6).unwrap());
     for (name, body) in parts {
         z.start_file(name, options).unwrap();
-        z.write_all(body.as_bytes()).unwrap();
+        z.write_all(body.as_ref()).unwrap();
     }
     z.finish().unwrap().into_inner()
 }
@@ -42,10 +42,13 @@ fn fixture(formula: &str, cache: &str) -> Vec<u8> {
     pack(&single(formula, &format!("<v>{cache}</v>")))
 }
 fn member(bytes: &[u8], name: &str) -> String {
+    String::from_utf8(member_bytes(bytes, name)).unwrap()
+}
+fn member_bytes(bytes: &[u8], name: &str) -> Vec<u8> {
     let mut z = ZipArchive::new(Cursor::new(bytes)).unwrap();
-    let mut s = String::new();
-    z.by_name(name).unwrap().read_to_string(&mut s).unwrap();
-    s
+    let mut b = Vec::new();
+    z.by_name(name).unwrap().read_to_end(&mut b).unwrap();
+    b
 }
 fn data(bytes: &[u8], row: u32) -> Data {
     let mut x = Xlsx::new(Cursor::new(bytes)).unwrap();
@@ -245,10 +248,19 @@ fn package_mapping_and_signature_rejections() {
 const WORKBOOK_TYPE: &str =
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml";
 const VBA_PROJECT: &str = "xl/vbaProject.bin";
+/// Bytes for the VBA project part: the compound-file (CFB) signature padded
+/// with zeros to one 512-byte header sector. Not a readable VBA project; the
+/// recalculation treats the part as opaque bytes.
+fn vba_project() -> Vec<u8> {
+    let mut bytes = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+    bytes.resize(512, 0);
+    bytes
+}
 /// `single(formula, cache)` saved as Excel saves it with the workbook part
-/// typed `content_type`; a macro-enabled kind also carries a VBA project the
-/// way Excel writes one (Default `bin` type, workbook `vbaProject`
-/// relationship, code names on the workbook and sheet).
+/// typed `content_type`; a macro-enabled kind is also wired for a VBA project
+/// the way Excel writes one (Default `bin` type, workbook `vbaProject`
+/// relationship, code names on the workbook and sheet). `pack_kind` adds the
+/// project part itself.
 fn workbook_kind(content_type: &str, formula: &str, cache: &str) -> BTreeMap<String, String> {
     let mut p = single(formula, cache);
     let ct = p.get_mut("[Content_Types].xml").unwrap();
@@ -267,12 +279,19 @@ fn workbook_kind(content_type: &str, formula: &str, cache: &str) -> BTreeMap<Str
         );
         let sheet = p.get_mut(SHEET).unwrap();
         *sheet = sheet.replace("<sheetData>", "<sheetPr codeName=\"Sheet1\"/><sheetData>");
-        p.insert(
-            VBA_PROJECT.into(),
-            "\u{d0}\u{cf}\u{11}\u{e0} Attribute VB_Name = \"Module1\"\0Sub Auto_Open(): Range(\"A1\") = 7: End Sub".into(),
-        );
     }
     p
+}
+/// `p` packed with the VBA project part when its workbook refers to one.
+fn pack_kind(p: &BTreeMap<String, String>) -> Vec<u8> {
+    let mut parts: BTreeMap<String, Vec<u8>> = p
+        .iter()
+        .map(|(name, body)| (name.clone(), body.clone().into_bytes()))
+        .collect();
+    if p["xl/_rels/workbook.xml.rels"].contains("relationships/vbaProject") {
+        parts.insert(VBA_PROJECT.into(), vba_project());
+    }
+    pack(&parts)
 }
 #[test]
 fn macro_enabled_and_template_workbooks_recalculate_like_xlsx() {
@@ -283,14 +302,13 @@ fn macro_enabled_and_template_workbooks_recalculate_like_xlsx() {
         "application/vnd.ms-excel.addin.macroEnabled.main+xml",
     ] {
         let p = workbook_kind(content_type, "1+1", "<v>99</v>");
-        let input = pack(&p);
+        let input = pack_kind(&p);
         let out = recalculate_xlsx_bytes(&input, XlsxRecalculateOptions::default())
             .unwrap_or_else(|e| panic!("{content_type}: {e:?}"));
         assert_eq!(
             (out.cache_cells_changed, out.worksheet_parts_changed),
             (1, 1)
         );
-        // The VBA project is neither run (it would write 7) nor dropped.
         assert_eq!(data(&out.bytes, 0), Data::Float(2.0), "{content_type}");
         // Every part except the worksheet is copied byte for byte: the VBA
         // project, its relationship and the content types too.
@@ -315,7 +333,10 @@ fn macro_enabled_and_template_workbooks_recalculate_like_xlsx() {
         let types = member(&out.bytes, "[Content_Types].xml");
         assert!(types.contains(&format!("ContentType=\"{content_type}\"")));
         if content_type.contains("macroEnabled") {
-            assert_eq!(member(&out.bytes, VBA_PROJECT), p[VBA_PROJECT]);
+            // The VBA project is opaque bytes to the recalculation: a CFB
+            // header that is not a readable project, written back unchanged.
+            assert_eq!(member_bytes(&input, VBA_PROJECT), vba_project());
+            assert_eq!(member_bytes(&out.bytes, VBA_PROJECT), vba_project());
             assert!(types.contains("application/vnd.ms-office.vbaProject"));
             assert!(
                 member(&out.bytes, "xl/_rels/workbook.xml.rels")
@@ -367,11 +388,76 @@ fn workbook_part_content_type_must_be_a_workbook_type() {
             let close = open + ct[open..].find('"').unwrap();
             ct.replace_range(open..close, content_type);
         }
-        let error = recalculate_xlsx_bytes(&pack(&p), XlsxRecalculateOptions::default())
+        let error = recalculate_xlsx_bytes(&pack_kind(&p), XlsxRecalculateOptions::default())
             .expect_err(content_type);
         assert!(
             format!("{error:?}").contains("part/content-type mismatch"),
             "{content_type}: {error:?}"
+        );
+    }
+}
+#[test]
+fn cell_filename_extension_follows_the_workbook_type() {
+    let filename = "CELL(\"filename\",A1)";
+    for (content_type, extension) in [
+        (WORKBOOK_TYPE, "xlsx"),
+        (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml",
+            "xltx",
+        ),
+        (
+            "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+            "xlsm",
+        ),
+        (
+            "application/vnd.ms-excel.template.macroEnabled.main+xml",
+            "xltm",
+        ),
+        (
+            "application/vnd.ms-excel.addin.macroEnabled.main+xml",
+            "xlam",
+        ),
+    ] {
+        let p = workbook_kind(content_type, filename, "<v>0</v>");
+        let out = recalculate_xlsx_bytes(&pack_kind(&p), Default::default()).unwrap();
+        let sheet = member(&out.bytes, SHEET);
+        assert!(
+            sheet.contains(&format!("<v>[workbook.{extension}]Sheet1</v>")),
+            "{content_type}: {sheet}"
+        );
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn cell_filename_names_the_input_file() {
+    use formualizer_workbook::recalculate_xlsx_file;
+    let filename = "CELL(\"filename\",A1)";
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.xlsx");
+    for (content_type, file) in [
+        (
+            "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+            "Q3 Budget.xlsm",
+        ),
+        (WORKBOOK_TYPE, "Q3 Budget.xlsx"),
+    ] {
+        let input = dir.path().join(file);
+        std::fs::write(
+            &input,
+            pack_kind(&workbook_kind(content_type, filename, "<v>0</v>")),
+        )
+        .unwrap();
+        recalculate_xlsx_file(&input, Some(&output), Default::default()).unwrap();
+        let sheet = member(&std::fs::read(&output).unwrap(), SHEET);
+        assert!(sheet.contains(&format!("<v>[{file}]Sheet1</v>")), "{sheet}");
+        // A name the host gives wins over the file's.
+        let mut options = XlsxRecalculateOptions::default();
+        options.eval_config.workbook_file_name = Some(format!("Host {file}"));
+        recalculate_xlsx_file(&input, None, options).unwrap();
+        let sheet = member(&std::fs::read(&input).unwrap(), SHEET);
+        assert!(
+            sheet.contains(&format!("<v>[Host {file}]Sheet1</v>")),
+            "{sheet}"
         );
     }
 }

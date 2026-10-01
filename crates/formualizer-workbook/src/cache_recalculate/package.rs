@@ -377,10 +377,12 @@ pub(super) fn relationships(
     })?;
     Ok(result)
 }
+/// The sheets, the date system and the file extension of the workbook's kind
+/// (`xlsx`, `xltx`, `xlsm`, `xltm` or `xlam`).
 pub(super) fn discover(
     archive: &mut Archive<'_>,
     options: &XlsxRecalculateOptions,
-) -> Result<(Vec<Sheet>, formualizer_common::DateSystem), IoError> {
+) -> Result<(Vec<Sheet>, formualizer_common::DateSystem, &'static str), IoError> {
     let root = relationships(archive, "", options)?;
     if root.values().any(|r| r.kind.contains("digital-signature")) {
         return Err(unsupported(
@@ -596,8 +598,8 @@ pub(super) fn discover(
             }
         }
     }
-    content_types::validate(archive, &sheets, options)?;
-    Ok((sheets, epoch))
+    let extension = content_types::validate(archive, &sheets, options)?;
+    Ok((sheets, epoch, extension))
 }
 fn cell_coordinate(value: &str, part: &str) -> Result<(u32, u32), IoError> {
     let (row, col, _, _) = formualizer_common::coord::parse_a1_1based(value)

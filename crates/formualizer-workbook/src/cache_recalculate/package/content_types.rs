@@ -11,19 +11,37 @@ use super::{
 /// separate part (Default `bin`, `vbaProject` relationship) that is neither
 /// parsed nor run here; the writer copies it, its relationship and
 /// `[Content_Types].xml` unchanged, so the saved package keeps its kind.
-const WORKBOOK_CONTENT_TYPES: [&str; 5] = [
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml",
-    "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
-    "application/vnd.ms-excel.template.macroEnabled.main+xml",
-    "application/vnd.ms-excel.addin.macroEnabled.main+xml",
+/// Each type is paired with the file extension Excel saves that kind under.
+const WORKBOOK_CONTENT_TYPES: [(&str, &str); 5] = [
+    (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+        "xlsx",
+    ),
+    (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml",
+        "xltx",
+    ),
+    (
+        "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+        "xlsm",
+    ),
+    (
+        "application/vnd.ms-excel.template.macroEnabled.main+xml",
+        "xltm",
+    ),
+    (
+        "application/vnd.ms-excel.addin.macroEnabled.main+xml",
+        "xlam",
+    ),
 ];
 
+/// Checks every part's content type and returns the file extension of the
+/// workbook's kind (`xlsx`, `xltx`, `xlsm`, `xltm` or `xlam`).
 pub(super) fn validate(
     archive: &mut Archive<'_>,
     sheets: &[Sheet],
     options: &XlsxRecalculateOptions,
-) -> Result<(), IoError> {
+) -> Result<&'static str, IoError> {
     const NS: &str = "http://schemas.openxmlformats.org/package/2006/content-types";
     const PREFIX: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.";
     let data = read_part(
@@ -93,6 +111,7 @@ pub(super) fn validate(
         }
         Ok(())
     })?;
+    let mut extension = None;
     for name in archive.file_names() {
         if name == "[Content_Types].xml" || name.ends_with('/') {
             continue;
@@ -105,9 +124,11 @@ pub(super) fn validate(
             })
             .ok_or_else(|| unsupported("part without content type", name))?;
         if name == "xl/workbook.xml" {
-            if !WORKBOOK_CONTENT_TYPES.contains(&content.as_str()) {
-                return Err(unsupported("part/content-type mismatch", name));
-            }
+            let (_, kind) = WORKBOOK_CONTENT_TYPES
+                .iter()
+                .find(|(workbook, _)| *workbook == content.as_str())
+                .ok_or_else(|| unsupported("part/content-type mismatch", name))?;
+            extension = Some(*kind);
             continue;
         }
         let expected = if sheets.iter().any(|s| s.part == name) {
@@ -128,5 +149,5 @@ pub(super) fn validate(
             return Err(unsupported("part/content-type mismatch", name));
         }
     }
-    Ok(())
+    extension.ok_or_else(|| unsupported("part without content type", "xl/workbook.xml"))
 }
