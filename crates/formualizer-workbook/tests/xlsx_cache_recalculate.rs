@@ -242,6 +242,139 @@ fn package_mapping_and_signature_rejections() {
     p.insert("_xmlsignatures/sig1.xml".into(), "<Signature/>".into());
     reject(&p);
 }
+const WORKBOOK_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml";
+const VBA_PROJECT: &str = "xl/vbaProject.bin";
+/// `single(formula, cache)` saved as Excel saves it with the workbook part
+/// typed `content_type`; a macro-enabled kind also carries a VBA project the
+/// way Excel writes one (Default `bin` type, workbook `vbaProject`
+/// relationship, code names on the workbook and sheet).
+fn workbook_kind(content_type: &str, formula: &str, cache: &str) -> BTreeMap<String, String> {
+    let mut p = single(formula, cache);
+    let ct = p.get_mut("[Content_Types].xml").unwrap();
+    *ct = ct.replace(WORKBOOK_TYPE, content_type);
+    if content_type.contains("macroEnabled") {
+        *ct = ct.replace(
+            "ContentType=\"application/octet-stream\"",
+            "ContentType=\"application/vnd.ms-office.vbaProject\"",
+        );
+        let rels = p.get_mut("xl/_rels/workbook.xml.rels").unwrap();
+        *rels = rels.replace("</Relationships>", "<Relationship Id=\"rId9\" Type=\"http://schemas.microsoft.com/office/2006/relationships/vbaProject\" Target=\"vbaProject.bin\"/></Relationships>");
+        let workbook = p.get_mut("xl/workbook.xml").unwrap();
+        *workbook = workbook.replace(
+            "<sheets>",
+            "<workbookPr codeName=\"ThisWorkbook\"/><sheets>",
+        );
+        let sheet = p.get_mut(SHEET).unwrap();
+        *sheet = sheet.replace("<sheetData>", "<sheetPr codeName=\"Sheet1\"/><sheetData>");
+        p.insert(
+            VBA_PROJECT.into(),
+            "\u{d0}\u{cf}\u{11}\u{e0} Attribute VB_Name = \"Module1\"\0Sub Auto_Open(): Range(\"A1\") = 7: End Sub".into(),
+        );
+    }
+    p
+}
+#[test]
+fn macro_enabled_and_template_workbooks_recalculate_like_xlsx() {
+    for content_type in [
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml",
+        "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+        "application/vnd.ms-excel.template.macroEnabled.main+xml",
+        "application/vnd.ms-excel.addin.macroEnabled.main+xml",
+    ] {
+        let p = workbook_kind(content_type, "1+1", "<v>99</v>");
+        let input = pack(&p);
+        let out = recalculate_xlsx_bytes(&input, XlsxRecalculateOptions::default())
+            .unwrap_or_else(|e| panic!("{content_type}: {e:?}"));
+        assert_eq!(
+            (out.cache_cells_changed, out.worksheet_parts_changed),
+            (1, 1)
+        );
+        // The VBA project is neither run (it would write 7) nor dropped.
+        assert_eq!(data(&out.bytes, 0), Data::Float(2.0), "{content_type}");
+        // Every part except the worksheet is copied byte for byte: the VBA
+        // project, its relationship and the content types too.
+        let mut before = ZipArchive::new(Cursor::new(&input)).unwrap();
+        let mut after = ZipArchive::new(Cursor::new(&out.bytes)).unwrap();
+        assert_eq!(before.len(), after.len());
+        for i in 0..before.len() {
+            let a = before.by_index(i).unwrap();
+            let b = after.by_index(i).unwrap();
+            assert_eq!(a.name(), b.name());
+            if a.name() != SHEET {
+                assert_eq!(
+                    &input
+                        [a.data_start() as usize..(a.data_start() + a.compressed_size()) as usize],
+                    &out.bytes
+                        [b.data_start() as usize..(b.data_start() + b.compressed_size()) as usize],
+                    "{content_type}: {}",
+                    a.name()
+                );
+            }
+        }
+        let types = member(&out.bytes, "[Content_Types].xml");
+        assert!(types.contains(&format!("ContentType=\"{content_type}\"")));
+        if content_type.contains("macroEnabled") {
+            assert_eq!(member(&out.bytes, VBA_PROJECT), p[VBA_PROJECT]);
+            assert!(types.contains("application/vnd.ms-office.vbaProject"));
+            assert!(
+                member(&out.bytes, "xl/_rels/workbook.xml.rels")
+                    .contains("relationships/vbaProject\" Target=\"vbaProject.bin\"")
+            );
+        }
+        // A current macro-enabled package is an exact no-op.
+        let again = recalculate_xlsx_bytes(&out.bytes, XlsxRecalculateOptions::default()).unwrap();
+        assert_eq!(again.bytes, out.bytes);
+    }
+}
+#[test]
+fn workbook_part_content_type_must_be_a_workbook_type() {
+    let xlsm = "application/vnd.ms-excel.sheet.macroEnabled.main+xml";
+    for (part, content_type) in [
+        // The binary (.xlsb) workbook, a word-processing document and a
+        // worksheet type are not SpreadsheetML workbook parts.
+        (
+            "/xl/workbook.xml",
+            "application/vnd.ms-excel.sheet.binary.macroEnabled.main",
+        ),
+        (
+            "/xl/workbook.xml",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+        ),
+        (
+            "/xl/workbook.xml",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
+        ),
+        (
+            "/xl/workbook.xml",
+            "application/vnd.ms-excel.sheet.macroEnabled+xml",
+        ),
+        // A workbook type does not type a worksheet.
+        ("/xl/worksheets/sheet1.xml", xlsm),
+        // Without its override the workbook part is plain application/xml.
+        ("/xl/workbook.xml", ""),
+    ] {
+        let mut p = workbook_kind(xlsm, "1+1", "<v>99</v>");
+        let ct = p.get_mut("[Content_Types].xml").unwrap();
+        if content_type.is_empty() {
+            *ct = ct.replace(
+                &format!("<Override PartName=\"{part}\" ContentType=\"{xlsm}\"/>"),
+                "",
+            );
+        } else {
+            let start = ct.find(&format!("PartName=\"{part}\"")).unwrap();
+            let open = start + ct[start..].find("ContentType=\"").unwrap() + 13;
+            let close = open + ct[open..].find('"').unwrap();
+            ct.replace_range(open..close, content_type);
+        }
+        let error = recalculate_xlsx_bytes(&pack(&p), XlsxRecalculateOptions::default())
+            .expect_err(content_type);
+        assert!(
+            format!("{error:?}").contains("part/content-type mismatch"),
+            "{content_type}: {error:?}"
+        );
+    }
+}
 #[test]
 fn limits_and_precancellation() {
     let input = fixture("1+1", "99");

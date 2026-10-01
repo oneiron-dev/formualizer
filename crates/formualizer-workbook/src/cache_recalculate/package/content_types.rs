@@ -3,6 +3,22 @@ use super::{
     xml,
 };
 
+/// Content types of the workbook part. Excel opens each of these packages
+/// the same way: a template (.xltx), a macro-enabled workbook (.xlsm) or
+/// template (.xltm) and an add-in (.xlam) hold the same SpreadsheetML
+/// workbook as an .xlsx (ECMA-376 Part 1 §12.3.23, [MS-OFFMACRO2] §2.2.1.4;
+/// the add-in type is the one Excel writes for .xlam). A VBA project is a
+/// separate part (Default `bin`, `vbaProject` relationship) that is neither
+/// parsed nor run here; the writer copies it, its relationship and
+/// `[Content_Types].xml` unchanged, so the saved package keeps its kind.
+const WORKBOOK_CONTENT_TYPES: [&str; 5] = [
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml",
+    "application/vnd.ms-excel.sheet.macroEnabled.main+xml",
+    "application/vnd.ms-excel.template.macroEnabled.main+xml",
+    "application/vnd.ms-excel.addin.macroEnabled.main+xml",
+];
+
 pub(super) fn validate(
     archive: &mut Archive<'_>,
     sheets: &[Sheet],
@@ -88,9 +104,13 @@ pub(super) fn validate(
                     .and_then(|(_, e)| defaults.get(&e.to_ascii_lowercase()))
             })
             .ok_or_else(|| unsupported("part without content type", name))?;
-        let expected = if name == "xl/workbook.xml" {
-            Some(format!("{PREFIX}sheet.main+xml"))
-        } else if sheets.iter().any(|s| s.part == name) {
+        if name == "xl/workbook.xml" {
+            if !WORKBOOK_CONTENT_TYPES.contains(&content.as_str()) {
+                return Err(unsupported("part/content-type mismatch", name));
+            }
+            continue;
+        }
+        let expected = if sheets.iter().any(|s| s.part == name) {
             Some(format!("{PREFIX}worksheet+xml"))
         } else if name == "xl/styles.xml" {
             Some(format!("{PREFIX}styles+xml"))
