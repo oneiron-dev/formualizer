@@ -2921,6 +2921,28 @@ mod structured_references {
     }
 
     #[test]
+    fn empty_brackets_are_the_data_body() {
+        // `Table1[]` is `Table1[#Data]`, not the whole table: only `[#All]`
+        // includes the header and totals rows.
+        for formula in ["=Table1[]", "=Table1[ ]"] {
+            let t = expect_table(formula);
+            assert_eq!(t.name, "Table1");
+            assert_eq!(
+                t.specifier,
+                Some(TableSpecifier::SpecialItem(SpecialItem::Data))
+            );
+        }
+        assert_eq!(
+            expect_table("=Table1[]").specifier,
+            expect_table("=Table1[#Data]").specifier
+        );
+        assert_ne!(
+            expect_table("=Table1[]").specifier,
+            expect_table("=Table1[#All]").specifier
+        );
+    }
+
+    #[test]
     fn this_row_at_only() {
         let t = expect_table("=Table1[@]");
         assert_eq!(

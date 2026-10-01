@@ -242,6 +242,22 @@ fn running_total_from_index_to_this_row() {
 }
 
 #[test]
+fn empty_brackets_are_the_data_body() {
+    let mut engine = engine();
+    let n = LiteralValue::Number;
+    // Sales[] is Sales[#Data] (A2:B4): no header, no totals row.
+    assert_eq!(eval(&mut engine, 1, 4, "=ROWS(Sales[])"), n(3.0));
+    assert_eq!(eval(&mut engine, 2, 4, "=COUNTA(Sales[])"), n(6.0));
+    assert_eq!(eval(&mut engine, 3, 4, "=SUM(Sales[])"), n(6.0));
+    assert_eq!(eval(&mut engine, 4, 4, "=MIN(ROW(Sales[]))"), n(2.0));
+    // The whole table is still only Sales[#All].
+    assert_eq!(eval(&mut engine, 5, 4, "=ROWS(Sales[#All])"), n(5.0));
+    assert_eq!(eval(&mut engine, 6, 4, "=COUNTA(Sales[#All])"), n(10.0));
+    assert_eq!(eval(&mut engine, 7, 4, "=ROWS(Sales[#Data])"), n(3.0));
+    assert_eq!(eval(&mut engine, 8, 4, "=ROWS(Sales)"), n(3.0));
+}
+
+#[test]
 fn this_row_outside_the_table_body_is_a_value_error() {
     let mut engine = engine();
     let error = engine

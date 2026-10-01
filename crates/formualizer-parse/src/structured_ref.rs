@@ -128,8 +128,10 @@ impl<'a> SpecifierParser<'a> {
 fn parse_content(content: &str) -> Result<TableSpecifier, ParsingError> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
-        // `Table1[]` is canonically the whole table.
-        return Ok(TableSpecifier::All);
+        // `Table1[]` is the data body, like `Table1` and `Table1[#Data]`
+        // (MS-OI29500 "Structure References"); only `[#All]` adds the
+        // header and totals rows.
+        return Ok(TableSpecifier::SpecialItem(SpecialItem::Data));
     }
 
     // Decide between three top-level shapes based on a structural scan that
