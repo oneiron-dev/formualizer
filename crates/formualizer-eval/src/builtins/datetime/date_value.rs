@@ -6,11 +6,14 @@ use crate::traits::{ArgumentHandle, FunctionContext};
 use chrono::NaiveDate;
 use formualizer_common::{
     ExcelError, LiteralValue, date_to_serial_for, parse_excel_date_text, parse_excel_time_text,
-    time_to_fraction,
+    time_to_fraction, trim_date_time_spaces,
 };
 
 fn parse_legacy_datevalue_text(input: &str) -> Option<NaiveDate> {
-    let text = input.trim_matches(' ');
+    // Only the spaces around date text are ignored: a leading line feed or
+    // tab would otherwise land inside the rebuilt "Month day, year" text,
+    // where the month-name parser skips it.
+    let text = trim_date_time_spaces(input)?;
     let parts: Vec<&str> = text.split('/').collect();
     if parts.len() == 3
         && parts
@@ -366,6 +369,22 @@ mod tests {
             ExcelErrorKind::Value,
             "oracle: lo-verified interior whitespace"
         );
+    }
+
+    #[test]
+    fn legacy_datevalue_fallback_ignores_only_surrounding_spaces() {
+        let jan2 = NaiveDate::from_ymd_opt(2023, 1, 2);
+        assert_eq!(parse_legacy_datevalue_text(" 2 January 2023  "), jan2);
+        for text in [
+            "\n2 January 2023",
+            "\t2 Jan 2023",
+            " \n2 January 2023",
+            "2 January 2023\n",
+            "\u{a0}2 January 2023",
+            "\n2/1/2023",
+        ] {
+            assert_eq!(parse_legacy_datevalue_text(text), None, "{text:?}");
+        }
     }
 
     #[test]

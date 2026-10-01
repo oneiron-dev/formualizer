@@ -76,7 +76,7 @@ pub fn parse_excel_date_text(input: &str) -> Option<NaiveDate> {
 /// With `current_year` absent those forms are rejected, keeping parsing
 /// independent of the wall clock.
 pub fn parse_excel_date_text_in_year(input: &str, current_year: Option<i32>) -> Option<NaiveDate> {
-    let text = trim_spaces(input)?;
+    let text = trim_date_time_spaces(input)?;
     if text.is_empty() {
         return None;
     }
@@ -92,7 +92,9 @@ pub fn parse_excel_date_text_in_year(input: &str, current_year: Option<i32>) -> 
 
 /// Excel ignores the spaces around date and time text, and only those: a
 /// tab or line feed there makes the text non-temporal (`"6:47\n"`).
-fn trim_spaces(input: &str) -> Option<&str> {
+/// Returns the text without its surrounding spaces, or `None` when other
+/// whitespace remains at either end.
+pub fn trim_date_time_spaces(input: &str) -> Option<&str> {
     let text = input.trim_matches(' ');
     let edge = |c: Option<char>| c.is_some_and(char::is_whitespace);
     (!edge(text.chars().next()) && !edge(text.chars().next_back())).then_some(text)
@@ -342,7 +344,7 @@ fn parse_month_name(text: &str) -> Option<u32> {
 /// Fractional seconds (e.g. `12:30:45.5`) are truncated to whole seconds.
 /// `24:00` and `24:00:00` are accepted as midnight (Excel compatibility).
 pub fn parse_excel_time_text(input: &str) -> Option<NaiveTime> {
-    let text = trim_spaces(input)?;
+    let text = trim_date_time_spaces(input)?;
     let mut normalized = String::with_capacity(text.len());
     let mut pending_space = false;
     for ch in text.chars() {
@@ -420,7 +422,7 @@ pub fn parse_excel_datetime_text_in_year(
     input: &str,
     current_year: Option<i32>,
 ) -> Option<NaiveDateTime> {
-    let text = trim_spaces(input)?;
+    let text = trim_date_time_spaces(input)?;
     text.char_indices()
         .filter(|(_, ch)| *ch == 'T' || ch.is_ascii_whitespace())
         .find_map(|(index, ch)| {
@@ -1086,6 +1088,15 @@ mod tests {
         );
         for text in ["6:47\n", "\n6:47", "6:47\t", "6:47\r", "6:47\u{a0}"] {
             assert_eq!(parse_excel_time_text(text), None, "{text:?}");
+        }
+        assert_eq!(trim_date_time_spaces("  1/2/2023 "), Some("1/2/2023"));
+        for text in [
+            "\n2 January 2023",
+            " \t1/2/2023",
+            "1/2/2023\r ",
+            "\u{a0}1/2/2023",
+        ] {
+            assert_eq!(trim_date_time_spaces(text), None, "{text:?}");
         }
         assert_eq!(parse_excel_date_text(" 1/2/2023 "), Some(date(2023, 1, 2)));
         assert_eq!(parse_excel_date_text("1/2/2023\n"), None);

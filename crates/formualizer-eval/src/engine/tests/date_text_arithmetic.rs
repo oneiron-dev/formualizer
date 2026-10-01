@@ -217,6 +217,80 @@ fn only_spaces_around_numeric_and_time_text_are_ignored() {
 }
 
 #[test]
+fn datevalue_month_name_text_ignores_only_surrounding_spaces() {
+    // DATEVALUE's "day Month year" fallback rebuilds the text, so a leading
+    // line feed or tab must be rejected before it lands inside the day.
+    for formula in [
+        "=DATEVALUE(CHAR(10)&\"2 January 2023\")",
+        "=DATEVALUE(CHAR(9)&\"2 Jan 2023\")",
+        "=DATEVALUE(\" \"&CHAR(10)&\"2 January 2023\")",
+        "=DATEVALUE(\"2 January 2023\"&CHAR(10)&\" \")",
+    ] {
+        assert_expected(
+            DateSystem::Excel1900,
+            formula,
+            "rule: only spaces are ignored",
+            Expected::Error(ExcelErrorKind::Value),
+        );
+    }
+    // DATEVALUE's result carries a date format, so compare serials.
+    for formula in [
+        "=DATEVALUE(\"2 January 2023\")",
+        "=DATEVALUE(\"  2 January 2023 \")",
+    ] {
+        assert_eq!(
+            eval_formula(DateSystem::Excel1900, formula)
+                .as_serial_number_for(DateSystem::Excel1900),
+            Some(44928.0),
+            "{formula} (spaces are ignored)"
+        );
+    }
+}
+
+#[test]
+fn criteria_read_linefeed_text_as_text_like_the_cells() {
+    // A3 holds the text "5"&CHAR(10), which is not numeric text. As a
+    // criterion it is the same text, so a cell matches its own value, and it
+    // does not match the number 5 in A1.
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    let sheet = "Sheet1";
+    engine
+        .set_cell_value(sheet, 1, 1, LiteralValue::Number(5.0))
+        .unwrap();
+    engine
+        .set_cell_value(sheet, 3, 1, LiteralValue::Text("5\n".into()))
+        .unwrap();
+    engine
+        .set_cell_value(sheet, 3, 2, LiteralValue::Number(7.0))
+        .unwrap();
+    let cases = [
+        ("=COUNTIF(A3,A3)", 1.0),
+        ("=COUNTIF(A3,\"5\"&CHAR(10))", 1.0),
+        ("=COUNTIF(A3,\"=5\"&CHAR(10))", 1.0),
+        ("=SUMIF(A3,A3,B3)", 7.0),
+        ("=COUNTIFS(A3,A3)", 1.0),
+        ("=SUMIFS(B3,A3,A3)", 7.0),
+        ("=AVERAGEIF(A3,A3,B3)", 7.0),
+        ("=COUNTIF(A1,A3)", 0.0),
+        ("=COUNTIF(A1:A3,5)", 1.0),
+        ("=COUNTIF(A1:A3,\" 5 \")", 1.0),
+    ];
+    for (row, (formula, _)) in (10u32..).zip(cases.iter()) {
+        engine
+            .set_cell_formula(sheet, row, 1, parse(formula).unwrap())
+            .unwrap();
+    }
+    engine.evaluate_all().unwrap();
+    for (row, (formula, expected)) in (10u32..).zip(cases.iter()) {
+        assert_eq!(
+            engine.get_cell_value(sheet, row, 1),
+            Some(LiteralValue::Number(*expected)),
+            "{formula}"
+        );
+    }
+}
+
+#[test]
 fn excel_date_shapes_and_year_less_dates_use_the_clock_year() {
     // Excel en-US reads m-d-y with dashes and y/m/d with a four-digit year.
     for (formula, serial_1900) in [("=\"03-01-01\"+0", 36951.0), ("=\"2003/1/1\"+0", 37622.0)] {

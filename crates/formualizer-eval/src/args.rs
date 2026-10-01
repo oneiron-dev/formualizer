@@ -133,7 +133,7 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
             let s_trim = s.trim();
 
             // Text criteria keep their spaces: "="&A9 with A9 = "   2E" matches
-            // only "   2E". Numbers are read from the trimmed text.
+            // only "   2E". Numbers are read without the spaces around them.
             let unquote = |t: &str| -> String {
                 let trimmed = t.trim();
                 if let Some(inner) = trimmed.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
@@ -148,8 +148,10 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
             for op in ops.iter() {
                 if let Some(rhs) = s.trim_start().strip_prefix(op) {
                     let rhs_trim = rhs.trim();
-                    // Try numeric parse for comparisons
-                    if let Some(n) = criteria_number(rhs_trim) {
+                    // Try numeric parse for comparisons. Like the cells it is
+                    // compared with, a criterion number ignores only the spaces
+                    // around it: "=5"&CHAR(10) is text.
+                    if let Some(n) = criteria_number(rhs.trim_matches(' ')) {
                         return Ok(match *op {
                             ">=" => CriteriaPredicate::Ge(n),
                             "<=" => CriteriaPredicate::Le(n),
@@ -197,8 +199,10 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
                 return Ok(CriteriaPredicate::Eq(LiteralValue::Boolean(false)));
             }
             // A number written as text ("111111") is a numeric criterion, as
-            // if written "=111111".
-            if let Some(n) = criteria_number(plain.trim()) {
+            // if written "=111111". Only the spaces around it are ignored, as
+            // for the cells: "5"&CHAR(10) is a text criterion that matches the
+            // text "5"&CHAR(10) and not the number 5.
+            if let Some(n) = criteria_number(plain.trim_matches(' ')) {
                 return Ok(CriteriaPredicate::Eq(LiteralValue::Number(n)));
             }
             if let Some(kind) = criteria_error(plain.trim()) {
@@ -453,6 +457,35 @@ mod criteria_tests {
         let pct = parse_criteria(&text(">=50%")).unwrap();
         assert!(criteria_match(&pct, &LiteralValue::Number(0.5)));
         assert!(!criteria_match(&pct, &LiteralValue::Number(0.4)));
+    }
+
+    #[test]
+    fn criterion_numbers_ignore_only_surrounding_spaces() {
+        // "5"&CHAR(10) is not numeric text, in a criterion as in a cell: it is
+        // a text criterion that matches the cell holding that text and not
+        // the number 5.
+        for criterion in ["5\n", "=5\n", "\t5", "=\n5", "5\u{a0}"] {
+            let pred = parse_criteria(&text(criterion)).unwrap();
+            assert!(
+                !criteria_match(&pred, &LiteralValue::Number(5.0)),
+                "{criterion:?}"
+            );
+        }
+        for (criterion, cell) in [("5\n", "5\n"), ("=5\n", "5\n"), ("\t5", "\t5")] {
+            let pred = parse_criteria(&text(criterion)).unwrap();
+            assert!(criteria_match(&pred, &text(cell)), "{criterion:?}");
+        }
+        // A numeric criterion does not read the cell text "5\n" as 5 either.
+        for criterion in [text("5"), text("=5"), LiteralValue::Number(5.0)] {
+            let pred = parse_criteria(&criterion).unwrap();
+            assert!(!criteria_match(&pred, &text("5\n")), "{criterion:?}");
+        }
+        // ">4"&CHAR(10) has no number to compare a cell with.
+        let gt = parse_criteria(&text(">4\n")).unwrap();
+        assert!(!criteria_match(&gt, &LiteralValue::Number(5.0)));
+        // The spaces around a criterion number are still ignored.
+        let ge = parse_criteria(&text(">= 4 ")).unwrap();
+        assert!(criteria_match(&ge, &LiteralValue::Number(5.0)));
     }
 
     #[test]
