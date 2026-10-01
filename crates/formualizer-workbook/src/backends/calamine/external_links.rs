@@ -13,14 +13,21 @@ use std::collections::BTreeMap;
 use std::io::{BufReader, Read, Seek};
 use zip::ZipArchive;
 
-fn read_member<R: Read + Seek>(archive: &mut ZipArchive<R>, name: &str) -> Option<Vec<u8>> {
+pub(super) fn read_member<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    name: &str,
+) -> Option<Vec<u8>> {
     let mut entry = archive.by_name(name).ok()?;
     let mut bytes = Vec::new();
     entry.read_to_end(&mut bytes).ok()?;
     Some(bytes)
 }
 
-fn local_attr<R>(xml: &XmlReader<R>, start: &BytesStart<'_>, local: &[u8]) -> Option<String> {
+pub(super) fn local_attr<R>(
+    xml: &XmlReader<R>,
+    start: &BytesStart<'_>,
+    local: &[u8],
+) -> Option<String> {
     start
         .attributes()
         .filter_map(Result::ok)

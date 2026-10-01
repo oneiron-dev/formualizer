@@ -1326,6 +1326,7 @@ mod tests_average {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum VisibilityPolicy {
     IncludeAll,
+    ExcludeFilterHidden,
     ExcludeManualOrFilterHidden,
 }
 
@@ -1475,6 +1476,9 @@ impl AggregateCollector {
         };
         let visibility_mask = match visibility_policy {
             VisibilityPolicy::IncludeAll => None,
+            VisibilityPolicy::ExcludeFilterHidden => {
+                ctx.get_row_visibility_mask(view, VisibilityMaskMode::ExcludeFilterHidden)
+            }
             VisibilityPolicy::ExcludeManualOrFilterHidden => {
                 ctx.get_row_visibility_mask(view, VisibilityMaskMode::ExcludeManualOrFilterHidden)
             }
@@ -1718,8 +1722,10 @@ impl Function for SubtotalFn {
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
 
+        // Rows a filter hides are always left out; 101-111 also leave out
+        // rows hidden by hand.
         let (mapped_code, visibility) = if (1..=11).contains(&function_num) {
-            (function_num, VisibilityPolicy::IncludeAll)
+            (function_num, VisibilityPolicy::ExcludeFilterHidden)
         } else if (101..=111).contains(&function_num) {
             (
                 function_num - 100,

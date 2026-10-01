@@ -47,7 +47,7 @@ fn op_expected(function_num_1_to_11: i32, values: &[f64]) -> f64 {
 }
 
 #[test]
-fn subtotal_109_respects_manual_and_filter_hidden_rows() {
+fn subtotal_9_skips_filter_hidden_rows_and_109_skips_both() {
     let mut engine = Engine::new(TestWorkbook::new(), arrow_eval_config());
 
     engine
@@ -81,21 +81,125 @@ fn subtotal_109_respects_manual_and_filter_hidden_rows() {
         .set_row_hidden("Sheet1", 4, true, RowVisibilitySource::Filter)
         .unwrap();
 
+    // Filtered-out rows are always skipped; only 109 skips the manual row.
     engine.evaluate_all().unwrap();
-    assert_num(engine.get_cell_value("Sheet1", 1, 2), 160.0);
+    assert_num(engine.get_cell_value("Sheet1", 1, 2), 130.0);
     assert_num(engine.get_cell_value("Sheet1", 1, 3), 110.0);
 
     engine
         .set_row_hidden("Sheet1", 3, false, RowVisibilitySource::Manual)
         .unwrap();
     engine.evaluate_all().unwrap();
+    assert_num(engine.get_cell_value("Sheet1", 1, 2), 130.0);
     assert_num(engine.get_cell_value("Sheet1", 1, 3), 130.0);
 
     engine
         .set_row_hidden("Sheet1", 4, false, RowVisibilitySource::Filter)
         .unwrap();
     engine.evaluate_all().unwrap();
+    assert_num(engine.get_cell_value("Sheet1", 1, 2), 160.0);
     assert_num(engine.get_cell_value("Sheet1", 1, 3), 160.0);
+}
+
+#[test]
+fn subtotal_1_to_11_keep_manually_hidden_rows() {
+    let mut engine = Engine::new(TestWorkbook::new(), arrow_eval_config());
+    for (row, value) in [(2, 10), (3, 20), (4, 30)] {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Int(value))
+            .unwrap();
+    }
+    engine
+        .set_cell_formula("Sheet1", 1, 2, parse("=SUBTOTAL(9,A2:A4)").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 1, 3, parse("=SUBTOTAL(2,A2:A4)").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 1, 4, parse("=SUM(A2:A4)").unwrap())
+        .unwrap();
+
+    engine
+        .set_row_hidden("Sheet1", 3, true, RowVisibilitySource::Manual)
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_num(engine.get_cell_value("Sheet1", 1, 2), 60.0);
+    assert_num(engine.get_cell_value("Sheet1", 1, 3), 3.0);
+    assert_num(engine.get_cell_value("Sheet1", 1, 4), 60.0);
+
+    // A plain SUM still counts a filtered-out row.
+    engine
+        .set_row_hidden("Sheet1", 4, true, RowVisibilitySource::Filter)
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_num(engine.get_cell_value("Sheet1", 1, 2), 30.0);
+    assert_num(engine.get_cell_value("Sheet1", 1, 3), 2.0);
+    assert_num(engine.get_cell_value("Sheet1", 1, 4), 60.0);
+}
+
+#[test]
+fn subtotal_3_of_a_single_filtered_cell_is_zero() {
+    let mut engine = Engine::new(TestWorkbook::new(), arrow_eval_config());
+    for (row, value) in [(2, "a"), (3, "b"), (4, "c")] {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Text(value.into()))
+            .unwrap();
+    }
+    engine
+        .set_cell_formula("Sheet1", 1, 2, parse("=SUBTOTAL(3,A3)").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula(
+            "Sheet1",
+            1,
+            3,
+            parse("=SUBTOTAL(3,OFFSET(A1,2,0))").unwrap(),
+        )
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 1, 4, parse("=SUBTOTAL(3,A4)").unwrap())
+        .unwrap();
+
+    engine
+        .set_row_hidden("Sheet1", 3, true, RowVisibilitySource::Filter)
+        .unwrap();
+    engine
+        .set_row_hidden("Sheet1", 4, true, RowVisibilitySource::Manual)
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_num(engine.get_cell_value("Sheet1", 1, 2), 0.0);
+    assert_num(engine.get_cell_value("Sheet1", 1, 3), 0.0);
+    assert_num(engine.get_cell_value("Sheet1", 1, 4), 1.0);
+}
+
+#[test]
+fn aggregate_hidden_row_options_skip_filtered_and_manual_rows() {
+    let mut engine = Engine::new(TestWorkbook::new(), arrow_eval_config());
+    for (row, value) in [(2, 10), (3, 20), (4, 30), (5, 100)] {
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Int(value))
+            .unwrap();
+    }
+    for (col, options) in [(2, 1), (3, 3), (4, 5), (5, 7)] {
+        engine
+            .set_cell_formula(
+                "Sheet1",
+                1,
+                col,
+                parse(&format!("=AGGREGATE(9,{options},A2:A5)")).unwrap(),
+            )
+            .unwrap();
+    }
+    engine
+        .set_row_hidden("Sheet1", 3, true, RowVisibilitySource::Manual)
+        .unwrap();
+    engine
+        .set_row_hidden("Sheet1", 4, true, RowVisibilitySource::Filter)
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    for col in 2..=5 {
+        assert_num(engine.get_cell_value("Sheet1", 1, col), 110.0);
+    }
 }
 
 #[test]
@@ -180,12 +284,13 @@ fn subtotal_all_function_codes_match_expected_matrix() {
 
     engine.evaluate_all().unwrap();
 
-    let include_all = [10.0, 20.0, 30.0, 100.0];
+    // 1-11 keep the manually hidden 20 and drop the filtered-out 30.
+    let unfiltered = [10.0, 20.0, 100.0];
     let visible_only = [10.0, 100.0];
 
     let mut verify_col = 2u32;
     for code in 1..=11 {
-        let expected = op_expected(code, &include_all);
+        let expected = op_expected(code, &unfiltered);
         assert_num(engine.get_cell_value("Sheet1", 1, verify_col), expected);
         verify_col += 1;
     }

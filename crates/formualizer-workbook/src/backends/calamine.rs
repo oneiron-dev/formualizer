@@ -5,7 +5,7 @@ use crate::traits::{
 };
 use formualizer_common::{DateSystem, ExcelError, ExcelErrorKind, LiteralValue};
 use parking_lot::RwLock;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -32,6 +32,7 @@ use zip::ZipArchive;
 mod compressed_evidence;
 mod external_links;
 mod formula_replay;
+mod row_visibility;
 
 use compressed_evidence::{EvidenceRecord, MonotonicFormulaEvidence};
 use formula_replay::{
@@ -543,6 +544,7 @@ pub struct CalamineAdapter {
     defined_names: OnceLock<Vec<DefinedName>>,
     external_link_targets: OnceLock<BTreeMap<u32, String>>,
     calc_settings: OnceLock<Option<CalcSettings>>,
+    hidden_rows: OnceLock<HashMap<String, row_visibility::HiddenRows>>,
     load_stats: AdapterLoadStats,
     shadow_relocation_comparator: Option<ShadowRelocationComparator>,
     #[cfg(test)]
@@ -1269,6 +1271,7 @@ impl CalamineAdapter {
             defined_names: OnceLock::new(),
             external_link_targets: OnceLock::new(),
             calc_settings: OnceLock::new(),
+            hidden_rows: OnceLock::new(),
             load_stats: AdapterLoadStats::default(),
             shadow_relocation_comparator: None,
             #[cfg(test)]
@@ -1343,6 +1346,26 @@ impl CalamineAdapter {
             } else {
                 parsed
             }
+        })
+    }
+
+    /// Saved hidden rows of every sheet, split into manual and filter-hidden.
+    fn lazy_hidden_rows(&self) -> &HashMap<String, row_visibility::HiddenRows> {
+        self.hidden_rows.get_or_init(|| {
+            // An Advanced Filter leaves no <autoFilter>; its range is the
+            // sheet's _xlnm._FilterDatabase name.
+            let filter_databases = self
+                .lazy_defined_names()
+                .iter()
+                .filter(|name| name.name.eq_ignore_ascii_case("_xlnm._FilterDatabase"))
+                .filter_map(|name| match &name.definition {
+                    DefinedNameDefinition::Range { address } => {
+                        Some((address.sheet.clone(), (address.start_row, address.end_row)))
+                    }
+                    _ => None,
+                })
+                .collect();
+            row_visibility::scan_hidden_rows(self.cancellable_reader(), &filter_databases)
         })
     }
 
@@ -1899,6 +1922,11 @@ impl SpreadsheetReader for CalamineAdapter {
     }
 
     fn read_sheet(&mut self, sheet: &str) -> Result<SheetData, Self::Error> {
+        let hidden_rows = self
+            .lazy_hidden_rows()
+            .get(sheet)
+            .cloned()
+            .unwrap_or_default();
         // Values
         let mut wb = self.workbook.write();
         let range = wb.worksheet_range(sheet)?;
@@ -1921,10 +1949,8 @@ impl SpreadsheetReader for CalamineAdapter {
             date_system_1904: false, // calamine XLSX currently doesn’t expose this
             merged_cells: Vec::<MergedRange>::new(),
             hidden: false,
-            // Explicit fallback: calamine does not expose row visibility metadata.
-            row_hidden_manual: vec![],
-            // Explicit fallback: filter-hidden row state is unavailable via calamine.
-            row_hidden_filter: vec![],
+            row_hidden_manual: hidden_rows.manual,
+            row_hidden_filter: hidden_rows.filter,
         })
     }
 
@@ -2130,9 +2156,8 @@ where
                 }
                 self.loaded_sheets.insert(n.to_string());
 
-                let row_hidden_manual: &[u32] = &[];
-                let row_hidden_filter: &[u32] = &[];
-                for row in row_hidden_manual {
+                let hidden_rows = self.lazy_hidden_rows().get(n).cloned().unwrap_or_default();
+                for row in &hidden_rows.manual {
                     engine
                         .set_row_hidden(
                             n,
@@ -2142,7 +2167,7 @@ where
                         )
                         .map_err(|e| calamine::Error::Io(std::io::Error::other(e.to_string())))?;
                 }
-                for row in row_hidden_filter {
+                for row in &hidden_rows.filter {
                     engine
                         .set_row_hidden(
                             n,
