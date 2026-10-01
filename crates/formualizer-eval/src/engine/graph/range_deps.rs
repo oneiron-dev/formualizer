@@ -440,10 +440,11 @@ impl DependencyGraph {
             explicit_col: Option<i64>,
         ) -> Option<bool> {
             let (sr, er, sc, ec) = graph.compressed_range_resolved_bounds(range_sheet, range)?;
+            // Mirrors INDEX: an omitted column on a multi-row range selects the entire row.
             let (row, col) = match explicit_col {
                 Some(col) => (position, col),
                 None if sr == er => (1, position),
-                None => (position, 1),
+                None => (position, 0),
             };
             if row < 0 || col < 0 {
                 return Some(false);

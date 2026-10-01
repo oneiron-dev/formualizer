@@ -258,6 +258,97 @@ fn static_index_self_loop_classification_matches_index_reference_semantics() {
 }
 
 #[test]
+fn static_index_self_loop_omitted_column_selects_entire_row() {
+    // INDEX(range, r) on a multi-column range selects the entire row r, so the
+    // row containing the formula is a self-loop and any other row is not.
+    for mode in [
+        FormulaPlaneMode::Off,
+        FormulaPlaneMode::AuthoritativeExperimental,
+    ] {
+        let mut engine = Engine::new(
+            TestWorkbook::new(),
+            EvalConfig::default().with_formula_plane_mode(mode),
+        );
+        for col in 5..=7 {
+            engine
+                .set_cell_value("Sheet1", 2, col, LiteralValue::Int(col as i64))
+                .unwrap();
+        }
+        engine
+            .set_cell_formula("Sheet1", 1, 3, parse("=SUM(INDEX(A1:C100,1))").unwrap())
+            .unwrap();
+        engine
+            .set_cell_formula("Sheet1", 3, 6, parse("=SUM(INDEX(E1:G100,2))").unwrap())
+            .unwrap();
+
+        engine.evaluate_all().unwrap();
+        assert_number(&engine, "Sheet1", 3, 6, 18.0);
+        match engine.get_cell_value("Sheet1", 1, 3) {
+            Some(LiteralValue::Error(error)) => {
+                assert_eq!(error.kind, ExcelErrorKind::Circ, "{mode:?}")
+            }
+            other => panic!("{mode:?} Sheet1!C1: expected #CIRC!, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn index_whole_columns_omitted_column_selects_entire_row() {
+    let mut engine = new_engine();
+    for col in 1..=3 {
+        engine
+            .set_cell_value("Sheet1", 2, col, LiteralValue::Int(col as i64 * 10))
+            .unwrap();
+    }
+    // A dynamic-array formula spills the whole row.
+    engine
+        .set_cell_formula("Sheet1", 5, 5, parse("=INDEX(A:C,2)").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 6, 5, parse("=SUM(INDEX(A:C,2))").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    for (col, expected) in [(5, 10.0), (6, 20.0), (7, 30.0)] {
+        assert_number(&engine, "Sheet1", 5, col, expected);
+    }
+    assert_number(&engine, "Sheet1", 6, 5, 60.0);
+}
+
+#[test]
+fn index_omitted_column_row_under_legacy_array_semantics() {
+    let mut engine = new_engine();
+    for col in 1..=3 {
+        engine
+            .set_cell_value("Sheet1", 2, col, LiteralValue::Int(col as i64 * 10))
+            .unwrap();
+    }
+    // A legacy (CSE) array over E8:G8 fills with the selected row.
+    engine
+        .set_cell_formula("Sheet1", 8, 5, parse("=INDEX(A:C,2)").unwrap())
+        .unwrap();
+    // Ordinary formulas take the implicit intersection of the row reference:
+    // the formula's own column inside A:C, #VALUE! outside it.
+    engine
+        .set_cell_formula("Sheet1", 9, 2, parse("=INDEX(A1:C3,2)").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 9, 5, parse("=INDEX(A1:C3,2)").unwrap())
+        .unwrap();
+    engine.use_legacy_array_semantics();
+    engine.declare_array_formula("Sheet1", 8, 5, 1, 3, false);
+    engine.evaluate_all().unwrap();
+
+    for (col, expected) in [(5, 10.0), (6, 20.0), (7, 30.0)] {
+        assert_number(&engine, "Sheet1", 8, col, expected);
+    }
+    assert_number(&engine, "Sheet1", 9, 2, 20.0);
+    match engine.get_cell_value("Sheet1", 9, 5) {
+        Some(LiteralValue::Error(error)) => assert_eq!(error.kind, ExcelErrorKind::Value),
+        other => panic!("Sheet1!E9: expected #VALUE!, got {other:?}"),
+    }
+}
+
+#[test]
 fn offset_whole_column_and_row_clamped() {
     let mut engine = new_engine();
     engine

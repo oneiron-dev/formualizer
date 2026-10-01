@@ -224,10 +224,12 @@ impl IndexFn {
             Ok(bounds) => bounds,
             Err(error) => return Some(Err(error)),
         };
+        // A lone index selects a column of a single-row reference; otherwise it
+        // selects a row and the omitted column_num acts as 0 (the entire row).
         let (row, col) = match explicit_col {
             Some(col) => (position, col),
             None if sr == er => (1, position),
-            None => (position, 1),
+            None => (position, 0),
         };
         if row < 0 || col < 0 {
             return Some(Err(ExcelError::new(ExcelErrorKind::Ref)));
@@ -361,7 +363,8 @@ impl IndexFn {
 /// - Indexing is 1-based for both `row_num` and `column_num`.
 /// - If `column_num` is omitted for a single-row or single-column input, `row_num` selects the
 ///   position along that 1D vector.
-/// - For rectangular 2D inputs, omitted `column_num` defaults to the first column.
+/// - For inputs with more than one row and column, `row_num` with `column_num` omitted
+///   selects the entire row, like `column_num` = `0` (Excel behavior).
 /// - A `row_num` or `column_num` of `0` selects the entire column or row respectively
 ///   (both `0` selects the whole range), matching Excel.
 /// - Negative or out-of-bounds indexes return `#REF!`.
@@ -402,7 +405,7 @@ impl IndexFn {
 ///   - OFFSET
 /// faq:
 ///   - q: "How does INDEX behave when column_num is omitted?"
-///     a: "For single-row or single-column inputs, row_num selects the position along that vector; for 2D inputs, omitted column_num defaults to the first column."
+///     a: "For single-row or single-column inputs, row_num selects the position along that vector; for 2D inputs, an omitted column_num returns the entire row, like column_num 0."
 ///   - q: "Which errors indicate bad indexes?"
 ///     a: "Non-numeric index arguments return #VALUE!. A 0 row_num/column_num selects an entire column/row (Excel behavior); negative or out-of-bounds indexes return #REF!."
 /// ```
@@ -536,11 +539,11 @@ impl Function for IndexFn {
 
             // Map (index, optional column) to (row, col) exactly like eval_reference:
             // for a single-row input the lone index selects the column, otherwise it
-            // selects the row and the column defaults to 1.
+            // selects the row and the omitted column acts as 0 (the entire row).
             let (row, col) = match explicit_col {
                 Some(c) => (index, c),
                 None if single_row => (1, index),
-                None => (index, 1),
+                None => (index, 0),
             };
 
             // Negative indices are #REF!. A 0 selects the entire row (column_num == 0)
@@ -1347,7 +1350,8 @@ mod tests {
     }
 
     #[test]
-    fn index_rectangular_reference_defaults_omitted_col_to_first_column() {
+    fn index_rectangular_reference_omitted_col_returns_entire_row() {
+        // INDEX(A1:B2, 2) on a 2-D range -> the entire row 2 (A2:B2), like column_num 0.
         let wb = TestWorkbook::new()
             .with_cell_a1("Sheet1", "A1", LiteralValue::Int(10))
             .with_cell_a1("Sheet1", "A2", LiteralValue::Int(20))
@@ -1355,7 +1359,62 @@ mod tests {
             .with_function(std::sync::Arc::new(IndexFn));
 
         let value = evaluate_formula("=INDEX(A1:B2,2)", &wb).unwrap();
-        assert_eq!(value, LiteralValue::Number(20.0));
+        let LiteralValue::Array(rows) = value else {
+            panic!("expected the 1x2 row, got {value:?}");
+        };
+        assert_eq!(rows.len(), 1);
+        let flat: Vec<f64> = rows[0].iter().map(as_number).collect();
+        assert_eq!(flat, vec![20.0, 200.0]);
+
+        let ast = Parser::new("=INDEX(A1:B2,2)").unwrap().parse().unwrap();
+        match interp(&wb).evaluate_ast_as_reference(&ast).expect("ref ok") {
+            ReferenceType::Range {
+                start_row,
+                start_col,
+                end_row,
+                end_col,
+                ..
+            } => assert_eq!(
+                (start_row, start_col, end_row, end_col),
+                (Some(2), Some(1), Some(2), Some(2))
+            ),
+            other => panic!("expected A2:B2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn index_rectangular_reference_omitted_col_matches_zero_col() {
+        let wb = TestWorkbook::new()
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Int(1))
+            .with_cell_a1("Sheet1", "B1", LiteralValue::Int(2))
+            .with_cell_a1("Sheet1", "C1", LiteralValue::Int(3))
+            .with_cell_a1("Sheet1", "A2", LiteralValue::Int(4))
+            .with_cell_a1("Sheet1", "B2", LiteralValue::Int(5))
+            .with_cell_a1("Sheet1", "C2", LiteralValue::Int(6))
+            .with_cell_a1("Sheet1", "A3", LiteralValue::Int(7))
+            .with_function(std::sync::Arc::new(IndexFn))
+            .with_function(std::sync::Arc::new(MatchFn))
+            .with_function(std::sync::Arc::new(crate::builtins::math::aggregate::SumFn));
+
+        for (formula, expected) in [
+            ("=SUM(INDEX(A1:C3,2))", 15.0),
+            ("=SUM(INDEX(A1:C3,2,))", 15.0),
+            ("=SUM(INDEX(A1:C3,2,0))", 15.0),
+            // Both selectors 0 (row 0, column omitted) -> the whole range.
+            ("=SUM(INDEX(A1:C3,0))", 28.0),
+            // The selected row is a reference, so it can end a range.
+            ("=SUM(A1:INDEX(A1:C3,2))", 21.0),
+            ("=MATCH(6,INDEX(A1:C3,2),0)", 3.0),
+        ] {
+            let value = evaluate_formula(formula, &wb).unwrap();
+            assert_eq!(as_number(&value), expected, "{formula}");
+        }
+
+        let value = evaluate_formula("=INDEX(A1:C3,4)", &wb).unwrap();
+        match value {
+            LiteralValue::Error(err) => assert_eq!(err.kind, ExcelErrorKind::Ref),
+            other => panic!("expected #REF!, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1507,6 +1566,49 @@ mod tests {
 
         let value = evaluate_formula("=INDEX({1,2,3},0,2)", &wb).unwrap();
         assert_eq!(as_number(&value), 2.0);
+    }
+
+    #[test]
+    fn index_array_constant_omitted_column_on_2d_returns_entire_row() {
+        // INDEX({1,2,3;4,5,6},2) -> the whole row {4,5,6}, like column_num 0.
+        let wb = TestWorkbook::new().with_function(std::sync::Arc::new(IndexFn));
+
+        for formula in ["=INDEX({1,2,3;4,5,6},2)", "=INDEX({1,2,3;4,5,6},2,)"] {
+            let raw = evaluate_formula(formula, &wb).unwrap();
+            let LiteralValue::Array(rows) = raw else {
+                panic!("{formula}: expected a 1x3 array, got {raw:?}");
+            };
+            assert_eq!(rows.len(), 1, "{formula}");
+            let flat: Vec<f64> = rows[0].iter().map(as_number).collect();
+            assert_eq!(flat, vec![4.0, 5.0, 6.0], "{formula}");
+        }
+
+        // Row 0 with the column omitted selects the whole array.
+        let raw = evaluate_formula("=INDEX({1,2;3,4},0)", &wb).unwrap();
+        let LiteralValue::Array(rows) = raw else {
+            panic!("expected the whole 2x2 array, got {raw:?}");
+        };
+        let flat: Vec<f64> = rows.iter().flatten().map(as_number).collect();
+        assert_eq!(flat, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn index_array_constant_vector_with_omitted_column_selects_element() {
+        // One-row and one-column arrays keep the lone index as a position.
+        let wb = TestWorkbook::new().with_function(std::sync::Arc::new(IndexFn));
+
+        assert_eq!(
+            as_number(&evaluate_formula("=INDEX({1,2,3},2)", &wb).unwrap()),
+            2.0
+        );
+        assert_eq!(
+            as_number(&evaluate_formula("=INDEX({1;2;3},2)", &wb).unwrap()),
+            2.0
+        );
+        assert_eq!(
+            as_number(&evaluate_formula("=INDEX({1,2;3,4},2,1)", &wb).unwrap()),
+            3.0
+        );
     }
 
     #[test]
