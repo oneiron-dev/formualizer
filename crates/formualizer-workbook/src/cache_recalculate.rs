@@ -395,12 +395,6 @@ pub fn recalculate_xlsx_bytes(
             {
                 cache_patches(data, cell, &Cache::Empty, &mut patches);
             }
-            if let Some((span, reference)) = &cell.reanchored_ref {
-                patches.push(Patch {
-                    span: span.clone(),
-                    replacement: reference.clone().into_bytes(),
-                });
-            }
         }
         if !patches.is_empty() {
             view_parts.insert(

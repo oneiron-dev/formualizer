@@ -905,9 +905,47 @@ fn shared_formula_master_below_its_range_start_is_the_expansion_origin() {
         sheet.contains("<f t=\"shared\" si=\"0\"/><v>30</v>"),
         "{sheet}"
     );
-    // A member above or left of the master cannot be expanded from it.
-    let rows = "<row r=\"2\"><c r=\"B2\"><f t=\"shared\" ref=\"A2:B3\" si=\"0\">1</f><v>0</v></c></row>\
-        <row r=\"3\"><c r=\"A3\"><f t=\"shared\" si=\"0\"/><v>0</v></c></row>";
+    // A member above the master, read before it, also shifts from it.
+    let rows = "<row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"B1\"><f t=\"shared\" si=\"0\"/><v>0</v></c></row>\
+        <row r=\"2\"><c r=\"A2\"><v>2</v></c><c r=\"B2\"><f t=\"shared\" ref=\"B1:B3\" si=\"0\">A2*10</f><v>0</v></c></row>\
+        <row r=\"3\"><c r=\"A3\"><v>3</v></c><c r=\"B3\"><f t=\"shared\" si=\"0\"/><v>0</v></c></row>";
+    let out = recalculate_xlsx_bytes(&pack(&parts(rows)), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for (cell, value) in [("B1", 10), ("B3", 30)] {
+        let written = format!("<c r=\"{cell}\"><f t=\"shared\" si=\"0\"/><v>{value}</v>");
+        assert!(sheet.contains(&written), "{sheet}");
+    }
+    assert!(sheet.contains(">A2*10</f><v>20</v>"), "{sheet}");
+}
+#[test]
+fn shared_formula_members_left_of_the_master_shift_from_the_master() {
+    // Excel's shape: the group's first cell (B2) is the master and ref is the
+    // group's bounding box A2:C3. A2 holds its own formula; A3 is a member
+    // one column left of the master, so its relative column shifts by -1.
+    let rows = "<row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"B1\"><v>2</v></c><c r=\"C1\"><v>3</v></c></row>\
+        <row r=\"2\"><c r=\"A2\"><f>A1+1000</f><v>0</v></c><c r=\"B2\"><f t=\"shared\" ref=\"A2:C3\" si=\"0\">B$1*10+$D2</f><v>0</v></c><c r=\"C2\"><f t=\"shared\" si=\"0\"/><v>0</v></c><c r=\"D2\"><v>5</v></c></row>\
+        <row r=\"3\"><c r=\"A3\"><f t=\"shared\" si=\"0\"/><v>0</v></c><c r=\"B3\"><f t=\"shared\" si=\"0\"/><v>0</v></c><c r=\"C3\"><f t=\"shared\" si=\"0\"/><v>0</v></c><c r=\"D3\"><v>7</v></c></row>";
+    let out = recalculate_xlsx_bytes(&pack(&parts(rows)), Default::default()).unwrap();
+    assert_eq!(out.formula_cells, 6);
+    let sheet = member(&out.bytes, SHEET);
+    assert!(
+        sheet.contains("<c r=\"A2\"><f>A1+1000</f><v>1001</v>"),
+        "{sheet}"
+    );
+    assert!(
+        sheet.contains("ref=\"A2:C3\" si=\"0\">B$1*10+$D2</f><v>25</v>"),
+        "{sheet}"
+    );
+    for (cell, value) in [("C2", 35), ("A3", 17), ("B3", 27), ("C3", 37)] {
+        let written = format!("<c r=\"{cell}\"><f t=\"shared\" si=\"0\"/><v>{value}</v>");
+        assert!(sheet.contains(&written), "{sheet}");
+    }
+    // Members and masters outside the declared ref are still refused.
+    let rows = "<row r=\"2\"><c r=\"B2\"><f t=\"shared\" ref=\"B2:B3\" si=\"0\">1</f><v>0</v></c></row>\
+        <row r=\"4\"><c r=\"B4\"><f t=\"shared\" si=\"0\"/><v>0</v></c></row>";
+    reject(&parts(rows));
+    let rows = "<row r=\"2\"><c r=\"B2\"><f t=\"shared\" ref=\"C2:C3\" si=\"0\">1</f><v>0</v></c></row>\
+        <row r=\"3\"><c r=\"C3\"><f t=\"shared\" si=\"0\"/><v>0</v></c></row>";
     reject(&parts(rows));
 }
 #[test]
