@@ -148,6 +148,116 @@ fn textjoin_omitted_ignore_empty_skips_empty_values() {
 }
 
 #[test]
+fn textjoin_uses_range_and_array_delimiters_in_turn() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    // Microsoft's Example 3: a row of delimiters joins a table, commas
+    // between the fields of a row and a semicolon between rows.
+    for (row, values) in [
+        (1, ["Tulsa", "OK", "74133", "US"]),
+        (2, ["Seattle", "WA", "98109", "US"]),
+        (3, ["end", "", "", ""]),
+        (4, [",", ",", ",", ";"]),
+    ] {
+        for (col, value) in (1..).zip(values) {
+            if !value.is_empty() {
+                set_value(&mut engine, row, col, LiteralValue::Text(value.into()));
+            }
+        }
+    }
+    set_formula(&mut engine, 1, 6, "=TEXTJOIN(A4:D4,TRUE,A1:D3)");
+    set_formula(
+        &mut engine,
+        2,
+        6,
+        "=TEXTJOIN({\"-\",\"+\"},TRUE,\"a\",\"b\",\"c\")",
+    );
+    // They start over when they run out, and carry on across arguments.
+    set_formula(
+        &mut engine,
+        3,
+        6,
+        "=TEXTJOIN({\"-\",\"+\"},TRUE,A1:B1,\"c\",\"d\",\"e\")",
+    );
+    // A delimiter is used up only when it is placed: skipped empty values
+    // take none, kept ones do.
+    set_formula(
+        &mut engine,
+        4,
+        6,
+        "=TEXTJOIN({\"1\",\"2\",\"3\"},TRUE,\"a\",\"\",\"b\",\"c\")",
+    );
+    set_formula(
+        &mut engine,
+        5,
+        6,
+        "=TEXTJOIN({\"1\",\"2\",\"3\"},FALSE,\"a\",\"\",\"b\",\"c\")",
+    );
+    // A computed array; numbers and logicals are their text.
+    set_formula(
+        &mut engine,
+        6,
+        6,
+        "=TEXTJOIN(IF({1,0},\"-\",\"+\"),TRUE,\"a\",\"b\",\"c\")",
+    );
+    set_formula(
+        &mut engine,
+        7,
+        6,
+        "=TEXTJOIN({0,TRUE},TRUE,\"a\",\"b\",\"c\")",
+    );
+    // An empty delimiter slot joins with nothing.
+    set_formula(&mut engine, 8, 6, "=TEXTJOIN(,TRUE,\"a\",\"b\")");
+    set_formula(
+        &mut engine,
+        9,
+        6,
+        "=TEXTJOIN({\"-\",#N/A},TRUE,\"a\",\"b\",\"c\")",
+    );
+
+    engine.evaluate_all().expect("evaluate formulas");
+
+    assert_text(&engine, 1, 6, "Tulsa,OK,74133,US;Seattle,WA,98109,US;end");
+    assert_text(&engine, 2, 6, "a-b+c");
+    assert_text(&engine, 3, 6, "Tulsa-OK+c-d+e");
+    assert_text(&engine, 4, 6, "a1b2c");
+    assert_text(&engine, 5, 6, "a12b3c");
+    assert_text(&engine, 6, 6, "a-b+c");
+    assert_text(&engine, 7, 6, "a0bTRUEc");
+    assert_text(&engine, 8, 6, "ab");
+    match engine.get_cell_value("Sheet1", 9, 6) {
+        Some(LiteralValue::Error(error)) => assert_eq!(error.kind, ExcelErrorKind::Na),
+        other => panic!("expected #N/A at F9, got {other:?}"),
+    }
+}
+
+#[test]
+fn textjoin_delimiter_range_reads_row_major_and_counts_blank_cells() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    for (row, col, text) in [(1, 1, "1"), (1, 2, "2"), (2, 1, "3"), (2, 2, "4")] {
+        set_value(&mut engine, row, col, LiteralValue::Text(text.into()));
+    }
+    set_formula(
+        &mut engine,
+        1,
+        4,
+        "=TEXTJOIN(A1:B2,TRUE,\"a\",\"b\",\"c\",\"d\",\"e\",\"f\")",
+    );
+    // A1:A3 ends below the last used row: its blank A3 is an empty
+    // delimiter, so the cycle is "1", "3", "".
+    set_formula(
+        &mut engine,
+        2,
+        4,
+        "=TEXTJOIN(A1:A3,TRUE,\"a\",\"b\",\"c\",\"d\",\"e\")",
+    );
+
+    engine.evaluate_all().expect("evaluate formulas");
+
+    assert_text(&engine, 1, 4, "a1b2c3d4e1f");
+    assert_text(&engine, 2, 4, "a1b3cd1e");
+}
+
+#[test]
 fn expanded_formula_range_propagates_later_error_and_concatenate_stays_scalar() {
     let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
     set_value(&mut engine, 1, 1, LiteralValue::Text("first".into()));

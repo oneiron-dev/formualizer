@@ -15,12 +15,21 @@ static ARG_ANY_RANGE_ONE: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
 });
 
 static TEXTJOIN_ARGS: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-    vec![ArgSchema::any(), ArgSchema::any(), {
-        let mut schema = ArgSchema::any();
-        schema.shape = ShapeKind::Range;
-        schema.repeating = Some(1);
-        schema
-    }]
+    // The delimiter may be a range or array of delimiters.
+    vec![
+        {
+            let mut schema = ArgSchema::any();
+            schema.shape = ShapeKind::Range;
+            schema
+        },
+        ArgSchema::any(),
+        {
+            let mut schema = ArgSchema::any();
+            schema.shape = ShapeKind::Range;
+            schema.repeating = Some(1);
+            schema
+        },
+    ]
 });
 
 const MAX_CONCAT_RESULT_CHARS: usize = 32_767;
@@ -119,6 +128,62 @@ fn for_each_expanded_value(
         ResolvedArgument::Value(CalcValue::Callable(_)) => visitor(&LiteralValue::Error(
             ExcelError::new(ExcelErrorKind::Calc).with_message("LAMBDA value must be invoked"),
         )),
+    }
+}
+
+/// TEXTJOIN's delimiters. A range or array supplies one delimiter per cell,
+/// in row-major order; they are used in turn between the joined items and
+/// start again from the first when they run out.
+struct Delimiters {
+    /// The delimiters read from the cells, a row-major prefix of all of them.
+    texts: Vec<String>,
+    /// How many cells the delimiter covers; those past `texts` are blank.
+    count: usize,
+}
+
+impl Delimiters {
+    fn read(arg: &ArgumentHandle<'_, '_>) -> Result<Self, ExcelError> {
+        let mut texts = Vec::new();
+        let count = match arg.resolve_once_for_text()? {
+            ResolvedArgument::Range(view) | ResolvedArgument::Value(CalcValue::Range(view)) => {
+                // A walk stops at the sheet's last stored row; the blank
+                // cells below it still count as empty delimiters.
+                view.for_each_cell(&mut |value| {
+                    texts.push(literal_to_text(value)?);
+                    Ok(())
+                })?;
+                let (rows, cols) = view.dims();
+                rows.saturating_mul(cols)
+            }
+            ResolvedArgument::ReferenceError(error) => return Err(error),
+            ResolvedArgument::Value(CalcValue::Scalar(LiteralValue::Array(rows))) => {
+                for value in rows.iter().flatten() {
+                    texts.push(literal_to_text(value)?);
+                }
+                texts.len()
+            }
+            ResolvedArgument::Value(
+                CalcValue::Scalar(value) | CalcValue::AnnotatedScalar(value, _),
+            ) => {
+                texts.push(literal_to_text(&value)?);
+                1
+            }
+            ResolvedArgument::Value(CalcValue::Callable(_)) => {
+                return Err(ExcelError::new(ExcelErrorKind::Calc)
+                    .with_message("LAMBDA value must be invoked"));
+            }
+        };
+        Ok(Self { texts, count })
+    }
+
+    /// The `index`-th delimiter placed in the result (0-based).
+    fn nth(&self, index: usize) -> &str {
+        if self.count == 0 {
+            return "";
+        }
+        self.texts
+            .get(index % self.count)
+            .map_or("", String::as_str)
     }
 }
 
@@ -563,6 +628,8 @@ pub struct TextJoinFn;
 /// - `ignore_empty=TRUE` skips empty strings and empty cells.
 /// - `ignore_empty=FALSE` includes empty items, which can produce adjacent delimiters.
 /// - Text ranges and arrays are flattened in row-major order.
+/// - A range or array delimiter supplies its cells, row-major, as delimiters
+///   used in turn between the joined items, starting over when they run out.
 /// - Delimiter and values are coerced to text.
 /// - Any error in inputs propagates immediately.
 /// - Results longer than 32,767 characters return `#VALUE!`.
@@ -581,6 +648,12 @@ pub struct TextJoinFn;
 /// expected: "a--c"
 /// ```
 ///
+/// ```yaml,sandbox
+/// title: "Delimiters used in turn"
+/// formula: '=TEXTJOIN({"-","+"}, TRUE, "a", "b", "c", "d")'
+/// expected: "a-b+c-d"
+/// ```
+///
 /// ```yaml,docs
 /// related:
 ///   - CONCAT
@@ -596,8 +669,8 @@ pub struct TextJoinFn;
 /// Min args: 3
 /// Max args: variadic
 /// Variadic: true
-/// Signature: TEXTJOIN(arg1: any@scalar, arg2: any@scalar, arg3...: any@range)
-/// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=any,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=Some(1),default=false}
+/// Signature: TEXTJOIN(arg1: any@range, arg2: any@scalar, arg3...: any@range)
+/// Arg schema: arg1{kinds=any,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=any,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=Some(1),default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for TextJoinFn {
@@ -625,8 +698,8 @@ impl Function for TextJoinFn {
             )));
         }
 
-        // Get delimiter
-        let delimiter = to_text(&args[0])?;
+        // A range or array delimiter supplies delimiters used in turn.
+        let delimiters = Delimiters::read(&args[0])?;
 
         // Get ignore_empty flag; an empty slot, TEXTJOIN(",",,...), skips
         // empty values as TRUE does.
@@ -645,46 +718,37 @@ impl Function for TextJoinFn {
 
         let mut out = String::new();
         let mut out_chars = 0;
-        let mut has_item = false;
+        // Items joined so far; the n-th delimiter goes before item n + 1.
+        let mut joined = 0usize;
         for arg in args.iter().skip(2) {
             let mut cell_error = None;
             let visit_result = for_each_expanded_value(arg, &mut |value| {
-                match value {
+                let text = match value {
                     LiteralValue::Error(e) => {
                         cell_error = Some(e.clone());
                         return Err(e.clone());
                     }
-                    LiteralValue::Empty => {
-                        if !ignore_empty {
-                            if has_item {
-                                append_with_limit(&mut out, &mut out_chars, &delimiter)?;
-                            }
-                            has_item = true;
+                    LiteralValue::Empty => String::new(),
+                    LiteralValue::Text(t) => t.clone(),
+                    LiteralValue::Boolean(b) => {
+                        if *b {
+                            "TRUE".to_string()
+                        } else {
+                            "FALSE".to_string()
                         }
                     }
-                    value => {
-                        let s = match value {
-                            LiteralValue::Text(t) => t.clone(),
-                            LiteralValue::Boolean(b) => {
-                                if *b {
-                                    "TRUE".to_string()
-                                } else {
-                                    "FALSE".to_string()
-                                }
-                            }
-                            LiteralValue::Int(i) => i.to_string(),
-                            LiteralValue::Number(f) => f.to_string(),
-                            _ => value.to_string(),
-                        };
-                        if !ignore_empty || !s.is_empty() {
-                            if has_item {
-                                append_with_limit(&mut out, &mut out_chars, &delimiter)?;
-                            }
-                            append_with_limit(&mut out, &mut out_chars, &s)?;
-                            has_item = true;
-                        }
-                    }
+                    LiteralValue::Int(i) => i.to_string(),
+                    LiteralValue::Number(f) => f.to_string(),
+                    value => value.to_string(),
+                };
+                if ignore_empty && text.is_empty() {
+                    return Ok(());
                 }
+                if joined > 0 {
+                    append_with_limit(&mut out, &mut out_chars, delimiters.nth(joined - 1))?;
+                }
+                append_with_limit(&mut out, &mut out_chars, &text)?;
+                joined += 1;
                 Ok(())
             });
             if let Some(error) = cell_error {
@@ -1133,7 +1197,7 @@ mod tests {
     fn concat_textjoin_and_concatenate_publish_matching_shapes() {
         assert_eq!(ConcatFn.arg_schema()[0].shape, ShapeKind::Range);
         assert_eq!(ConcatenateFn.arg_schema()[0].shape, ShapeKind::Scalar);
-        assert_eq!(TextJoinFn.arg_schema()[0].shape, ShapeKind::Scalar);
+        assert_eq!(TextJoinFn.arg_schema()[0].shape, ShapeKind::Range);
         assert_eq!(TextJoinFn.arg_schema()[1].shape, ShapeKind::Scalar);
         assert_eq!(TextJoinFn.arg_schema()[2].shape, ShapeKind::Range);
         assert_eq!(TextJoinFn.arg_schema()[2].repeating, Some(1));

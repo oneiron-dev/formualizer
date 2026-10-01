@@ -17047,7 +17047,7 @@
     "variadic": false
   },
   "text/textjoin": {
-    "argSchema": "arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=any,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=Some(1),default=false}",
+    "argSchema": "arg1{kinds=any,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=any,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=Some(1),default=false}",
     "args": [
       {
         "by_ref": false,
@@ -17060,7 +17060,7 @@
         "name": "arg1",
         "repeating": null,
         "required": true,
-        "shape": "scalar"
+        "shape": "range"
       },
       {
         "by_ref": false,
@@ -17099,7 +17099,7 @@
     "name": "TEXTJOIN",
     "registrationSource": "crates/formualizer-eval/src/builtins/text/trim_case_concat.rs",
     "shortSummary": "Joins text values using a delimiter, with optional empty-value filtering.",
-    "signature": "TEXTJOIN(arg1: any@scalar, arg2: any@scalar, arg3...: any@range)",
+    "signature": "TEXTJOIN(arg1: any@range, arg2: any@scalar, arg3...: any@range)",
     "typeName": "TextJoinFn",
     "variadic": true
   },
