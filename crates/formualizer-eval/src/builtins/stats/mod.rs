@@ -194,6 +194,8 @@ pub(crate) fn percentile_exc(nums: &mut [f64], p: f64) -> Result<f64, ExcelError
 /// - Any non-zero `order` ranks values in ascending order.
 /// - Tied values receive the same rank (the first matching position in the sorted list).
 /// - Returns `#N/A` if `number` is not found in `ref`.
+/// - Returns `#VALUE!` if `number` or `order` is text that does not read as a number; an error in
+///   either is returned as is.
 ///
 /// # Examples
 ///
@@ -263,18 +265,16 @@ impl Function for RankEqFn {
                 ExcelError::new_na(),
             )));
         }
-        // An error in `number` or `order` is the result, as in Excel.
+        // `number` and `order` are scalar numbers: an error is the result and
+        // text that does not read as a number is #VALUE!. #N/A is only for a
+        // numeric `number` missing from `ref`.
         let t0 = args[0].value()?.into_literal();
         if let LiteralValue::Error(e) = t0 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
         }
         let target = match coerce_num(&t0) {
             Ok(n) => n,
-            Err(_) => {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                    ExcelError::new_na(),
-                )));
-            }
+            Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
         // optional order arg at end if 3 args
         let order = if args.len() >= 3 {
@@ -282,7 +282,10 @@ impl Function for RankEqFn {
             if let LiteralValue::Error(e) = ord {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
             }
-            coerce_num(&ord).unwrap_or(0.0)
+            match coerce_num(&ord) {
+                Ok(n) => n,
+                Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+            }
         } else {
             0.0
         };
@@ -322,6 +325,8 @@ impl Function for RankEqFn {
 /// - Any non-zero `order` ranks values in ascending order.
 /// - If `number` appears multiple times, the function returns the mean of those rank positions.
 /// - Returns `#N/A` if `number` is not found in `ref`.
+/// - Returns `#VALUE!` if `number` or `order` is text that does not read as a number; an error in
+///   either is returned as is.
 ///
 /// # Examples
 ///
@@ -388,25 +393,24 @@ impl Function for RankAvgFn {
                 ExcelError::new_na(),
             )));
         }
-        // An error in `number` or `order` is the result, as in Excel.
+        // Same argument rules as RANK.EQ.
         let t0 = scalar_like_value(&args[0])?;
         if let LiteralValue::Error(e) = t0 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
         }
         let target = match coerce_num(&t0) {
             Ok(n) => n,
-            Err(_) => {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                    ExcelError::new_na(),
-                )));
-            }
+            Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
         let order = if args.len() >= 3 {
             let ord = scalar_like_value(&args[2])?;
             if let LiteralValue::Error(e) = ord {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
             }
-            coerce_num(&ord).unwrap_or(0.0)
+            match coerce_num(&ord) {
+                Ok(n) => n,
+                Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+            }
         } else {
             0.0
         };
@@ -11027,6 +11031,71 @@ mod tests_basic_stats {
                 LiteralValue::Error(e) => assert!(e.to_string().contains("#N/A")),
                 other => panic!("expected #N/A {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn rank_number_and_order_are_scalar_numbers() {
+        use formualizer_common::ExcelErrorKind;
+        let wb = TestWorkbook::new()
+            .with_function(std::sync::Arc::new(RankEqFn))
+            .with_function(std::sync::Arc::new(RankAvgFn))
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Number(30.0))
+            .with_cell_a1("Sheet1", "A2", LiteralValue::Number(20.0))
+            .with_cell_a1("Sheet1", "A3", LiteralValue::Number(10.0))
+            .with_cell_a1("Sheet1", "B1", LiteralValue::Text("-".into()))
+            .with_cell_a1("Sheet1", "B2", LiteralValue::Text("20".into()))
+            .with_cell_a1("Sheet1", "B3", LiteralValue::Error(ExcelError::new_div()))
+            .with_cell_a1("Sheet1", "C1", LiteralValue::Empty);
+        let ctx = interp(&wb);
+        let eval = |f: &str| {
+            ctx.evaluate_ast(&formualizer_parse::parser::parse(f).unwrap())
+                .unwrap()
+                .into_literal()
+        };
+        let kind = |f: String| match eval(&f) {
+            LiteralValue::Error(e) => Some(e.kind),
+            _ => None,
+        };
+        for name in ["RANK", "RANK.EQ", "RANK.AVG"] {
+            // Text that does not read as a number is #VALUE!, not #N/A.
+            assert_eq!(
+                kind(format!("={name}(B1,A1:A3)")),
+                Some(ExcelErrorKind::Value)
+            );
+            assert_eq!(
+                kind(format!("={name}(\"abc\",A1:A3,0)")),
+                Some(ExcelErrorKind::Value)
+            );
+            assert_eq!(
+                kind(format!("={name}(20,A1:A3,\"x\")")),
+                Some(ExcelErrorKind::Value)
+            );
+            // An error in number or order is returned as is.
+            assert_eq!(
+                kind(format!("={name}(B3,A1:A3)")),
+                Some(ExcelErrorKind::Div)
+            );
+            assert_eq!(
+                kind(format!("={name}(20,A1:A3,B3)")),
+                Some(ExcelErrorKind::Div)
+            );
+            // Unchanged: numeric text ranks as its number, a blank number is 0,
+            // and a numeric number missing from ref is #N/A.
+            assert_eq!(
+                eval(&format!("={name}(B2,A1:A3)")),
+                LiteralValue::Number(2.0)
+            );
+            assert_eq!(
+                eval(&format!("={name}(\"20\",A1:A3,1)")),
+                LiteralValue::Number(2.0)
+            );
+            assert_eq!(
+                eval(&format!("={name}(30,A1:A3,C1)")),
+                LiteralValue::Number(1.0)
+            );
+            assert_eq!(kind(format!("={name}(C1,A1:A3)")), Some(ExcelErrorKind::Na));
+            assert_eq!(kind(format!("={name}(25,A1:A3)")), Some(ExcelErrorKind::Na));
         }
     }
 
