@@ -8,13 +8,18 @@
 //!   sorted. This matches LibreOffice behavior and prevents silently wrong
 //!   results. Excel documents approximate results on unsorted data as "may not
 //!   be correct" rather than erroring; we choose safety. See issue #283.
+//!   A text lookup value is exempt: it bisects like Excel without the order
+//!   check (see `approximate_search_checks_order`).
 //! - Binary search used for approximate modes for efficiency; linear scan for exact or when data has fewer than 8 searchable elements to avoid overhead.
 //! - VLOOKUP/HLOOKUP wrap MATCH logic; VLOOKUP: vertical first column; HLOOKUP: horizontal first row.
 //! - Error handling: lookup-value errors propagate; error cells in approximate lookup vectors are skipped.
 //! - Type coercion: text comparison is case-insensitive. Approximate modes compare the lookup
 //!   value only with entries of its own type (number, text or logical); the others are skipped.
 
-use super::lookup_utils::{SearchedVector, cmp_for_approximate, find_exact_index};
+use super::lookup_utils::{
+    SearchedVector, approximate_search_checks_order, cmp_for_approximate, excel_approximate_search,
+    find_exact_index,
+};
 use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
 use crate::engine::{DateSystem, lookup_index_cache::LookupAxis};
 use crate::function::Function;
@@ -37,6 +42,8 @@ use formualizer_macros::func_caps;
 /// is not. This keeps the array-literal MATCH branch consistent with the
 /// reference branch and with VLOOKUP/HLOOKUP, all of which refuse unsorted
 /// approximate data rather than returning a silently wrong row. (#283)
+/// A text lookup value skips the check and bisects like Excel (see
+/// [`approximate_search_checks_order`]).
 fn binary_search_match(
     slice: &[LiteralValue],
     needle: &LiteralValue,
@@ -47,6 +54,9 @@ fn binary_search_match(
         return Ok(None);
     }
     let searched = SearchedVector::new(slice, needle, date_system)?;
+    if !approximate_search_checks_order(needle) {
+        return Ok(excel_approximate_search(&searched, needle, mode == -1));
+    }
 
     let is_sorted = match mode {
         1 => searched.is_sorted_ascending(),
@@ -122,7 +132,7 @@ pub struct MatchFn;
 /// - Exact matching never selects a blank candidate. A blank lookup value retains numeric-zero semantics and can select a real numeric zero, but not blank, text, or boolean candidates.
 /// - `match_type=1` looks for the largest value less than or equal to the lookup value.
 /// - `match_type=-1` looks for the smallest value greater than or equal to the lookup value.
-/// - Approximate modes require sorted data. MATCH detects unsorted input and returns `#N/A`, matching the same guard applied by VLOOKUP and HLOOKUP.
+/// - Approximate modes require sorted data. MATCH detects unsorted input and returns `#N/A`, matching the same guard applied by VLOOKUP and HLOOKUP. A text lookup value is not checked: it bisects like Excel, so text keys out of text order (such as "1".."10") give Excel's answer.
 /// - If no match is found, returns `#N/A`.
 ///
 /// # Examples
@@ -154,7 +164,7 @@ pub struct MatchFn;
 ///   - VLOOKUP
 /// faq:
 ///   - q: "Why does MATCH with match_type 1 or -1 return #N/A on unsorted data?"
-///     a: "Approximate modes assume ordered lookup data; this implementation treats detected unsorted inputs as no valid match and returns #N/A."
+///     a: "Approximate modes assume ordered lookup data; this implementation treats detected unsorted inputs as no valid match and returns #N/A. A text lookup value is not checked and bisects like Excel."
 ///   - q: "When are wildcards interpreted in MATCH?"
 ///     a: "Wildcard patterns (*, ?, ~ escapes) are only applied in exact mode (match_type=0) for text lookup values."
 /// ```
@@ -326,6 +336,15 @@ impl Function for MatchFn {
                             }
                         };
 
+                    // A text search bisects like Excel, without the #283 order check.
+                    if !approximate_search_checks_order(&lookup_value) {
+                        let idx = excel_approximate_search(&searched, &lookup_value, mt == -1);
+                        return Ok(crate::traits::CalcValue::Scalar(match idx {
+                            Some(i) => LiteralValue::Int((i + 1) as i64),
+                            None => LiteralValue::Error(ExcelError::new(ExcelErrorKind::Na)),
+                        }));
+                    }
+
                     // Lightweight unsorted detection for approximate modes
                     let is_sorted = if mt == 1 {
                         searched.is_sorted_ascending()
@@ -475,7 +494,7 @@ pub struct VLookupFn;
 /// - `range_lookup` defaults to `TRUE`, matching Excel and LibreOffice.
 /// - When `range_lookup=TRUE`, approximate match logic is used against the first column.
 /// - In exact mode, a blank candidate never matches. A blank lookup value matches a real numeric zero, but not blank, text, or boolean candidates.
-/// - Approximate matching assumes the first column is sorted ascending. Unsorted data is detected and returns `#N/A` rather than a silently wrong row, matching LibreOffice Calc (#283).
+/// - Approximate matching assumes the first column is sorted ascending. Unsorted data is detected and returns `#N/A` rather than a silently wrong row, matching LibreOffice Calc (#283). A text lookup value is not checked: it bisects like Excel.
 /// - Numeric `range_lookup` values use logical coercion: zero is exact and nonzero is approximate.
 /// - If the lookup value is not found, returns `#N/A`.
 /// - If `col_index_num` is invalid, returns `#REF!` (or `#VALUE!` if non-numeric).
@@ -735,7 +754,7 @@ pub struct HLookupFn;
 /// - `range_lookup` defaults to `TRUE`, matching Excel and LibreOffice.
 /// - When `range_lookup=TRUE`, approximate match logic is used against the first row.
 /// - In exact mode, a blank candidate never matches. A blank lookup value matches a real numeric zero, but not blank, text, or boolean candidates.
-/// - Approximate matching assumes the first row is sorted ascending. Unsorted data is detected and returns `#N/A` rather than a silently wrong column, matching LibreOffice Calc (#283).
+/// - Approximate matching assumes the first row is sorted ascending. Unsorted data is detected and returns `#N/A` rather than a silently wrong column, matching LibreOffice Calc (#283). A text lookup value is not checked: it bisects like Excel.
 /// - Numeric `range_lookup` values use logical coercion: zero is exact and nonzero is approximate.
 /// - If the lookup value is not found, returns `#N/A`.
 /// - If `row_index_num` is invalid, returns `#REF!` (or `#VALUE!` if non-numeric).

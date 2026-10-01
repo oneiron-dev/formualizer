@@ -271,6 +271,95 @@ impl<'a> SearchedVector<'a> {
                 .is_some_and(|c| c >= 0)
         })
     }
+
+    /// The first searched entry at or after `position` in the original
+    /// vector, as an index into this projection.
+    fn first_at_or_after(&self, position: usize) -> Option<usize> {
+        let index = match &self.positions {
+            Some(positions) => positions.partition_point(|&p| p < position),
+            None => position,
+        };
+        (index < self.len()).then_some(index)
+    }
+}
+
+/// Whether the engine checks that the lookup vector is in order before an
+/// approximate search for `needle` and answers `#N/A` when it is not (#283).
+///
+/// Excel never checks the order: it bisects, and on data out of order the
+/// answer is wherever the probes lead. The engine keeps the #283 guard for
+/// numbers and logicals, but a text search bisects as Excel does (see
+/// [`excel_approximate_search`]). Text keys are often kept in an order that is
+/// not text order, such as IDs "1".."10" stored in numeric order, which Excel
+/// compares as text ("10" < "9") and still answers from, and the engine's
+/// case-insensitive comparison does not reproduce the collation Excel sorts
+/// text by (its documented sort order ignores hyphens and apostrophes, for
+/// one), so text that Excel's own sort put in order could look unsorted to
+/// the guard.
+pub fn approximate_search_checks_order(needle: &LiteralValue) -> bool {
+    !matches!(needle, LiteralValue::Text(_))
+}
+
+/// Excel's bisection for an approximate search (`MATCH` with `match_type`
+/// 1/-1, `VLOOKUP`/`HLOOKUP` with `range_lookup` TRUE) without any order
+/// check. Returns the position in the original vector.
+///
+/// Excel bisects the vector with inclusive bounds and a floor midpoint. A
+/// probe that lands on an entry the search skips (see [`cmp_for_approximate`])
+/// moves forward to the next searched entry; when there is none up to the
+/// upper bound, the search continues in the lower half. An exact hit is kept
+/// in preference to any inexact one, and the search goes on towards the end of
+/// the run of equal entries that Excel returns: the last for an ascending
+/// search, the first for a descending one. Otherwise the answer is the last
+/// probed entry below (ascending) or above (descending) the lookup value, and
+/// `None` when no probe qualified. On ordered data this is the entry the
+/// documented rule names; on data out of order it is wherever the probes lead.
+pub fn excel_approximate_search(
+    searched: &SearchedVector<'_>,
+    needle: &LiteralValue,
+    descending: bool,
+) -> Option<usize> {
+    let len = searched.values.len();
+    if searched.is_empty() || len == 0 {
+        return None;
+    }
+    let (mut lo, mut hi) = (0usize, len - 1);
+    let (mut exact, mut nearest) = (None, None);
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        let probe = searched
+            .first_at_or_after(mid)
+            .map(|index| (index, searched.original_position(index)))
+            .filter(|&(_, position)| position <= hi);
+        // Nothing searched from the midpoint to the upper bound: go left.
+        let Some((index, position)) = probe else {
+            if mid == 0 {
+                break;
+            }
+            hi = mid - 1;
+            continue;
+        };
+        let c = cmp_for_approximate(searched.get(index), needle, searched.date_system)
+            .expect("SearchedVector contains only entries comparable with the lookup value");
+        let towards_end = if c == 0 {
+            exact = Some(position);
+            !descending
+        } else {
+            let qualifies = (c < 0) != descending;
+            if qualifies {
+                nearest = Some(position);
+            }
+            qualifies
+        };
+        if towards_end {
+            lo = position + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    exact.or(nearest)
 }
 
 /// Detect ascending sort (strict or equal allowed) for slice according to cmp_for_lookup.

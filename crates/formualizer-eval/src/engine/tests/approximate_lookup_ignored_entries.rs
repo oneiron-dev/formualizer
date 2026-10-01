@@ -628,3 +628,60 @@ fn numeric_text_and_logical_needles_search_their_own_type() {
         assert_number(eval(&mut engine, formula), expected, formula);
     }
 }
+
+/// Text keys stored in numeric order ("1".."10") are out of text order, since
+/// Excel compares text with text as text ("10" < "2"). Excel never checks the
+/// order of an approximate search: it bisects, and for "5" every probe lands
+/// on "3".."8" before settling on "5", so MATCH gives 5 and VLOOKUP the value
+/// beside it. The engine's #283 unsorted guard does not apply to a text
+/// lookup value, which bisects like Excel instead of answering #N/A.
+#[test]
+fn text_keys_out_of_text_order_are_bisected_not_rejected() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    for i in 1..=10u32 {
+        engine
+            .set_cell_value("Sheet1", i, 4, LiteralValue::Text(i.to_string()))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", i, 5, LiteralValue::Int(i as i64 * 100))
+            .unwrap();
+    }
+    let keys = (1..=10).map(|i| format!("\"{i}\"")).collect::<Vec<_>>();
+    let column = keys.join(";");
+    let table_row = format!(
+        "{};{}",
+        keys.join(","),
+        (1..=10)
+            .map(|i| (i * 100).to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    for (formula, expected) in [
+        ("=MATCH(\"5\",D1:D10,1)".to_string(), 5.0),
+        ("=MATCH(\"5\",D1:D10)".to_string(), 5.0),
+        ("=MATCH(\"5\",D:D,1)".to_string(), 5.0),
+        (format!("=MATCH(\"5\",{{{column}}},1)"), 5.0),
+        ("=VLOOKUP(\"5\",D1:E10,2)".to_string(), 500.0),
+        ("=VLOOKUP(\"5\",D:E,2,TRUE)".to_string(), 500.0),
+        (format!("=HLOOKUP(\"5\",{{{table_row}}},2,TRUE)"), 500.0),
+        // Descending search over the same keys: "10" sorts below "5" as text
+        // but is never probed; the run of qualifying entries ends at "5".
+        (
+            "=MATCH(\"5\",{\"10\";\"9\";\"8\";\"7\";\"6\";\"5\";\"4\";\"3\";\"2\";\"1\"},-1)"
+                .to_string(),
+            6.0,
+        ),
+        // A short vector is bisected too, not scanned for the last entry
+        // <= "10": the first probe "2" is above "10", so the answer is "1".
+        ("=MATCH(\"10\",{\"1\";\"2\";\"10\"},1)".to_string(), 1.0),
+        // Keys in text order are unchanged.
+        ("=MATCH(\"10\",{\"1\";\"10\";\"2\"},1)".to_string(), 2.0),
+    ] {
+        assert_number(eval(&mut engine, &formula), expected, &formula);
+    }
+    // A text needle below every probed key still finds nothing.
+    assert_na(
+        eval(&mut engine, "=MATCH(\"0\",D1:D10,1)"),
+        "MATCH(\"0\",D1:D10,1)",
+    );
+}
