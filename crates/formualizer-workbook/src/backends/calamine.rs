@@ -438,8 +438,7 @@ struct StreamedSheet {
 fn data_ref_to_literal(value: &DataRef<'_>, date_system: DateSystem) -> Option<LiteralValue> {
     match value {
         DataRef::Empty => None,
-        DataRef::String(s) if s.is_empty() => None,
-        DataRef::SharedString("") => None,
+        // A cell holding empty text ("") is text, not blank (ISBLANK is FALSE).
         DataRef::String(s) => Some(LiteralValue::Text(s.clone())),
         DataRef::SharedString(s) => Some(LiteralValue::Text((*s).to_string())),
         DataRef::Float(f) => Some(LiteralValue::Number(*f)),
@@ -470,8 +469,6 @@ fn data_ref_to_literal(value: &DataRef<'_>, date_system: DateSystem) -> Option<L
 fn data_ref_to_overlay(value: &DataRef<'_>) -> Option<OverlayValue> {
     match value {
         DataRef::Empty => None,
-        DataRef::String(s) if s.is_empty() => None,
-        DataRef::SharedString("") => None,
         DataRef::String(s) => Some(OverlayValue::Text(Arc::from(s.as_str()))),
         DataRef::SharedString(s) => Some(OverlayValue::Text(Arc::from(*s))),
         DataRef::Float(f) => Some(OverlayValue::Number(*f)),
@@ -1753,10 +1750,9 @@ impl CalamineAdapter {
             let excel_row = (row + start_row + 1) as u32;
             let excel_col = (col + start_col + 1) as u32;
 
-            // Convert value (skip empty cells and empty strings)
+            // Convert value (skip empty cells; empty text "" is text, not blank)
             let value = match val {
                 Data::Empty => None,
-                Data::String(s) if s.is_empty() => None, // Treat empty strings as no value
                 Data::String(s) => Some(LiteralValue::Text(s.clone())),
                 Data::Float(f) => Some(LiteralValue::Number(*f)),
                 Data::Int(i) => Some(LiteralValue::Int(*i)),
