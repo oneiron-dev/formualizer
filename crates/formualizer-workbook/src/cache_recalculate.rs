@@ -1,5 +1,6 @@
 //! Strict cache-only XLSX recalculation, without a rich document model.
 //! Unsupported package/formula cases fail before any output is published.
+mod calc_always;
 mod package;
 mod sheet;
 mod xml;
@@ -341,7 +342,8 @@ pub fn recalculate_xlsx_bytes(
     options: XlsxRecalculateOptions,
 ) -> Result<XlsxRecalculateResult, IoError> {
     let mut archive = package::admit(bytes, &options)?;
-    let (sheets, date_system, extension) = package::discover(&mut archive, &options)?;
+    let (sheets, date_system, extension, defined_names) =
+        package::discover(&mut archive, &options)?;
     let mut plans = Vec::new();
     let mut observed = 0;
     let mut logical_cells = 0u64;
@@ -497,6 +499,8 @@ pub fn recalculate_xlsx_bytes(
         engine.evaluate_all()?;
     }
     checkpoint(&options.cancel)?;
+    let calc_always = calc_always::calc_always(&engine, &sheets, &plans, &defined_names)?;
+    checkpoint(&options.cancel)?;
     let coerced: HashSet<_> = engine
         .formula_parse_diagnostics()
         .iter()
@@ -512,7 +516,7 @@ pub fn recalculate_xlsx_bytes(
             .ok_or_else(|| unsupported("ZIP expanded-size overflow", "workbook"))?,
     )
     .map_err(|_| unsupported("ZIP expanded-size overflow", "workbook"))?;
-    for (sheet, (data, scan)) in sheets.iter().zip(plans) {
+    for (s, (sheet, (data, scan))) in sheets.iter().zip(plans).enumerate() {
         let mut patches = Vec::new();
         // Evaluated array extent (rows, cols) per anchor index.
         let mut array_results: BTreeMap<usize, (u32, u32)> = BTreeMap::new();
@@ -598,9 +602,20 @@ pub fn recalculate_xlsx_bytes(
                 changed += 1;
                 cache_patches(&data, cell, &cache, &mut patches);
             }
+            // A flag is not a cache: only patched values count.
+            if calc_always.cells[s][index] && !cell.calc_always {
+                patches.push(calc_always_patch(cell));
+            }
         }
-        changed +=
-            array_member_patches(&engine, sheet, &data, &scan, &array_results, &mut patches)?;
+        changed += array_member_patches(
+            &engine,
+            sheet,
+            &data,
+            &scan,
+            &array_results,
+            &calc_always.members[s],
+            &mut patches,
+        )?;
         if !patches.is_empty() {
             let patched = apply_patches(&data, patches, options.limits.max_worksheet_bytes)?;
             expanded = expanded
@@ -636,18 +651,33 @@ pub fn recalculate_xlsx_bytes(
     })
 }
 
+/// Flag a formula calculated always. Excel writes `ca="1"` after the
+/// formula's type and extent and before its shared-formula index.
+fn calc_always_patch(cell: &sheet::Cell) -> Patch {
+    let (span, replacement): (_, &[u8]) = match (&cell.calc_always_attr, cell.shared_index_attr) {
+        (Some(span), _) => (span.clone(), b"ca=\"1\""),
+        (None, Some(at)) => (at..at, b"ca=\"1\" "),
+        (None, None) => (cell.formula_attrs_end..cell.formula_attrs_end, b" ca=\"1\""),
+    };
+    Patch {
+        span,
+        replacement: replacement.to_vec(),
+    }
+}
+
 /// Write evaluated array results into the member caches of each multi-cell
 /// array formula. A dynamic array's members outside its current spill are
 /// blank. A legacy (CSE) array fills its whole extent: a one-row or
 /// one-column result repeats and positions beyond the result are #N/A.
-/// Excel writes an empty `<f ca="1"/>` before the cache of each member of an
-/// array formula that is calculated always (`ca` on the anchor's formula).
+/// Excel writes an empty `<f ca="1"/>` before the cache of each member that
+/// is calculated always (`flags`, see [`calc_always`]).
 fn array_member_patches(
     engine: &Engine<WBResolver>,
     sheet: &package::Sheet,
     data: &[u8],
     scan: &sheet::Scan,
     results: &BTreeMap<usize, (u32, u32)>,
+    flags: &[bool],
     patches: &mut Vec<Patch>,
 ) -> Result<usize, IoError> {
     let mut changed = 0;
@@ -681,11 +711,11 @@ fn array_member_patches(
             value => value.unwrap_or(LiteralValue::Empty),
         }
     };
-    for member in &scan.members {
+    for (member, &flag) in scan.members.iter().zip(flags) {
         seen.insert((member.cell.row, member.cell.col));
         let value = value_at(member.anchor, member.cell.row, member.cell.col);
         let cache = Cache::from_value(value, engine.config.date_system)?;
-        let mark = scan.cells[member.anchor].calc_always && !member.marked;
+        let mark = flag && !member.marked;
         if mark {
             // <f> is the cell's first child; it precedes an inserted <v>.
             let open = member.cell.open_end;

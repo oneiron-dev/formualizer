@@ -19,6 +19,12 @@ pub(super) struct Sheet {
     pub part: String,
     pub tables: Vec<Table>,
 }
+/// A defined name and the formula it stands for.
+#[derive(Debug)]
+pub(super) struct DefinedName {
+    pub name: String,
+    pub formula: String,
+}
 /// A worksheet table (ListObject): its display name, full area (1-based
 /// r1, c1, r2, c2, header and totals rows included) and column names.
 #[derive(Debug)]
@@ -377,12 +383,19 @@ pub(super) fn relationships(
     })?;
     Ok(result)
 }
-/// The sheets, the date system and the file extension of the workbook's kind
-/// (`xlsx`, `xltx`, `xlsm`, `xltm` or `xlam`).
+/// The sheets, the date system, the file extension of the workbook's kind
+/// (`xlsx`, `xltx`, `xlsm`, `xltm` or `xlam`) and the defined names.
+pub(super) type Discovered = (
+    Vec<Sheet>,
+    formualizer_common::DateSystem,
+    &'static str,
+    Vec<DefinedName>,
+);
+/// Read and validate the workbook part and the parts it relates.
 pub(super) fn discover(
     archive: &mut Archive<'_>,
     options: &XlsxRecalculateOptions,
-) -> Result<(Vec<Sheet>, formualizer_common::DateSystem, &'static str), IoError> {
+) -> Result<Discovered, IoError> {
     let root = relationships(archive, "", options)?;
     if root.values().any(|r| r.kind.contains("digital-signature")) {
         return Err(unsupported(
@@ -429,8 +442,20 @@ pub(super) fn discover(
     let mut workbook_pr = false;
     let mut metadata_sections = HashSet::new();
     let mut defined_names = HashSet::new();
+    let mut formulas: Vec<DefinedName> = Vec::new();
     let mut sheet_ids = HashSet::new();
     xml::walk(&data, options, |path, node| {
+        if let xml::Kind::Text(text) = &node.kind {
+            if xml::path_is(
+                path,
+                xml::MAIN,
+                &["workbook", "definedNames", "definedName"],
+            ) && let Some(name) = formulas.last_mut()
+            {
+                name.formula.push_str(text);
+            }
+            return Ok(());
+        }
         if !matches!(node.kind, xml::Kind::Open { .. }) {
             return Ok(());
         }
@@ -491,6 +516,10 @@ pub(super) fn discover(
             if !defined_names.insert((scope, node.required("name")?.to_ascii_lowercase())) {
                 return Err(unsupported("duplicate defined name", "workbook XML"));
             }
+            formulas.push(DefinedName {
+                name: node.required("name")?.to_owned(),
+                formula: String::new(),
+            });
         }
         if e.local == "workbookPr" {
             if workbook_pr || !xml::path_is(path, xml::MAIN, &["workbook", "workbookPr"]) {
@@ -599,7 +628,7 @@ pub(super) fn discover(
         }
     }
     let extension = content_types::validate(archive, &sheets, options)?;
-    Ok((sheets, epoch, extension))
+    Ok((sheets, epoch, extension, formulas))
 }
 fn cell_coordinate(value: &str, part: &str) -> Result<(u32, u32), IoError> {
     let (row, col, _, _) = formualizer_common::coord::parse_a1_1based(value)

@@ -35,6 +35,15 @@ pub(super) struct Cell {
     pub dynamic_array: bool,
     /// The formula is calculated always (`ca`).
     pub calc_always: bool,
+    /// The span of the `<f>` start tag's `ca` attribute.
+    pub calc_always_attr: Option<Range<usize>>,
+    /// Where the `si` attribute starts: Excel writes `ca` before it.
+    pub shared_index_attr: Option<usize>,
+    /// Where the `<f>` start tag's attributes end (at `>` or `/>`).
+    pub formula_attrs_end: usize,
+    /// For a shared-formula descendant, the index of its master in
+    /// [`Scan::cells`], whose text it shares.
+    pub shared_master: Option<usize>,
 }
 /// A value cell inside a multi-cell array formula's extent; `anchor` indexes
 /// the formula cell in [`Scan::cells`]. `marked`: the member holds the empty
@@ -264,6 +273,10 @@ pub(super) fn scan(
                             has_formula: false,
                             dynamic_array,
                             calc_always: false,
+                            calc_always_attr: None,
+                            shared_index_attr: None,
+                            formula_attrs_end: 0,
+                            shared_master: None,
                         });
                     }
                 }
@@ -283,6 +296,11 @@ pub(super) fn scan(
                             // ca is an XML Schema boolean: surrounding whitespace collapses.
                             cell.calc_always =
                                 matches!(node.value("ca").map(str::trim), Some("1" | "true"));
+                            cell.calc_always_attr =
+                                node.attribute("", "ca").map(|a| a.span.clone());
+                            cell.shared_index_attr = node.attribute("", "si").map(|a| a.span.start);
+                            cell.formula_attrs_end =
+                                node.span.end - if *empty { "/>".len() } else { ">".len() };
                             cell.formula_kind = node.value("t").unwrap_or("normal").to_owned();
                             if !matches!(cell.formula_kind.as_str(), "normal" | "shared" | "array")
                             {
@@ -480,9 +498,11 @@ pub(super) fn scan(
         return Err(unsupported("workbook logical cell limit", "workbook"));
     }
     let mut anchors = HashMap::new();
-    for cell in &cells {
+    let mut masters = HashMap::new();
+    for (index, cell) in cells.iter().enumerate() {
         if let Some(id) = cell.shared_id {
             if !cell.formula_text.trim().is_empty() {
+                masters.insert(id, index);
                 // Excel writes the group's first cell as the master and the
                 // group's bounding box as ref, so members may lie left of or
                 // above the master. Each member is the master's text shifted
@@ -503,7 +523,7 @@ pub(super) fn scan(
             }
         }
     }
-    for cell in &cells {
+    for cell in &mut cells {
         if let Some(id) = cell.shared_id {
             let &(r1, c1, r2, c2) = anchors
                 .get(&id)
@@ -513,6 +533,9 @@ pub(super) fn scan(
                     "shared formula outside declared range",
                     "worksheet",
                 ));
+            }
+            if cell.formula_text.trim().is_empty() {
+                cell.shared_master = masters.get(&id).copied();
             }
         }
     }

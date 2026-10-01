@@ -1131,6 +1131,241 @@ fn calculate_always_arrays_mark_each_member_with_an_empty_formula() {
         "{sheet}"
     );
 }
+/// Add a second worksheet, Sheet2, holding `rows`.
+fn with_sheet2(mut p: BTreeMap<String, String>, rows: &str) -> BTreeMap<String, String> {
+    let wb = p.get_mut("xl/workbook.xml").unwrap();
+    *wb = wb.replace(
+        "</sheets>",
+        "<sheet name=\"Sheet2\" sheetId=\"2\" r:id=\"rId2\"/></sheets>",
+    );
+    let rel = p.get_mut("xl/_rels/workbook.xml.rels").unwrap();
+    *rel = rel.replace("</Relationships>", &format!("<Relationship Id=\"rId2\" Type=\"{OFFICE}/worksheet\" Target=\"worksheets/sheet2.xml\"/></Relationships>"));
+    let ct = p.get_mut("[Content_Types].xml").unwrap();
+    *ct = ct.replace("</Types>", "<Override PartName=\"/xl/worksheets/sheet2.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/></Types>");
+    p.insert(
+        "xl/worksheets/sheet2.xml".into(),
+        format!("<worksheet xmlns=\"{MAIN}\"><sheetData>{rows}</sheetData></worksheet>"),
+    );
+    p
+}
+fn with_names(mut p: BTreeMap<String, String>, names: &str) -> BTreeMap<String, String> {
+    let wb = p.get_mut("xl/workbook.xml").unwrap();
+    *wb = wb.replace(
+        "</workbook>",
+        &format!("<definedNames>{names}</definedNames></workbook>"),
+    );
+    p
+}
+#[test]
+fn volatile_formulas_and_their_readers_are_calculated_always() {
+    // Excel saves ca="1" on a formula calling a volatile function (TODAY,
+    // OFFSET, INDIRECT, ...) and on every formula reading such a cell, through
+    // cell, range, name and table references and from other sheets. ca goes
+    // after t and ref and before si, also on shared-formula descendants.
+    let rows = "<row r=\"1\"><c r=\"A1\"><f>TODAY()</f><v>1</v></c><c r=\"B1\"><f>A1-A1+1</f><v>1</v></c><c r=\"C1\"><f>SUM(A1:B1)-A1</f><v>1</v></c><c r=\"D1\"><f>1+1</f><v>2</v></c>\
+        <c r=\"E1\"><f t=\"shared\" ref=\"E1:E2\" si=\"0\">$D$1*2</f><v>4</v></c><c r=\"F1\"><f t=\"shared\" ref=\"F1:F2\" si=\"1\">$B$1*2</f><v>2</v></c>\
+        <c r=\"G1\"><f>Stamp+1</f><v>2</v></c><c r=\"H1\"><f>Pick*3</f><v>6</v></c><c r=\"I1\"><f>INDIRECT(&quot;D1&quot;)</f><v>2</v></c></row>\
+        <row r=\"2\"><c r=\"A2\" t=\"inlineStr\"><is><t>Qty</t></is></c><c r=\"E2\"><f t=\"shared\" si=\"0\"/><v>4</v></c><c r=\"F2\"><f t=\"shared\" si=\"1\"/><v>2</v></c><c r=\"G2\"><f>SUM(Sales[Qty])</f><v>1</v></c></row>\
+        <row r=\"3\"><c r=\"A3\"><f>B1</f><v>1</v></c></row>";
+    let mut p = with_names(
+        with_sheet2(
+            parts(rows),
+            "<row r=\"1\"><c r=\"A1\"><f>Sheet1!C1*2</f><v>2</v></c><c r=\"B1\"><f>Sheet1!D1</f><v>2</v></c></row>",
+        ),
+        "<definedName name=\"Pick\">OFFSET(Sheet1!$D$1,0,0)</definedName><definedName name=\"Stamp\">Sheet1!$B$1</definedName>",
+    );
+    let sheet = p.get_mut(SHEET).unwrap();
+    *sheet = sheet.replace(
+        "</sheetData>",
+        &format!("</sheetData><tableParts count=\"1\"><tablePart xmlns:r=\"{OFFICE}\" r:id=\"rId1\"/></tableParts>"),
+    );
+    p.insert(
+        "xl/worksheets/_rels/sheet1.xml.rels".into(),
+        format!("<Relationships xmlns=\"{RELS}\"><Relationship Id=\"rId1\" Type=\"{OFFICE}/table\" Target=\"../tables/table1.xml\"/></Relationships>"),
+    );
+    p.insert(
+        "xl/tables/table1.xml".into(),
+        format!("<table xmlns=\"{MAIN}\" id=\"1\" name=\"Sales\" displayName=\"Sales\" ref=\"A2:A3\" totalsRowShown=\"0\"><tableColumns count=\"1\"><tableColumn id=\"1\" name=\"Qty\"/></tableColumns></table>"),
+    );
+    let ct = p.get_mut("[Content_Types].xml").unwrap();
+    *ct = ct.replace("</Types>", "<Override PartName=\"/xl/tables/table1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml\"/></Types>");
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<c r=\"A1\"><f ca=\"1\">TODAY()</f>",
+        "<f ca=\"1\">A1-A1+1</f><v>1</v>",
+        "<f ca=\"1\">SUM(A1:B1)-A1</f><v>1</v>",
+        "<f>1+1</f><v>2</v>",
+        "<f t=\"shared\" ref=\"E1:E2\" si=\"0\">$D$1*2</f><v>4</v>",
+        "<c r=\"E2\"><f t=\"shared\" si=\"0\"/><v>4</v>",
+        "<f t=\"shared\" ref=\"F1:F2\" ca=\"1\" si=\"1\">$B$1*2</f><v>2</v>",
+        "<c r=\"F2\"><f t=\"shared\" ca=\"1\" si=\"1\"/><v>2</v>",
+        "<f ca=\"1\">Stamp+1</f><v>2</v>",
+        "<f ca=\"1\">Pick*3</f><v>6</v>",
+        "<f ca=\"1\">INDIRECT(&quot;D1&quot;)</f><v>2</v>",
+        "<f ca=\"1\">SUM(Sales[Qty])</f><v>1</v>",
+        "<c r=\"A3\"><f ca=\"1\">B1</f><v>1</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected} in {sheet}");
+    }
+    let sheet2 = member(&out.bytes, "xl/worksheets/sheet2.xml");
+    assert!(
+        sheet2.contains("<f ca=\"1\">Sheet1!C1*2</f><v>2</v>"),
+        "{sheet2}"
+    );
+    assert!(sheet2.contains("<f>Sheet1!D1</f><v>2</v>"), "{sheet2}");
+    // Only TODAY's cache changed; the flags are not caches.
+    assert_eq!(out.cache_cells_changed, 1);
+    // The flags are kept and recalculating again is an exact no-op.
+    assert_eq!(
+        recalculate_xlsx_bytes(&out.bytes, Default::default())
+            .unwrap()
+            .bytes,
+        out.bytes
+    );
+    // A false flag on a volatile formula becomes true; a flag the file has
+    // is kept, and its readers are calculated always as well.
+    let rows = "<row r=\"1\"><c r=\"A1\"><f ca=\"0\">INDIRECT(&quot;B1&quot;)</f><v>2</v></c><c r=\"B1\"><f ca=\"1\">1+1</f><v>2</v></c><c r=\"C1\"><f>B1*2</f><v>4</v></c></row>";
+    let sheet = member(
+        &recalculate_xlsx_bytes(&pack(&parts(rows)), Default::default())
+            .unwrap()
+            .bytes,
+        SHEET,
+    );
+    for expected in [
+        "<f ca=\"1\">INDIRECT(&quot;B1&quot;)</f>",
+        "<f ca=\"1\">1+1</f>",
+        "<f ca=\"1\">B1*2</f>",
+    ] {
+        assert!(sheet.contains(expected), "{expected} in {sheet}");
+    }
+}
+#[test]
+fn unknown_functions_and_their_readers_are_calculated_always() {
+    // A function Excel does not have (another application's function such as
+    // Google Sheets' exported __xludf.DUMMYFUNCTION, a _xludf. user-defined
+    // function, a bare unknown name) is #NAME? and calculated always, and so
+    // are its readers. Functions written with Excel's _xlfn. prefix are known.
+    // FORMULATEXT, and SUMIF whose sum range differs in size from its range,
+    // are calculated always too.
+    let rows = "<row r=\"1\"><c r=\"A1\" t=\"str\"><f>IFERROR(__xludf.DUMMYFUNCTION(&quot;SORT(B1:B3)&quot;),&quot;x&quot;)</f><v>x</v></c><c r=\"B1\" t=\"str\"><f>A1&amp;&quot;y&quot;</f><v>xy</v></c>\
+        <c r=\"C1\"><f>_xlfn.XOR(TRUE,FALSE)*1</f><v>1</v></c><c r=\"D1\"><f>SUMIF(E1:E2,1,F1:F3)</f><v>0</v></c><c r=\"E1\"><v>1</v></c><c r=\"F1\"><v>5</v></c></row>\
+        <row r=\"2\"><c r=\"A2\"><f>IFERROR(_xludf.IMAGE(&quot;u&quot;),3)</f><v>3</v></c><c r=\"B2\"><f>MYUDF(1)</f><v>0</v></c><c r=\"C2\"><f>SUM(C1,1)</f><v>2</v></c><c r=\"D2\"><f>SUMIF(E1:E2,1,F1:F2)</f><v>5</v></c><c r=\"E2\"><v>2</v></c><c r=\"F2\"><v>7</v></c></row>\
+        <row r=\"3\"><c r=\"C3\" t=\"str\"><f>_xlfn.FORMULATEXT(C2)</f><v>=SUM(C1,1)</v></c><c r=\"F3\"><v>9</v></c></row>";
+    let out = recalculate_xlsx_bytes(&pack(&parts(rows)), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<f ca=\"1\">IFERROR(__xludf.DUMMYFUNCTION(",
+        "<f ca=\"1\">A1&amp;&quot;y&quot;</f><v>xy</v>",
+        "<f>_xlfn.XOR(TRUE,FALSE)*1</f><v>1</v>",
+        "<f ca=\"1\">SUMIF(E1:E2,1,F1:F3)</f><v>5</v>",
+        "<f ca=\"1\">IFERROR(_xludf.IMAGE(&quot;u&quot;),3)</f><v>3</v>",
+        "<c r=\"B2\" t=\"e\"><f ca=\"1\">MYUDF(1)</f><v>#NAME?</v>",
+        "<f>SUM(C1,1)</f><v>2</v>",
+        "<f>SUMIF(E1:E2,1,F1:F2)</f><v>5</v>",
+        "<f ca=\"1\">_xlfn.FORMULATEXT(C2)</f>",
+    ] {
+        assert!(sheet.contains(expected), "{expected} in {sheet}");
+    }
+    assert_eq!(
+        recalculate_xlsx_bytes(&out.bytes, Default::default())
+            .unwrap()
+            .bytes,
+        out.bytes
+    );
+}
+#[test]
+fn shared_formula_members_left_of_the_master_are_judged_on_their_own_formula() {
+    // Excel's shared groups may have members left of their master (B2, ref
+    // A2:C3; E2, ref D2:E3). Each member is the master's formula at the
+    // member's place, and its flag is that formula's: A3 is A$1*2 and reads
+    // TODAY in A1 while B3 and C3 do not; every member of the volatile E2
+    // group is calculated always; K1 reads the member A3.
+    let rows = "<row r=\"1\"><c r=\"A1\"><f>TODAY()</f><v>1</v></c><c r=\"B1\"><v>5</v></c><c r=\"C1\"><v>6</v></c><c r=\"K1\"><f>A3+1</f><v>0</v></c><c r=\"L1\"><f>B3+1</f><v>11</v></c></row>\
+        <row r=\"2\"><c r=\"A2\"><f>A1-A1+1000</f><v>1000</v></c><c r=\"B2\"><f t=\"shared\" ref=\"A2:C3\" si=\"0\">B$1*2</f><v>10</v></c><c r=\"C2\"><f t=\"shared\" si=\"0\"/><v>12</v></c>\
+        <c r=\"E2\"><f t=\"shared\" ref=\"D2:E3\" si=\"1\">ROW()+0*NOW()</f><v>2</v></c></row>\
+        <row r=\"3\"><c r=\"A3\"><f t=\"shared\" si=\"0\"/><v>0</v></c><c r=\"B3\"><f t=\"shared\" si=\"0\"/><v>10</v></c><c r=\"C3\"><f t=\"shared\" si=\"0\"/><v>12</v></c>\
+        <c r=\"D3\"><f t=\"shared\" si=\"1\"/><v>3</v></c><c r=\"E3\"><f t=\"shared\" si=\"1\"/><v>3</v></c></row>";
+    let out = recalculate_xlsx_bytes(&pack(&parts(rows)), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<c r=\"A1\"><f ca=\"1\">TODAY()</f>",
+        "<c r=\"A2\"><f ca=\"1\">A1-A1+1000</f><v>1000</v>",
+        "<c r=\"B2\"><f t=\"shared\" ref=\"A2:C3\" si=\"0\">B$1*2</f><v>10</v>",
+        "<c r=\"C2\"><f t=\"shared\" si=\"0\"/><v>12</v>",
+        "<c r=\"A3\"><f t=\"shared\" ca=\"1\" si=\"0\"/>",
+        "<c r=\"B3\"><f t=\"shared\" si=\"0\"/><v>10</v>",
+        "<c r=\"C3\"><f t=\"shared\" si=\"0\"/><v>12</v>",
+        "<c r=\"K1\"><f ca=\"1\">A3+1</f>",
+        "<c r=\"L1\"><f>B3+1</f><v>11</v>",
+        "<c r=\"E2\"><f t=\"shared\" ref=\"D2:E3\" ca=\"1\" si=\"1\">ROW()+0*NOW()</f><v>2</v>",
+        "<c r=\"D3\"><f t=\"shared\" ca=\"1\" si=\"1\"/><v>3</v>",
+        "<c r=\"E3\"><f t=\"shared\" ca=\"1\" si=\"1\"/><v>3</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected} in {sheet}");
+    }
+    assert_eq!(
+        recalculate_xlsx_bytes(&out.bytes, Default::default())
+            .unwrap()
+            .bytes,
+        out.bytes
+    );
+}
+#[test]
+fn arrays_reading_calculated_always_cells_mark_the_members_that_read_them() {
+    // An array formula that only reads calculated-always cells is calculated
+    // always, and Excel marks with <f ca="1"/> the members whose elements of
+    // a range as tall (or wide) as the array are calculated always: B2 reads
+    // A2, B3 reads the value A3 and B4 the empty A4. A reference of another
+    // shape (D1:D3 reads A1) reaches every member, as does a volatile array
+    // formula (E1:E2) and one the file flags without reading a flagged cell
+    // (G1:G2). The array formula F1:F2 reads nothing calculated always.
+    let rows = "<row r=\"1\"><c r=\"A1\"><f>IFERROR(__xludf.DUMMYFUNCTION(&quot;x&quot;),1)</f><v>1</v></c><c r=\"B1\"><f t=\"array\" ref=\"B1:B4\">IF(ISNUMBER(A1:A4),A1:A4*2,&quot;&quot;)</f><v>2</v></c>\
+        <c r=\"C1\"><f>SUM(B1:B4)</f><v>16</v></c><c r=\"D1\"><f t=\"array\" ref=\"D1:D3\">A1*{1;2;3}</f><v>1</v></c><c r=\"E1\"><f t=\"array\" ref=\"E1:E2\">ROW(INDIRECT(&quot;A1:A2&quot;))</f><v>1</v></c><c r=\"F1\"><f t=\"array\" ref=\"F1:F2\">{1;2}*3</f><v>3</v></c><c r=\"G1\"><f t=\"array\" ref=\"G1:G2\" ca=\"1\">{1;2}*4</f><v>4</v></c></row>\
+        <row r=\"2\"><c r=\"A2\"><f>IFERROR(__xludf.DUMMYFUNCTION(&quot;x&quot;),2)</f><v>2</v></c><c r=\"B2\"><v>4</v></c><c r=\"C2\"><f>B3+1</f><v>11</v></c><c r=\"D2\"><v>2</v></c><c r=\"E2\"><v>2</v></c><c r=\"F2\"><v>6</v></c><c r=\"G2\"><v>8</v></c></row>\
+        <row r=\"3\"><c r=\"A3\"><v>5</v></c><c r=\"B3\"><v>10</v></c><c r=\"C3\"><f>B2+1</f><v>5</v></c><c r=\"D3\"><v>3</v></c></row>\
+        <row r=\"4\"><c r=\"B4\" t=\"str\"><v></v></c></row>";
+    let input = pack(&parts(rows));
+    let out = recalculate_xlsx_bytes(&input, Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<f t=\"array\" ref=\"B1:B4\" ca=\"1\">",
+        "<c r=\"B2\"><f ca=\"1\"/><v>4</v></c>",
+        "<c r=\"B3\"><v>10</v></c>",
+        "<c r=\"B4\" t=\"str\"><v></v></c>",
+        "<f ca=\"1\">SUM(B1:B4)</f><v>16</v>",
+        "<f>B3+1</f><v>11</v>",
+        "<f ca=\"1\">B2+1</f><v>5</v>",
+        "<f t=\"array\" ref=\"D1:D3\" ca=\"1\">",
+        "<c r=\"D2\"><f ca=\"1\"/><v>2</v></c>",
+        "<c r=\"D3\"><f ca=\"1\"/><v>3</v></c>",
+        "<f t=\"array\" ref=\"E1:E2\" ca=\"1\">",
+        "<c r=\"E2\"><f ca=\"1\"/><v>2</v></c>",
+        "<f t=\"array\" ref=\"F1:F2\">{1;2}*3</f><v>3</v>",
+        "<c r=\"F2\"><v>6</v></c>",
+        "<c r=\"G2\"><f ca=\"1\"/><v>8</v></c>",
+    ] {
+        assert!(sheet.contains(expected), "{expected} in {sheet}");
+    }
+    assert_eq!(out.cache_cells_changed, 0);
+    let again = recalculate_xlsx_bytes(&out.bytes, Default::default()).unwrap();
+    assert_eq!(member(&again.bytes, SHEET), sheet);
+    assert_eq!(again.bytes, out.bytes);
+}
+#[test]
+fn workbooks_without_calculated_always_formulas_are_unchanged() {
+    // Nothing volatile or unknown: ranges, names, shared and array formulas
+    // with current caches are an exact no-op.
+    let rows = "<row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"B1\"><f>SUM(A1:A2)</f><v>3</v></c><c r=\"C1\"><f t=\"shared\" ref=\"C1:C2\" si=\"0\">A1*Two</f><v>2</v></c><c r=\"D1\"><f t=\"array\" ref=\"D1:D2\">A1:A2*10</f><v>10</v></c><c r=\"E1\"><f>SUMIF(A1:A2,\"&gt;1\",A1:A2)</f><v>2</v></c></row>\
+        <row r=\"2\"><c r=\"A2\"><v>2</v></c><c r=\"C2\"><f t=\"shared\" si=\"0\"/><v>4</v></c><c r=\"D2\"><v>20</v></c><c r=\"E2\"><f>INDEX(A1:A2,2)+SUBTOTAL(9,A1:A2)</f><v>5</v></c></row>";
+    let input = pack(&with_names(
+        parts(rows),
+        "<definedName name=\"Two\">Sheet1!$A$2</definedName>",
+    ));
+    let out = recalculate_xlsx_bytes(&input, Default::default()).unwrap();
+    assert_eq!(out.bytes, input);
+    assert_eq!(out.cache_cells_changed, 0);
+}
 #[test]
 fn multiple_changed_members_relocate_growing_and_shrinking_payloads() {
     let old = (0..2048u32)
@@ -1377,6 +1612,7 @@ fn defined_names_keep_spaces_around_entities_in_sheet_names() {
 fn names_defined_by_formulas_and_constants() {
     // Names may hold a formula (MATCH over other names), an array constant
     // or a reference-returning formula (OFFSET); each evaluates where used.
+    // The formulas reading the OFFSET name are calculated always.
     let mut p = parts(
         "<row r=\"1\"><c r=\"A1\"><v>2020</v></c><c r=\"B1\" t=\"inlineStr\"><is><t>April</t></is></c><c r=\"C1\" t=\"inlineStr\"><is><t>Monday</t></is></c></row>\
          <row r=\"2\"><c r=\"A2\"><f>MonOpt</f><v>0</v></c><c r=\"B2\"><f>WkOpt</f><v>0</v></c><c r=\"C2\"><f>SUM(Days)</f><v>0</v></c><c r=\"D2\"><f>WEEKDAY(DATE(Yr,MonOpt,1),WkOpt)</f><v>0</v></c><c r=\"E2\"><f>INDEX(Days+1,2)</f><v>0</v></c><c r=\"F2\"><f>DATE(Yr,MonOpt,1)</f><v>0</v></c></row>\
@@ -1397,11 +1633,11 @@ fn names_defined_by_formulas_and_constants() {
         "<f>WEEKDAY(DATE(Yr,MonOpt,1),WkOpt)</f><v>3</v>",
         "<f>INDEX(Days+1,2)</f><v>2</v>",
         "<f>DATE(Yr,MonOpt,1)</f><v>43922</v>",
-        "<f>SUM(Filled)</f><v>21</v>",
-        "<f>ROWS(Filled)</f><v>3</v>",
-        "<f>MATCH(7,Filled,0)</f><v>2</v>",
-        "<f>INDEX(Filled,2)</f><v>7</v>",
-        "<f>COUNTIF(Filled,\"&gt;5\")</f><v>2</v>",
+        "<f ca=\"1\">SUM(Filled)</f><v>21</v>",
+        "<f ca=\"1\">ROWS(Filled)</f><v>3</v>",
+        "<f ca=\"1\">MATCH(7,Filled,0)</f><v>2</v>",
+        "<f ca=\"1\">INDEX(Filled,2)</f><v>7</v>",
+        "<f ca=\"1\">COUNTIF(Filled,\"&gt;5\")</f><v>2</v>",
     ] {
         assert!(sheet.contains(expected), "{expected}: {sheet}");
     }
@@ -1444,7 +1680,7 @@ fn range_names_are_references() {
     let sheet = member(&out.bytes, SHEET);
     for expected in [
         "INDEX(Years,B2,1)</f><v>2023</v></c><c r=\"C6\"><f>INDEX(Years,B2,1)</f><v>2023</v>",
-        "<f>OFFSET(Years,1,0,1,1)</f><v>2023</v>",
+        "<f ca=\"1\">OFFSET(Years,1,0,1,1)</f><v>2023</v>",
         "<f>ROWS(Years)</f><v>3</v>",
     ] {
         assert!(sheet.contains(expected), "{expected}: {sheet}");
@@ -1522,12 +1758,12 @@ fn formulas_without_the_array_flag_lift_reference_parameters_over_arrays_of_refe
     let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
     let sheet = member(&out.bytes, SHEET);
     for expected in [
-        "<f>SUBTOTAL(9,OFFSET(B1,A1:A3,0))</f><v>10</v>",
-        "<f>SUMPRODUCT(SUBTOTAL(9,OFFSET(B1,ROW(B1:B3)-1,0))*{1;10;100})+A1:A3*5</f><v>3215</v>",
-        "<f>SUM(SUBTOTAL(9,OFFSET(B1,ROW(B1:B3)-1,0)))</f><v>10</v>",
-        "<f t=\"array\" ref=\"E3\">SUM(SUBTOTAL(9,OFFSET(B1,ROW(B1:B3)-1,0)))</f><v>60</v>",
-        "<f>SUMPRODUCT(SUBTOTAL(3,OFFSET(A1,ROW(A2:A4)-1,0)))</f><v>2</v>",
-        "<f>SUMPRODUCT(N(OFFSET(B1,ROW(B1:B3)-1,0)))</f><v>60</v>",
+        "<f ca=\"1\">SUBTOTAL(9,OFFSET(B1,A1:A3,0))</f><v>10</v>",
+        "<f ca=\"1\">SUMPRODUCT(SUBTOTAL(9,OFFSET(B1,ROW(B1:B3)-1,0))*{1;10;100})+A1:A3*5</f><v>3215</v>",
+        "<f ca=\"1\">SUM(SUBTOTAL(9,OFFSET(B1,ROW(B1:B3)-1,0)))</f><v>10</v>",
+        "<f t=\"array\" ref=\"E3\" ca=\"1\">SUM(SUBTOTAL(9,OFFSET(B1,ROW(B1:B3)-1,0)))</f><v>60</v>",
+        "<f ca=\"1\">SUMPRODUCT(SUBTOTAL(3,OFFSET(A1,ROW(A2:A4)-1,0)))</f><v>2</v>",
+        "<f ca=\"1\">SUMPRODUCT(N(OFFSET(B1,ROW(B1:B3)-1,0)))</f><v>60</v>",
     ] {
         assert!(sheet.contains(expected), "{expected}: {sheet}");
     }
