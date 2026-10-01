@@ -14,6 +14,7 @@ mod groupby;
 mod legacy; // classic LOOKUP function (vector & array forms)
 pub(crate) mod lookup_utils; // shared helper utilities for lookup family
 mod reference_info; // modern lookup & dynamic array subset (XLOOKUP, FILTER, UNIQUE)
+mod sort_collation; // Excel's text sort order for SORT and SORTBY
 mod stack; // stacking & concatenation functions (HSTACK, VSTACK)
 
 #[cfg(test)]

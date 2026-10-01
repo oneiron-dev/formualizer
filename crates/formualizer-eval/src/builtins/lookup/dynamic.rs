@@ -21,6 +21,7 @@
 
 use super::super::utils::collapse_if_scalar;
 use super::lookup_utils::{PreparedLookupMatcher, cmp_for_lookup, value_to_f64_lenient};
+use super::sort_collation::cmp_text_for_sort;
 use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
 use crate::engine::lookup_index_cache::LookupAxis;
 use crate::function::Function; // FnCaps imported via macro
@@ -845,9 +846,9 @@ impl Function for XMatchFn {
 
 /// Key order shared by SORT and SORTBY, following Excel's sort order rather
 /// than the lookup comparison: numbers (dates and times as serials) < text
-/// (case-insensitive, never parsed as a number) < FALSE < TRUE < errors (all
-/// equal), and descending reverses that order. A blank is not ranked as 0: it
-/// goes last in both directions, after a real 0.
+/// (never parsed as a number, in Excel's text order: see `sort_collation`)
+/// < FALSE < TRUE < errors (all equal), and descending reverses that order. A
+/// blank is not ranked as 0: it goes last in both directions, after a real 0.
 fn cmp_for_sort(
     a: &LiteralValue,
     b: &LiteralValue,
@@ -870,7 +871,7 @@ fn cmp_for_sort(
         _ => {}
     }
     let ord = rank(a).cmp(&rank(b)).then_with(|| match (a, b) {
-        (LiteralValue::Text(x), LiteralValue::Text(y)) => x.to_lowercase().cmp(&y.to_lowercase()),
+        (LiteralValue::Text(x), LiteralValue::Text(y)) => cmp_text_for_sort(x, y),
         (LiteralValue::Boolean(x), LiteralValue::Boolean(y)) => x.cmp(y),
         _ => match (
             a.as_serial_number_for(date_system),
@@ -894,6 +895,9 @@ pub struct SortFn;
 /// - Defaults: `sort_index=1`, `sort_order=1` (ascending), `by_col=FALSE`.
 /// - `sort_index` is 1-based in the active sort axis.
 /// - `sort_order < 0` sorts descending; otherwise ascending.
+/// - Text sorts in Excel's order: case-insensitive, apostrophes and hyphens
+///   ignored, symbols before digits before letters, and accented letters
+///   with their base letter.
 /// - Invalid sort indexes return `#VALUE!`.
 /// - Empty input returns an empty spill.
 ///
@@ -1126,6 +1130,25 @@ impl Function for SortFn {
 
 /* ───────────────────────── SORTBY() ───────────────────────── */
 
+/// Reads a SORTBY sort_order argument: an omitted one is ascending, otherwise
+/// the sign of the number picks the direction. A range or array gives its
+/// top-left value; an error, or text that is not a number, is returned as the
+/// error.
+fn sortby_ascending(arg: &ArgumentHandle<'_, '_>) -> Result<bool, ExcelError> {
+    if arg.is_omitted() {
+        return Ok(true);
+    }
+    let value = match arg.value()?.into_literal() {
+        LiteralValue::Array(rows) => rows
+            .first()
+            .and_then(|row| row.first())
+            .cloned()
+            .unwrap_or(LiteralValue::Empty),
+        value => value,
+    };
+    Ok(crate::coercion::to_number_lenient(&value)? >= 0.0)
+}
+
 #[derive(Debug)]
 pub struct SortByFn;
 /// Sorts an array based on one or more aligned sort-by arrays.
@@ -1134,8 +1157,10 @@ pub struct SortByFn;
 ///
 /// # Remarks
 /// - Requires at least one `by_array` aligned to the row count of `array`.
+/// - Arguments are positional: `by_array1, [sort_order1], [by_array2, sort_order2], ...`.
 /// - `sort_order` defaults to ascending when omitted.
-/// - Additional `by_array`/`sort_order` criteria are processed left-to-right.
+/// - Additional `by_array`/`sort_order` criteria are processed left-to-right,
+///   each breaking the ties left by the earlier ones.
 /// - Shape mismatches or invalid criteria return `#VALUE!`.
 /// - Returns a spilled sorted array.
 ///
@@ -1183,8 +1208,8 @@ pub struct SortByFn;
 /// Min args: 2
 /// Max args: variadic
 /// Variadic: true
-/// Signature: SORTBY(arg1: range@range, arg2: range@range, arg3?...: number@scalar)
-/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=true}
+/// Signature: SORTBY(arg1: range@range, arg2...: range|number@range)
+/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=range|number,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=Some(1),default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for SortByFn {
@@ -1213,29 +1238,20 @@ impl Function for SortByFn {
                     repeating: None,
                     default: None,
                 },
-                // by_array1
+                // by_array1, [sort_order1], [by_array2, sort_order2], ...
+                // The by_array and sort_order arguments alternate, so one
+                // repeating entry covers them all; `eval` reads each one by
+                // its position and coerces the sort orders.
                 ArgSchema {
-                    kinds: smallvec::smallvec![ArgKind::Range],
+                    kinds: smallvec::smallvec![ArgKind::Range, ArgKind::Number],
                     required: true,
                     by_ref: false,
                     shape: ShapeKind::Range,
                     coercion: CoercionPolicy::None,
                     max: None,
-                    repeating: None,
+                    repeating: Some(1),
                     default: None,
                 },
-                // sort_order1 (optional, default 1)
-                ArgSchema {
-                    kinds: smallvec::smallvec![ArgKind::Number],
-                    required: false,
-                    by_ref: false,
-                    shape: ShapeKind::Scalar,
-                    coercion: CoercionPolicy::NumberLenientText,
-                    max: None,
-                    repeating: None,
-                    default: Some(LiteralValue::Int(1)),
-                },
-                // Additional by_array/sort_order pairs can follow (variadic)
             ]
         });
         &SCHEMA
@@ -1262,8 +1278,8 @@ impl Function for SortByFn {
             ));
         }
 
-        // Parse sort criteria: pairs of (by_array, sort_order)
-        // Arguments after array: by_array1, [sort_order1], [by_array2], [sort_order2], ...
+        // Parse sort criteria by position: after the array come
+        // by_array1, [sort_order1], [by_array2, sort_order2], ...
         let mut sort_criteria: Vec<(Vec<LiteralValue>, bool)> = Vec::new();
         let mut arg_idx = 1;
 
@@ -1296,32 +1312,15 @@ impl Function for SortByFn {
                 )));
             };
 
-            arg_idx += 1;
-
-            // sort_order (optional)
-            let ascending = if arg_idx < args.len() {
-                // TODO(phase6): SORTBY parsing can mis-handle multi-criteria sort_order.
-                // Check if next arg is a number (sort_order) or a range (next by_array)
-                match args[arg_idx].value() {
-                    Ok(v) => {
-                        let lit = v.into_literal();
-                        match lit {
-                            LiteralValue::Int(i) => {
-                                arg_idx += 1;
-                                i >= 0
-                            }
-                            LiteralValue::Number(n) => {
-                                arg_idx += 1;
-                                n >= 0.0
-                            }
-                            _ => true, // Next arg is likely a range, use default ascending
-                        }
-                    }
-                    Err(_) => true,
-                }
-            } else {
-                true
+            // The sort_order after each by_array; omitted means ascending.
+            let ascending = match args.get(arg_idx + 1) {
+                Some(order) => match sortby_ascending(order) {
+                    Ok(ascending) => ascending,
+                    Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+                },
+                None => true,
             };
+            arg_idx += 2;
 
             sort_criteria.push((by_values, ascending));
         }
@@ -4084,6 +4083,113 @@ mod tests {
             eval("=SORTBY(A1:A5,B1:B5,-1)"),
             names(&["p", "q", "z", "n", "blank"])
         );
+    }
+
+    #[test]
+    fn sort_orders_text_in_excel_text_order() {
+        // Excel ignores apostrophes and hyphens (a string that differs only by
+        // one sorts after the one without it), puts symbols before digits and
+        // digits before letters, and sorts an accented letter with its base
+        // letter. Each column holds the Excel order reversed.
+        let t = |v: &str| LiteralValue::Text(v.into());
+        let pairs: [(&str, &str); 7] = [
+            ("a-c", "ab"),
+            ("a'c", "ab"),
+            ("co-op", "coop"),
+            ("a", "~"),
+            ("b", "{x"),
+            ("f", "é"),
+            ("a", "1"),
+        ];
+        let cols = ["A", "B", "C", "D", "E", "F", "G"];
+        let mut wb = TestWorkbook::new().with_function(Arc::new(SortFn));
+        for (col_name, (first, second)) in cols.iter().zip(pairs) {
+            wb = wb
+                .with_cell_a1("Sheet1", format!("{col_name}1"), t(first))
+                .with_cell_a1("Sheet1", format!("{col_name}2"), t(second));
+        }
+        let ctx = wb.interpreter();
+        let eval = |f: &str| {
+            ctx.evaluate_ast(&formualizer_parse::parser::parse(f).unwrap())
+                .unwrap()
+                .into_literal()
+        };
+        for (col_name, (first, second)) in cols.iter().zip(pairs) {
+            assert_eq!(
+                eval(&format!("=SORT({col_name}1:{col_name}2)")),
+                col(vec![t(second), t(first)]),
+                "ascending {col_name}"
+            );
+            assert_eq!(
+                eval(&format!("=SORT({col_name}1:{col_name}2,1,-1)")),
+                col(vec![t(first), t(second)]),
+                "descending {col_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn sortby_applies_later_keys_to_break_ties() {
+        // M ranks r3 (5) ahead of the two blank keys; N breaks their tie.
+        let n = |v: f64| LiteralValue::Number(v);
+        let t = |v: &str| LiteralValue::Text(v.into());
+        let wb = TestWorkbook::new()
+            .with_function(Arc::new(SortByFn))
+            .with_cell_a1("Sheet1", "L1", t("r1"))
+            .with_cell_a1("Sheet1", "L2", t("r2"))
+            .with_cell_a1("Sheet1", "L3", t("r3"))
+            .with_cell_a1("Sheet1", "M3", n(5.0))
+            .with_cell_a1("Sheet1", "N1", n(1.0))
+            .with_cell_a1("Sheet1", "N2", n(2.0))
+            .with_cell_a1("Sheet1", "N3", n(3.0))
+            .with_cell_a1("Sheet1", "O1", t("x"))
+            .with_cell_a1("Sheet1", "O2", t("x"))
+            .with_cell_a1("Sheet1", "O3", t("x"))
+            .with_cell_a1("Sheet1", "P1", n(-1.0));
+        let ctx = wb.interpreter();
+        let eval = |f: &str| {
+            ctx.evaluate_ast(&formualizer_parse::parser::parse(f).unwrap())
+                .unwrap()
+                .into_literal()
+        };
+        let names = |v: &[&str]| col(v.iter().map(|s| t(s)).collect());
+        assert_eq!(
+            eval("=SORTBY(L1:L3,M1:M3,1,N1:N3,-1)"),
+            names(&["r3", "r2", "r1"])
+        );
+        // An omitted sort order, last or in the middle, is ascending.
+        assert_eq!(
+            eval("=SORTBY(L1:L3,M1:M3,1,N1:N3)"),
+            names(&["r3", "r1", "r2"])
+        );
+        assert_eq!(
+            eval("=SORTBY(L1:L3,M1:M3,,N1:N3,-1)"),
+            names(&["r3", "r2", "r1"])
+        );
+        // A third key only matters where the first two tie.
+        assert_eq!(
+            eval("=SORTBY(L1:L3,O1:O3,1,M1:M3,-1,N1:N3,-1)"),
+            names(&["r3", "r2", "r1"])
+        );
+        // Arguments are read by position: a sort order from a cell is a sort
+        // order, not another key.
+        assert_eq!(eval("=SORTBY(L1:L3,N1:N3,P1)"), names(&["r3", "r2", "r1"]));
+        assert_eq!(
+            eval("=SORTBY(L1:L3,O1:O3,1,N1:N3,P1)"),
+            names(&["r3", "r2", "r1"])
+        );
+        // A later key of the wrong size, or a bad later sort order, is an
+        // error.
+        let err = |f: &str| match eval(f) {
+            LiteralValue::Error(e) => e.kind,
+            other => panic!("{f}: expected an error, got {other:?}"),
+        };
+        assert_eq!(err("=SORTBY(L1:L3,M1:M3,1,N1:N2)"), ExcelErrorKind::Value);
+        assert_eq!(
+            err("=SORTBY(L1:L3,M1:M3,1,N1:N3,\"up\")"),
+            ExcelErrorKind::Value
+        );
+        assert_eq!(err("=SORTBY(L1:L3,M1:M3,1,N1:N3,#N/A)"), ExcelErrorKind::Na);
     }
 
     #[test]
