@@ -9,6 +9,11 @@ use crate::test_workbook::TestWorkbook;
 
 /// A1:D4 hold 1..16 row by row; each formula goes in F1, F2, ...
 fn eval_all(formulas: &[&str]) -> Vec<LiteralValue> {
+    eval_all_with(&[], formulas)
+}
+
+/// As [`eval_all`], with extra `(row, col, value)` inputs outside A1:D4 and F.
+fn eval_all_with(inputs: &[(u32, u32, LiteralValue)], formulas: &[&str]) -> Vec<LiteralValue> {
     let mut engine = Engine::new(TestWorkbook::default(), EvalConfig::default());
     for r in 1..=4u32 {
         for c in 1..=4u32 {
@@ -21,6 +26,11 @@ fn eval_all(formulas: &[&str]) -> Vec<LiteralValue> {
                 )
                 .unwrap();
         }
+    }
+    for (r, c, value) in inputs {
+        engine
+            .set_cell_value("Sheet1", *r, *c, value.clone())
+            .unwrap();
     }
     for (i, f) in formulas.iter().enumerate() {
         engine
@@ -188,6 +198,63 @@ fn index_reference_propagates_an_error_index() {
     assert_eq!(kind(&got[7]), Some(ExcelErrorKind::Value));
     assert_eq!(got[8], n(1.0 + 2.0 + 5.0 + 6.0));
     assert_eq!(kind(&got[9]), Some(ExcelErrorKind::Ref));
+}
+
+/// row_num and column_num are number parameters, in the reference path (SUM's
+/// range, a `:` endpoint, a single cell) and over an array alike: a blank cell
+/// is 0 and so selects the whole row or column, TRUE and FALSE are 1 and 0,
+/// and numeric text converts (a fraction truncates). Only text that is not a
+/// number is #VALUE!. E1 is blank, E3 is the text "2", E4 is TRUE and E5 is
+/// the empty text.
+#[test]
+fn index_coerces_blank_logical_and_numeric_text_indexes() {
+    let got = eval_all_with(
+        &[
+            (3, 5, LiteralValue::Text("2".into())),
+            (4, 5, LiteralValue::Boolean(true)),
+            (5, 5, LiteralValue::Text(String::new())),
+        ],
+        &[
+            "=SUM(INDEX(A1:D4,E1,2))",
+            "=SUM(A1:INDEX(A1:D4,E1,2))",
+            "=ROWS(INDEX(A1:D4,E1,2))",
+            "=SUM(INDEX(A1:D4,2,E1))",
+            "=SUM(INDEX(A1:D4,\"2\",2))",
+            "=INDEX(A1:D4,E3,2)",
+            "=INDEX(A1:D4,\"2.9\",\"3\")",
+            "=INDEX(A1:D4,TRUE,2)",
+            "=INDEX(A1:D4,E4,2)",
+            "=SUM(INDEX(A1:D4,FALSE,2))",
+            "=SUM(A1:INDEX(A1:D4,E3,E4))",
+            "=INDEX(A1:A4,E3)",
+            "=SUM(INDEX(A1:D4*1,E1,2))",
+            "=INDEX({1,2;3,4},E3,E4)",
+            "=INDEX({1,2;3,4},\"2\",TRUE)",
+            "=INDEX(A1:D4,\"x\",2)",
+            "=SUM(A1:INDEX(A1:D4,2,\"x\"))",
+            "=INDEX(A1:D4,E5,2)",
+            "=INDEX({1,2;3,4},\"x\",1)",
+            "=INDEX({1,2;3,4},1,E5)",
+        ],
+    );
+    assert_eq!(got[0], n(2.0 + 6.0 + 10.0 + 14.0));
+    assert_eq!(got[1], n(1.0 + 2.0 + 5.0 + 6.0 + 9.0 + 10.0 + 13.0 + 14.0));
+    assert_eq!(got[2], n(4.0));
+    assert_eq!(got[3], n(5.0 + 6.0 + 7.0 + 8.0));
+    assert_eq!(got[4], n(6.0));
+    assert_eq!(got[5], n(6.0));
+    assert_eq!(got[6], n(7.0));
+    assert_eq!(got[7], n(2.0));
+    assert_eq!(got[8], n(2.0));
+    assert_eq!(got[9], n(2.0 + 6.0 + 10.0 + 14.0));
+    assert_eq!(got[10], n(1.0 + 5.0));
+    assert_eq!(got[11], n(5.0));
+    assert_eq!(got[12], n(2.0 + 6.0 + 10.0 + 14.0));
+    assert_eq!(got[13], n(3.0));
+    assert_eq!(got[14], n(3.0));
+    for (i, value) in got.iter().enumerate().skip(15) {
+        assert_eq!(kind(value), Some(ExcelErrorKind::Value), "formula {i}");
+    }
 }
 
 /// A `:` range as a whole formula spills like the literal range, and under

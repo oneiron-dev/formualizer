@@ -4,19 +4,6 @@ use crate::traits::{ArgumentHandle, FunctionContext};
 use formualizer_common::{ArgKind, ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_parse::parser::ReferenceType;
 
-fn number_strict_scalar() -> ArgSchema {
-    ArgSchema {
-        kinds: smallvec::smallvec![ArgKind::Number],
-        required: true,
-        by_ref: false,
-        shape: ShapeKind::Scalar,
-        coercion: CoercionPolicy::NumberStrict,
-        max: None,
-        repeating: None,
-        default: None,
-    }
-}
-
 fn arg_byref_array() -> Vec<ArgSchema> {
     vec![
         // Accept both references and array literals
@@ -30,17 +17,13 @@ fn arg_byref_array() -> Vec<ArgSchema> {
             repeating: None,
             default: None,
         },
-        number_strict_scalar(),
+        // row_num and column_num are number parameters: a blank is 0, TRUE and
+        // FALSE are 1 and 0, and numeric text converts.
+        ArgSchema::number_lenient_scalar(),
         // Column is optional for 1D arrays
         ArgSchema {
-            kinds: smallvec::smallvec![ArgKind::Number],
             required: false,
-            by_ref: false,
-            shape: ShapeKind::Scalar,
-            coercion: CoercionPolicy::NumberStrict,
-            max: None,
-            repeating: None,
-            default: None,
+            ..ArgSchema::number_lenient_scalar()
         },
     ]
 }
@@ -154,13 +137,10 @@ impl IndexFn {
         match arg.value()? {
             crate::traits::CalcValue::Range(_)
             | crate::traits::CalcValue::Scalar(LiteralValue::Array(_)) => Ok(None),
-            value => match value.into_literal() {
-                LiteralValue::Number(number) => Ok(Some(number as i64)),
-                LiteralValue::Int(integer) => Ok(Some(integer)),
-                // An error index is the result, as in value context (MATCH's #N/A).
-                LiteralValue::Error(error) => Err(error),
-                _ => Err(ExcelError::new(ExcelErrorKind::Value)),
-            },
+            // A blank index is 0 (the whole row or column), TRUE/FALSE and
+            // numeric text convert, and an error index is the result, as in
+            // value context (MATCH's #N/A).
+            value => integer_parameter(value.into_literal(), arg).map(Some),
         }
     }
 
@@ -383,7 +363,9 @@ impl IndexFn {
 /// - A `row_num` or `column_num` of `0` selects the entire column or row respectively
 ///   (both `0` selects the whole range), matching Excel.
 /// - Negative or out-of-bounds indexes return `#REF!`.
-/// - Non-numeric index arguments return `#VALUE!`.
+/// - `row_num` and `column_num` are numbers: a blank cell is 0, TRUE and FALSE are 1 and 0,
+///   and numeric text converts. Other text returns `#VALUE!`, and an error index returns
+///   that error.
 /// - An array `row_num` or `column_num` returns an array of the selected values, paired and
 ///   broadcast element by element like any single-value parameter.
 /// - In a workbook formula entered without the array flag, a range `row_num` or `column_num`
@@ -422,7 +404,7 @@ impl IndexFn {
 ///   - q: "How does INDEX behave when column_num is omitted?"
 ///     a: "For single-row or single-column inputs, row_num selects the position along that vector; for 2D inputs, an omitted column_num returns the entire row, like column_num 0."
 ///   - q: "Which errors indicate bad indexes?"
-///     a: "Non-numeric index arguments return #VALUE!. A 0 row_num/column_num selects an entire column/row (Excel behavior); negative or out-of-bounds indexes return #REF!."
+///     a: "A blank index is 0, TRUE and FALSE are 1 and 0, and numeric text converts; other text returns #VALUE! and an error index returns that error. A 0 row_num/column_num selects an entire column/row (Excel behavior); negative or out-of-bounds indexes return #REF!."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: INDEX
@@ -431,7 +413,7 @@ impl IndexFn {
 /// Max args: 3
 /// Variadic: false
 /// Signature: INDEX(arg1: any@range, arg2: number@scalar, arg3?: number@scalar)
-/// Arg schema: arg1{kinds=any,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberStrict,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberStrict,max=None,repeating=None,default=false}
+/// Arg schema: arg1{kinds=any,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
 /// Caps: PURE, RETURNS_REFERENCE
 /// [formualizer-docgen:schema:end]
 impl Function for IndexFn {
@@ -518,13 +500,10 @@ impl Function for IndexFn {
             let index = if args[1].is_omitted() {
                 0
             } else {
-                match args[1].value()?.into_literal() {
-                    LiteralValue::Number(n) => n as i64,
-                    LiteralValue::Int(i) => i,
-                    _ => {
-                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                            ExcelError::new(ExcelErrorKind::Value),
-                        )));
+                match integer_parameter(args[1].value()?.into_literal(), &args[1]) {
+                    Ok(index) => index,
+                    Err(error) => {
+                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
                     }
                 }
             };
@@ -534,12 +513,11 @@ impl Function for IndexFn {
                 Some(if args[2].is_omitted() {
                     0
                 } else {
-                    match args[2].value()?.into_literal() {
-                        LiteralValue::Number(n) => n as i64,
-                        LiteralValue::Int(i) => i,
-                        _ => {
+                    match integer_parameter(args[2].value()?.into_literal(), &args[2]) {
+                        Ok(column) => column,
+                        Err(error) => {
                             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                                ExcelError::new(ExcelErrorKind::Value),
+                                error,
                             )));
                         }
                     }
@@ -806,7 +784,15 @@ fn offset_reference<'b>(
 /// (saturating, so a huge offset is off the sheet). An array is lifted by the
 /// caller (`ArgumentHandle::reference_array`) and is `#VALUE!` here.
 fn offset_number(arg: &ArgumentHandle<'_, '_>) -> Result<i64, ExcelError> {
-    match arg.value()?.into_literal() {
+    integer_parameter(arg.value()?.into_literal(), arg)
+}
+
+/// A whole-number parameter (INDEX's row_num and column_num, OFFSET's offsets
+/// and sizes): a blank is 0, TRUE and FALSE are 1 and 0, and numeric or date
+/// text converts; other text is #VALUE!, an error is itself, and a fraction
+/// truncates.
+fn integer_parameter(value: LiteralValue, arg: &ArgumentHandle<'_, '_>) -> Result<i64, ExcelError> {
+    match value {
         LiteralValue::Error(e) => Err(e),
         LiteralValue::Array(_) => Err(ExcelError::new(ExcelErrorKind::Value)),
         value => crate::coercion::to_serial_lenient_in_year(
