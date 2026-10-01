@@ -291,6 +291,26 @@ fn criteria_read_linefeed_text_as_text_like_the_cells() {
 }
 
 #[test]
+fn group_separators_in_numeric_text_are_skipped() {
+    for (formula, expected) in [
+        ("=\"1,234\"+0", Expected::Number(1234.0)),
+        ("=VALUE(\"1,234.5\")", Expected::Number(1234.5)),
+        ("=SUM(\"1,234\",1)", Expected::Number(1235.0)),
+        ("=TEXT(\"1,234\",\"0.0\")", Expected::Text("1234.0")),
+        // 3_45896: a joined list of serials is one number, past the calendar.
+        (
+            "=TEXT(\"45627,45657\",\"yyyy-mm-dd\")",
+            Expected::Error(ExcelErrorKind::Value),
+        ),
+        // A group shorter than three digits is not a number.
+        ("=\"1,23\"+0", Expected::Error(ExcelErrorKind::Value)),
+        ("=TEXT(\"1,23\",\"0.0\")", Expected::Text("1,23")),
+    ] {
+        assert_expected(DateSystem::Excel1900, formula, "en-US grouping", expected);
+    }
+}
+
+#[test]
 fn excel_date_shapes_and_year_less_dates_use_the_clock_year() {
     // Excel en-US reads m-d-y with dashes and y/m/d with a four-digit year.
     for (formula, serial_1900) in [("=\"03-01-01\"+0", 36951.0), ("=\"2003/1/1\"+0", 37622.0)] {

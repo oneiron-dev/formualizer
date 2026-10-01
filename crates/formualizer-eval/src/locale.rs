@@ -2,8 +2,9 @@
 ///
 /// Milestone 0 intentionally uses an invariant locale:
 ///
-/// - Numeric parsing is ASCII/invariant only (`.` decimal separator; no thousands separators),
-///   with support for trailing percent suffix (`"90%" -> 0.9`).
+/// - Numeric parsing is ASCII/invariant only (`.` decimal separator; en-US `,` group
+///   separators in the integer part), with support for trailing percent suffix
+///   (`"90%" -> 0.9`).
 /// - Strings are case-folded with ASCII-only rules (`to_ascii_lowercase`).
 ///
 /// This means locale-dependent inputs like `"1.234,56"` are *not* interpreted as numbers.
@@ -30,9 +31,9 @@ impl Locale {
     pub fn parse_number_invariant(&self, s: &str) -> Option<f64> {
         let trimmed = s.trim_matches(' ');
         if let Some(without_pct) = trimmed.strip_suffix('%') {
-            parse_finite_number(without_pct.trim_end_matches(' ')).map(|n| n / 100.0)
+            parse_grouped(without_pct.trim_end_matches(' ')).map(|n| n / 100.0)
         } else {
-            parse_finite_number(trimmed)
+            parse_grouped(trimmed)
         }
     }
 
@@ -53,6 +54,34 @@ pub fn parse_finite_number(text: &str) -> Option<f64> {
     text.parse::<f64>().ok().filter(|n| n.is_finite())
 }
 
+/// Parse a number whose integer part may carry en-US `,` group separators,
+/// as Excel reads `"1,234"`: each comma follows a digit and is followed by
+/// at least three digits (`"45627,45657"` is 4562745657; `"1,23"`, `"1,"`
+/// and `",5"` are not numbers), and none comes after the decimal point or
+/// exponent.
+fn parse_grouped(text: &str) -> Option<f64> {
+    if !text.contains(',') {
+        return parse_finite_number(text);
+    }
+    let (integer, rest) = text.split_at(text.find(['.', 'e', 'E']).unwrap_or(text.len()));
+    if rest.contains(',') {
+        return None;
+    }
+    let mut groups = integer.split(',');
+    let mut plain = groups.next()?.to_owned();
+    if !plain.ends_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    for group in groups {
+        if group.len() < 3 || !group.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        plain.push_str(group);
+    }
+    plain.push_str(rest);
+    parse_finite_number(&plain)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Locale, parse_finite_number};
@@ -71,6 +100,34 @@ mod tests {
         assert_eq!(loc.parse_number_invariant("  42 "), Some(42.0));
         for text in ["5\n", "\n5", "5\t", "\r5", "\u{a0}5", "5%\n"] {
             assert_eq!(loc.parse_number_invariant(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn parse_number_invariant_skips_group_separators() {
+        let loc = Locale::invariant();
+        for (text, n) in [
+            ("1,234", 1234.0),
+            ("-1,234,567", -1234567.0),
+            ("1,234.5", 1234.5),
+            ("1,0000", 10000.0),
+            ("45627,45657", 4562745657.0),
+            ("1,234e2", 123400.0),
+            (" 1,234% ", 12.34),
+        ] {
+            assert_eq!(loc.parse_number_invariant(text), Some(n), "{text}");
+        }
+        for text in [
+            "1,23",
+            "12,34,567",
+            "1,",
+            ",5",
+            "1,,234",
+            "1.234,5",
+            "1e3,000",
+            "1,2a4",
+        ] {
+            assert_eq!(loc.parse_number_invariant(text), None, "{text}");
         }
     }
 
