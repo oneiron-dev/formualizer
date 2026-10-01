@@ -185,3 +185,60 @@ fn approximate_match_modes_scan_unsorted_data() {
         3.0
     );
 }
+
+/// In XLOOKUP's exact-or-next-larger scan an empty entry ranks above every
+/// number: a qualifying number still wins, but when no number is at or above
+/// the lookup value the first blank met is returned instead of if_not_found.
+/// Excel: `=XLOOKUP(0.5,FILTER(B2:F3,A2:A3=2),B1:F1,"",1)` => 30, the header
+/// of the first blank in the filtered row.
+#[test]
+fn next_larger_ranks_a_blank_above_every_number() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    let rows: [(i64, [Option<f64>; 5]); 2] = [
+        (1, [Some(0.1), None, Some(0.3), None, Some(0.2)]),
+        (2, [Some(0.065), Some(0.109), None, None, Some(0.436)]),
+    ];
+    for col in 0..5u32 {
+        engine
+            .set_cell_value(
+                "Sheet1",
+                1,
+                col + 2,
+                LiteralValue::Int((col as i64 + 1) * 10),
+            )
+            .unwrap();
+    }
+    for (row, (id, keys)) in rows.into_iter().enumerate() {
+        let row = row as u32 + 2;
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Int(id))
+            .unwrap();
+        for (col, key) in keys.into_iter().enumerate() {
+            if let Some(key) = key {
+                engine
+                    .set_cell_value("Sheet1", row, col as u32 + 2, LiteralValue::Number(key))
+                    .unwrap();
+            }
+        }
+    }
+    for (formula, expected) in [
+        ("=XLOOKUP(0.5,FILTER(B2:F3,A2:A3=2),B1:F1,\"\",1)", 30.0),
+        ("=XLOOKUP(0.3,FILTER(B2:F3,A2:A3=2),B1:F1,\"\",1)", 50.0),
+        ("=XLOOKUP(0.5,B2:F2,B1:F1,\"\",1)", 20.0),
+        ("=XLOOKUP(0.5,B2:F2,B1:F1,\"\",1,-1)", 40.0),
+        ("=XMATCH(0.5,B2:F2,1)", 2.0),
+        // Control: a qualifying number outranks the blanks.
+        ("=XLOOKUP(0.25,B2:F2,B1:F1,\"\",1)", 30.0),
+    ] {
+        assert_eq!(
+            number(eval_formula(&mut engine, formula)),
+            expected,
+            "{formula}"
+        );
+    }
+    // A blank is not a 0 below the lookup value.
+    assert_eq!(
+        eval_formula(&mut engine, "=XLOOKUP(0.05,B2:F2,B1:F1,\"none\",-1)"),
+        Some(LiteralValue::Text("none".into()))
+    );
+}

@@ -20,7 +20,7 @@
 
 use super::super::utils::collapse_if_scalar;
 use super::lookup_utils::{
-    PreparedLookupMatcher, cmp_for_approximate, cmp_for_lookup,
+    PreparedLookupMatcher, cmp_for_approximate, cmp_for_lookup, searches_numbers,
 };
 use super::sort_collation::cmp_text_for_sort;
 use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
@@ -100,7 +100,9 @@ fn find_semantic_empty(
 /// and the data need not be sorted: an exact match is returned at once,
 /// otherwise the nearest entry on the requested side, the first one met in
 /// search order among equals. Entries of another type than the lookup value
-/// are not candidates.
+/// are not candidates, except that an empty entry ranks above every number:
+/// when no number is at or above a numeric lookup value, exact-or-next-larger
+/// returns the first blank met.
 fn linear_approximate_match(
     len: usize,
     cell: impl Fn(usize) -> LiteralValue,
@@ -115,10 +117,15 @@ fn linear_approximate_match(
     } else {
         Box::new(0..len)
     };
+    let blank_ranks_above = side == 1 && searches_numbers(needle);
+    let mut first_blank: Option<usize> = None;
     let mut best: Option<(usize, LiteralValue)> = None;
     for i in order {
         let cand = cell(i);
         let Some(c) = cmp_for_approximate(&cand, needle, date_system) else {
+            if blank_ranks_above && first_blank.is_none() && matches!(cand, LiteralValue::Empty) {
+                first_blank = Some(i);
+            }
             continue;
         };
         if c == 0 {
@@ -132,7 +139,7 @@ fn linear_approximate_match(
             best = Some((i, cand));
         }
     }
-    best.map(|(i, _)| i)
+    best.map(|(i, _)| i).or(first_blank)
 }
 
 /* ───────────────────────── XLOOKUP() ───────────────────────── */
@@ -150,7 +157,7 @@ pub struct XLookupFn;
 /// - `if_not_found` is optional; if omitted and no match exists, returns `#N/A`.
 /// - `match_mode`: `0` exact, `-1` exact-or-next-smaller, `1` exact-or-next-larger, `2` wildcard.
 /// - `search_mode`: `1` forward, `-1` reverse. Other modes are accepted with current fallback behavior.
-/// - Approximate modes (`-1`/`1`) scan every entry in search order, so the lookup array need not be sorted; only entries of the lookup value's type (number, text or logical) are candidates.
+/// - Approximate modes (`-1`/`1`) scan every entry in search order, so the lookup array need not be sorted; only entries of the lookup value's type (number, text or logical) are candidates, except that a blank ranks above every number for exact-or-next-larger.
 /// - `lookup_array` must be 1D. Invalid shape returns `#VALUE!`.
 /// - If `return_array` is multi-column or multi-row, the matched row/column is returned as a spill.
 ///

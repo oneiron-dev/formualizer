@@ -173,14 +173,17 @@ pub fn cmp_for_approximate(
             Some(a.to_lowercase().cmp(&b.to_lowercase()) as i32)
         }
         (LiteralValue::Boolean(a), LiteralValue::Boolean(b)) => Some(a.cmp(b) as i32),
-        (v, n)
-            if is_numeric_exact_value(v)
-                && (is_numeric_exact_value(n) || matches!(n, LiteralValue::Empty)) =>
-        {
+        (v, n) if is_numeric_exact_value(v) && searches_numbers(n) => {
             cmp_for_lookup(v, n, date_system)
         }
         _ => None,
     }
+}
+
+/// Whether an approximate lookup for `needle` searches the numbers (a blank
+/// lookup value searches as the number 0).
+pub fn searches_numbers(needle: &LiteralValue) -> bool {
+    is_numeric_exact_value(needle) || matches!(needle, LiteralValue::Empty)
 }
 
 /// Whether Excel's approximate search visits `value` when looking for `needle`.
