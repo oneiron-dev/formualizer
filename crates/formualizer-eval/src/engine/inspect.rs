@@ -11,6 +11,7 @@
 //! FormulaPlane authority than legacy; and (b) reports produced under a binding
 //! `max_work` budget are representation-dependent in how much they discover.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -19,11 +20,11 @@ use formualizer_common::{
     CellAddress, ExcelError, ExcelErrorKind, LiteralValue, RangeAddress, RangeArea, SheetId,
 };
 use formualizer_parse::parser::{
-    ASTNode, ReferenceType, SpecialItem, TableReference, TableSpecifier,
+    ASTNode, ASTNodeType, ReferenceType, SpecialItem, TableReference, TableSpecifier,
 };
 use rustc_hash::FxHashMap;
 
-use crate::engine::named_range::NamedDefinition;
+use crate::engine::named_range::{NameScope, NamedDefinition};
 use crate::engine::refs;
 use crate::engine::used_extent::{
     ExtentPolicy, OpenRangeBounds, ResolvedExtent, resolve_used_extent,
@@ -1676,6 +1677,21 @@ impl<R: EvaluationContext> Engine<R> {
         max_links: u32,
         work: &mut WorkBudget,
     ) -> Result<(Vec<Precedent>, TruncationReport), InspectError> {
+        let source = self.inspect_source();
+        self.collect_references(key, max_links, work, |collector| {
+            source.visit_declared_references(key, collector)
+        })
+    }
+
+    /// Collect the references `visit` reports, resolved as a formula at `key`
+    /// reads them.
+    fn collect_references(
+        &self,
+        key: CellKey,
+        max_links: u32,
+        work: &mut WorkBudget,
+        visit: impl FnOnce(&mut dyn ReferenceVisitor) -> Result<(), InspectError>,
+    ) -> Result<(Vec<Precedent>, TruncationReport), InspectError> {
         struct Collector<'a, R> {
             engine: &'a Engine<R>,
             key: CellKey,
@@ -1710,7 +1726,6 @@ impl<R: EvaluationContext> Engine<R> {
             }
         }
 
-        let source = self.inspect_source();
         let mut collector = Collector {
             engine: self,
             key,
@@ -1719,7 +1734,7 @@ impl<R: EvaluationContext> Engine<R> {
             precedents: Vec::new(),
             truncated: false,
         };
-        source.visit_declared_references(key, &mut collector)?;
+        visit(&mut collector)?;
         let truncation = if collector.truncated {
             TruncationReport {
                 incomplete: true,
@@ -1745,6 +1760,95 @@ impl<R: EvaluationContext> Engine<R> {
         Ok(PrecedentReport {
             stamp: self.inspect_stamp(),
             cell: canonical,
+            precedents,
+            truncation,
+        })
+    }
+
+    /// Return the declared references of what `name` stands for in a formula
+    /// at `cell`, source-ordered and first-occurrence-deduplicated: a cell or
+    /// range name's area, nothing for a constant, and every reference of a
+    /// name defined by a formula, as a cell formula's precedents are. The name
+    /// is the one `cell`'s sheet sees (its sheet-scoped name, else the
+    /// workbook-scoped one), and its formula is read where the engine
+    /// evaluates it: a sheet-scoped name's on its own sheet, a workbook-scoped
+    /// name's on `cell`'s sheet, at `cell`'s row and column. The report's
+    /// `cell` is that place; the names the formula uses stay symbolic and
+    /// resolve from it, so asking again from there follows them. An undefined
+    /// name has no precedents.
+    pub fn name_precedents(
+        &self,
+        cell: &CellAddress,
+        name: &str,
+        options: &PrecedentOptions,
+    ) -> Result<PrecedentReport, InspectError> {
+        let (key, canonical) = self.canonical_cell(cell)?;
+        let Some(named) = self.graph.resolve_name_entry(name, key.sheet_id) else {
+            return Ok(PrecedentReport {
+                stamp: self.inspect_stamp(),
+                cell: canonical,
+                precedents: Vec::new(),
+                truncation: TruncationReport::default(),
+            });
+        };
+        let place = CellKey {
+            sheet_id: match named.scope {
+                NameScope::Sheet(sheet_id) => sheet_id,
+                NameScope::Workbook => key.sheet_id,
+            },
+            ..key
+        };
+        // A cell or range name reads its area as a reference to it would.
+        let area = |start: &CellRef, end: &CellRef| {
+            let sheet = Some(self.graph.sheet_name(start.sheet_id).to_string());
+            let (row, col) = (start.coord.row() + 1, start.coord.col() + 1);
+            let reference = if start == end {
+                ReferenceType::Cell {
+                    sheet,
+                    row,
+                    col,
+                    row_abs: true,
+                    col_abs: true,
+                }
+            } else {
+                ReferenceType::Range {
+                    sheet,
+                    start_row: Some(row),
+                    start_col: Some(col),
+                    end_row: Some(end.coord.row() + 1),
+                    end_col: Some(end.coord.col() + 1),
+                    start_row_abs: true,
+                    start_col_abs: true,
+                    end_row_abs: true,
+                    end_col_abs: true,
+                }
+            };
+            Cow::Owned(ASTNode::new(
+                ASTNodeType::Reference {
+                    original: reference.to_string(),
+                    reference,
+                },
+                None,
+            ))
+        };
+        let definition = match &named.definition {
+            NamedDefinition::Formula { ast, .. } => Some(Cow::Borrowed(ast)),
+            NamedDefinition::Cell(cell) => Some(area(cell, cell)),
+            NamedDefinition::Range(range) => Some(area(&range.start, &range.end)),
+            NamedDefinition::Literal(_) => None,
+        };
+        let mut work = WorkBudget::new(options.max_work);
+        let (precedents, truncation) = match definition {
+            Some(ast) => {
+                self.collect_references(place, options.max_links, &mut work, |collector| {
+                    visit_formula_ast_references(&ast, collector)
+                })?
+            }
+            None => (Vec::new(), TruncationReport::default()),
+        };
+        Ok(PrecedentReport {
+            stamp: self.inspect_stamp(),
+            cell: self.address_for_key(place),
             precedents,
             truncation,
         })

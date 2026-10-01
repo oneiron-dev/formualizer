@@ -1277,15 +1277,18 @@ fn unknown_functions_and_their_readers_are_calculated_always() {
 #[test]
 fn shared_formula_members_left_of_the_master_are_judged_on_their_own_formula() {
     // Excel's shared groups may have members left of their master (B2, ref
-    // A2:C3; E2, ref D2:E3). Each member is the master's formula at the
-    // member's place, and its flag is that formula's: A3 is A$1*2 and reads
-    // TODAY in A1 while B3 and C3 do not; every member of the volatile E2
-    // group is calculated always; K1 reads the member A3.
+    // A2:C3; E2, ref D2:E3; G2, ref F2:G3). Each member is the master's
+    // formula at the member's place, and its flag is that formula's: A3 is
+    // A$1*2 and reads TODAY in A1 while B3 and C3 do not; every member of the
+    // volatile E2 group is calculated always; K1 reads the member A3. G2's
+    // SUMIF sums $J$5 over the one-cell H$5:H5, while its members F3 (G$5:G6)
+    // and G3 (H$5:H6) resize it.
     let rows = "<row r=\"1\"><c r=\"A1\"><f>TODAY()</f><v>1</v></c><c r=\"B1\"><v>5</v></c><c r=\"C1\"><v>6</v></c><c r=\"K1\"><f>A3+1</f><v>0</v></c><c r=\"L1\"><f>B3+1</f><v>11</v></c></row>\
         <row r=\"2\"><c r=\"A2\"><f>A1-A1+1000</f><v>1000</v></c><c r=\"B2\"><f t=\"shared\" ref=\"A2:C3\" si=\"0\">B$1*2</f><v>10</v></c><c r=\"C2\"><f t=\"shared\" si=\"0\"/><v>12</v></c>\
-        <c r=\"E2\"><f t=\"shared\" ref=\"D2:E3\" si=\"1\">ROW()+0*NOW()</f><v>2</v></c></row>\
+        <c r=\"E2\"><f t=\"shared\" ref=\"D2:E3\" si=\"1\">ROW()+0*NOW()</f><v>2</v></c><c r=\"G2\"><f t=\"shared\" ref=\"F2:G3\" si=\"2\">SUMIF(H$5:H5,\"&gt;0\",$J$5)</f><v>10</v></c></row>\
         <row r=\"3\"><c r=\"A3\"><f t=\"shared\" si=\"0\"/><v>0</v></c><c r=\"B3\"><f t=\"shared\" si=\"0\"/><v>10</v></c><c r=\"C3\"><f t=\"shared\" si=\"0\"/><v>12</v></c>\
-        <c r=\"D3\"><f t=\"shared\" si=\"1\"/><v>3</v></c><c r=\"E3\"><f t=\"shared\" si=\"1\"/><v>3</v></c></row>";
+        <c r=\"D3\"><f t=\"shared\" si=\"1\"/><v>3</v></c><c r=\"E3\"><f t=\"shared\" si=\"1\"/><v>3</v></c><c r=\"F3\"><f t=\"shared\" si=\"2\"/><v>0</v></c><c r=\"G3\"><f t=\"shared\" si=\"2\"/><v>10</v></c></row>\
+        <row r=\"5\"><c r=\"H5\"><v>1</v></c><c r=\"J5\"><v>10</v></c></row>";
     let out = recalculate_xlsx_bytes(&pack(&parts(rows)), Default::default()).unwrap();
     let sheet = member(&out.bytes, SHEET);
     for expected in [
@@ -1301,6 +1304,9 @@ fn shared_formula_members_left_of_the_master_are_judged_on_their_own_formula() {
         "<c r=\"E2\"><f t=\"shared\" ref=\"D2:E3\" ca=\"1\" si=\"1\">ROW()+0*NOW()</f><v>2</v>",
         "<c r=\"D3\"><f t=\"shared\" ca=\"1\" si=\"1\"/><v>3</v>",
         "<c r=\"E3\"><f t=\"shared\" ca=\"1\" si=\"1\"/><v>3</v>",
+        "<c r=\"G2\"><f t=\"shared\" ref=\"F2:G3\" si=\"2\">SUMIF(H$5:H5,\"&gt;0\",$J$5)</f><v>10</v>",
+        "<c r=\"F3\"><f t=\"shared\" ca=\"1\" si=\"2\"/><v>0</v>",
+        "<c r=\"G3\"><f t=\"shared\" ca=\"1\" si=\"2\"/><v>10</v>",
     ] {
         assert!(sheet.contains(expected), "{expected} in {sheet}");
     }
@@ -1365,6 +1371,178 @@ fn workbooks_without_calculated_always_formulas_are_unchanged() {
     let out = recalculate_xlsx_bytes(&input, Default::default()).unwrap();
     assert_eq!(out.bytes, input);
     assert_eq!(out.cache_cells_changed, 0);
+}
+/// Add a worksheet table `name` over `area` of Sheet1, one column per name
+/// in `columns`.
+fn with_table(
+    mut p: BTreeMap<String, String>,
+    name: &str,
+    area: &str,
+    columns: &[&str],
+) -> BTreeMap<String, String> {
+    let sheet = p.get_mut(SHEET).unwrap();
+    *sheet = sheet.replace(
+        "</sheetData>",
+        &format!("</sheetData><tableParts count=\"1\"><tablePart xmlns:r=\"{OFFICE}\" r:id=\"rId1\"/></tableParts>"),
+    );
+    p.insert(
+        "xl/worksheets/_rels/sheet1.xml.rels".into(),
+        format!("<Relationships xmlns=\"{RELS}\"><Relationship Id=\"rId1\" Type=\"{OFFICE}/table\" Target=\"../tables/table1.xml\"/></Relationships>"),
+    );
+    let names: String = columns
+        .iter()
+        .enumerate()
+        .map(|(i, column)| format!("<tableColumn id=\"{}\" name=\"{column}\"/>", i + 1))
+        .collect();
+    p.insert(
+        "xl/tables/table1.xml".into(),
+        format!("<table xmlns=\"{MAIN}\" id=\"1\" name=\"{name}\" displayName=\"{name}\" ref=\"{area}\" totalsRowShown=\"0\"><tableColumns count=\"{}\">{names}</tableColumns></table>", columns.len()),
+    );
+    let ct = p.get_mut("[Content_Types].xml").unwrap();
+    *ct = ct.replace("</Types>", "<Override PartName=\"/xl/tables/table1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml\"/></Types>");
+    p
+}
+#[test]
+fn arrays_reading_through_a_name_mark_each_member_reading_a_flagged_cell() {
+    // A reference through a defined name is a reference to the name's
+    // cells, so {=Data*2} lines up with A1:A3 as {=A1:A3*2} does: B3's
+    // element reads A3, which reads TODAY in A1, and is marked like the
+    // anchor's; B2's reads the plain A2. A formula reading the name is
+    // calculated always too, and recalculating the output changes nothing.
+    let rows = "<row r=\"1\"><c r=\"A1\"><f>TODAY()</f><v>1</v></c><c r=\"B1\"><f t=\"array\" ref=\"B1:B3\">Data*2</f><v>2</v></c><c r=\"C1\"><f>SUM(Data)</f><v>8</v></c></row>\
+        <row r=\"2\"><c r=\"A2\"><v>5</v></c><c r=\"B2\"><v>10</v></c></row>\
+        <row r=\"3\"><c r=\"A3\"><f>A1+1</f><v>2</v></c><c r=\"B3\"><v>4</v></c></row>";
+    let named = with_names(
+        parts(rows),
+        "<definedName name=\"Data\">Sheet1!$A$1:$A$3</definedName>",
+    );
+    let direct = parts(&rows.replace("Data", "A1:A3"));
+    for (p, array) in [(named, "Data*2"), (direct, "A1:A3*2")] {
+        let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+        let sheet = member(&out.bytes, SHEET);
+        for expected in [
+            "<c r=\"A1\"><f ca=\"1\">TODAY()</f>",
+            &format!("<f t=\"array\" ref=\"B1:B3\" ca=\"1\">{array}</f>"),
+            "<c r=\"B2\"><v>10</v></c>",
+            "<c r=\"B3\"><f ca=\"1\"/>",
+            "<c r=\"A3\"><f ca=\"1\">A1+1</f>",
+            "<f ca=\"1\">SUM(",
+        ] {
+            assert!(sheet.contains(expected), "{expected} in {sheet}");
+        }
+        assert_eq!(
+            recalculate_xlsx_bytes(&out.bytes, Default::default())
+                .unwrap()
+                .bytes,
+            out.bytes
+        );
+    }
+}
+#[test]
+fn readers_through_names_defined_by_formulas_are_calculated_always() {
+    // The cells a name's formula refers to are precedents of every formula
+    // using the name: an expression over A1 (Twice), a name defined as a
+    // range name (Alias), a range ending at INDEX over a column holding the
+    // TODAY reader G2 (Dyn) and a table column holding one (Qty). Plain's
+    // formula reads nothing calculated always.
+    let rows = "<row r=\"1\"><c r=\"A1\"><f>TODAY()</f><v>1</v></c><c r=\"B1\"><f>Twice+1</f><v>3</v></c><c r=\"C1\"><f>SUM(Alias)</f><v>8</v></c><c r=\"D1\"><f>SUM(Dyn)</f><v>3</v></c>\
+        <c r=\"E1\"><f>SUM(Qty)</f><v>1</v></c><c r=\"F1\"><v>7</v></c><c r=\"G1\"><v>1</v></c><c r=\"H1\" t=\"inlineStr\"><is><t>Q</t></is></c><c r=\"I1\"><f>Plain*2</f><v>14</v></c></row>\
+        <row r=\"2\"><c r=\"A2\"><v>7</v></c><c r=\"G2\"><f>TODAY()*0+2</f><v>2</v></c><c r=\"H2\"><f>TODAY()*0+1</f><v>1</v></c></row>";
+    let p = with_names(
+        with_table(parts(rows), "Sales", "H1:H2", &["Q"]),
+        "<definedName name=\"Twice\">Sheet1!$A$1*2</definedName><definedName name=\"Base\">Sheet1!$A$1:$A$2</definedName><definedName name=\"Alias\">Base</definedName>\
+         <definedName name=\"Dyn\">Sheet1!$G$1:INDEX(Sheet1!$G:$G,2)</definedName><definedName name=\"Qty\">Sales[Q]</definedName><definedName name=\"Plain\">Sheet1!$F$1*1</definedName>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<f ca=\"1\">Twice+1</f>",
+        "<f ca=\"1\">SUM(Alias)</f>",
+        "<f ca=\"1\">SUM(Dyn)</f><v>3</v>",
+        "<f ca=\"1\">SUM(Qty)</f><v>1</v>",
+        "<f>Plain*2</f><v>14</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected} in {sheet}");
+    }
+    assert_eq!(
+        recalculate_xlsx_bytes(&out.bytes, Default::default())
+            .unwrap()
+            .bytes,
+        out.bytes
+    );
+}
+#[test]
+fn formulas_use_the_defined_name_their_sheet_sees() {
+    // A formula resolves its sheet's own name before the workbook's
+    // (ECMA-376 18.2.5, localSheetId). Sheet1's X is the plain A1 and
+    // Sheet2's is NOW(), so only the formulas meaning Sheet2's X are
+    // calculated always, Sheet2!X on Sheet1 included.
+    let sheet2 = "<row r=\"1\"><c r=\"A1\"><f>X</f><v>1</v></c></row>";
+    let rows = "<row r=\"1\"><c r=\"A1\"><v>5</v></c><c r=\"B1\"><f>X+1</f><v>6</v></c><c r=\"C1\"><f>Sheet2!X</f><v>1</v></c></row>";
+    for names in [
+        "<definedName name=\"X\" localSheetId=\"0\">Sheet1!$A$1</definedName><definedName name=\"X\" localSheetId=\"1\">NOW()</definedName>",
+        "<definedName name=\"X\">Sheet1!$A$1</definedName><definedName name=\"X\" localSheetId=\"1\">NOW()</definedName>",
+    ] {
+        let p = with_names(with_sheet2(parts(rows), sheet2), names);
+        let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+        let sheet = member(&out.bytes, SHEET);
+        assert!(sheet.contains("<f>X+1</f><v>6</v>"), "{names}: {sheet}");
+        assert!(
+            sheet.contains("<f ca=\"1\">Sheet2!X</f>"),
+            "{names}: {sheet}"
+        );
+        let sheet2 = member(&out.bytes, "xl/worksheets/sheet2.xml");
+        assert!(sheet2.contains("<f ca=\"1\">X</f>"), "{names}: {sheet2}");
+    }
+    // A workbook-level NOW() shadowed on Sheet1 only reaches Sheet2.
+    let p = with_names(
+        with_sheet2(parts(rows), sheet2),
+        "<definedName name=\"X\">NOW()</definedName><definedName name=\"X\" localSheetId=\"0\">Sheet1!$A$1</definedName>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    assert!(sheet.contains("<f>X+1</f><v>6</v>"), "{sheet}");
+    assert!(sheet.contains("<f ca=\"1\">Sheet2!X</f>"), "{sheet}");
+    let sheet2 = member(&out.bytes, "xl/worksheets/sheet2.xml");
+    assert!(sheet2.contains("<f ca=\"1\">X</f>"), "{sheet2}");
+}
+#[test]
+fn sumif_resizing_is_judged_on_the_ranges_each_cell_evaluates() {
+    // SUMIF and AVERAGEIF sum the criteria range's shape from the sum
+    // range's top-left cell. The shared B1:B3 grows its criteria range
+    // row by row, so B2 and B3 resize $C$1 and B1 does not. Ranges through a
+    // name (Crit), INDEX and a table column are sized as they evaluate.
+    let rows = "<row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"B1\"><f t=\"shared\" ref=\"B1:B3\" si=\"0\">SUMIF($A$1:A1,\"&gt;0\",$C$1)</f><v>10</v></c><c r=\"C1\"><v>10</v></c>\
+        <c r=\"D1\"><f>SUMIF(Crit,\"&gt;0\",$C$1)</f><v>60</v></c><c r=\"E1\"><f>SUMIF($A$1:$A$3,\"&gt;0\",INDEX($C:$C,1):INDEX($C:$C,3))</f><v>60</v></c><c r=\"F1\" t=\"inlineStr\"><is><t>N</t></is></c></row>\
+        <row r=\"2\"><c r=\"A2\"><v>2</v></c><c r=\"B2\"><f t=\"shared\" si=\"0\"/><v>30</v></c><c r=\"C2\"><v>20</v></c>\
+        <c r=\"D2\"><f>SUMIF(Crit,\"&gt;0\",$C$1:$C$3)</f><v>60</v></c><c r=\"E2\"><f>SUMIF($A$1:$A$3,\"&gt;0\",INDEX($C:$C,1):INDEX($C:$C,1))</f><v>60</v></c><c r=\"F2\"><v>1</v></c></row>\
+        <row r=\"3\"><c r=\"A3\"><v>3</v></c><c r=\"B3\"><f t=\"shared\" si=\"0\"/><v>60</v></c><c r=\"C3\"><v>30</v></c>\
+        <c r=\"D3\"><f>AVERAGEIF(Sales[N],\"&gt;0\",$C$1)</f><v>15</v></c><c r=\"E3\"><f>SUMIF(Sales[N],\"&gt;0\",$C$1:$C$2)</f><v>30</v></c><c r=\"F3\"><v>2</v></c></row>";
+    let p = with_names(
+        with_table(parts(rows), "Sales", "F1:F3", &["N"]),
+        "<definedName name=\"Crit\">Sheet1!$A$1:$A$3</definedName>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<f t=\"shared\" ref=\"B1:B3\" si=\"0\">SUMIF($A$1:A1,\"&gt;0\",$C$1)</f><v>10</v>",
+        "<c r=\"B2\"><f t=\"shared\" ca=\"1\" si=\"0\"/><v>30</v>",
+        "<c r=\"B3\"><f t=\"shared\" ca=\"1\" si=\"0\"/><v>60</v>",
+        "<f ca=\"1\">SUMIF(Crit,",
+        "<f>SUMIF(Crit,\"&gt;0\",$C$1:$C$3)</f><v>60</v>",
+        "<f>SUMIF($A$1:$A$3,\"&gt;0\",INDEX($C:$C,1):INDEX($C:$C,3))</f><v>60</v>",
+        "<f ca=\"1\">SUMIF($A$1:$A$3,\"&gt;0\",INDEX($C:$C,1):INDEX($C:$C,1))</f><v>60</v>",
+        "<f ca=\"1\">AVERAGEIF(Sales[N],",
+        "<f>SUMIF(Sales[N],\"&gt;0\",$C$1:$C$2)</f><v>30</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected} in {sheet}");
+    }
+    assert_eq!(
+        recalculate_xlsx_bytes(&out.bytes, Default::default())
+            .unwrap()
+            .bytes,
+        out.bytes
+    );
 }
 #[test]
 fn multiple_changed_members_relocate_growing_and_shrinking_payloads() {

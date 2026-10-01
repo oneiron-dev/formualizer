@@ -8,9 +8,16 @@
 //!   `_xll.` or VBA) function or another application's function, whose
 //!   value is #NAME?;
 //! - sums or averages a range whose size differs from its criteria range
-//!   (SUMIF, AVERAGEIF), which reads cells outside its references;
+//!   (SUMIF, AVERAGEIF), which reads cells outside its references; the
+//!   ranges are those the formula evaluates at its cell, so each cell of a
+//!   shared formula is judged on its own;
 //! - reads a calculated-always cell through a cell, range, name or table
-//!   reference, on any sheet.
+//!   reference, on any sheet; a defined name reads the cells its formula
+//!   refers to.
+//!
+//! A formula uses the defined name its sheet sees: the sheet's own name of
+//! that spelling, else the workbook's (`localSheetId`). A workbook-level
+//! name's formula is read on the sheet of the formula using it.
 //!
 //! Each member of a multi-cell array formula carries its own flag, the empty
 //! `<f ca="1"/>`: every member when the array formula itself is calculated
@@ -31,7 +38,10 @@ use formualizer_eval::engine::Engine;
 use formualizer_eval::engine::inspect::{
     DependentsOptions, NameResolution, PrecedentOptions, SemanticReference,
 };
-use formualizer_parse::{Token, TokenSubType, TokenType, Tokenizer};
+use formualizer_eval::interpreter::Interpreter;
+use formualizer_eval::{CellRef, Coord};
+use formualizer_parse::parser::{ASTNode, ASTNodeType, ReferenceType};
+use formualizer_parse::{TokenSubType, TokenType, Tokenizer};
 use std::collections::{HashMap, HashSet};
 
 /// Functions whose formulas Excel recalculates at every calculation.
@@ -112,135 +122,232 @@ enum Slot {
     Member(usize),
 }
 
-/// The workbook's defined names and those whose formulas are calculated
-/// always, lowercase.
-struct Names {
-    defined: HashSet<String>,
-    calc_always: HashSet<String>,
+/// Where the formulas of each sheet find the workbook's defined names.
+struct Scopes {
+    /// Index into the defined names by the sheet a name is local to (`None`:
+    /// the workbook) and its lowercase spelling.
+    names: HashMap<(Option<usize>, String), usize>,
+    /// Sheet indexes by lowercase sheet name.
+    sheets: HashMap<String, usize>,
 }
 
-/// How a formula's call of a function makes it calculated always.
-enum Call {
-    Volatile,
-    Unknown,
-    Known,
-}
-
-fn call(name: &str, names: &Names) -> Call {
-    // A call of a LAMBDA value, `LAMBDA(x,x)(1)`, names no function.
-    if name.is_empty() {
-        return Call::Known;
-    }
-    let upper = name.to_ascii_uppercase();
-    if upper.starts_with("_XLUDF.") || upper.starts_with("_XLL.") {
-        return Call::Unknown;
-    }
-    let (bare, prefixed) = ["_XLFN._XLWS.", "_XLFN.", "_XLWS."]
-        .iter()
-        .find_map(|p| upper.strip_prefix(p))
-        .map_or((upper.as_str(), false), |bare| (bare, true));
-    let lower = name.to_ascii_lowercase();
-    if VOLATILE.contains(&bare) || names.calc_always.contains(&lower) {
-        Call::Volatile
-    } else if prefixed
-        || bare.starts_with("_XLPM.")
-        || BUILT_IN.binary_search(&bare).is_ok()
-        || names.defined.contains(&lower)
-    {
-        Call::Known
-    } else {
-        Call::Unknown
-    }
-}
-
-/// Rows and columns of an A1 cell or area operand (`$A$1:B2`, `A:B`, `1:2`).
-fn dimensions(operand: &str) -> Option<(u32, u32)> {
-    let local = operand.rsplit_once('!').map_or(operand, |(_, area)| area);
-    let (start, end) = local.split_once(':').unwrap_or((local, local));
-    let endpoint = |text: &str| {
-        let text = text.replace('$', "");
-        if let Ok((row, col, _, _)) = formualizer_common::coord::parse_a1_1based(&text) {
-            Some((Some(row), Some(col)))
-        } else if let Ok(row) = text.parse::<u32>() {
-            Some((Some(row), None))
-        } else if !text.is_empty() && text.bytes().all(|b| b.is_ascii_alphabetic()) {
-            let col = formualizer_common::coord::parse_a1_1based(&format!("{text}1"))
-                .ok()?
-                .1;
-            Some((None, Some(col)))
-        } else {
-            None
+impl Scopes {
+    fn new<'a>(
+        sheets: impl IntoIterator<Item = &'a str>,
+        defined: &[package::DefinedName],
+    ) -> Self {
+        Self {
+            names: defined
+                .iter()
+                .enumerate()
+                .map(|(i, n)| ((n.sheet, n.name.to_ascii_lowercase()), i))
+                .collect(),
+            sheets: sheets
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| (name.to_lowercase(), i))
+                .collect(),
         }
-    };
-    let (a, b) = (endpoint(start)?, endpoint(end)?);
-    let span = |x: Option<u32>, y: Option<u32>, all: u32| match (x, y) {
-        (Some(x), Some(y)) => Some(x.abs_diff(y) + 1),
-        (None, None) => Some(all),
-        _ => None,
-    };
-    Some((span(a.0, b.0, 1_048_576)?, span(a.1, b.1, 16_384)?))
-}
-
-/// SUMIF/AVERAGEIF whose third argument is not the size of the first: Excel
-/// sums the cells of the criteria range's size from the sum range's corner.
-fn resized_sum_range(tokens: &[Token], open: usize) -> bool {
-    let mut args: Vec<Vec<&Token>> = vec![Vec::new()];
-    let mut depth = 0usize;
-    for token in &tokens[open + 1..] {
-        match (token.token_type, token.subtype) {
-            (TokenType::Func | TokenType::Paren | TokenType::Array, TokenSubType::Open) => {
-                depth += 1
-            }
-            (TokenType::Func | TokenType::Paren | TokenType::Array, TokenSubType::Close) => {
-                if depth == 0 {
-                    break;
-                }
-                depth -= 1;
-            }
-            (TokenType::Sep, TokenSubType::Arg) if depth == 0 => {
-                args.push(Vec::new());
-                continue;
-            }
-            (TokenType::Whitespace, _) => continue,
-            _ => {}
-        }
-        args.last_mut().expect("argument").push(token);
     }
-    let area = |arg: &[&Token]| match arg {
-        [token]
-            if token.token_type == TokenType::Operand && token.subtype == TokenSubType::Range =>
-        {
-            dimensions(&token.value)
+
+    /// The defined name a formula on `sheet` means by `text` (`Name`,
+    /// `Sheet1!Name`): the sheet's own name of that spelling, else the
+    /// workbook's (ECMA-376 18.2.5, `localSheetId`).
+    fn resolve(&self, text: &str, sheet: usize) -> Option<usize> {
+        if self.names.is_empty() {
+            return None;
         }
-        _ => None,
-    };
-    matches!(&args[..], [range, _, sum] if area(range).zip(area(sum)).is_some_and(|(a, b)| a != b))
+        let (sheet, name) = match text.rsplit_once('!') {
+            Some((qualifier, name)) => {
+                let qualifier = qualifier
+                    .strip_prefix('\'')
+                    .and_then(|q| q.strip_suffix('\''))
+                    .map_or_else(|| qualifier.to_owned(), |q| q.replace("''", "'"));
+                (self.sheets.get(&qualifier.to_lowercase()).copied(), name)
+            }
+            None => (Some(sheet), text),
+        };
+        let name = name.to_ascii_lowercase();
+        sheet
+            .and_then(|s| self.names.get(&(Some(s), name.clone())))
+            .or_else(|| self.names.get(&(None, name)))
+            .copied()
+    }
 }
 
-/// Whether a formula's own text makes it calculated always.
-fn calculated_always(text: &str, names: &Names) -> bool {
-    let tokens = Tokenizer::new_best_effort(&format!("={text}")).items;
-    tokens
-        .iter()
-        .enumerate()
-        .any(|(i, token)| match (token.token_type, token.subtype) {
-            (TokenType::Func, TokenSubType::Open) => {
-                let name = token.value.trim_end_matches('(');
-                !matches!(call(name, names), Call::Known)
-                    || (["SUMIF", "AVERAGEIF"]
+/// What a formula's text makes of it, read on a sheet.
+#[derive(Default)]
+struct Text {
+    /// It calls a volatile function or one Excel does not have, or uses a
+    /// calculated-always name.
+    calc_always: bool,
+    /// It uses a defined name.
+    names: bool,
+    /// It calls SUMIF or AVERAGEIF, whose sum range may be resized.
+    sums: bool,
+}
+
+/// The workbook's defined names, as the formulas of each sheet see them.
+struct Names<'a> {
+    engine: &'a Engine<WBResolver>,
+    sheets: &'a [package::Sheet],
+    defined: &'a [package::DefinedName],
+    scopes: Scopes,
+    /// Whether a name is calculated always, by name and the sheet its
+    /// formula is read on.
+    calc_always: HashMap<(usize, usize), bool>,
+}
+
+impl Names<'_> {
+    /// Whether name `i`, used by a formula on `sheet`, is calculated always.
+    /// Its formula is read where it is evaluated: a sheet's own name on that
+    /// sheet, a workbook-level name on the sheet using it.
+    fn calculated_always(&mut self, i: usize, sheet: usize) -> bool {
+        let defined = self.defined;
+        let place = defined[i].sheet.unwrap_or(sheet);
+        if let Some(&flag) = self.calc_always.get(&(i, place)) {
+            return flag;
+        }
+        // A name reaching itself is not calculated always through itself.
+        self.calc_always.insert((i, place), false);
+        let formula = &defined[i].formula;
+        let text = self.read(formula, place);
+        let flag = text.calc_always
+            || (text.sums
+                && formualizer_parse::parse(format!("={formula}"))
+                    .is_ok_and(|ast| resizes(self.engine, &ast, &self.sheets[place].name, 1, 1)));
+        self.calc_always.insert((i, place), flag);
+        flag
+    }
+
+    /// What the text of a formula on `sheet` calls and names.
+    fn read(&mut self, text: &str, sheet: usize) -> Text {
+        let mut out = Text::default();
+        for token in Tokenizer::new_best_effort(&format!("={text}")).items {
+            match (token.token_type, token.subtype) {
+                (TokenType::Func, TokenSubType::Open) => {
+                    let name = token.value.trim_end_matches('(');
+                    out.sums |= ["SUMIF", "AVERAGEIF"]
                         .iter()
-                        .any(|f| name.eq_ignore_ascii_case(f))
-                        && resized_sum_range(&tokens, i))
+                        .any(|f| name.eq_ignore_ascii_case(f));
+                    out.calc_always = out.calc_always || self.calls_calculated_always(name, sheet);
+                }
+                (TokenType::Operand, TokenSubType::Range) => {
+                    if let Some(i) = self.scopes.resolve(&token.value, sheet) {
+                        out.names = true;
+                        out.calc_always = out.calc_always || self.calculated_always(i, sheet);
+                    }
+                }
+                _ => {}
             }
-            (TokenType::Operand, TokenSubType::Range) if !names.calc_always.is_empty() => {
-                let name = token
-                    .value
-                    .rsplit_once('!')
-                    .map_or(token.value.as_str(), |(_, n)| n);
-                names.calc_always.contains(&name.to_ascii_lowercase())
+        }
+        out
+    }
+
+    /// Whether calling `name` from a formula on `sheet` makes it calculated
+    /// always: a volatile function, a calculated-always name, or a function
+    /// Excel does not have (a user-defined `_xludf.` or add-in `_xll.`
+    /// function, or a bare name that is neither one of the file format's
+    /// functions nor a defined name the sheet sees).
+    fn calls_calculated_always(&mut self, name: &str, sheet: usize) -> bool {
+        // A call of a LAMBDA value, `LAMBDA(x,x)(1)`, names no function.
+        if name.is_empty() {
+            return false;
+        }
+        let upper = name.to_ascii_uppercase();
+        if upper.starts_with("_XLUDF.") || upper.starts_with("_XLL.") {
+            return true;
+        }
+        let (bare, prefixed) = ["_XLFN._XLWS.", "_XLFN.", "_XLWS."]
+            .iter()
+            .find_map(|p| upper.strip_prefix(p))
+            .map_or((upper.as_str(), false), |bare| (bare, true));
+        if VOLATILE.contains(&bare) {
+            return true;
+        }
+        if prefixed || bare.starts_with("_XLPM.") || BUILT_IN.binary_search(&bare).is_ok() {
+            return false;
+        }
+        self.scopes
+            .resolve(name, sheet)
+            .is_none_or(|i| self.calculated_always(i, sheet))
+    }
+}
+
+/// Whether a SUMIF or AVERAGEIF in `ast`, evaluated at `row` and `col` of
+/// `sheet`, sums a range sized unlike its criteria range. Excel then sums the
+/// criteria range's shape from the sum range's top-left cell, cells outside
+/// the references it names, and calculates the formula always. The ranges
+/// are sized as they evaluate there: through names, tables and functions
+/// returning references, and for each cell of a shared formula on its own.
+fn resizes(engine: &Engine<WBResolver>, ast: &ASTNode, sheet: &str, row: u32, col: u32) -> bool {
+    fn walk(node: &ASTNode, resized: &dyn Fn(&[ASTNode]) -> bool) -> bool {
+        match &node.node_type {
+            ASTNodeType::Function { name, args } => {
+                (["SUMIF", "AVERAGEIF"]
+                    .iter()
+                    .any(|f| name.eq_ignore_ascii_case(f))
+                    && resized(args))
+                    || args.iter().any(|arg| walk(arg, resized))
             }
+            ASTNodeType::Call { callee, args } => {
+                walk(callee, resized) || args.iter().any(|arg| walk(arg, resized))
+            }
+            ASTNodeType::UnaryOp { expr, .. } => walk(expr, resized),
+            ASTNodeType::BinaryOp { left, right, .. } => {
+                walk(left, resized) || walk(right, resized)
+            }
+            ASTNodeType::Array(rows) => rows.iter().flatten().any(|item| walk(item, resized)),
             _ => false,
-        })
+        }
+    }
+    let Some(sheet_id) = engine.sheet_id(sheet) else {
+        return false;
+    };
+    let interpreter = Interpreter::new_with_cell(
+        engine,
+        sheet,
+        CellRef::new(sheet_id, Coord::from_excel(row, col, true, true)),
+    );
+    let span = |first: Option<u32>, last: Option<u32>, all: u32| match (first, last) {
+        (Some(first), Some(last)) => first.abs_diff(last) + 1,
+        (Some(first), None) => all.saturating_sub(first) + 1,
+        (None, Some(last)) => last,
+        (None, None) => all,
+    };
+    let size = |node: &ASTNode| {
+        let reference = interpreter.evaluate_ast_as_reference(node).ok()?;
+        match &reference {
+            ReferenceType::Cell { .. } => Some((1, 1)),
+            ReferenceType::Range {
+                start_row,
+                start_col,
+                end_row,
+                end_col,
+                ..
+            } => Some((
+                span(*start_row, *end_row, 1_048_576),
+                span(*start_col, *end_col, 16_384),
+            )),
+            ReferenceType::Table(_) => {
+                let (rows, cols) = interpreter
+                    .resolve_range_view(&reference, sheet)
+                    .ok()?
+                    .dims();
+                Some((u32::try_from(rows).ok()?, u32::try_from(cols).ok()?))
+            }
+            _ => None,
+        }
+    };
+    walk(
+        ast,
+        &|args| matches!(args, [range, _, sum] if size(range).zip(size(sum)).is_some_and(|(a, b)| a != b)),
+    )
+}
+
+/// [`resizes`] for the formula the engine holds at a cell.
+fn resizes_at(engine: &Engine<WBResolver>, sheet: &str, row: u32, col: u32) -> bool {
+    matches!(engine.get_cell(sheet, row, col), Some((Some(ast), _)) if resizes(engine, &ast, sheet, row, col))
 }
 
 fn inspect_error(error: impl std::fmt::Display) -> IoError {
@@ -248,6 +355,12 @@ fn inspect_error(error: impl std::fmt::Display) -> IoError {
         format!("dependency inspection: {error}"),
         "calculate-always flags",
     )
+}
+
+fn precedent_options() -> PrecedentOptions {
+    PrecedentOptions::default()
+        .with_max_links(u32::MAX)
+        .with_max_work(u64::MAX)
 }
 
 /// The areas a formula reads through cell, range, name and table references,
@@ -258,12 +371,38 @@ fn precedent_areas(
     sheet_index: &HashMap<&str, usize>,
     names_only: bool,
 ) -> Result<Vec<Area>, IoError> {
-    let options = PrecedentOptions::default()
-        .with_max_links(u32::MAX)
-        .with_max_work(u64::MAX);
     let report = engine
-        .precedents(address, &options)
+        .precedents(address, &precedent_options())
         .map_err(inspect_error)?;
+    let mut areas = Vec::new();
+    let mut seen = HashSet::new();
+    for precedent in &report.precedents {
+        if !names_only || matches!(precedent.reference, SemanticReference::Name { .. }) {
+            reference_areas(
+                engine,
+                &precedent.reference,
+                address,
+                sheet_index,
+                &mut seen,
+                &mut areas,
+            )?;
+        }
+    }
+    Ok(areas)
+}
+
+/// Add the areas a reference read by a formula at `at` stands for. The
+/// cells a name's formula refers to are read by every formula using the
+/// name, through the names it uses in turn (`seen`: the formula names
+/// followed, by the sheet they are read from).
+fn reference_areas(
+    engine: &Engine<WBResolver>,
+    reference: &SemanticReference,
+    at: &CellAddress,
+    sheet_index: &HashMap<&str, usize>,
+    seen: &mut HashSet<(String, String)>,
+    areas: &mut Vec<Area>,
+) -> Result<(), IoError> {
     let cell = |c: &CellAddress| {
         Some((
             *sheet_index.get(c.sheet.as_str())?,
@@ -291,51 +430,64 @@ fn precedent_areas(
             d.end_column.unwrap_or(16_384),
         ))
     };
-    Ok(report
-        .precedents
-        .iter()
-        .filter_map(|p| match &p.reference {
-            SemanticReference::Name { resolution, .. } => match resolution {
-                NameResolution::Cell(c) => cell(c),
+    let area = match reference {
+        SemanticReference::Cell(c)
+        | SemanticReference::Name {
+            resolution: NameResolution::Cell(c),
+            ..
+        } => cell(c),
+        SemanticReference::Range {
+            declared: d,
+            resolved,
+            ..
+        }
+        | SemanticReference::Name {
+            resolution:
                 NameResolution::Range {
                     declared: d,
                     resolved,
-                } => resolved.as_ref().map_or_else(|| declared(d), range),
-                _ => None,
-            },
-            _ if names_only => None,
-            SemanticReference::Cell(c) => cell(c),
-            SemanticReference::Range {
-                declared: d,
-                resolved,
-                ..
-            } => resolved.as_ref().map_or_else(|| declared(d), range),
-            SemanticReference::Table { resolved, .. } => range(resolved),
-            _ => None,
-        })
-        .collect())
+                },
+            ..
+        } => resolved.as_ref().map_or_else(|| declared(d), range),
+        SemanticReference::Table { resolved, .. } => range(resolved),
+        SemanticReference::Name {
+            name,
+            resolution: NameResolution::Formula { .. },
+        } => {
+            if seen.insert((at.sheet.clone(), name.to_ascii_lowercase())) {
+                let report = engine
+                    .name_precedents(at, name, &precedent_options())
+                    .map_err(inspect_error)?;
+                for precedent in &report.precedents {
+                    reference_areas(
+                        engine,
+                        &precedent.reference,
+                        &report.cell,
+                        sheet_index,
+                        seen,
+                        areas,
+                    )?;
+                }
+            }
+            None
+        }
+        _ => None,
+    };
+    areas.extend(area);
+    Ok(())
 }
 
 fn contains(&(a, top, left, bottom, right): &Area, (s, row, col): (usize, u32, u32)) -> bool {
     a == s && (top..=bottom).contains(&row) && (left..=right).contains(&col)
 }
 
-/// Whether a formula's text reads a defined name.
-fn reads_name(text: &str, names: &Names) -> bool {
-    Tokenizer::new_best_effort(&format!("={text}"))
-        .items
-        .iter()
-        .any(|token| {
-            token.token_type == TokenType::Operand
-                && token.subtype == TokenSubType::Range
-                && names.defined.contains(
-                    &token
-                        .value
-                        .rsplit_once('!')
-                        .map_or(token.value.as_str(), |(_, n)| n)
-                        .to_ascii_lowercase(),
-                )
-        })
+/// The formulas reading an area through names: the formula cells, flagged
+/// once, and the array formulas, whose members line up with each flagged
+/// cell of the area they read.
+#[derive(Default)]
+struct NamedReaders {
+    cells: Vec<(usize, usize)>,
+    arrays: Vec<(usize, usize)>,
 }
 
 /// The calculated-always formulas and array members of the evaluated
@@ -347,29 +499,12 @@ pub(super) fn calc_always(
     defined_names: &[package::DefinedName],
 ) -> Result<CalcAlways, IoError> {
     let mut names = Names {
-        defined: defined_names
-            .iter()
-            .map(|n| n.name.to_ascii_lowercase())
-            .collect(),
-        calc_always: HashSet::new(),
+        engine,
+        sheets,
+        defined: defined_names,
+        scopes: Scopes::new(sheets.iter().map(|s| s.name.as_str()), defined_names),
+        calc_always: HashMap::new(),
     };
-    // A name is calculated always when its formula is, possibly through
-    // other names.
-    loop {
-        let found: Vec<String> = defined_names
-            .iter()
-            .map(|n| n.name.to_ascii_lowercase())
-            .zip(defined_names)
-            .filter(|(key, n)| {
-                !names.calc_always.contains(key) && calculated_always(&n.formula, &names)
-            })
-            .map(|(key, _)| key)
-            .collect();
-        if found.is_empty() {
-            break;
-        }
-        names.calc_always.extend(found);
-    }
     let mut flags = CalcAlways {
         cells: plans
             .iter()
@@ -384,25 +519,34 @@ pub(super) fn calc_always(
     // Multi-cell array formulas the file flags, unless they read flagged
     // cells: those are calculated always on their own (below).
     let mut flagged_arrays = Vec::new();
+    // The formulas using a defined name, per sheet.
+    let mut uses_names = Vec::new();
     for (s, (_, scan)) in plans.iter().enumerate() {
-        let own: Vec<bool> = scan
+        // A shared formula's descendants have their master's text, and what
+        // it calls and names is the same wherever it is evaluated.
+        let texts: Vec<Option<Text>> = scan
             .cells
             .iter()
             .map(|cell| {
-                !cell.formula_text.trim().is_empty()
-                    && calculated_always(&cell.formula_text, &names)
+                (!cell.formula_text.trim().is_empty()).then(|| names.read(&cell.formula_text, s))
             })
             .collect();
+        let mut uses = Vec::with_capacity(scan.cells.len());
         for (i, cell) in scan.cells.iter().enumerate() {
-            if own[cell.shared_master.unwrap_or(i)]
-                || (cell.calc_always && cell.array_extent.is_none())
-            {
+            let text = texts[cell.shared_master.unwrap_or(i)].as_ref();
+            uses.push(text.is_some_and(|t| t.names));
+            // The ranges SUMIF sums are not: each cell is judged on its own.
+            let own = text.is_some_and(|t| {
+                t.calc_always || (t.sums && resizes_at(engine, &sheets[s].name, cell.row, cell.col))
+            });
+            if own || (cell.calc_always && cell.array_extent.is_none()) {
                 flags.cells[s][i] = true;
                 queue.push((s, cell.row, cell.col));
             } else if cell.calc_always {
                 flagged_arrays.push((s, i));
             }
         }
+        uses_names.push(uses);
         // A calculated-always array formula flags each of its members; the
         // file's own member flags are kept.
         for (j, member) in scan.members.iter().enumerate() {
@@ -426,20 +570,21 @@ pub(super) fn calc_always(
     };
     let mut slots = HashMap::new();
     // The engine's dependency report stops at a defined name, so the readers
-    // of each named area are collected from the formulas that name one.
-    let mut named: HashMap<Area, Vec<(usize, usize)>> = HashMap::new();
+    // of each area read through names are collected from the formulas that
+    // use one.
+    let mut named: HashMap<Area, NamedReaders> = HashMap::new();
     for (s, (_, scan)) in plans.iter().enumerate() {
-        let mentions: Vec<bool> = scan
-            .cells
-            .iter()
-            .map(|cell| !names.defined.is_empty() && reads_name(&cell.formula_text, &names))
-            .collect();
         for (i, cell) in scan.cells.iter().enumerate() {
             slots.insert((s, cell.row, cell.col), Slot::Cell(i));
-            if mentions[cell.shared_master.unwrap_or(i)] {
+            if uses_names[s][i] {
                 let at = address(s, cell.row, cell.col)?;
                 for area in precedent_areas(engine, &at, &sheet_index, true)? {
-                    named.entry(area).or_default().push((s, i));
+                    let readers = named.entry(area).or_default();
+                    if cell.array_extent.is_some() {
+                        readers.arrays.push((s, i));
+                    } else {
+                        readers.cells.push((s, i));
+                    }
                 }
             }
         }
@@ -447,10 +592,7 @@ pub(super) fn calc_always(
             slots.insert((s, member.cell.row, member.cell.col), Slot::Member(j));
         }
     }
-    let mut named: Vec<_> = named
-        .into_iter()
-        .map(|(area, readers)| (area, Some(readers)))
-        .collect();
+    let mut named: Vec<_> = named.into_iter().collect();
     let mut reads: HashMap<(usize, usize), Vec<Area>> = HashMap::new();
     let mut whole = HashSet::new();
     let options = DependentsOptions::default()
@@ -494,8 +636,12 @@ pub(super) fn calc_always(
             }
         }
         for (area, found) in &mut named {
-            if found.is_some() && contains(area, (s, row, col)) {
-                readers.extend(found.take().expect("unread name"));
+            if contains(area, (s, row, col)) {
+                // A formula is flagged at once, and an array's members are
+                // lined up with every flagged cell it reads, as for the
+                // engine's readers above.
+                readers.append(&mut found.cells);
+                readers.extend_from_slice(&found.arrays);
             }
         }
         for (t, i) in readers {
@@ -570,11 +716,32 @@ mod tests {
     }
 
     #[test]
-    fn operand_dimensions() {
-        assert_eq!(dimensions("$A$1:B3"), Some((3, 2)));
-        assert_eq!(dimensions("'My Sheet'!C5"), Some((1, 1)));
-        assert_eq!(dimensions("A:C"), Some((1_048_576, 3)));
-        assert_eq!(dimensions("$2:$4"), Some((3, 16_384)));
-        assert_eq!(dimensions("Prices"), None);
+    fn a_sheet_sees_its_own_names_before_the_workbook_ones() {
+        let name = |name: &str, sheet| package::DefinedName {
+            name: name.to_owned(),
+            sheet,
+            formula: String::new(),
+        };
+        let defined = [
+            name("X", None),
+            name("x", Some(1)),
+            name("Y", Some(0)),
+            name("Z", Some(1)),
+        ];
+        let scopes = Scopes::new(["Sheet1", "My 'Sheet'"], &defined);
+        assert_eq!(scopes.resolve("X", 0), Some(0));
+        assert_eq!(scopes.resolve("X", 1), Some(1));
+        assert_eq!(scopes.resolve("y", 0), Some(2));
+        // Sheet1's Y is not the second sheet's, which has no workbook-level
+        // Y to fall back on; nor is that sheet's Z Sheet1's.
+        assert_eq!(scopes.resolve("Y", 1), None);
+        assert_eq!(scopes.resolve("Z", 0), None);
+        // A qualified name is the one that sheet sees.
+        assert_eq!(scopes.resolve("'My ''Sheet'''!X", 0), Some(1));
+        assert_eq!(scopes.resolve("sheet1!X", 1), Some(0));
+        assert_eq!(scopes.resolve("Sheet1!Y", 1), Some(2));
+        assert_eq!(scopes.resolve("'My ''Sheet'''!Y", 0), None);
+        assert_eq!(scopes.resolve("A1", 0), None);
+        assert_eq!(Scopes::new(["Sheet1"], &[]).resolve("X", 0), None);
     }
 }

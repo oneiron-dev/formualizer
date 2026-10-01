@@ -613,6 +613,113 @@ fn names_and_structured_tables_retain_symbolic_resolution() {
 }
 
 #[test]
+fn name_precedents_read_a_definition_where_the_engine_evaluates_it() {
+    let mut engine = engine();
+    engine.add_sheet("Model").unwrap();
+    engine.add_sheet("Other").unwrap();
+    for row in 1..=2 {
+        engine
+            .set_cell_value("Model", row, 1, LiteralValue::Number(row as f64))
+            .unwrap();
+    }
+    let model = engine.sheet_id("Model").unwrap();
+    let other = engine.sheet_id("Other").unwrap();
+    let formula = |text: &str| NamedDefinition::Formula {
+        ast: parse(text).unwrap(),
+        dependencies: Vec::new(),
+        range_deps: Vec::new(),
+    };
+    let base = RangeRef::new(
+        CellRef::new(model, Coord::from_excel(1, 1, true, true)),
+        CellRef::new(model, Coord::from_excel(2, 1, true, true)),
+    );
+    for (name, definition, scope) in [
+        ("Base", NamedDefinition::Range(base), NameScope::Workbook),
+        ("Alias", formula("=Base"), NameScope::Workbook),
+        ("Twice", formula("=Model!$A$1*2"), NameScope::Workbook),
+        (
+            "Dyn",
+            formula("=Model!$A$1:INDEX(Model!$A:$A,2)"),
+            NameScope::Workbook,
+        ),
+        (
+            "Rate",
+            NamedDefinition::Literal(LiteralValue::Number(0.2)),
+            NameScope::Workbook,
+        ),
+        ("Here", formula("=Model!$C$1"), NameScope::Workbook),
+        ("Here", formula("=$B$1+1"), NameScope::Sheet(other)),
+    ] {
+        engine.define_name(name, definition, scope).unwrap();
+    }
+    let options = PrecedentOptions::default();
+    let read = |sheet: &str, name: &str| {
+        let report = engine
+            .name_precedents(&address(sheet, 4, 4), name, &options)
+            .unwrap();
+        assert!(!report.truncation.incomplete);
+        report
+    };
+    let cell =
+        |sheet: &str, row: u32, column: u32| SemanticReference::Cell(address(sheet, row, column));
+    let references = |report: &PrecedentReport| {
+        report
+            .precedents
+            .iter()
+            .map(|p| p.reference.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // A formula name reads what its formula references.
+    assert_eq!(references(&read("Model", "Twice")), [cell("Model", 1, 1)]);
+    // A range name reads its area, a constant nothing.
+    assert!(matches!(
+        &references(&read("Model", "Base"))[..],
+        [SemanticReference::Range { resolved: Some(range), .. }]
+            if range.start_row == 1 && range.end_row == 2 && range.start_col == 1
+    ));
+    assert!(read("Model", "Rate").precedents.is_empty());
+    // A name over a name keeps it symbolic.
+    assert!(matches!(
+        &references(&read("Model", "Alias"))[..],
+        [SemanticReference::Name { name, resolution: NameResolution::Range { .. } }]
+            if name == "Base"
+    ));
+    // Both ends of a dynamic range are read: the cell and the whole column.
+    assert!(matches!(
+        &references(&read("Model", "Dyn"))[..],
+        [SemanticReference::Cell(first), SemanticReference::Range { declared, .. }]
+            if *first == address("Model", 1, 1)
+                && declared.start_row.is_none() && declared.start_column == Some(1)
+    ));
+    // A sheet-scoped name shadows the workbook's on its sheet and is read
+    // there; a workbook-scoped name is read on the reader's sheet.
+    let report = read("Other", "Here");
+    assert_eq!(report.cell, address("Other", 4, 4));
+    assert_eq!(references(&report), [cell("Other", 1, 2)]);
+    let report = read("Model", "Here");
+    assert_eq!(report.cell, address("Model", 4, 4));
+    assert_eq!(references(&report), [cell("Model", 1, 3)]);
+    let report = read("Other", "Twice");
+    assert_eq!(report.cell, address("Other", 4, 4));
+    assert_eq!(references(&report), [cell("Model", 1, 1)]);
+    // An undefined name reads nothing.
+    let report = read("Model", "Missing");
+    assert!(report.precedents.is_empty());
+    assert_eq!(report.cell, address("Model", 4, 4));
+    // Budgets truncate in band, as for a cell.
+    let report = engine
+        .name_precedents(
+            &address("Model", 4, 4),
+            "Dyn",
+            &PrecedentOptions::default().with_max_links(1),
+        )
+        .unwrap();
+    assert_eq!(report.precedents.len(), 1);
+    assert!(report.truncation.incomplete);
+}
+
+#[test]
 fn dirty_trace_pairs_current_formula_with_cached_value_and_stamp() {
     let mut engine = engine();
     set_formula(&mut engine, 1, 1, "=1");

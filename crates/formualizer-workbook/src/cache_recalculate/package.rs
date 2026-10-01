@@ -19,10 +19,13 @@ pub(super) struct Sheet {
     pub part: String,
     pub tables: Vec<Table>,
 }
-/// A defined name and the formula it stands for.
+/// A defined name, the sheet it is local to (`localSheetId`, an index into
+/// the sheets; `None` for a workbook-level name) and the formula it stands
+/// for.
 #[derive(Debug)]
 pub(super) struct DefinedName {
     pub name: String,
+    pub sheet: Option<usize>,
     pub formula: String,
 }
 /// A worksheet table (ListObject): its display name, full area (1-based
@@ -518,6 +521,7 @@ pub(super) fn discover(
             }
             formulas.push(DefinedName {
                 name: node.required("name")?.to_owned(),
+                sheet: scope,
                 formula: String::new(),
             });
         }
