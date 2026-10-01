@@ -44,6 +44,9 @@ pub(super) struct Cell {
     /// For a shared-formula descendant, the index of its master in
     /// [`Scan::cells`], whose text it shares.
     pub shared_master: Option<usize>,
+    /// The cell's `vm` (1-based value-metadata index tagging its cached error
+    /// with a rich error) and the attribute's span.
+    pub value_metadata: Option<(usize, Range<usize>)>,
 }
 /// A value cell inside a multi-cell array formula's extent; `anchor` indexes
 /// the formula cell in [`Scan::cells`]. `marked`: the member holds the empty
@@ -112,6 +115,7 @@ fn integer(value: &str) -> Result<u32, IoError> {
 pub(super) fn scan(
     bytes: &[u8],
     options: &XlsxRecalculateOptions,
+    value_metadata_records: usize,
     observed: &mut usize,
     logical_cells: &mut u64,
 ) -> Result<Scan, IoError> {
@@ -240,10 +244,23 @@ pub(super) fn scan(
                         return Err(unsupported("serialized cell count limit", "worksheet"));
                     }
                     // `cm` (dynamic-array cell metadata) is admitted only on
-                    // single-cell array formulas, checked when the cell closes.
-                    if node.value("vm").is_some() {
-                        return Err(unsupported("dynamic/rich cell metadata", "worksheet"));
-                    }
+                    // array formulas, `vm` (a rich error tagging the cached
+                    // error) only on formula results; checked when the cell
+                    // closes.
+                    let value_metadata = match node.attribute("", "vm") {
+                        Some(vm) => Some((
+                            vm.value
+                                .parse()
+                                .ok()
+                                .filter(|i| (1..=value_metadata_records).contains(i))
+                                .filter(|_| !*empty)
+                                .ok_or_else(|| {
+                                    unsupported("dynamic/rich cell metadata", "worksheet")
+                                })?,
+                            vm.span.clone(),
+                        )),
+                        None => None,
+                    };
                     let dynamic_array = node.value("cm").is_some();
                     let kind = node.value("t").map(str::to_owned);
                     if !matches!(
@@ -277,6 +294,7 @@ pub(super) fn scan(
                             shared_index_attr: None,
                             formula_attrs_end: 0,
                             shared_master: None,
+                            value_metadata,
                         });
                     }
                 }
@@ -460,7 +478,9 @@ pub(super) fn scan(
                             "worksheet",
                         ));
                     }
-                    if cell.dynamic_array && cell.formula_kind != "array" {
+                    if (cell.dynamic_array && cell.formula_kind != "array")
+                        || (cell.value_metadata.is_some() && !cell.has_formula)
+                    {
                         return Err(unsupported("dynamic/rich cell metadata", "worksheet"));
                     }
                     if cell.has_formula {

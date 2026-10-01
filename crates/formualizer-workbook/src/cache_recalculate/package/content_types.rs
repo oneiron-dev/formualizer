@@ -69,7 +69,8 @@ pub(super) fn validate(
             }
             let content = node.required("ContentType")?;
             // Cell metadata is admitted only as the vetted xl/metadata.xml
-            // part (dynamic-array flags); see `dynamic_array_metadata_only`.
+            // part (dynamic-array flags and rich error tags); see
+            // `cell_metadata`.
             let metadata_part = e.local == "Override"
                 && node.value("PartName") == Some("/xl/metadata.xml")
                 && content == format!("{PREFIX}sheetMetadata+xml");

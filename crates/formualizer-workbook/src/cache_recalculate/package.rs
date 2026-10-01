@@ -2,12 +2,16 @@
 mod content_types;
 mod rewrite;
 use super::{IoError, XlsxRecalculateOptions, checkpoint, unsupported, xml};
+use formualizer_common::ExcelErrorKind;
 pub(super) use rewrite::rewrite;
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Cursor, Read};
 use zip::ZipArchive;
 
 pub(super) type Archive<'a> = ZipArchive<Cursor<&'a [u8]>>;
+/// The error each value-metadata record (a cell's 1-based `vm`) tags the
+/// cell's cached error as; `None` for a kind the engine never produces.
+pub(super) type ValueErrors = Vec<Option<ExcelErrorKind>>;
 #[derive(Debug)]
 pub(super) struct Relationship {
     pub kind: String,
@@ -196,7 +200,7 @@ fn audit_directory(
 pub(super) fn admit<'a>(
     bytes: &'a [u8],
     options: &XlsxRecalculateOptions,
-) -> Result<Archive<'a>, IoError> {
+) -> Result<(Archive<'a>, ValueErrors), IoError> {
     checkpoint(&options.cancel)?;
     if bytes.len() > options.limits.max_input_bytes {
         return Err(unsupported("input byte limit", "XLSX package"));
@@ -244,8 +248,9 @@ pub(super) fn admit<'a>(
             return Err(unsupported("package digital signature", "XLSX package"));
         }
         // Linked-workbook parts stay as saved; references into them evaluate
-        // from their saved values.
-        if file.name().starts_with("xl/richData/") {
+        // from their saved values. Rich values are admitted only as the error
+        // tags Excel writes for cached errors (see `cell_metadata`).
+        if file.name().starts_with("xl/richData/") && !RICH_ERROR_PARTS.contains(&file.name()) {
             return Err(unsupported(
                 "external links or rich/dynamic cell metadata",
                 "XLSX package",
@@ -270,22 +275,159 @@ pub(super) fn admit<'a>(
             return Err(unsupported("ZIP expanded-size mismatch", file.name()));
         }
     }
-    if archive.index_for_name("xl/metadata.xml").is_some() {
-        dynamic_array_metadata_only(&mut archive, options)?;
+    let rich_errors = rich_errors(&mut archive, options)?;
+    let value_errors = if archive.index_for_name("xl/metadata.xml").is_some() {
+        cell_metadata(&mut archive, options, &rich_errors)?
+    } else {
+        Vec::new()
+    };
+    Ok((archive, value_errors))
+}
+const RICH: &str = "http://schemas.microsoft.com/office/spreadsheetml/2017/richdata";
+const RICH_STRUCTURES: &str = "xl/richData/rdrichvaluestructure.xml";
+const RICH_VALUES: &str = "xl/richData/rdrichvalue.xml";
+const RICH_TYPES: &str = "xl/richData/rdRichValueTypes.xml";
+/// The rich-data parts of an error-only package; the types part holds only
+/// global key flags.
+const RICH_ERROR_PARTS: [&str; 4] = ["xl/richData/", RICH_STRUCTURES, RICH_VALUES, RICH_TYPES];
+fn metadata_refusal(part: &str) -> IoError {
+    unsupported("external links or rich/dynamic cell metadata", part)
+}
+/// Excel saves an error that has no legacy XLSX code (#SPILL!, #CALC!, ...)
+/// as a cached #VALUE! plus a rich value of structure `_error` whose integer
+/// `errorType` names the real error ([MS-XLSX] 2.3.6.1.3: 8 #SPILL!,
+/// 13 #CALC!); its other keys describe the error (`subType`, a spill's
+/// offsets, a #FIELD!'s `field` name) and a rich value may carry a fallback
+/// (`fb`). Returns that error per rich value; any rich value that is not
+/// such an error (images, linked data types) or whose keys index another
+/// rich value, array or property bag is unsupported.
+fn rich_errors(
+    archive: &mut Archive<'_>,
+    options: &XlsxRecalculateOptions,
+) -> Result<Vec<Option<ExcelErrorKind>>, IoError> {
+    let has = |archive: &Archive<'_>, name| archive.index_for_name(name).is_some();
+    if has(archive, RICH_TYPES) {
+        let data = read_part(archive, RICH_TYPES, options.limits.max_worksheet_bytes)?;
+        xml::walk(&data, options, |path, _| match path.first() {
+            Some(root) if root.local != "rvTypesInfo" => Err(metadata_refusal(RICH_TYPES)),
+            _ => Ok(()),
+        })?;
     }
-    Ok(archive)
+    if !has(archive, RICH_VALUES) && !has(archive, RICH_STRUCTURES) {
+        return Ok(Vec::new());
+    }
+    // Per structure, the position of `errorType` among its keys.
+    let mut structures: Vec<(usize, Option<usize>)> = Vec::new();
+    let data = read_part(archive, RICH_STRUCTURES, options.limits.max_worksheet_bytes)?;
+    xml::walk(&data, options, |path, node| {
+        if !matches!(node.kind, xml::Kind::Open { .. }) {
+            return Ok(());
+        }
+        if xml::path_is(path, RICH, &["rvStructures"]) {
+            Ok(())
+        } else if xml::path_is(path, RICH, &["rvStructures", "s"])
+            && node.value("t") == Some("_error")
+        {
+            structures.push((0, None));
+            Ok(())
+        } else if xml::path_is(path, RICH, &["rvStructures", "s", "k"])
+            && !matches!(node.value("t"), Some("a" | "r" | "spb"))
+        {
+            let (keys, error_type) = structures.last_mut().expect("open structure");
+            // Key names are case-insensitive ([MS-XLSX] CT_Key).
+            if node
+                .value("n")
+                .is_some_and(|n| n.eq_ignore_ascii_case("errorType"))
+                && (node.value("t") != Some("i") || error_type.replace(*keys).is_some())
+            {
+                return Err(metadata_refusal(RICH_STRUCTURES));
+            }
+            *keys += 1;
+            Ok(())
+        } else {
+            Err(metadata_refusal(RICH_STRUCTURES))
+        }
+    })?;
+    // Per rich value, its structure, its values and whether it has a fallback.
+    let mut values: Vec<(usize, Vec<String>, bool)> = Vec::new();
+    let data = read_part(archive, RICH_VALUES, options.limits.max_worksheet_bytes)?;
+    xml::walk(&data, options, |path, node| match &node.kind {
+        xml::Kind::Open { .. } if xml::path_is(path, RICH, &["rvData"]) => Ok(()),
+        xml::Kind::Open { .. } if xml::path_is(path, RICH, &["rvData", "rv"]) => {
+            let s = node
+                .required("s")?
+                .parse()
+                .map_err(|_| metadata_refusal(RICH_VALUES))?;
+            values.push((s, Vec::new(), false));
+            Ok(())
+        }
+        // The optional fallback precedes the values; it is not a key's value.
+        xml::Kind::Open { .. } if xml::path_is(path, RICH, &["rvData", "rv", "fb"]) => {
+            let (_, fields, fallback) = values.last_mut().expect("open rich value");
+            if !fields.is_empty() || std::mem::replace(fallback, true) {
+                return Err(metadata_refusal(RICH_VALUES));
+            }
+            Ok(())
+        }
+        xml::Kind::Open { .. } if xml::path_is(path, RICH, &["rvData", "rv", "v"]) => {
+            values
+                .last_mut()
+                .expect("open rich value")
+                .1
+                .push(String::new());
+            Ok(())
+        }
+        xml::Kind::Open { .. } => Err(metadata_refusal(RICH_VALUES)),
+        xml::Kind::Text(text) if xml::path_is(path, RICH, &["rvData", "rv", "v"]) => {
+            let value = values.last_mut().expect("open rich value");
+            value.1.last_mut().expect("open value").push_str(text);
+            Ok(())
+        }
+        _ => Ok(()),
+    })?;
+    values
+        .into_iter()
+        .map(|(s, fields, _)| {
+            let &(keys, error_type) = structures
+                .get(s)
+                .ok_or_else(|| metadata_refusal(RICH_VALUES))?;
+            let code = error_type
+                .filter(|_| fields.len() == keys)
+                .and_then(|i| fields[i].trim().parse::<i64>().ok())
+                .ok_or_else(|| metadata_refusal(RICH_VALUES))?;
+            Ok(match code {
+                8 => Some(ExcelErrorKind::Spill),
+                13 => Some(ExcelErrorKind::Calc),
+                _ => None,
+            })
+        })
+        .collect()
 }
 /// Excel marks dynamic-array formulas with `cm` indexes into `xl/metadata.xml`
 /// cell metadata of type XLDAPR. That metadata only records that the formula
 /// is a dynamic array; it does not change the formula or its cached value.
-/// Value metadata (rich values, linked data types) remains unsupported.
-fn dynamic_array_metadata_only(
+/// A cell's `vm` indexes value metadata of type XLRICHVALUE, which points at a
+/// rich value; only the error tags of [`rich_errors`] are supported. Returns
+/// the error each value-metadata record tags.
+fn cell_metadata(
     archive: &mut Archive<'_>,
     options: &XlsxRecalculateOptions,
-) -> Result<(), IoError> {
+    rich_errors: &[Option<ExcelErrorKind>],
+) -> Result<ValueErrors, IoError> {
     const PART: &str = "xl/metadata.xml";
     let data = read_part(archive, PART, options.limits.max_worksheet_bytes)?;
+    let mut types = Vec::new();
+    // Rich value index per XLRICHVALUE future-metadata block.
+    let mut rich_blocks: Vec<Option<usize>> = Vec::new();
+    let mut future = None;
+    // The (type, block) record of each cell and value metadata block.
+    let mut records: [Vec<Option<(usize, usize)>>; 2] = [Vec::new(), Vec::new()];
     xml::walk(&data, options, |path, node| {
+        if matches!(node.kind, xml::Kind::Close)
+            && xml::path_is(path, xml::MAIN, &["metadata", "futureMetadata"])
+        {
+            future = None;
+        }
         if !matches!(node.kind, xml::Kind::Open { .. }) {
             return Ok(());
         }
@@ -293,25 +435,90 @@ fn dynamic_array_metadata_only(
         if path.len() == 1 && !xml::path_is(path, xml::MAIN, &["metadata"]) {
             return Err(unsupported("metadata XML root/namespace", PART));
         }
-        let dynamic_array_type = xml::path_is(
-            path,
-            xml::MAIN,
-            &["metadata", "metadataTypes", "metadataType"],
-        ) && node.value("name") == Some("XLDAPR");
+        let name = node.value("name");
         let blocked = match e.local.as_str() {
-            "metadataType" => !dynamic_array_type,
-            "futureMetadata" => node.value("name") != Some("XLDAPR"),
-            "valueMetadata" | "mdxMetadata" | "metadataStrings" => true,
+            "metadataType" | "futureMetadata" => !matches!(name, Some("XLDAPR" | "XLRICHVALUE")),
+            "mdxMetadata" | "metadataStrings" => true,
             _ => false,
         };
         if blocked && e.ns == xml::MAIN {
-            return Err(unsupported(
-                "external links or rich/dynamic cell metadata",
-                PART,
-            ));
+            return Err(metadata_refusal(PART));
+        }
+        if xml::path_is(
+            path,
+            xml::MAIN,
+            &["metadata", "metadataTypes", "metadataType"],
+        ) {
+            types.push(name.unwrap_or_default().to_owned());
+        }
+        if xml::path_is(path, xml::MAIN, &["metadata", "futureMetadata"]) {
+            future = name.map(str::to_owned);
+        }
+        let rich_future = future.as_deref() == Some("XLRICHVALUE");
+        if rich_future && xml::path_is(path, xml::MAIN, &["metadata", "futureMetadata", "bk"]) {
+            rich_blocks.push(None);
+        }
+        if e.ns == RICH && e.local == "rvb" {
+            // A block names its rich value in its own extension list.
+            let in_block = path.len() == 6
+                && xml::path_is(
+                    &path[..5],
+                    xml::MAIN,
+                    &["metadata", "futureMetadata", "bk", "extLst", "ext"],
+                );
+            let block = rich_blocks
+                .last_mut()
+                .filter(|_| rich_future && in_block)
+                .ok_or_else(|| metadata_refusal(PART))?;
+            let index = node
+                .required("i")?
+                .parse()
+                .map_err(|_| metadata_refusal(PART))?;
+            if block.replace(index).is_some() {
+                return Err(metadata_refusal(PART));
+            }
+        }
+        for (records, section) in records.iter_mut().zip(["cellMetadata", "valueMetadata"]) {
+            if xml::path_is(path, xml::MAIN, &["metadata", section, "bk"]) {
+                records.push(None);
+            }
+            if xml::path_is(path, xml::MAIN, &["metadata", section, "bk", "rc"]) {
+                let index = |name| {
+                    node.required(name)?
+                        .parse()
+                        .map_err(|_| metadata_refusal(PART))
+                };
+                let record = records.last_mut().expect("open metadata block");
+                if record.replace((index("t")?, index("v")?)).is_some() {
+                    return Err(metadata_refusal(PART));
+                }
+            }
         }
         Ok(())
-    })
+    })?;
+    // `rc t` is a 1-based metadata type; `v` a block of that type's future
+    // metadata. Cell metadata only flags dynamic arrays.
+    let type_of = |record: Option<(usize, usize)>| {
+        record.and_then(|(t, v)| Some((types.get(t.checked_sub(1)?)?.as_str(), v)))
+    };
+    if records[0]
+        .iter()
+        .any(|record| type_of(*record).is_none_or(|(t, _)| t != "XLDAPR"))
+    {
+        return Err(metadata_refusal(PART));
+    }
+    records[1]
+        .iter()
+        .map(|record| match type_of(*record) {
+            Some(("XLRICHVALUE", block)) => rich_blocks
+                .get(block)
+                .copied()
+                .flatten()
+                .and_then(|value| rich_errors.get(value).copied())
+                .ok_or_else(|| metadata_refusal(PART)),
+            _ => Err(metadata_refusal(PART)),
+        })
+        .collect()
 }
 pub(super) fn read_part(
     archive: &mut Archive<'_>,

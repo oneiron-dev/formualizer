@@ -854,6 +854,200 @@ fn misplaced_arrays_and_rich_value_metadata_stay_unsupported() {
     let other = XLDAPR.replace("name=\"XLDAPR\" min", "name=\"XLRICHVALUE\" min");
     reject(&with_metadata(parts(array), &other));
 }
+const RICH_RELS: &str = "http://schemas.microsoft.com/office/2017/06/relationships";
+/// Excel's tags for cached errors without a legacy code: value metadata `i`
+/// (cell `vm="i+1"`) is an `_error` rich value with `errorType` codes[i].
+fn with_rich_errors(mut p: BTreeMap<String, String>, codes: &[u32]) -> BTreeMap<String, String> {
+    let ct = p.get_mut("[Content_Types].xml").unwrap();
+    *ct = ct.replace("</Types>","<Override PartName=\"/xl/metadata.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml\"/><Override PartName=\"/xl/richData/rdrichvalue.xml\" ContentType=\"application/vnd.ms-excel.rdrichvalue+xml\"/><Override PartName=\"/xl/richData/rdrichvaluestructure.xml\" ContentType=\"application/vnd.ms-excel.rdrichvaluestructure+xml\"/></Types>");
+    let rel = p.get_mut("xl/_rels/workbook.xml.rels").unwrap();
+    *rel = rel.replace("</Relationships>",&format!("<Relationship Id=\"rId9\" Type=\"{OFFICE}/sheetMetadata\" Target=\"metadata.xml\"/><Relationship Id=\"rId10\" Type=\"{RICH_RELS}/rdRichValue\" Target=\"richData/rdrichvalue.xml\"/><Relationship Id=\"rId11\" Type=\"{RICH_RELS}/rdRichValueStructure\" Target=\"richData/rdrichvaluestructure.xml\"/></Relationships>"));
+    let n = codes.len();
+    let blocks: String = (0..n).map(|i| format!("<bk><extLst><ext uri=\"{{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}}\"><xlrd:rvb i=\"{i}\"/></ext></extLst></bk>")).collect();
+    let records: String = (0..n)
+        .map(|i| format!("<bk><rc t=\"2\" v=\"{i}\"/></bk>"))
+        .collect();
+    let types = XLDAPR.replace("<metadataTypes count=\"1\">", "<metadataTypes count=\"2\">").replace("</metadataTypes>", "<metadataType name=\"XLRICHVALUE\" minSupportedVersion=\"120000\" copy=\"1\" pasteAll=\"1\" pasteValues=\"1\" merge=\"1\" splitFirst=\"1\" rowColShift=\"1\" clearFormats=\"1\" clearComments=\"1\" assign=\"1\" coerce=\"1\"/></metadataTypes>");
+    let types = types.replace("<cellMetadata", &format!("<futureMetadata name=\"XLRICHVALUE\" count=\"{n}\">{blocks}</futureMetadata><cellMetadata"));
+    p.insert("xl/metadata.xml".into(), format!("<metadata xmlns=\"{MAIN}\" xmlns:xlrd=\"http://schemas.microsoft.com/office/spreadsheetml/2017/richdata\" xmlns:xda=\"http://schemas.microsoft.com/office/spreadsheetml/2017/dynamicarray\">{types}<valueMetadata count=\"{n}\">{records}</valueMetadata></metadata>"));
+    let values: String = codes
+        .iter()
+        .map(|c| format!("<rv s=\"0\"><v>0</v><v>{c}</v><v>0</v><v>3</v></rv>"))
+        .collect();
+    p.insert("xl/richData/rdrichvalue.xml".into(), format!("<rvData xmlns=\"http://schemas.microsoft.com/office/spreadsheetml/2017/richdata\" count=\"{n}\">{values}</rvData>"));
+    p.insert("xl/richData/rdrichvaluestructure.xml".into(), "<rvStructures xmlns=\"http://schemas.microsoft.com/office/spreadsheetml/2017/richdata\" count=\"1\"><s t=\"_error\"><k n=\"colOffset\" t=\"i\"/><k n=\"errorType\" t=\"i\"/><k n=\"rwOffset\" t=\"i\"/><k n=\"subType\" t=\"i\"/></s></rvStructures>".into());
+    p
+}
+#[test]
+fn rich_error_tags_are_kept_only_while_the_cell_holds_that_error() {
+    // vm 1 tags #SPILL! (errorType 8), vm 2 #CALC! (13), vm 3 #CONNECT! (9).
+    // A1 still spills into A2's value, B1 is now 2, C1 is now a genuine
+    // #VALUE!, D1 is still #CALC!, E1 is a #SPILL! tagged #CONNECT!.
+    // Functions newer than the 2007 file format are saved with Excel's
+    // _xlfn. prefix.
+    let rows = "<row r=\"1\"><c r=\"A1\" t=\"e\" cm=\"1\" vm=\"1\"><f t=\"array\" ref=\"A1\">_xlfn.SEQUENCE(2)</f><v>#VALUE!</v></c>\
+        <c r=\"B1\" t=\"e\" vm=\"1\"><f>1+1</f><v>#VALUE!</v></c>\
+        <c r=\"C1\" t=\"e\" vm=\"1\"><f>&quot;a&quot;+1</f><v>#VALUE!</v></c>\
+        <c r=\"D1\" t=\"e\" vm=\"2\"><f>_xlfn._xlws.FILTER(A2:A2,FALSE)</f><v>#VALUE!</v></c>\
+        <c r=\"E1\" vm=\"3\" t=\"e\" cm=\"1\"><f t=\"array\" ref=\"E1\">_xlfn.SEQUENCE(2)</f><v>#VALUE!</v></c></row>\
+        <row r=\"2\"><c r=\"A2\"><v>7</v></c><c r=\"E2\"><v>7</v></c></row>";
+    let mut p = with_rich_errors(parts(rows), &[8, 13, 9]);
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<c r=\"A1\" t=\"e\" cm=\"1\" vm=\"1\">",
+        // The removed type attribute leaves its separating space.
+        "<c r=\"B1\" ><f>1+1</f><v>2</v>",
+        "<c r=\"C1\" t=\"e\"><f>",
+        "<c r=\"D1\" t=\"e\" vm=\"2\">",
+        "<c r=\"E1\" t=\"e\" cm=\"1\">",
+    ] {
+        assert!(sheet.contains(expected), "{expected} in {sheet}");
+    }
+    assert_eq!(out.summary.errors, 4);
+    assert!(!sheet.contains("ca=\"1\""), "{sheet}");
+    for part in ["xl/metadata.xml", "xl/richData/rdrichvalue.xml"] {
+        assert_eq!(member(&out.bytes, part), p[part]);
+    }
+    let again = recalculate_xlsx_bytes(&out.bytes, Default::default()).unwrap();
+    assert_eq!(again.bytes, out.bytes);
+    // Excel adds the rich value types part (global key flags) when it saves.
+    p.insert("xl/richData/rdRichValueTypes.xml".into(), "<rvTypesInfo xmlns=\"http://schemas.microsoft.com/office/spreadsheetml/2017/richdata2\"><global><keyFlags><key name=\"_Self\"><flag name=\"ExcludeFromFile\" value=\"1\"/></key></keyFlags></global></rvTypesInfo>".into());
+    assert_eq!(
+        recalculate_xlsx_bytes(&pack(&p), Default::default())
+            .unwrap()
+            .summary
+            .errors,
+        4
+    );
+}
+#[test]
+fn rich_values_other_than_error_tags_stay_unsupported() {
+    let rows = "<row r=\"1\"><c r=\"A1\" t=\"e\" vm=\"1\"><f>1+1</f><v>#VALUE!</v></c></row>";
+    assert!(
+        recalculate_xlsx_bytes(
+            &pack(&with_rich_errors(parts(rows), &[8])),
+            Default::default()
+        )
+        .is_ok()
+    );
+    // A tag on a value that no formula computes, or outside the records.
+    for cell in [
+        "<c r=\"A1\" t=\"e\" vm=\"1\"><v>#VALUE!</v></c>",
+        "<c r=\"A1\" vm=\"1\"/>",
+        "<c r=\"A1\" t=\"e\" vm=\"2\"><f>1+1</f><v>#VALUE!</v></c>",
+        "<c r=\"A1\" t=\"e\" vm=\"0\"><f>1+1</f><v>#VALUE!</v></c>",
+    ] {
+        reject(&with_rich_errors(
+            parts(&format!("<row r=\"1\">{cell}</row>")),
+            &[8],
+        ));
+    }
+    // A rich value that is not an error, such as a picture in a cell.
+    let mut image = with_rich_errors(parts(rows), &[8]);
+    let s = image
+        .get_mut("xl/richData/rdrichvaluestructure.xml")
+        .unwrap();
+    *s = s.replace("<s t=\"_error\">", "<s t=\"_localImage\">");
+    reject(&image);
+    // An error key that refers to another rich value (#BUSY! targetValue).
+    let mut reference = with_rich_errors(parts(rows), &[8]);
+    let s = reference
+        .get_mut("xl/richData/rdrichvaluestructure.xml")
+        .unwrap();
+    *s = s.replace(
+        "<k n=\"subType\" t=\"i\"/>",
+        "<k n=\"targetValue\" t=\"r\"/>",
+    );
+    reject(&reference);
+    // Other rich data parts (images, arrays, property bags).
+    let mut extra = with_rich_errors(parts(rows), &[8]);
+    extra.insert("xl/richData/richValueRel.xml".into(), "<richValueRels xmlns=\"http://schemas.microsoft.com/office/spreadsheetml/2022/richvaluerel\"/>".into());
+    reject(&extra);
+    // A rich value reference outside its future-metadata block.
+    let mut outside = with_rich_errors(parts(rows), &[8]);
+    let m = outside.get_mut("xl/metadata.xml").unwrap();
+    *m = m.replace(
+        "<bk><extLst><ext uri=\"{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}\"><xlrd:rvb i=\"0\"/></ext></extLst></bk>",
+        "<bk/><extLst><ext uri=\"{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}\"><xlrd:rvb i=\"0\"/></ext></extLst>",
+    );
+    assert!(m.contains("<bk/><extLst>"));
+    reject(&outside);
+    // A value record must name rich value metadata.
+    let mut untyped = with_rich_errors(parts(rows), &[8]);
+    let m = untyped.get_mut("xl/metadata.xml").unwrap();
+    *m = m.replace(
+        "<valueMetadata count=\"1\"><bk><rc t=\"2\"",
+        "<valueMetadata count=\"1\"><bk><rc t=\"1\"",
+    );
+    reject(&untyped);
+}
+#[test]
+fn documented_rich_error_variants_are_admitted() {
+    // vm 1 tags #CALC! (13), vm 2 #FIELD! (12). A1 is still #CALC!, B1 is
+    // now 2.
+    let rows = "<row r=\"1\"><c r=\"A1\" t=\"e\" vm=\"1\"><f>_xlfn._xlws.FILTER(C1:C1,FALSE)</f><v>#VALUE!</v></c>\
+        <c r=\"B1\" t=\"e\" vm=\"2\"><f>1+1</f><v>#VALUE!</v></c></row>";
+    const STRUCTURES: &str = "xl/richData/rdrichvaluestructure.xml";
+    const VALUES: &str = "xl/richData/rdrichvalue.xml";
+    let mut p = with_rich_errors(parts(rows), &[13, 12]);
+    // Key names are case-insensitive; a #FIELD! names the missing field in
+    // a string key.
+    let s = p.get_mut(STRUCTURES).unwrap();
+    *s = s.replace("n=\"errorType\"", "n=\"ErrorType\"").replace(
+        "</rvStructures>",
+        "<s t=\"_error\"><k n=\"errorType\" t=\"i\"/><k n=\"field\" t=\"s\"/></s></rvStructures>",
+    );
+    // A rich value may carry a fallback before its values.
+    let v = p.get_mut(VALUES).unwrap();
+    *v = v
+        .replace(
+            "<rv s=\"0\"><v>0</v><v>13</v>",
+            "<rv s=\"0\"><fb t=\"e\">#VALUE!</fb><v>0</v><v>13</v>",
+        )
+        .replace(
+            "<rv s=\"0\"><v>0</v><v>12</v><v>0</v><v>3</v></rv>",
+            "<rv s=\"1\"><v>12</v><v>City</v></rv>",
+        );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<c r=\"A1\" t=\"e\" vm=\"1\"><f>_xlfn._xlws.FILTER(C1:C1,FALSE)</f><v>#VALUE!</v>",
+        "<c r=\"B1\" ><f>1+1</f><v>2</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected} in {sheet}");
+    }
+    // A fallback after the values or twice, an errorType that is not an
+    // integer, and a key indexing a property bag are not error tags.
+    for (part, from, to) in [
+        (
+            VALUES,
+            "<v>City</v></rv>",
+            "<v>City</v><fb t=\"e\">#VALUE!</fb></rv>",
+        ),
+        (
+            VALUES,
+            "<fb t=\"e\">#VALUE!</fb>",
+            "<fb t=\"e\">#VALUE!</fb><fb t=\"e\">#VALUE!</fb>",
+        ),
+        (
+            STRUCTURES,
+            "<k n=\"ErrorType\" t=\"i\"/>",
+            "<k n=\"ErrorType\" t=\"s\"/>",
+        ),
+        (
+            STRUCTURES,
+            "<k n=\"field\" t=\"s\"/>",
+            "<k n=\"field\" t=\"spb\"/>",
+        ),
+    ] {
+        let mut bad = p.clone();
+        let text = bad.get_mut(part).unwrap();
+        assert!(text.contains(from), "{from} in {text}");
+        *text = text.replace(from, to);
+        reject(&bad);
+    }
+}
 #[test]
 fn extension_markup_outside_cells_is_not_workbook_or_cell_metadata() {
     let mut p = single("1+1", "<v>9</v>");
