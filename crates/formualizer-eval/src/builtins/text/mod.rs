@@ -3,6 +3,7 @@
 //! CONCAT, CONCATENATE, TEXTJOIN, SUBSTITUTE, REPLACE, FIND, SEARCH, EXACT, VALUE, TEXT (limited formats)
 //! CHAR, CODE, REPT, CLEAN, UNICHAR, UNICODE, TEXTBEFORE, TEXTAFTER, DOLLAR, FIXED
 //! TEXTSPLIT, VALUETOTEXT, ARRAYTOTEXT (array text functions)
+//! FILTERXML (XPath 1.0 over XML text)
 
 use crate::traits::{ArgumentHandle, CalcValue};
 use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
@@ -21,6 +22,7 @@ mod array_text; // TEXTSPLIT, VALUETOTEXT, ARRAYTOTEXT
 mod byte; // FINDB, LEFTB, LENB, MIDB, REPLACEB, RIGHTB, SEARCHB
 mod char_code_rept; // CHAR, CODE, REPT
 mod extended; // CLEAN, UNICHAR, UNICODE, TEXTBEFORE, TEXTAFTER, DOLLAR, FIXED
+mod filterxml; // FILTERXML
 mod find_search_exact; // FIND, SEARCH, EXACT
 mod len_left_right; // LEN, LEFT, RIGHT
 mod mid_sub_replace; // MID, SUBSTITUTE, REPLACE
@@ -44,6 +46,7 @@ pub fn register_builtins() {
     byte::register_builtins();
     char_code_rept::register_builtins();
     extended::register_builtins();
+    filterxml::register_builtins();
     len_left_right::register_builtins();
     mid_sub_replace::register_builtins();
     trim_case_concat::register_builtins();

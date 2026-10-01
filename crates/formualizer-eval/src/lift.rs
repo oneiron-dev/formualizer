@@ -59,12 +59,11 @@ pub(crate) fn lift_spec(name: &str) -> Option<Lift> {
     Some(match name {
         // Text
         "ASC" | "CHAR" | "CLEAN" | "CODE" | "CONCATENATE" | "DOLLAR" | "EXACT" | "FIND"
-        | "FINDB" | "FIXED" | "LEFT" | "LEFTB" | "LEN" | "LENB" | "LOWER" | "MID" | "MIDB"
-        | "NUMBERVALUE" | "PROPER" | "REPLACE" | "REPLACEB" | "REPT" | "RIGHT" | "RIGHTB"
-        | "SEARCH" | "SEARCHB" | "SUBSTITUTE" | "T" | "TEXT" | "TRIM" | "UNICHAR" | "UNICODE"
-        | "UPPER" | "VALUE" | "ROMAN" | "ARABIC" | "BASE" | "DECIMAL" | "DOLLARDE" | "DOLLARFR" => {
-            Lift::All
-        }
+        | "FILTERXML" | "FINDB" | "FIXED" | "LEFT" | "LEFTB" | "LEN" | "LENB" | "LOWER" | "MID"
+        | "MIDB" | "NUMBERVALUE" | "PROPER" | "REPLACE" | "REPLACEB" | "REPT" | "RIGHT"
+        | "RIGHTB" | "SEARCH" | "SEARCHB" | "SUBSTITUTE" | "T" | "TEXT" | "TRIM" | "UNICHAR"
+        | "UNICODE" | "UPPER" | "VALUE" | "ROMAN" | "ARABIC" | "BASE" | "DECIMAL" | "DOLLARDE"
+        | "DOLLARFR" => Lift::All,
         // The delimiter may be an array of alternative delimiters.
         "TEXTBEFORE" | "TEXTAFTER" => Lift::Only(&[0, 2, 3, 4, 5]),
         // Date and time

@@ -41,6 +41,9 @@ bumpalo = { version = "3.16", features = ["collections"] }
 smallvec = { workspace = true }
 # web-time is only needed for the js-runtime (browser/wasm-bindgen) profile.
 web-time = { workspace = true, optional = true }
+# FILTERXML: XML parsing and XPath 1.0 (pure Rust, the XPath version Excel's MSXML runs).
+sxd-document = "0.3.2"
+sxd-xpath = "0.4.2"
 
 # Arrow (per-crate) — pinned to 58.x series
 arrow-array = "59.2.0"
