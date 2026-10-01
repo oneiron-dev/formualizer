@@ -122,19 +122,18 @@ impl Cache {
                 }
                 Self::Text(text)
             }
+            // Excel caches an error that has no legacy XLSX code as #VALUE!;
+            // only a cell's vm rich value records the real error.
+            LiteralValue::Error(error)
+                if matches!(error.kind, ExcelErrorKind::Spill | ExcelErrorKind::Calc) =>
+            {
+                Self::Error("#VALUE!".into())
+            }
             LiteralValue::Error(error) => {
                 let token = error.kind.to_string();
                 if !matches!(
                     token.as_str(),
-                    "#DIV/0!"
-                        | "#N/A"
-                        | "#NAME?"
-                        | "#NULL!"
-                        | "#NUM!"
-                        | "#REF!"
-                        | "#VALUE!"
-                        | "#SPILL!"
-                        | "#CALC!"
+                    "#DIV/0!" | "#N/A" | "#NAME?" | "#NULL!" | "#NUM!" | "#REF!" | "#VALUE!"
                 ) {
                     return Err(unsupported(
                         "engine-specific error has no approved XLSX cache encoding",

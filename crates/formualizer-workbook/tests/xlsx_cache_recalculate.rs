@@ -518,23 +518,49 @@ fn typed_text_controls_fail_instead_of_silent_corruption() {
     }
 }
 #[test]
-fn modern_scalar_errors_are_cached_and_can_be_recalculated_again() {
+fn modern_scalar_errors_are_cached_as_value_errors() {
+    // Excel caches #SPILL! and #CALC! as #VALUE!; the summary keeps the kind.
+    // New functions are spelled as Excel saves them (_xlfn.).
     for (formula, token) in [
         (
-            " cm=\"1\"><f t=\"array\" ref=\"A1\">SEQUENCE(2)</f>",
+            " cm=\"1\"><f t=\"array\" ref=\"A1\">_xlfn.SEQUENCE(2)</f>",
             "#SPILL!",
         ),
-        ("><f>FILTER(A2:A2,FALSE)</f>", "#CALC!"),
+        ("><f>_xlfn._xlws.FILTER(A2:A2,FALSE)</f>", "#CALC!"),
     ] {
         let p = parts(&format!(
             "<row r=\"1\"><c r=\"A1\"{formula}<v>99</v></c></row><row r=\"2\"><c r=\"A2\"><v>7</v></c></row>"
         ));
         let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
         assert_eq!(out.summary.errors, 1);
-        assert!(member(&out.bytes, SHEET).contains(&format!("<v>{token}</v>")));
+        assert_eq!(out.summary.error_summary[token].count, 1);
+        assert!(member(&out.bytes, SHEET).contains("t=\"e\""));
+        assert!(member(&out.bytes, SHEET).contains("</f><v>#VALUE!</v>"));
+        assert_eq!(
+            data(&out.bytes, 0),
+            Data::Error(calamine::CellErrorType::Value)
+        );
         let again = recalculate_xlsx_bytes(&out.bytes, Default::default()).unwrap();
         assert_eq!(again.bytes, out.bytes);
         assert_eq!(again.summary.errors, 1);
+    }
+    // As Excel saved it: a #SPILL! cached as #VALUE! and tagged #SPILL!.
+    let rows = "<row r=\"1\"><c r=\"A1\" t=\"e\" cm=\"1\" vm=\"1\"><f t=\"array\" ref=\"A1\">_xlfn.SEQUENCE(2)</f><v>#VALUE!</v></c></row>\
+        <row r=\"2\"><c r=\"A2\"><v>7</v></c></row>";
+    let input = pack(&with_rich_errors(parts(rows), &[8]));
+    let out = recalculate_xlsx_bytes(&input, Default::default()).unwrap();
+    assert_eq!((out.summary.errors, out.cache_cells_changed), (1, 0));
+    assert_eq!(out.bytes, input);
+    // A genuine #VALUE! is unchanged too; other errors keep their codes.
+    for (formula, token) in [
+        ("&quot;a&quot;+1", "#VALUE!"),
+        ("1/0", "#DIV/0!"),
+        ("NA()", "#N/A"),
+    ] {
+        let out = recalculate_xlsx_bytes(&fixture(formula, "99"), Default::default()).unwrap();
+        assert!(
+            member(&out.bytes, SHEET).contains(&format!("t=\"e\"><f>{formula}</f><v>{token}</v>"))
+        );
     }
 }
 #[test]
