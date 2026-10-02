@@ -683,6 +683,210 @@ fn index_area_num_reads_blank_and_numeric_text_cells() {
     }
 }
 
+/// A1:B2 = 1,2;3,4 ; D1:E3 = 10,20;30,40;50,60 ; G1:G3 = 100,200,300 on
+/// Sheet1, Data!A1:A2 = 7,8 and Data!D1 = 70; the name Areas =
+/// Sheet1!$A$1:$B$2,Sheet1!$D$1:$E$3, AreasAlias = Areas, and the Data-level
+/// LocalAreas = $A$1:$A$2,$D$1:$D$2.
+fn multi_area_engine(mode: FormulaPlaneMode) -> Engine<TestWorkbook> {
+    use crate::engine::named_range::{NameScope, NamedDefinition};
+    let mut engine = Engine::new(
+        TestWorkbook::new(),
+        EvalConfig::default().with_formula_plane_mode(mode),
+    );
+    engine.add_sheet("Data").unwrap();
+    for (row, col, value) in [
+        (1, 1, 1),
+        (1, 2, 2),
+        (2, 1, 3),
+        (2, 2, 4),
+        (1, 4, 10),
+        (1, 5, 20),
+        (2, 4, 30),
+        (2, 5, 40),
+        (3, 4, 50),
+        (3, 5, 60),
+        (1, 7, 100),
+        (2, 7, 200),
+        (3, 7, 300),
+    ] {
+        engine
+            .set_cell_value("Sheet1", row, col, LiteralValue::Int(value))
+            .unwrap();
+    }
+    engine
+        .set_cell_value("Data", 1, 1, LiteralValue::Int(7))
+        .unwrap();
+    engine
+        .set_cell_value("Data", 2, 1, LiteralValue::Int(8))
+        .unwrap();
+    engine
+        .set_cell_value("Data", 1, 4, LiteralValue::Int(70))
+        .unwrap();
+    let data = engine.sheet_id("Data").unwrap();
+    for (name, formula, scope) in [
+        (
+            "Areas",
+            "=Sheet1!$A$1:$B$2,Sheet1!$D$1:$E$3",
+            NameScope::Workbook,
+        ),
+        // A name for a multi-area name.
+        ("AreasAlias", "=Areas", NameScope::Workbook),
+        // Unqualified areas of a Data-level name lie on Data.
+        ("LocalAreas", "=$A$1:$A$2,$D$1:$D$2", NameScope::Sheet(data)),
+    ] {
+        engine
+            .define_name(
+                name,
+                NamedDefinition::Formula {
+                    ast: parse(formula).unwrap(),
+                    dependencies: Vec::new(),
+                    range_deps: Vec::new(),
+                },
+                scope,
+            )
+            .unwrap();
+    }
+    engine
+}
+
+fn assert_error(engine: &Engine<TestWorkbook>, row: u32, col: u32, kind: ExcelErrorKind) {
+    match engine.get_cell_value("Sheet1", row, col) {
+        Some(LiteralValue::Error(error)) => {
+            assert_eq!(error.kind, kind, "Sheet1!R{row}C{col}")
+        }
+        other => panic!("Sheet1!R{row}C{col}: expected {kind:?}, got {other:?}"),
+    }
+}
+
+#[test]
+fn index_area_num_selects_an_area_of_a_union() {
+    // INDEX((A1:B2,D1:E3),row_num,column_num,area_num): the areas are numbered
+    // in the order written, area_num defaults to 1, and row_num/column_num
+    // select within the chosen area.
+    for mode in [
+        FormulaPlaneMode::Off,
+        FormulaPlaneMode::AuthoritativeExperimental,
+    ] {
+        let mut engine = multi_area_engine(mode);
+        let numbers = [
+            ("=INDEX((A1:B2,D1:E3),2,2,2)", 40.0),
+            ("=INDEX((A1:B2,D1:E3),2,2)", 4.0),
+            ("=INDEX((A1:B2,D1:E3),1,1,1)", 1.0),
+            ("=INDEX((A1:B2,D1:E3),2,2,\"2\")", 40.0),
+            ("=INDEX((A1:B2,D1:E3,G1:G3),2,1,3)", 200.0),
+            // A column area with the column omitted, a row area with the row omitted.
+            ("=INDEX((A1:B2,D1:E3,G1:G3),3,,3)", 300.0),
+            ("=INDEX((A1:B1,D1:E3),,2,1)", 2.0),
+            // Nested unions flatten in order.
+            ("=INDEX(((A1:B2,D1:E3),G1:G3),1,1,3)", 100.0),
+            ("=INDEX((Sheet1!A1:B2,D1:E3),1,1,2)", 10.0),
+            // Reference results: a whole column or area, ROW, and ':'.
+            ("=SUM(INDEX((A1:B2,D1:E3),0,2,2))", 120.0),
+            ("=SUM(INDEX((A1:B2,D1:E3),0,0,2))", 210.0),
+            ("=ROW(INDEX((A1:B2,D1:E3),3,1,2))", 3.0),
+            ("=SUM(INDEX((A1:B2,D1:E3),1,1,2):E2)", 100.0),
+            // An array of area numbers selects once per element.
+            ("=SUM(INDEX((A1:B2,D1:E3),2,2,{1,2}))", 44.0),
+            // A name defined as a multi-area reference.
+            ("=INDEX(Areas,1,2,2)", 20.0),
+            ("=INDEX(Areas,1,2)", 2.0),
+            ("=SUM(INDEX(Areas,0,1,2))", 90.0),
+            ("=INDEX(AreasAlias,2,2,2)", 40.0),
+            ("=INDEX(Data!LocalAreas,1,1,2)", 70.0),
+            ("=INDEX(Data!LocalAreas,2,1)", 8.0),
+        ];
+        let errors = [
+            ("=INDEX((A1:B2,D1:E3),1,1,3)", ExcelErrorKind::Ref),
+            ("=INDEX(Areas,1,1,3)", ExcelErrorKind::Ref),
+            ("=INDEX((A1:B2,D1:E3),1,1,0)", ExcelErrorKind::Value),
+            // Row 3 lies inside area 2 but outside area 1.
+            ("=INDEX((A1:B2,D1:E3),3,1,1)", ExcelErrorKind::Ref),
+            ("=INDEX((A1:B2,D1:E3),3,1,1/0)", ExcelErrorKind::Div),
+            // A union's areas must lie on one sheet.
+            ("=INDEX((A1:B2,Data!A1:A2),1,1,2)", ExcelErrorKind::Value),
+            ("=INDEX((A1:B2,Data!A1:A2),1,1,1)", ExcelErrorKind::Value),
+        ];
+        for (row, (formula, _)) in numbers.iter().enumerate() {
+            engine
+                .set_cell_formula("Sheet1", row as u32 + 1, 10, parse(formula).unwrap())
+                .unwrap();
+        }
+        for (row, (formula, _)) in errors.iter().enumerate() {
+            engine
+                .set_cell_formula("Sheet1", row as u32 + 1, 11, parse(formula).unwrap())
+                .unwrap();
+        }
+        engine.evaluate_all().unwrap();
+        for (row, (formula, expected)) in numbers.iter().enumerate() {
+            match engine.get_cell_value("Sheet1", row as u32 + 1, 10) {
+                Some(LiteralValue::Number(n)) => {
+                    assert_eq!(n, *expected, "{mode:?} {formula}")
+                }
+                Some(LiteralValue::Int(i)) => {
+                    assert_eq!(i as f64, *expected, "{mode:?} {formula}")
+                }
+                other => panic!("{mode:?} {formula}: expected {expected}, got {other:?}"),
+            }
+        }
+        for (row, (_, kind)) in errors.iter().enumerate() {
+            assert_error(&engine, row as u32 + 1, 11, *kind);
+        }
+
+        // Each area is a dependency: editing a cell of area 2 recalculates.
+        engine
+            .set_cell_value("Sheet1", 2, 5, LiteralValue::Int(41))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", 1, 5, LiteralValue::Int(21))
+            .unwrap();
+        engine.evaluate_all().unwrap();
+        assert_number(&engine, "Sheet1", 1, 10, 41.0);
+        assert_number(&engine, "Sheet1", 15, 10, 21.0);
+    }
+}
+
+#[test]
+fn static_index_self_loop_classification_reads_only_the_selected_union_area() {
+    // INDEX reads only the area it selects: a union holding the formula cell
+    // in an area INDEX does not select is not circular, nor is a selection of
+    // another cell; selecting the formula's own cell is.
+    for mode in [
+        FormulaPlaneMode::Off,
+        FormulaPlaneMode::AuthoritativeExperimental,
+    ] {
+        let mut engine = Engine::new(
+            TestWorkbook::new(),
+            EvalConfig::default().with_formula_plane_mode(mode),
+        );
+        for (col, value) in [(2, 7), (4, 42), (6, 8), (8, 9)] {
+            engine
+                .set_cell_value("Sheet1", 1, col, LiteralValue::Int(value))
+                .unwrap();
+        }
+        for (col, formula) in [
+            (2, "=INDEX((B:B,D:D),1,1,2)"),
+            (6, "=INDEX((F:F,D:D),1,1,1)"),
+            (8, "=INDEX((D:D,H:H),100,1,2)"),
+            (10, "=INDEX((J1:J100,D1:D100),1,1,2)"),
+        ] {
+            engine
+                .set_cell_formula("Sheet1", 100, col, parse(formula).unwrap())
+                .unwrap();
+        }
+
+        engine.evaluate_all().unwrap();
+        assert_number(&engine, "Sheet1", 100, 2, 42.0);
+        assert_number(&engine, "Sheet1", 100, 6, 8.0);
+        assert_number(&engine, "Sheet1", 100, 10, 42.0);
+        match engine.get_cell_value("Sheet1", 100, 8) {
+            Some(LiteralValue::Error(error)) => {
+                assert_eq!(error.kind, ExcelErrorKind::Circ, "{mode:?}")
+            }
+            other => panic!("{mode:?} Sheet1!H100: expected #CIRC!, got {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn offset_whole_column_and_row_clamped() {
     let mut engine = new_engine();

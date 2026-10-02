@@ -472,6 +472,59 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    /// The areas of a multi-area reference, numbered in the order they are
+    /// written: a union of references joined by the `,` reference operator
+    /// (`(A1:B2,D1:E2)`), or a name defined as one. `None` for anything else,
+    /// a single range included. Each area evaluates as a reference, and the
+    /// first that fails is the result. A union's areas must lie on one sheet,
+    /// so areas on different sheets are `#VALUE!`.
+    pub(crate) fn evaluate_ast_as_areas(
+        &self,
+        node: &ASTNode,
+    ) -> Option<Result<Vec<ReferenceType>, ExcelError>> {
+        match &node.node_type {
+            ASTNodeType::BinaryOp { op, left, right } if op == "," => {
+                let mut areas = Vec::new();
+                for side in [left.as_ref(), right.as_ref()] {
+                    let side_areas = match self.evaluate_ast_as_areas(side) {
+                        Some(side_areas) => side_areas,
+                        None => self.evaluate_ast_as_reference(side).map(|area| vec![area]),
+                    };
+                    match side_areas {
+                        Ok(side_areas) => areas.extend(side_areas),
+                        Err(error) => return Some(Err(error)),
+                    }
+                }
+                let sheet_of = |area: &ReferenceType| -> String {
+                    match area {
+                        ReferenceType::Cell {
+                            sheet: Some(sheet), ..
+                        }
+                        | ReferenceType::Range {
+                            sheet: Some(sheet), ..
+                        } => sheet.clone(),
+                        _ => self.current_sheet.to_string(),
+                    }
+                };
+                let mut sheets = areas.iter().map(sheet_of);
+                if let Some(first) = sheets.next()
+                    && sheets.any(|sheet| !sheet.eq_ignore_ascii_case(&first))
+                {
+                    return Some(Err(ExcelError::new(ExcelErrorKind::Value)
+                        .with_message("The areas of a reference must lie on one sheet")));
+                }
+                Some(Ok(areas))
+            }
+            ASTNodeType::Reference {
+                reference: ReferenceType::NamedRange(name),
+                ..
+            } if self.resolve_local_name(name).is_none() => {
+                self.context.resolve_name_areas(name, self.current_sheet)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn try_evaluate_ast_as_reference(
         &self,
         node: &ASTNode,

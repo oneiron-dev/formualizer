@@ -1704,6 +1704,42 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         }
     }
 
+    /// The areas of a multi-area reference argument, numbered in the order
+    /// written: a union such as `(A1:B2,D1:E2)` or a name defined as one.
+    /// `None` for any other argument, a single range included.
+    pub(crate) fn reference_areas(&self) -> Option<Result<Vec<ReferenceType>, ExcelError>> {
+        // Only a union or a name can hold several areas; check the node itself
+        // before rebuilding an arena argument's AST.
+        let candidate = match &self.expr {
+            ArgumentExpr::Ast(node) => {
+                matches!(
+                    &node.node_type,
+                    ASTNodeType::BinaryOp { op, .. } if op == ","
+                ) || matches!(
+                    &node.node_type,
+                    ASTNodeType::Reference {
+                        reference: ReferenceType::NamedRange(_),
+                        ..
+                    }
+                )
+            }
+            ArgumentExpr::Arena { id, data_store, .. } => match data_store.get_node(*id) {
+                Some(crate::engine::arena::AstNodeData::BinaryOp { op_id, .. }) => {
+                    data_store.resolve_ast_string(*op_id) == ","
+                }
+                Some(crate::engine::arena::AstNodeData::Reference { ref_type, .. }) => matches!(
+                    ref_type,
+                    crate::engine::arena::CompactRefType::NamedRange(_)
+                ),
+                _ => false,
+            },
+        };
+        if !candidate {
+            return None;
+        }
+        self.interp.evaluate_ast_as_areas(self.ast())
+    }
+
     /* tiny validator helper for macro */
     pub fn matches_kind(&self, k: formualizer_common::ArgKind) -> Result<bool, ExcelError> {
         Ok(match k {
@@ -2122,6 +2158,17 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
     /// a reference or a value take its value.
     fn is_value_name(&self, _name: &str, _current_sheet: &str) -> bool {
         false
+    }
+
+    /// The areas of a name defined as a multi-area reference
+    /// (`Sheet1!$A$1:$B$2,Sheet1!$D$1:$E$2`), in the order written. `None`
+    /// when `name` is not such a name.
+    fn resolve_name_areas(
+        &self,
+        _name: &str,
+        _current_sheet: &str,
+    ) -> Option<Result<Vec<ReferenceType>, ExcelError>> {
+        None
     }
 
     /// Resolve a single-cell reference as a scalar value.

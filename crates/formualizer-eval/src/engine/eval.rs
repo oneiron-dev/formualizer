@@ -27146,6 +27146,63 @@ where
         Self::in_named_formula(|| formula.reference_array()).transpose()
     }
 
+    fn resolve_name_areas(
+        &self,
+        name: &str,
+        current_sheet: &str,
+    ) -> Option<Result<Vec<ReferenceType>, ExcelError>> {
+        use formualizer_parse::parser::ASTNodeType;
+        let current_id = self.graph.sheet_id(current_sheet)?;
+        let named = self.graph.resolve_name_entry(name, current_id)?;
+        let NamedDefinition::Formula { ast, .. } = &named.definition else {
+            return None;
+        };
+        // A union, or a name for another name (which may be one).
+        if !matches!(
+            &ast.node_type,
+            ASTNodeType::BinaryOp { op, .. } if op == ","
+        ) && !matches!(
+            &ast.node_type,
+            ASTNodeType::Reference {
+                reference: ReferenceType::NamedRange(_),
+                ..
+            }
+        ) {
+            return None;
+        }
+        let sheet_id = match named.scope {
+            NameScope::Sheet(id) => id,
+            NameScope::Workbook => current_id,
+        };
+        let sheet = self.graph.sheet_name(sheet_id);
+        let cell_ref = self.graph.make_cell_ref(sheet, 0, 0);
+        let interpreter = Interpreter::new_with_cell(self, sheet, cell_ref);
+        let areas = match Self::in_named_formula(|| Ok(interpreter.evaluate_ast_as_areas(ast))) {
+            Ok(areas) => areas?,
+            Err(err) => return Some(Err(err)),
+        };
+        // The areas lie on the sheet the name is evaluated on, wherever the
+        // formula that uses the name sits.
+        Some(areas.map(|areas| {
+            areas
+                .into_iter()
+                .map(|mut area| {
+                    if let ReferenceType::Cell {
+                        sheet: area_sheet, ..
+                    }
+                    | ReferenceType::Range {
+                        sheet: area_sheet, ..
+                    } = &mut area
+                        && area_sheet.is_none()
+                    {
+                        *area_sheet = Some(sheet.to_string());
+                    }
+                    area
+                })
+                .collect()
+        }))
+    }
+
     fn clock(&self) -> &dyn crate::timezone::ClockProvider {
         &self.clock
     }

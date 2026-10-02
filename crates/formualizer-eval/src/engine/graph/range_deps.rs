@@ -493,6 +493,18 @@ impl DependencyGraph {
             Some(contains)
         }
 
+        /// The areas of INDEX's reference in the order written: those of a
+        /// `,` union, or the reference itself.
+        fn union_areas<'n>(node: &'n ASTNode, areas: &mut Vec<&'n ASTNode>) {
+            match &node.node_type {
+                ASTNodeType::BinaryOp { op, left, right } if op == "," => {
+                    union_areas(left, areas);
+                    union_areas(right, areas);
+                }
+                _ => areas.push(node),
+            }
+        }
+
         fn visit(
             graph: &DependencyGraph,
             node: &ASTNode,
@@ -513,10 +525,12 @@ impl DependencyGraph {
                 ASTNodeType::Function { name, args }
                     if name.eq_ignore_ascii_case("INDEX") && (2..=4).contains(&args.len()) =>
                 {
-                    // area_num: absent or omitted is area 1, the one area a
-                    // range has, so INDEX(r,i,j,1) selects like INDEX(r,i,j).
-                    // Any other static area is an error (#VALUE! below 1, #REF!
-                    // above it) that never reads the range.
+                    // area_num: absent or omitted is area 1. INDEX reads only
+                    // the area it selects: a range is area 1, the one area it
+                    // has, so INDEX(r,i,j,1) selects like INDEX(r,i,j), and a
+                    // union (A:A,C:C) numbers its areas in the order written.
+                    // An area INDEX does not select is never read; a static
+                    // area past the last one (or below 1) is an error.
                     let area = match args.get(3) {
                         None => Some(1),
                         Some(node) if matches!(node.node_type, ASTNodeType::Omitted) => Some(1),
@@ -525,27 +539,28 @@ impl DependencyGraph {
                     let row = static_index(&args[1]);
                     let col = args.get(2).and_then(static_index);
                     let selection = row.and_then(|row| {
-                        if area == Some(1) && (args.len() == 2 || col.is_some()) {
+                        if args.len() == 2 || col.is_some() {
                             Some((row, col))
                         } else {
                             None
                         }
                     });
-                    let mut use_kind = match area {
-                        Some(area)
-                            if area != 1
-                                && matching_range(
-                                    graph,
-                                    &args[0],
-                                    dependent,
-                                    range_sheet,
-                                    range,
-                                ) =>
-                        {
-                            RangeSelfUse::Excluded
-                        }
-                        _ => visit(graph, &args[0], dependent, range_sheet, range, selection),
-                    };
+                    let mut areas = Vec::new();
+                    union_areas(&args[0], &mut areas);
+                    let mut use_kind = RangeSelfUse::NoMatch;
+                    for (number, node) in (1..).zip(areas) {
+                        use_kind = use_kind.merge(match area {
+                            Some(area) if area == number => {
+                                visit(graph, node, dependent, range_sheet, range, selection)
+                            }
+                            Some(_)
+                                if matching_range(graph, node, dependent, range_sheet, range) =>
+                            {
+                                RangeSelfUse::Excluded
+                            }
+                            _ => visit(graph, node, dependent, range_sheet, range, None),
+                        });
+                    }
                     for arg in &args[1..] {
                         use_kind =
                             use_kind.merge(visit(graph, arg, dependent, range_sheet, range, None));

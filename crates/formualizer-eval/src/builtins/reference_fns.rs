@@ -157,30 +157,38 @@ impl IndexFn {
         }
     }
 
-    /// Checks area_num against the source's one area. A range or array is a
-    /// single area, so area 1 (or an omitted area_num) selects it: `Ok(())`.
-    /// area_num is a whole-number parameter read like row_num and column_num
+    /// area_num, the area of the reference INDEX selects in: 1 when omitted.
+    /// It is a whole-number parameter read like row_num and column_num
     /// (`index_argument`: truncated; a blank is 0, a logical and numeric text
     /// convert, other text is `#VALUE!`, an error is itself), the same way in
-    /// reference and value context. An area below 1 is not an area number at
-    /// all, so it is `#VALUE!`; an area above 1 lies outside the reference, so
-    /// it is `#REF!`. `None` for an array area_num, which dispatch lifts over.
-    fn check_area_num<'a, 'b>(args: &[ArgumentHandle<'a, 'b>]) -> Option<Result<(), ExcelError>> {
+    /// reference and value context. An area below 1 is no area number at all,
+    /// so it is `#VALUE!`; an area past the reference's last area is the
+    /// caller's `#REF!`. `None` for an array area_num, which dispatch lifts
+    /// over.
+    fn area_num<'a, 'b>(args: &[ArgumentHandle<'a, 'b>]) -> Option<Result<i64, ExcelError>> {
         let Some(area) = args.get(3).filter(|area| !area.is_omitted()) else {
-            return Some(Ok(()));
+            return Some(Ok(1));
         };
-        let area = match Self::index_argument(area) {
-            Ok(Some(area)) => area,
+        Some(match Self::index_argument(area) {
+            Ok(Some(area)) if area < 1 => Err(ExcelError::new(ExcelErrorKind::Value)),
+            Ok(Some(area)) => Ok(area),
             Ok(None) => return None,
-            Err(error) => return Some(Err(error)),
-        };
-        Some(if area < 1 {
-            Err(ExcelError::new(ExcelErrorKind::Value))
-        } else if area == 1 {
-            Ok(())
-        } else {
-            Err(ExcelError::new(ExcelErrorKind::Ref))
+            Err(error) => Err(error),
         })
+    }
+
+    /// Checks area_num against a source that is one area (a range or an
+    /// array): area 1 selects it, a higher area lies outside it (`#REF!`).
+    fn check_single_area<'a, 'b>(
+        args: &[ArgumentHandle<'a, 'b>],
+    ) -> Option<Result<(), ExcelError>> {
+        Some(Self::area_num(args)?.and_then(|area| {
+            if area == 1 {
+                Ok(())
+            } else {
+                Err(ExcelError::new(ExcelErrorKind::Ref))
+            }
+        }))
     }
 
     fn bounded_dimensions(base: &ReferenceType) -> Option<(u32, u32)> {
@@ -239,6 +247,17 @@ impl IndexFn {
         ctx: &dyn FunctionContext<'b>,
         base: ReferenceType,
     ) -> Option<Result<ReferenceType, ExcelError>> {
+        Self::reference_from_areas(args, ctx, std::slice::from_ref(&base))
+    }
+
+    /// The reference INDEX selects: row_num and column_num pick within the
+    /// area_num-th of `areas` (area 1 of a single range), and an area_num past
+    /// the last area is `#REF!`.
+    fn reference_from_areas<'a, 'b>(
+        args: &[ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+        areas: &[ReferenceType],
+    ) -> Option<Result<ReferenceType, ExcelError>> {
         let position = match Self::index_argument(&args[1]) {
             Ok(Some(position)) => position,
             Ok(None) => return None,
@@ -253,14 +272,21 @@ impl IndexFn {
         } else {
             None
         };
-        if let Err(error) = Self::check_area_num(args)? {
-            return Some(Err(error));
-        }
+        let base = match Self::area_num(args)? {
+            Ok(area) => match usize::try_from(area - 1)
+                .ok()
+                .and_then(|area| areas.get(area))
+            {
+                Some(base) => base,
+                None => return Some(Err(ExcelError::new(ExcelErrorKind::Ref))),
+            },
+            Err(error) => return Some(Err(error)),
+        };
 
         // A structured reference is the area it selects on the table's own
         // sheet, read from the table's placement without reading a cell:
         // INDEX(Table1[Qty],2) is the second data cell of that column.
-        let base = match crate::traits::reference_as_area(ctx, base) {
+        let base = match crate::traits::reference_as_area(ctx, base.clone()) {
             Ok(base) => base,
             Err(error) => return Some(Err(error)),
         };
@@ -420,9 +446,11 @@ impl IndexFn {
 /// - In a workbook formula entered without the array flag, a range `row_num`, `column_num` or
 ///   `area_num` is implicitly intersected with the formula cell (`#VALUE!` when they do not
 ///   cross).
-/// - `area_num` (reference form) picks an area of the reference; a single range or array is
-///   area 1, so an omitted or `1` area selects it. An area below 1 returns `#VALUE!` and an
-///   area above 1 lies outside the reference and returns `#REF!`. Numeric text converts.
+/// - `area_num` (reference form) picks the area of a multi-area reference in which `row_num`
+///   and `column_num` select: a union such as `(A1:B2,D1:E2)`, or a name defined as one,
+///   numbers its areas in the order written. It defaults to 1, and a single range or array
+///   is area 1 only. An area below 1 returns `#VALUE!`, an area past the last one returns
+///   `#REF!`, and a union whose areas lie on different sheets returns `#VALUE!`.
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -514,6 +542,16 @@ impl Function for IndexFn {
         if !(2..=4).contains(&args.len()) {
             return Some(Err(ExcelError::new(ExcelErrorKind::Value)));
         }
+        // A multi-area reference, a union like (A1:B2,D1:E2) or a name defined
+        // as one: area_num picks the area row_num and column_num select in.
+        // An array index is `None` here, as for a single range, so the caller
+        // takes the value path, where dispatch lifts over it.
+        if let Some(areas) = args[0].reference_areas() {
+            return match areas {
+                Ok(areas) => Self::reference_from_areas(args, ctx, &areas),
+                Err(error) => Some(Err(error)),
+            };
+        }
         let base = match args[0].resolve_reference_or_value() {
             Ok(FunctionResolution::Reference(reference)) => reference,
             Ok(FunctionResolution::ReferenceError(_) | FunctionResolution::Value(_)) | Err(_) => {
@@ -537,8 +575,9 @@ impl Function for IndexFn {
                 Err(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
             }
         } else {
-            // Handle array literal
-            if args.len() < 2 {
+            // Handle array literal. A multi-area reference has no value of its
+            // own: an index dispatch did not lift is #VALUE!, as for a range.
+            if args.len() < 2 || args[0].reference_areas().is_some() {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new(ExcelErrorKind::Value),
                 )));
@@ -601,7 +640,7 @@ impl Function for IndexFn {
                 )))
             };
             // area_num is checked before the positions, as in the reference path.
-            match Self::check_area_num(args) {
+            match Self::check_single_area(args) {
                 Some(Ok(())) => {}
                 Some(Err(error)) => {
                     return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));

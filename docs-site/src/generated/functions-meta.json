@@ -11710,7 +11710,7 @@
     "variadic": false
   },
   "reference-fns/index-fn": {
-    "argSchema": "arg1{kinds=any,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberStrict,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberStrict,max=None,repeating=None,default=false}",
+    "argSchema": "arg1{kinds=any,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}",
     "args": [
       {
         "by_ref": false,
@@ -11727,7 +11727,7 @@
       },
       {
         "by_ref": false,
-        "coercion": "NumberStrict",
+        "coercion": "NumberLenientText",
         "has_default": false,
         "kinds": [
           "number"
@@ -11740,13 +11740,26 @@
       },
       {
         "by_ref": false,
-        "coercion": "NumberStrict",
+        "coercion": "NumberLenientText",
         "has_default": false,
         "kinds": [
           "number"
         ],
         "max": null,
         "name": "arg3",
+        "repeating": null,
+        "required": false,
+        "shape": "scalar"
+      },
+      {
+        "by_ref": false,
+        "coercion": "NumberLenientText",
+        "has_default": false,
+        "kinds": [
+          "number"
+        ],
+        "max": null,
+        "name": "arg4",
         "repeating": null,
         "required": false,
         "shape": "scalar"
@@ -11758,12 +11771,12 @@
     ],
     "category": "reference_fns",
     "implementationSource": "crates/formualizer-eval/src/builtins/reference_fns.rs",
-    "maxArgs": 3,
+    "maxArgs": 4,
     "minArgs": 2,
     "name": "INDEX",
     "registrationSource": "crates/formualizer-eval/src/builtins/reference_fns.rs",
     "shortSummary": "Returns the value or reference at a 1-based row and column within an array or range.",
-    "signature": "INDEX(arg1: any@range, arg2: number@scalar, arg3?: number@scalar)",
+    "signature": "INDEX(arg1: any@range, arg2: number@scalar, arg3?: number@scalar, arg4?: number@scalar)",
     "typeName": "IndexFn",
     "variadic": false
   },
