@@ -622,10 +622,13 @@ impl CompiledWildcardPattern {
 
 /// Excel-style wildcard pattern matcher with escape (~) supporting *, ? and literal escaping of ~ * ?
 pub fn wildcard_pattern_match(pattern: &str, text: &str) -> bool {
-    let pattern_folded = pattern.to_lowercase();
-    let text_folded = text.to_lowercase();
-    let compiled = CompiledWildcardPattern::from_folded(&pattern_folded);
-    compiled.matches_folded(&text_folded)
+    wildcard_pattern_match_as_given(&pattern.to_lowercase(), &text.to_lowercase())
+}
+
+/// [`wildcard_pattern_match`] without case folding, for callers that fold
+/// (or deliberately keep) case themselves.
+pub(crate) fn wildcard_pattern_match_as_given(pattern: &str, text: &str) -> bool {
+    CompiledWildcardPattern::from_folded(pattern).matches_folded(text)
 }
 
 /// Find index of exact (or wildcard) match in values; returns first match (Excel semantics).

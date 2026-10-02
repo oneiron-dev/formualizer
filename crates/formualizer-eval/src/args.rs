@@ -135,6 +135,13 @@ fn criteria_error(text: &str) -> Option<ExcelErrorKind> {
     })
 }
 
+/// Criteria text is a wildcard pattern when it holds `*` (any run of
+/// characters), `?` (one character) or the escape `~` (`~*`, `~?` and `~~`
+/// stand for the character itself, so `"~~"` matches a lone tilde).
+fn is_criteria_pattern(text: &str) -> bool {
+    text.contains(['*', '?', '~'])
+}
+
 /// Parse a criteria value (`">=5"`, `"<5/3/2011"`, `"a*"`, `7`) into a
 /// predicate. Operands that read as numbers, dates or times are numeric.
 pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError> {
@@ -182,7 +189,7 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
                     };
                     // Wildcards apply after "=" and "<>" as they do with no operator.
                     if let LiteralValue::Text(t) = &lit
-                        && (t.contains('*') || t.contains('?'))
+                        && is_criteria_pattern(t)
                     {
                         let (pattern, case_insensitive) = (t.clone(), true);
                         match *op {
@@ -215,8 +222,8 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
 
             let plain = unquote(s);
 
-            // Wildcards * or ? => TextLike
-            if plain.contains('*') || plain.contains('?') {
+            // Wildcards * or ?, or the ~ escape => TextLike
+            if is_criteria_pattern(&plain) {
                 return Ok(CriteriaPredicate::TextLike {
                     pattern: plain,
                     case_insensitive: true,
@@ -704,6 +711,51 @@ mod criteria_tests {
         assert!(!criteria_match(&ne_literal, &text("In Approval")));
         assert!(criteria_match(&ne_literal, &text("In Progress")));
         assert!(criteria_match(&ne_literal, &LiteralValue::Empty));
+    }
+
+    #[test]
+    fn tilde_escapes_wildcards_with_and_without_an_operator() {
+        // "~*", "~?" and "~~" stand for the character itself, after "=", after
+        // "<>" and with no operator; "~~" makes a pattern on its own.
+        let cells = ["a*b", "axb", "a?b", "a~b", "ab", "*"];
+        for (criterion, matched) in [
+            ("a~*b", &["a*b"][..]),
+            ("=a~*b", &["a*b"]),
+            ("<>a~*b", &["axb", "a?b", "a~b", "ab", "*"]),
+            ("A~?B", &["a?b"]),
+            ("=a~~b", &["a~b"]),
+            ("a~~b", &["a~b"]),
+            ("<>a~~b", &["a*b", "axb", "a?b", "ab", "*"]),
+            ("~*", &["*"]),
+            ("<>~*", &["a*b", "axb", "a?b", "a~b", "ab"]),
+            ("a~**", &["a*b"]),
+        ] {
+            let pred = parse_criteria(&text(criterion)).unwrap();
+            for cell in cells {
+                assert_eq!(
+                    criteria_match(&pred, &text(cell)),
+                    matched.contains(&cell),
+                    "{criterion} on {cell}"
+                );
+            }
+        }
+        // "<>" with an escaped pattern keeps non-text cells, like any "<>" pattern.
+        let ne = parse_criteria(&text("<>~*")).unwrap();
+        assert!(criteria_match(&ne, &LiteralValue::Empty));
+        assert!(criteria_match(&ne, &LiteralValue::Number(1.0)));
+    }
+
+    #[test]
+    fn question_mark_is_one_character_not_one_byte() {
+        let one = parse_criteria(&text("?")).unwrap();
+        let ne_one = parse_criteria(&text("<>?")).unwrap();
+        for cell in ["é", "日", "😀"] {
+            assert!(criteria_match(&one, &text(cell)), "{cell}");
+            assert!(!criteria_match(&ne_one, &text(cell)), "{cell}");
+        }
+        let two = parse_criteria(&text("=日?")).unwrap();
+        assert!(criteria_match(&two, &text("日本")));
+        assert!(!criteria_match(&two, &text("日本語")));
     }
 
     #[test]

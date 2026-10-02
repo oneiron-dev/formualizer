@@ -22,7 +22,8 @@
 //! - First row contains column headers (subset of database headers)
 //! - Subsequent rows contain criteria values (OR relationship between rows)
 //! - Multiple columns in same row have AND relationship
-//! - Supports comparison operators (>, <, >=, <=, <>), wildcards (*, ?)
+//! - Supports comparison operators (>, <, >=, <=, <>) and wildcards (*, ?, ~ escape),
+//!   which also apply after "=" and "<>"
 
 use super::utils::{ARG_ANY_ONE, criteria_match};
 use crate::args::{ArgSchema, CriteriaPredicate, parse_criteria};
@@ -2752,5 +2753,37 @@ mod tests {
         let result = f.dispatch(&args, &ctx.function_context(None)).unwrap();
 
         assert_eq!(result.into_literal(), LiteralValue::Number(30.0));
+    }
+
+    #[test]
+    fn dsum_wildcards_apply_after_eq_and_ne_operators() {
+        // Names: Alice, Bob, Carol, Dave; salaries 50000, 45000, 60000, 55000.
+        let wb = TestWorkbook::new().with_function(Arc::new(DSumFn));
+        let ctx = interp(&wb);
+        for (criterion, expected) in [
+            // Not Bob or Carol, the names holding an "o".
+            ("<>*o*", 105000.0),
+            // Carol and Dave, the names whose second letter is "a".
+            ("=?a*", 115000.0),
+        ] {
+            let db = lit(make_database());
+            let field = lit(LiteralValue::Text("Salary".into()));
+            let criteria = lit(LiteralValue::Array(vec![
+                vec![LiteralValue::Text("Name".into())],
+                vec![LiteralValue::Text(criterion.into())],
+            ]));
+            let args = vec![
+                crate::traits::ArgumentHandle::new(&db, &ctx),
+                crate::traits::ArgumentHandle::new(&field, &ctx),
+                crate::traits::ArgumentHandle::new(&criteria, &ctx),
+            ];
+            let f = ctx.context.get_function("", "DSUM").unwrap();
+            let result = f.dispatch(&args, &ctx.function_context(None)).unwrap();
+            assert_eq!(
+                result.into_literal(),
+                LiteralValue::Number(expected),
+                "{criterion}"
+            );
+        }
     }
 }

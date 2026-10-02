@@ -2940,6 +2940,30 @@ pub(crate) mod visibility_mask_test_hooks {
     }
 }
 
+/// A criteria operand as an Arrow `LIKE` pattern. LIKE's own `%`, `_` and
+/// `\` are escaped so they match themselves. With `wildcards` the operand is
+/// an Excel pattern: `*` and `?` become `%` and `_`, and `~x` (the escape of
+/// `~*`, `~?`, `~~`) is the literal `x`; without it the operand is plain text.
+fn criteria_like_pattern(operand: &str, wildcards: bool) -> String {
+    fn push_literal(out: &mut String, c: char) {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    let mut out = String::with_capacity(operand.len() + 2);
+    let mut chars = operand.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' if wildcards => out.push('%'),
+            '?' if wildcards => out.push('_'),
+            '~' if wildcards => push_literal(&mut out, chars.next().unwrap_or('~')),
+            c => push_literal(&mut out, c),
+        }
+    }
+    out
+}
+
 fn compute_criteria_mask(
     view: &RangeView<'_>,
     col_in_view: usize,
@@ -3078,11 +3102,13 @@ fn compute_criteria_mask(
     // TEXT PATH: build masks per row-chunk using lowered text slices.
     // This avoids concatenating full-string columns just to compute a boolean mask.
     let (text_kind, text_pat, empty_special) = match pred {
-        crate::args::CriteriaPredicate::Eq(formualizer_common::LiteralValue::Text(t)) => {
-            (0u8, t.to_lowercase(), t.is_empty())
-        }
+        crate::args::CriteriaPredicate::Eq(formualizer_common::LiteralValue::Text(t)) => (
+            0u8,
+            criteria_like_pattern(&t.to_lowercase(), false),
+            t.is_empty(),
+        ),
         crate::args::CriteriaPredicate::Ne(formualizer_common::LiteralValue::Text(t)) => {
-            (1u8, t.to_lowercase(), false)
+            (1u8, criteria_like_pattern(&t.to_lowercase(), false), false)
         }
         crate::args::CriteriaPredicate::TextLike {
             pattern,
@@ -3093,7 +3119,7 @@ fn compute_criteria_mask(
             } else {
                 pattern.clone()
             };
-            (2u8, p.replace('*', "%").replace('?', "_"), false)
+            (2u8, criteria_like_pattern(&p, true), false)
         }
         _ => return None,
     };

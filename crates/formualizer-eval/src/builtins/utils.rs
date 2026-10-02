@@ -473,8 +473,10 @@ fn text_like_match(pattern: &str, case_insensitive: bool, v: &LiteralValue) -> b
         (pattern.to_string(), s)
     };
 
-    // Fast-path for anchored patterns without '?' or escape sequences
-    if !pat.contains('?') && !pat.contains("~*") && !pat.contains("~?") {
+    // Fast paths for patterns whose only wildcard is '*'. A '?' (one
+    // character, not one byte) or a '~' escape (`~*`, `~?`, `~~` stand for
+    // the character itself) takes the full matcher.
+    if !pat.contains(['?', '~']) {
         // Pattern like "text*" - starts with
         if pat.ends_with('*') && !pat[..pat.len() - 1].contains('*') {
             return text.starts_with(&pat[..pat.len() - 1]);
@@ -493,42 +495,8 @@ fn text_like_match(pattern: &str, case_insensitive: bool, v: &LiteralValue) -> b
         }
     }
 
-    // Fall back to general wildcard matching for complex patterns
-    wildcard_match(&pat, &text)
-}
-
-fn wildcard_match(pat: &str, text: &str) -> bool {
-    // Simple glob-like matcher for * and ? (non-greedy backtracking).
-    fn helper(p: &[u8], t: &[u8]) -> bool {
-        if p.is_empty() {
-            return t.is_empty();
-        }
-        match p[0] {
-            b'*' => {
-                for i in 0..=t.len() {
-                    if helper(&p[1..], &t[i..]) {
-                        return true;
-                    }
-                }
-                false
-            }
-            b'?' => {
-                if t.is_empty() {
-                    false
-                } else {
-                    helper(&p[1..], &t[1..])
-                }
-            }
-            ch => {
-                if t.first().copied() == Some(ch) {
-                    helper(&p[1..], &t[1..])
-                } else {
-                    false
-                }
-            }
-        }
-    }
-    helper(pat.as_bytes(), text.as_bytes())
+    // The lookup functions' Excel wildcard matcher; both sides are folded above.
+    crate::builtins::lookup::lookup_utils::wildcard_pattern_match_as_given(&pat, &text)
 }
 
 // ─────────────────────────────── ArgSchema presets ───────────────────────────────

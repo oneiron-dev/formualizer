@@ -118,3 +118,79 @@ fn ne_and_eq_wildcard_criteria_in_if_functions() {
         );
     }
 }
+
+#[test]
+fn text_column_masks_read_escapes_and_like_metacharacters_literally() {
+    // A text-only column takes the Arrow LIKE kernel: Excel's `~` escape and
+    // text holding LIKE's own `%`, `_` or `\` must match as the scalar
+    // matcher does, through the mask and through COUNTIF.
+    let cells = [
+        "a*b", "axb", "a_b", "a~b", "ab", "50%", "50x", "c\\d", "cd", "?", "x",
+    ];
+    let mut engine = Engine::new(TestWorkbook::new(), arrow_eval_config());
+    {
+        let mut ingest = engine.begin_bulk_ingest_arrow();
+        ingest.add_sheet("S", 1, 4);
+        for cell in cells {
+            ingest
+                .append_row("S", &[LiteralValue::Text(cell.into())])
+                .unwrap();
+        }
+        ingest.finish().unwrap();
+    }
+    let last = cells.len() as u32;
+    let range = ReferenceType::range(Some("S".into()), Some(1), Some(1), Some(last), Some(1));
+    for (criterion, matched) in [
+        ("a~*b", &["a*b"][..]),
+        ("=a~*b", &["a*b"]),
+        ("a~~b", &["a~b"]),
+        ("a_b", &["a_b"]),
+        (
+            "<>a_b",
+            &[
+                "a*b", "axb", "a~b", "ab", "50%", "50x", "c\\d", "cd", "?", "x",
+            ],
+        ),
+        ("a?b", &["a*b", "axb", "a_b", "a~b"]),
+        ("*%", &["50%"]),
+        ("c\\d", &["c\\d"]),
+        ("c\\*", &["c\\d"]),
+        ("~?", &["?"]),
+        (
+            "<>~?",
+            &[
+                "a*b", "axb", "a_b", "a~b", "ab", "50%", "50x", "c\\d", "cd", "x",
+            ],
+        ),
+    ] {
+        let pred = crate::args::parse_criteria(&LiteralValue::Text(criterion.into())).unwrap();
+        let view = engine.resolve_range_view(&range, "S").unwrap();
+        let mask = engine.build_criteria_mask(&view, 0, &pred);
+        for (row, cell) in cells.iter().enumerate() {
+            let expected = matched.contains(cell);
+            assert_eq!(
+                crate::builtins::criteria_match(&pred, &view.get_cell(row, 0)),
+                expected,
+                "{criterion} on {cell}"
+            );
+            if let Some(mask) = &mask {
+                assert_eq!(mask.value(row), expected, "mask {criterion} on {cell}");
+            }
+        }
+        let formula = format!("=COUNTIF(A1:A{last},\"{criterion}\")");
+        engine
+            .set_cell_formula(
+                "S",
+                1,
+                3,
+                formualizer_parse::parser::parse(&formula).unwrap(),
+            )
+            .unwrap();
+        engine.evaluate_cell("S", 1, 3).unwrap();
+        assert_eq!(
+            engine.get_cell_value("S", 1, 3).unwrap(),
+            LiteralValue::Number(matched.len() as f64),
+            "{formula}"
+        );
+    }
+}
