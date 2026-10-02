@@ -135,6 +135,11 @@ impl Function for ValueFn {
 /// # Remarks
 /// - The decimal separator defaults to `.`.
 /// - The group separator defaults to `,`.
+/// - Only the first character of each separator is used.
+/// - Spaces are ignored, even in the middle (`" 3 000 "` is 3000), and empty
+///   text is 0.
+/// - Group separators before the decimal separator are ignored; one after it,
+///   or a second decimal separator, is `#VALUE!`.
 /// - Percent suffixes are supported and scale the result by 100 per suffix.
 ///
 /// ```yaml,sandbox
@@ -208,37 +213,56 @@ impl Function for NumberValueFn {
             ",".to_string()
         };
 
-        if decimal_sep.is_empty() || decimal_sep == group_sep {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+        // Microsoft's NUMBERVALUE remarks: only the first character of a
+        // separator is used, spaces are ignored anywhere, "" is 0, group
+        // separators before the decimal separator are ignored and one after it
+        // is invalid, and each trailing percent sign divides by 100.
+        let value_error = || {
+            Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_value(),
-            )));
+            )))
+        };
+        let Some(decimal) = decimal_sep.chars().next() else {
+            return value_error();
+        };
+        let group = group_sep.chars().next();
+        if group == Some(decimal) {
+            return value_error();
         }
-
-        let mut trimmed = text.trim();
-        let mut pct_count = 0u32;
-        while let Some(prefix) = trimmed.strip_suffix('%') {
-            trimmed = prefix.trim_end();
+        // A space that is itself a separator stays, so its position is checked.
+        let mut body: String = text
+            .trim()
+            .chars()
+            .filter(|&c| c != ' ' || c == decimal || Some(c) == group)
+            .collect();
+        if body.is_empty() {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(0.0)));
+        }
+        let mut pct_count = 0;
+        while body.ends_with('%') {
+            body.pop();
             pct_count += 1;
         }
-        if trimmed.is_empty() {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_value(),
-            )));
+        let (integer, fraction) = match body.split_once(decimal) {
+            Some((integer, fraction)) => (integer, Some(fraction)),
+            None => (body.as_str(), None),
+        };
+        if fraction.is_some_and(|f| f.contains(decimal) || group.is_some_and(|g| f.contains(g))) {
+            return value_error();
         }
-
-        let cleaned = trimmed.replace(&group_sep, "").replace(&decimal_sep, ".");
-        if cleaned.matches('.').count() > 1 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_value(),
-            )));
+        let mut plain: String = integer.chars().filter(|&c| Some(c) != group).collect();
+        // A "." that is not the decimal separator is not part of a number.
+        if plain.contains('.') || fraction.is_some_and(|f| f.contains('.')) {
+            return value_error();
         }
-
-        // Only finite numbers: "NaN", "inf", "infinity" and text beyond the
-        // double range are not numbers in Excel.
-        let Some(mut n) = crate::locale::parse_finite_number(&cleaned) else {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_value(),
-            )));
+        if let Some(fraction) = fraction {
+            plain.push('.');
+            plain.push_str(fraction);
+        }
+        // A plain decimal number, and only a finite one: Rust's spellings
+        // "inf" and "NaN" and text beyond the double range are not numbers.
+        let Some(mut n) = crate::locale::parse_finite_number(&plain) else {
+            return value_error();
         };
         for _ in 0..pct_count {
             n /= 100.0;
@@ -541,6 +565,54 @@ mod tests {
             .unwrap()
             .into_literal();
         assert!(matches!(out, LiteralValue::Error(e) if e.kind == ExcelErrorKind::Value));
+    }
+
+    #[test]
+    fn numbervalue_follows_the_documented_separator_rules() {
+        let wb = TestWorkbook::new().with_function(std::sync::Arc::new(NumberValueFn));
+        let ctx = wb.interpreter();
+        let f = ctx.context.get_function("", "NUMBERVALUE").unwrap();
+        let run = |args: &[&str]| {
+            let nodes: Vec<ASTNode> = args
+                .iter()
+                .map(|a| lit(LiteralValue::Text((*a).into())))
+                .collect();
+            let handles: Vec<ArgumentHandle> =
+                nodes.iter().map(|n| ArgumentHandle::new(n, &ctx)).collect();
+            f.dispatch(&handles, &ctx.function_context(None))
+                .unwrap()
+                .into_literal()
+        };
+        // Microsoft's remarks and examples.
+        for (args, expected) in [
+            (&[" 3 000 "][..], 3000.0),
+            (&[""][..], 0.0),
+            (&["9%%"][..], 0.0009),
+            (&["2.500,27", ",", "."][..], 2500.27),
+            (&["1,2.5"][..], 12.5),
+            (&["1 234,5", ", ", "x"][..], 1234.5),
+            (&["-1.5e3"][..], -1500.0),
+            (&["1\u{a0}234.5", ".", "\u{a0}"][..], 1234.5),
+        ] {
+            assert_eq!(run(args), LiteralValue::Number(expected), "{args:?}");
+        }
+        for args in [
+            &["1.5,3"][..],
+            &["1.5", ",", " "][..],
+            &["inf"][..],
+            &["NaN"][..],
+            &["1e400"][..],
+            &["%"][..],
+            &["1,5", ",x", ",y"][..],
+            // A space-like group separator after the decimal separator.
+            &["1.2\u{a0}3", ".", "\u{a0}"][..],
+            &["1\t2"][..],
+        ] {
+            assert!(
+                matches!(run(args), LiteralValue::Error(e) if e.kind == ExcelErrorKind::Value),
+                "{args:?}"
+            );
+        }
     }
 
     #[test]
