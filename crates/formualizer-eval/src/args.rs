@@ -102,6 +102,16 @@ fn criteria_number(text: &str) -> Option<f64> {
     crate::locale::Locale::invariant().parse_number_invariant(text)
 }
 
+/// A criterion operand that Excel reads as a number, a date or a time
+/// (`"5"`, `"3/1/2021"`, `"May 2, 1900"`, `"12:30"`). COUNTIF, SUMIF and the
+/// other criteria functions are not type-specific for numbers and dates: date
+/// and time text is its serial, read as the function call reads date text in
+/// its number arguments, in the workbook's date system with a year-less date
+/// in the clock's year ([`crate::coercion::argument_date_text_serial`]).
+fn criteria_serial(text: &str) -> Option<f64> {
+    criteria_number(text).or_else(|| crate::coercion::argument_date_text_serial(text))
+}
+
 /// An Excel error value written as criteria text (`#N/A`, `#DIV/0!`).
 fn criteria_error(text: &str) -> Option<ExcelErrorKind> {
     ExcelErrorKind::try_parse(text).filter(|kind| {
@@ -120,6 +130,8 @@ fn criteria_error(text: &str) -> Option<ExcelErrorKind> {
     })
 }
 
+/// Parse a criteria value (`">=5"`, `"<5/3/2011"`, `"a*"`, `7`) into a
+/// predicate. Operands that read as numbers, dates or times are numeric.
 pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError> {
     match v {
         LiteralValue::Text(s) => {
@@ -142,9 +154,9 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
                 if let Some(rhs) = s.trim_start().strip_prefix(op) {
                     let rhs_trim = rhs.trim();
                     // Try numeric parse for comparisons. Like the cells it is
-                    // compared with, a criterion number ignores only the spaces
-                    // around it: "=5"&CHAR(10) is text.
-                    if let Some(n) = criteria_number(rhs.trim_matches(' ')) {
+                    // compared with, a criterion number, date or time ignores
+                    // only the spaces around it: "=5"&CHAR(10) is text.
+                    if let Some(n) = criteria_serial(rhs.trim_matches(' ')) {
                         return Ok(match *op {
                             ">=" => CriteriaPredicate::Ge(n),
                             "<=" => CriteriaPredicate::Le(n),
@@ -192,10 +204,11 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
                 return Ok(CriteriaPredicate::Eq(LiteralValue::Boolean(false)));
             }
             // A number written as text ("111111") is a numeric criterion, as
-            // if written "=111111". Only the spaces around it are ignored, as
-            // for the cells: "5"&CHAR(10) is a text criterion that matches the
-            // text "5"&CHAR(10) and not the number 5.
-            if let Some(n) = criteria_number(plain.trim_matches(' ')) {
+            // if written "=111111"; so is a date or a time ("3/1/2021"). Only
+            // the spaces around it are ignored, as for the cells: "5"&CHAR(10)
+            // is a text criterion that matches the text "5"&CHAR(10) and not
+            // the number 5.
+            if let Some(n) = criteria_serial(plain.trim_matches(' ')) {
                 return Ok(CriteriaPredicate::Eq(LiteralValue::Number(n)));
             }
             if let Some(kind) = criteria_error(plain.trim()) {
@@ -479,6 +492,97 @@ mod criteria_tests {
         // The spaces around a criterion number are still ignored.
         let ge = parse_criteria(&text(">= 4 ")).unwrap();
         assert!(criteria_match(&ge, &LiteralValue::Number(5.0)));
+    }
+
+    #[test]
+    fn date_and_time_text_criteria_are_numbers() {
+        // COUNTIFS(B2:B7,"<5/3/2011") compares dates (Microsoft's COUNTIFS
+        // example); "May 2, 1900" is the serial 123, so it matches 123, "123"
+        // and "0123".
+        let may_3_2011 = 40666.0;
+        assert!(matches!(
+            parse_criteria(&text("<5/3/2011")).unwrap(),
+            CriteriaPredicate::Lt(n) if n == may_3_2011
+        ));
+        assert!(matches!(
+            parse_criteria(&text(">= May 3, 2011")).unwrap(),
+            CriteriaPredicate::Ge(n) if n == may_3_2011
+        ));
+        let pred = parse_criteria(&text("May 2, 1900")).unwrap();
+        for cell in [LiteralValue::Number(123.0), text("123"), text("0123")] {
+            assert!(criteria_match(&pred, &cell), "{cell:?}");
+        }
+        let noon = parse_criteria(&text("12:00")).unwrap();
+        assert!(criteria_match(&noon, &LiteralValue::Number(0.5)));
+        // Text that is no date stays a text criterion.
+        let code = parse_criteria(&text("Q1-2021")).unwrap();
+        assert!(matches!(code, CriteriaPredicate::Eq(LiteralValue::Text(_))));
+        assert!(criteria_match(&code, &text("q1-2021")));
+    }
+
+    #[test]
+    fn numeric_equality_matches_date_text_cells() {
+        // SUMIFS(K:K,A:A,DATE(2021,3,1)) sums the rows whose A holds the text
+        // "3-1-21" (M/d/yy, en-US) as well as the date itself.
+        let march_1_2021 = LiteralValue::Number(44256.0);
+        let pred = parse_criteria(&march_1_2021).unwrap();
+        for cell in [
+            text("3-1-21"),
+            text("3/1/2021"),
+            text(" Mar 1, 2021 "),
+            text("2021-03-01"),
+        ] {
+            assert!(criteria_match(&pred, &cell), "{cell:?}");
+        }
+        for cell in [text("3-2-21"), text("1-3-21"), text("gage")] {
+            assert!(!criteria_match(&pred, &cell), "{cell:?}");
+        }
+        let other = parse_criteria(&text("<>3/1/2021")).unwrap();
+        assert!(!criteria_match(&other, &text("3-1-21")));
+        assert!(criteria_match(&other, &text("3-2-21")));
+        // Ordered criteria compare numbers, not date text in a cell.
+        let after = parse_criteria(&text(">44255")).unwrap();
+        assert!(!criteria_match(&after, &text("3-1-21")));
+        // A logical is still never a number.
+        let one = parse_criteria(&LiteralValue::Number(1.0)).unwrap();
+        assert!(!criteria_match(&one, &LiteralValue::Boolean(true)));
+        // As for numbers, only the spaces around date text are ignored: a
+        // line feed leaves it text, in the cell and in the criterion.
+        assert!(!criteria_match(&pred, &text("3-1-21\n")));
+        let line_fed = parse_criteria(&text("3/1/2021\n")).unwrap();
+        assert!(matches!(
+            line_fed,
+            CriteriaPredicate::Eq(LiteralValue::Text(_))
+        ));
+        assert!(!criteria_match(&line_fed, &march_1_2021));
+        assert!(criteria_match(&line_fed, &text("3/1/2021\n")));
+    }
+
+    #[test]
+    fn criteria_dates_follow_the_date_system_and_clock_year() {
+        // Criteria read date text in the function call's date context: here
+        // a 1904 workbook whose clock is in 2021.
+        {
+            let _call = crate::coercion::enter_argument_date_context(
+                crate::engine::DateSystem::Excel1904,
+                Some(2021),
+            );
+            let pred = parse_criteria(&text("3/1/2021")).unwrap();
+            assert!(matches!(
+                pred,
+                CriteriaPredicate::Eq(LiteralValue::Number(n)) if n == 44256.0 - 1462.0
+            ));
+            assert!(criteria_match(&pred, &text("Mar 1")));
+            assert!(criteria_match(
+                &pred,
+                &LiteralValue::Number(44256.0 - 1462.0)
+            ));
+        }
+        // Outside a call (no clock year), year-less date text is not a date.
+        assert!(matches!(
+            parse_criteria(&text("Mar 1")).unwrap(),
+            CriteriaPredicate::Eq(LiteralValue::Text(_))
+        ));
     }
 
     #[test]

@@ -300,13 +300,14 @@ pub fn collapse_if_scalar(
 // ─────────────────────────────── Criteria helpers (shared by *IF* aggregators) ───────────────────────────────
 
 /// Match a value against a parsed `CriteriaPredicate` (see `crate::args::CriteriaPredicate`).
-/// Implements Excel-style semantics for equality (case-insensitive text, lenient numeric),
-/// inequality comparisons with numeric coercion, wildcard text matching, and type tests.
+/// Implements Excel-style semantics for equality (case-insensitive text, lenient numeric,
+/// date and time text equal to their serials), inequality comparisons with numeric
+/// coercion, wildcard text matching, and type tests.
 pub fn criteria_match(pred: &crate::args::CriteriaPredicate, v: &LiteralValue) -> bool {
     use crate::args::CriteriaPredicate as P;
     match pred {
-        P::Eq(t) => values_equal_invariant(t, v),
-        P::Ne(t) => !values_equal_invariant(t, v),
+        P::Eq(t) => values_equal_invariant(t, v) || date_text_equals(t, v),
+        P::Ne(t) => !(values_equal_invariant(t, v) || date_text_equals(t, v)),
         P::Gt(_) | P::Ge(_) | P::Lt(_) | P::Le(_) => {
             let (n, holds) = numeric_criterion(pred).expect("an ordered criterion is numeric");
             criteria_ordered_number(v).is_some_and(|x| holds(compare_to_15_digits(x, n)))
@@ -381,6 +382,34 @@ pub(crate) fn numeric_criteria_mask(
             Some(Equal)
         })
     }))
+}
+
+/// A numeric (in)equality criterion reads a cell's text as the date or time
+/// Excel reads it as: `SUMIFS(K:K,A:A,DATE(2021,3,1))` sums the rows holding
+/// the text "3-1-21", as numeric text already equals its number. The text is
+/// read in the function call's date context
+/// ([`crate::coercion::argument_date_text_serial`]), and its serial equals
+/// the criterion's number as numbers do, to 15 significant digits
+/// ([`numbers_equal`]). A logical is never a number for criteria.
+fn date_text_equals(criterion: &LiteralValue, v: &LiteralValue) -> bool {
+    let LiteralValue::Text(text) = v else {
+        return false;
+    };
+    let wanted = match criterion {
+        LiteralValue::Number(_)
+        | LiteralValue::Int(_)
+        | LiteralValue::Date(_)
+        | LiteralValue::DateTime(_)
+        | LiteralValue::Time(_)
+        | LiteralValue::Duration(_) => {
+            criterion.as_serial_number_for(crate::coercion::argument_date_context().0)
+        }
+        _ => None,
+    };
+    wanted.is_some_and(|wanted| {
+        crate::coercion::argument_date_text_serial(text)
+            .is_some_and(|serial| numbers_equal(wanted, serial))
+    })
 }
 
 /// The number a cell offers to an ordered numeric criterion (`">5"`, `"<=0"`).

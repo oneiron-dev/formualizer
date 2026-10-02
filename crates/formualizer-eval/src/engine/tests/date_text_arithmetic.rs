@@ -411,7 +411,7 @@ fn date_typed_arithmetic_uses_the_1904_workbook_system() {
 }
 
 #[test]
-fn known_comparison_and_criteria_divergences_remain_pinned() {
+fn comparisons_keep_date_text_as_text_but_criteria_read_it() {
     // Comparison operators do not read text as a date or number: text sorts
     // above every number, as in Excel and LibreOffice.
     assert_expected(
@@ -421,13 +421,12 @@ fn known_comparison_and_criteria_divergences_remain_pinned() {
         Expected::Boolean(false),
     );
 
-    // Formualizer does not date-coerce COUNTIF criteria here; LO returns 1.
-    // The criteria-coercion divergence is tracked separately from #289.
+    // COUNTIF criteria read date text as the date, as Excel and LO do.
     assert_expected(
         DateSystem::Excel1900,
         "=COUNTIF({37622},\"1/1/03\")",
-        "oracle: lo-verified divergence",
-        Expected::Number(0.0),
+        "oracle: lo-verified",
+        Expected::Number(1.0),
     );
 }
 

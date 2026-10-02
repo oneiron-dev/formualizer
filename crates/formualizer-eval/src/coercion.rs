@@ -37,7 +37,8 @@ pub fn to_number_lenient(value: &LiteralValue) -> Result<f64, ExcelError> {
 
 thread_local! {
     /// Date system and clock year of the function call being evaluated on
-    /// this thread, which [`to_number_argument`] reads date text in.
+    /// this thread, which [`to_number_argument`] and criteria read date text
+    /// in ([`argument_date_text_serial`]).
     static ARGUMENT_DATE_CONTEXT: std::cell::Cell<(DateSystem, Option<i32>)> =
         const { std::cell::Cell::new((DateSystem::Excel1900, None)) };
 }
@@ -83,17 +84,31 @@ pub(crate) fn enter_argument_date_context(
 /// [`to_number_lenient`].
 pub fn to_number_argument(value: &LiteralValue) -> Result<f64, ExcelError> {
     match value {
-        LiteralValue::Text(s) => to_number_lenient(value).or_else(|error| {
-            let (system, current_year) = ARGUMENT_DATE_CONTEXT.with(std::cell::Cell::get);
-            formualizer_common::parse_excel_datetime_text_to_serial_in_year_for(
-                system,
-                s,
-                current_year,
-            )
-            .ok_or(error)
-        }),
+        LiteralValue::Text(s) => {
+            to_number_lenient(value).or_else(|error| argument_date_text_serial(s).ok_or(error))
+        }
         _ => to_number_lenient(value),
     }
+}
+
+/// The date system and clock year of the function call being evaluated on
+/// this thread ([`enter_argument_date_context`]); outside a call, the 1900
+/// system and no clock year.
+pub(crate) fn argument_date_context() -> (DateSystem, Option<i32>) {
+    ARGUMENT_DATE_CONTEXT.with(std::cell::Cell::get)
+}
+
+/// The serial of text Excel reads as a date or a time, in the date context of
+/// the function call being evaluated ([`argument_date_context`]): the date
+/// and time text [`to_number_argument`] converts, which criteria read as
+/// their serials too (`COUNTIF(B:B,"<5/3/2011")`). `None` for other text.
+pub(crate) fn argument_date_text_serial(text: &str) -> Option<f64> {
+    // Every date or time form has a digit; skip parsing plain words.
+    if !text.bytes().any(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (system, current_year) = argument_date_context();
+    formualizer_common::parse_excel_datetime_text_to_serial_in_year_for(system, text, current_year)
 }
 
 /// Lenient numeric coercion that resolves temporal values in a date system.
