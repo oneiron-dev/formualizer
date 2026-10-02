@@ -639,6 +639,34 @@ fn serial_egress_preserves_phantom_day_and_fractional_dates() {
         assert_eq!(member(&out.bytes, "xl/styles.xml"), p["xl/styles.xml"]);
     }
 }
+#[test]
+fn numbers_used_as_text_keep_15_significant_digits() {
+    // A date-time serial in a date-formatted cell reads as its number, and
+    // text formulas see Excel's 15-digit text of it, not the display format.
+    let mut p = parts(
+        "<row r=\"1\"><c r=\"A1\" s=\"1\"><v>44468.756944444445</v></c>\
+         <c r=\"B1\" t=\"str\"><f>RIGHT(A1,8)</f><v>x</v></c>\
+         <c r=\"C1\" t=\"str\"><f>A1&amp;\"\"</f><v>x</v></c>\
+         <c r=\"D1\" t=\"str\"><f>CONCAT(1/3,\"|\",2^53)</f><v>x</v></c>\
+         <c r=\"E1\"><f>LEN(A1)</f><v>0</v></c></row>",
+    );
+    p.insert("xl/styles.xml".into(),format!("<styleSheet xmlns=\"{MAIN}\"><cellXfs count=\"2\"><xf numFmtId=\"0\"/><xf numFmtId=\"22\" applyNumberFormat=\"1\"/></cellXfs></styleSheet>"));
+    let rel = p.get_mut("xl/_rels/workbook.xml.rels").unwrap();
+    *rel=rel.replace("</Relationships>",&format!("<Relationship Id=\"style\" Type=\"{OFFICE}/styles\" Target=\"styles.xml\"/></Relationships>"));
+    let ct = p.get_mut("[Content_Types].xml").unwrap();
+    *ct=ct.replace("</Types>","<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/></Types>");
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let mut x = Xlsx::new(Cursor::new(out.bytes)).unwrap();
+    let range = x.worksheet_range("Sheet1").unwrap();
+    let cell = |col: u32| range.get_value((0, col)).cloned().unwrap_or(Data::Empty);
+    assert_eq!(cell(1), Data::String("69444444".into()));
+    assert_eq!(cell(2), Data::String("44468.7569444444".into()));
+    assert_eq!(
+        cell(3),
+        Data::String("0.333333333333333|9007199254740990".into())
+    );
+    assert_eq!(cell(4), Data::Float(16.0));
+}
 fn h16(b: &[u8], i: usize) -> usize {
     u16::from_le_bytes(b[i..i + 2].try_into().unwrap()) as usize
 }
