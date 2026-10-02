@@ -618,11 +618,21 @@ fn numbervalue_follows_microsofts_separator_and_space_rules() {
             "=NUMBERVALUE(\"- 1 2 . 5 %\")",
             LiteralValue::Number(-0.125),
         ),
-        // Only the space U+0020 is ignored, as around VALUE's numeric text: a
-        // line feed, tab or no-break space is no space.
-        ("=NUMBERVALUE(\"5\"&CHAR(10))", value_error()),
-        ("=NUMBERVALUE(CHAR(9)&\"5\")", value_error()),
+        // Tabs and line breaks are empty space too; a no-break space is a
+        // character.
+        ("=NUMBERVALUE(\"5\"&CHAR(10))", LiteralValue::Number(5.0)),
+        ("=NUMBERVALUE(CHAR(9)&\"5\")", LiteralValue::Number(5.0)),
+        (
+            "=NUMBERVALUE(\"1\"&CHAR(13)&CHAR(10)&\"2\")",
+            LiteralValue::Number(12.0),
+        ),
         ("=NUMBERVALUE(\"3\"&UNICHAR(160)&\"000\")", value_error()),
+        // A space group separator is ignored like any space, after the
+        // decimal separator too.
+        (
+            "=NUMBERVALUE(\"1.2 3\",\".\",\" \")",
+            LiteralValue::Number(1.23),
+        ),
         // Only the first character of a separator argument is used.
         (
             "=NUMBERVALUE(\"1.234,56\",\",x\",\".y\")",

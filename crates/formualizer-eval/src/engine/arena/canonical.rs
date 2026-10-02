@@ -123,10 +123,18 @@ pub(crate) fn compute_node_metadata(
             );
             mix_children(&mut hasher, children);
         }
-        AstNodeData::BinaryOp { op_id, .. } => {
+        AstNodeData::BinaryOp {
+            op_id,
+            parenthesized,
+            ..
+        } => {
             hasher.mix_u8(KIND_BINARY);
             let op = data_store_strings.get(*op_id).unwrap_or("");
             mix_string(&mut hasher, op);
+            // `(A1-B1)` and `A1-B1` end with different operations.
+            if *parenthesized {
+                mix_string(&mut hasher, "()");
+            }
             let supported = matches!(
                 op,
                 "+" | "-" | "*" | "/" | "^" | "&" | "=" | "<>" | "<" | "<=" | ">" | ">="
@@ -964,11 +972,13 @@ mod tests {
             op_id: plus_id,
             left_id: super::super::ast::AstNodeId::from_u32(0),
             right_id: super::super::ast::AstNodeId::from_u32(1),
+            parenthesized: false,
         };
         let second_sum = AstNodeData::BinaryOp {
             op_id: plus_id,
             left_id: super::super::ast::AstNodeId::from_u32(2),
             right_id: super::super::ast::AstNodeId::from_u32(3),
+            parenthesized: false,
         };
 
         let first = meta(&first_sum, &[&a1_meta, &b1_meta], &strings);

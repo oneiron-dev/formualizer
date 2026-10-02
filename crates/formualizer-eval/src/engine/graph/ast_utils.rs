@@ -73,7 +73,10 @@ pub(super) fn update_sheet_references_in_ast(
                 left: Box::new(update_sheet_references_in_ast(left, old_name, new_name)),
                 right: Box::new(update_sheet_references_in_ast(right, old_name, new_name)),
             },
-            source_token: None,
+            source_token: ast
+                .is_parenthesized()
+                .then(|| ast.source_token.clone())
+                .flatten(),
             contains_volatile: ast.contains_volatile,
         },
         ASTNodeType::UnaryOp { op, expr } => ASTNode {
@@ -201,7 +204,10 @@ pub(super) fn update_internal_sheet_references(
                     new_id,
                 )),
             },
-            source_token: None,
+            source_token: ast
+                .is_parenthesized()
+                .then(|| ast.source_token.clone())
+                .flatten(),
             contains_volatile: ast.contains_volatile,
         },
         ASTNodeType::UnaryOp { op, expr } => ASTNode {

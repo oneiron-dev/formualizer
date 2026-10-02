@@ -2,6 +2,7 @@
 //! Provides unified coercion, comparison and approximate-mode selection logic.
 
 use crate::engine::{DateSystem, range_view::RangeView};
+use crate::locale::fold_text_case;
 use arrow_array::Array;
 use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_parse::parser::{ExternalRefKind, ReferenceType};
@@ -46,7 +47,7 @@ pub(crate) fn lookup_numbers_equal(x: f64, y: f64) -> bool {
 
 /// Case-insensitive text equality (no wildcards).
 pub fn text_equal_ci(a: &str, b: &str) -> bool {
-    a.to_lowercase() == b.to_lowercase()
+    fold_text_case(a) == fold_text_case(b)
 }
 
 /// Compare two values for ordering using lenient numeric coercion first, fallback to case-insensitive text.
@@ -63,8 +64,8 @@ pub fn cmp_for_lookup(a: &LiteralValue, b: &LiteralValue, date_system: DateSyste
     }
     match (a, b) {
         (LiteralValue::Text(x), LiteralValue::Text(y)) => {
-            let xl = x.to_lowercase();
-            let yl = y.to_lowercase();
+            let xl = fold_text_case(x);
+            let yl = fold_text_case(y);
             Some(match xl.cmp(&yl) {
                 std::cmp::Ordering::Less => -1,
                 std::cmp::Ordering::Equal => 0,
@@ -106,7 +107,7 @@ impl<'a> PreparedLookupMatcher<'a> {
     pub(crate) fn new(needle: &'a LiteralValue, wildcard: bool, date_system: DateSystem) -> Self {
         let text = match needle {
             LiteralValue::Text(s) => {
-                let folded = s.to_lowercase();
+                let folded = fold_text_case(s);
                 if wildcard && (s.contains('*') || s.contains('?') || s.contains('~')) {
                     Some(PreparedTextMatcher::Wildcard {
                         compiled: CompiledWildcardPattern::from_folded(&folded),
@@ -142,12 +143,12 @@ impl<'a> PreparedLookupMatcher<'a> {
             (
                 Some(PreparedTextMatcher::Exact { folded_needle }),
                 LiteralValue::Text(candidate_text),
-            ) => candidate_text.to_lowercase() == *folded_needle,
+            ) => fold_text_case(candidate_text) == *folded_needle,
             (
                 Some(PreparedTextMatcher::Wildcard { compiled }),
                 LiteralValue::Text(candidate_text),
             ) => {
-                let folded_candidate = candidate_text.to_lowercase();
+                let folded_candidate = fold_text_case(candidate_text);
                 compiled.matches_folded(&folded_candidate)
             }
             // Excel exact lookups never match a text needle against a
@@ -194,7 +195,7 @@ pub fn cmp_for_approximate(
 ) -> Option<i32> {
     match (value, needle) {
         (LiteralValue::Text(a), LiteralValue::Text(b)) => {
-            Some(a.to_lowercase().cmp(&b.to_lowercase()) as i32)
+            Some(fold_text_case(a).cmp(&fold_text_case(b)) as i32)
         }
         (LiteralValue::Boolean(a), LiteralValue::Boolean(b)) => Some(a.cmp(b) as i32),
         (v, n) if is_numeric_exact_value(v) && searches_numbers(n) => {
@@ -622,7 +623,7 @@ impl CompiledWildcardPattern {
 
 /// Excel-style wildcard pattern matcher with escape (~) supporting *, ? and literal escaping of ~ * ?
 pub fn wildcard_pattern_match(pattern: &str, text: &str) -> bool {
-    wildcard_pattern_match_as_given(&pattern.to_lowercase(), &text.to_lowercase())
+    wildcard_pattern_match_as_given(&fold_text_case(pattern), &fold_text_case(text))
 }
 
 /// [`wildcard_pattern_match`] without case folding, for callers that fold
@@ -728,7 +729,7 @@ fn find_exact_text_in_view(
     wildcard: bool,
     vertical: bool,
 ) -> Result<Option<usize>, ExcelError> {
-    let needle_folded = s.to_lowercase();
+    let needle_folded = fold_text_case(s);
     let compiled_wildcard = (wildcard && (s.contains('*') || s.contains('?') || s.contains('~')))
         .then(|| CompiledWildcardPattern::from_folded(&needle_folded));
 

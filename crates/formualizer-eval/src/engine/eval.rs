@@ -1190,6 +1190,7 @@ fn arena_result_extent(
             op_id,
             left_id,
             right_id,
+            ..
         }) if matches!(
             data_store.resolve_ast_string(*op_id),
             "+" | "-" | "*" | "/" | "^" | "&" | "=" | "<>" | "<" | ">" | "<=" | ">="
@@ -1253,6 +1254,7 @@ fn arena_single_value(data_store: &crate::engine::arena::DataStore, node: AstNod
             op_id,
             left_id,
             right_id,
+            ..
         }) => {
             matches!(
                 data_store.resolve_ast_string(*op_id),
@@ -3224,20 +3226,22 @@ fn compute_criteria_mask(
 
     // TEXT PATH: build masks per row-chunk using lowered text slices.
     // This avoids concatenating full-string columns just to compute a boolean mask.
-    // The lanes and the patterns are folded with `str::to_lowercase`, exactly as
-    // the scalar matcher folds both sides, so the comparison itself is
-    // case-sensitive LIKE: ILIKE would add Unicode case folding of its own
-    // (U+017F matching "s", final sigma matching sigma) that the scalar
-    // matcher does not apply, and "=p" and "<>p" would stop being complements.
+    // The lanes and the patterns are folded with `locale::fold_text_case`,
+    // exactly as the scalar matcher folds both sides, so the comparison itself
+    // is case-sensitive LIKE: ILIKE would add Unicode case folding of its own
+    // (U+017F matching "s") that the scalar matcher does not apply, and "=p"
+    // and "<>p" would stop being complements.
     let (text_kind, text_pat, empty_special) = match pred {
         crate::args::CriteriaPredicate::Eq(formualizer_common::LiteralValue::Text(t)) => (
             0u8,
-            criteria_like_pattern(&t.to_lowercase(), false),
+            criteria_like_pattern(&crate::locale::fold_text_case(t), false),
             t.is_empty(),
         ),
-        crate::args::CriteriaPredicate::Ne(formualizer_common::LiteralValue::Text(t)) => {
-            (1u8, criteria_like_pattern(&t.to_lowercase(), false), false)
-        }
+        crate::args::CriteriaPredicate::Ne(formualizer_common::LiteralValue::Text(t)) => (
+            1u8,
+            criteria_like_pattern(&crate::locale::fold_text_case(t), false),
+            false,
+        ),
         // A case-sensitive pattern cannot be read on the lowered lane; the
         // caller takes the per-cell matcher.
         crate::args::CriteriaPredicate::TextLike {
@@ -3245,7 +3249,7 @@ fn compute_criteria_mask(
             case_insensitive: true,
         } => (
             2u8,
-            criteria_like_pattern(&pattern.to_lowercase(), true),
+            criteria_like_pattern(&crate::locale::fold_text_case(pattern), true),
             false,
         ),
         crate::args::CriteriaPredicate::NotTextLike {
@@ -3253,7 +3257,7 @@ fn compute_criteria_mask(
             case_insensitive: true,
         } => (
             3u8,
-            criteria_like_pattern(&pattern.to_lowercase(), true),
+            criteria_like_pattern(&crate::locale::fold_text_case(pattern), true),
             false,
         ),
         _ => return None,

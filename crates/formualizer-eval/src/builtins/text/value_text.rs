@@ -151,9 +151,10 @@ impl Function for ValueFn {
 /// - The decimal separator defaults to `.`.
 /// - The group separator defaults to `,`.
 /// - Only the first character of a separator argument is used.
-/// - Spaces are ignored anywhere in the text (`" 3 000 "` is `3000`); a tab, line feed or
-///   no-break space is no space and returns `#VALUE!`, as in VALUE. A space that is itself
-///   a separator is read as that separator.
+/// - Spaces are ignored anywhere in the text (`" 3 000 "` is `3000`), and so are tabs,
+///   line feeds and carriage returns; a no-break space is a character like any other.
+///   A space group separator is ignored like any space, also after the decimal separator
+///   (`NUMBERVALUE("1.2 3","."," ")` is `1.23`); a space decimal separator is read as one.
 /// - A group separator before the decimal separator is ignored; one after it,
 ///   or a second decimal separator, returns `#VALUE!`.
 /// - Percent suffixes are supported and scale the result by 100 per suffix.
@@ -246,35 +247,42 @@ impl Function for NumberValueFn {
     }
 }
 
+/// The characters NUMBERVALUE ignores anywhere in its text. Microsoft: "Empty
+/// spaces in the Text argument are ignored, even in the middle of the
+/// argument"; tabs and line breaks are empty space too (`CHAR(9)&"5"` and
+/// `"5"&CHAR(10)` are 5). A no-break space is not: it is a character (a
+/// separator when it is given as one).
+fn is_ignored_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r')
+}
+
 /// The number NUMBERVALUE reads from `text`, or `None` (`#VALUE!`), following
-/// Microsoft's rules: spaces are ignored anywhere in the text (`" 3 000 "` is
-/// 3000; only U+0020, the one space Excel ignores around numeric text, so a
-/// tab, line feed or no-break space is an invalid character) and empty text
-/// is 0; the decimal separator may appear once; a group separator before it is
-/// ignored and one after it is invalid, a space included when the group
-/// separator is a space; trailing percent signs divide by 100 each, whatever
-/// spaces stand between them. The rest is a decimal number with an optional
-/// sign and exponent, read by [`crate::locale::parse_finite_number`]: words
-/// such as `NaN` or `inf` are not numbers, and neither is a value too large
-/// for a number.
+/// Microsoft's rules: empty space is ignored anywhere in the text (`" 3 000 "`
+/// is 3000, see [`is_ignored_space`]), also when the group separator is a
+/// space, so a space after the decimal separator is ignored rather than an
+/// invalid group separator (`"1.2 3"` with group `" "` is 1.23), and empty
+/// text is 0; the decimal separator may appear once; a group separator
+/// before it is ignored and one after it is invalid; trailing percent signs
+/// divide by 100 each. A decimal separator that is a space or tab keeps its
+/// place. The rest is a decimal number with an optional sign and exponent,
+/// read by [`crate::locale::parse_finite_number`]: words such as `NaN` or
+/// `inf` are not numbers, and neither is a value too large for a number.
 fn number_value(text: &str, decimal_sep: char, group_sep: Option<char>) -> Option<f64> {
-    // A space that is itself a separator stays, so its position is checked.
     let kept: String = text
         .chars()
-        .filter(|&c| c != ' ' || c == decimal_sep || Some(c) == group_sep)
+        .filter(|&c| !is_ignored_space(c) || c == decimal_sep)
         .collect();
-    let mut body = kept.trim_matches(' ');
+    let mut body = kept.trim_matches(is_ignored_space);
     if body.is_empty() {
         // Empty text is 0, and so is a blank (an empty cell, a lookup's empty
         // target).
         return Some(0.0);
     }
-    // Each trailing percent sign divides by 100; spaces around them are
-    // ignored like any other space, even when space is a separator
-    // ("9% %" with group " " is 0.0009). Percent signs alone are no number.
+    // Each trailing percent sign divides by 100, whatever empty space stands
+    // between them ("9% %" is 0.0009). Percent signs alone are no number.
     let mut pct_count = 0;
     while let Some(rest) = body.strip_suffix('%') {
-        body = rest.trim_end_matches(' ');
+        body = rest.trim_end_matches(is_ignored_space);
         pct_count += 1;
     }
 
@@ -625,6 +633,14 @@ mod tests {
             (&["1 234,5", ", ", "x"][..], 1234.5),
             (&["-1.5e3"][..], -1500.0),
             (&["1\u{a0}234.5", ".", "\u{a0}"][..], 1234.5),
+            // Tabs and line breaks are empty space too.
+            (&["1\t2"][..], 12.0),
+            (&[" - 0 \t1\t2\r .\n3 4 "][..], -12.34),
+            // A space group separator is ignored like any space, also after
+            // the decimal separator.
+            (&["1.2 3", ".", " "][..], 1.23),
+            (&["1,2 3", ",", " "][..], 1.23),
+            (&["1 234,5", ",", " "][..], 1234.5),
         ] {
             assert_eq!(run(args), LiteralValue::Number(expected), "{args:?}");
         }
@@ -638,7 +654,6 @@ mod tests {
             &["1,5", ",x", ",y"][..],
             // A space-like group separator after the decimal separator.
             &["1.2\u{a0}3", ".", "\u{a0}"][..],
-            &["1\t2"][..],
         ] {
             assert!(
                 matches!(run(args), LiteralValue::Error(e) if e.kind == ExcelErrorKind::Value),

@@ -11,6 +11,8 @@ Parses a time string and returns its fractional-day serial value.
 
 ## Remarks
  - Supported formats include 24-hour and AM/PM text forms with optional seconds.
+ - Fractional seconds count (`"12:00:00.5"` is half a second past noon), and one colon
+   before a fraction is minutes and seconds (`"1:23.4"`, Excel's `mm:ss.0` form).
  - Result is a fraction in the range `0.0..1.0` and does not include a date component.
  - Because only a time fraction is returned, workbook date-system choice does not affect output.
 

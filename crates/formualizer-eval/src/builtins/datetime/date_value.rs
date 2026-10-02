@@ -5,8 +5,8 @@ use crate::function::Function;
 use crate::traits::{ArgumentHandle, FunctionContext};
 use chrono::NaiveDate;
 use formualizer_common::{
-    ExcelError, LiteralValue, date_to_serial_for, parse_excel_date_text, parse_excel_time_text,
-    time_to_fraction, trim_date_time_spaces,
+    ExcelError, LiteralValue, date_to_serial_for, parse_excel_date_text,
+    parse_excel_time_text_to_fraction, trim_date_time_spaces,
 };
 
 fn parse_legacy_datevalue_text(input: &str) -> Option<NaiveDate> {
@@ -148,6 +148,8 @@ impl Function for DateValueFn {
 ///
 /// # Remarks
 /// - Supported formats include 24-hour and AM/PM text forms with optional seconds.
+/// - Fractional seconds count (`"12:00:00.5"` is half a second past noon), and one colon
+///   before a fraction is minutes and seconds (`"1:23.4"`, Excel's `mm:ss.0` form).
 /// - Result is a fraction in the range `0.0..1.0` and does not include a date component.
 /// - Because only a time fraction is returned, workbook date-system choice does not affect output.
 ///
@@ -226,9 +228,12 @@ impl Function for TimeValueFn {
             }
         };
 
-        if let Some(time) = parse_excel_time_text(&time_text) {
+        // Fractional seconds count: TIMEVALUE("12:00:00.5") is half a second
+        // past noon, as VALUE reads the same text, and "1:23.4" is minutes and
+        // seconds (Excel's mm:ss.0 form).
+        if let Some(fraction) = parse_excel_time_text_to_fraction(&time_text) {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-                time_to_fraction(&time),
+                fraction,
             )));
         }
 

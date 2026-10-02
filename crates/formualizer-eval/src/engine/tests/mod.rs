@@ -189,6 +189,7 @@ mod sumifs_arrow_edits;
 mod sumifs_arrow_fastpath;
 mod sumifs_cached_mask_padding;
 mod sumifs_ne_blank_158;
+mod text_number_criteria_rules;
 mod used_bounds_cache;
 mod used_extent_resolver;
 mod whole_column_sumifs;

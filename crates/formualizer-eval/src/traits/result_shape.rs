@@ -176,6 +176,7 @@ fn node<'a, 'b>(arg: &ArgumentHandle<'a, 'b>) -> Node<'a, 'b> {
                     op_id,
                     left_id,
                     right_id,
+                    ..
                 }) if !matches!(data_store.resolve_ast_string(*op_id), ":" | " ") => {
                     Node::Operator(vec![child(*left_id), child(*right_id)])
                 }

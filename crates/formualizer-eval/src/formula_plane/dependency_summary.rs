@@ -744,9 +744,9 @@ impl SummaryAnalyzer {
             CanonicalExpr::Unary { op, expr } => {
                 self.analyze_unary(op, expr, context, in_function_arg)
             }
-            CanonicalExpr::Binary { op, left, right } => {
-                self.analyze_binary(op, left, right, context, in_function_arg)
-            }
+            CanonicalExpr::Binary {
+                op, left, right, ..
+            } => self.analyze_binary(op, left, right, context, in_function_arg),
             CanonicalExpr::Function { id, args } => {
                 let mut all_args_supported = true;
                 for (arg_index, arg) in args.iter().enumerate() {

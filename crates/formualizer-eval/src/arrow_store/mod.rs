@@ -245,7 +245,7 @@ impl ColumnChunk {
                 if sa.is_null(i) {
                     b.append_null();
                 } else {
-                    b.append_value(sa.value(i).to_lowercase());
+                    b.append_value(crate::locale::fold_text_case(sa.value(i)));
                 }
             }
             let lowered = b.finish();
@@ -1071,7 +1071,7 @@ impl OverlayValue {
 
     pub(crate) fn lowered_text_value(&self) -> Option<String> {
         match self {
-            OverlayValue::Text(s) => Some(s.to_lowercase()),
+            OverlayValue::Text(s) => Some(crate::locale::fold_text_case(s)),
             OverlayValue::Number(n) | OverlayValue::DateTime(n) | OverlayValue::Duration(n) => {
                 Some(n.to_string())
             }
@@ -3154,7 +3154,9 @@ impl<'a> OverlayCascade<'a> {
 
     fn payload_lowered_text_at(payload: &OverlayFragmentPayload, idx: usize) -> Option<String> {
         match payload.type_tag_at(idx)? {
-            TypeTag::Text => payload.text_at(idx).map(|value| value.to_lowercase()),
+            TypeTag::Text => payload
+                .text_at(idx)
+                .map(|value| crate::locale::fold_text_case(value)),
             TypeTag::Number | TypeTag::DateTime | TypeTag::Duration => {
                 payload.number_at(idx).map(|value| value.to_string())
             }

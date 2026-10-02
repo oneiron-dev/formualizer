@@ -449,11 +449,13 @@ fn excel_date_shapes_and_year_less_dates_use_the_clock_year() {
             other => panic!("{formula}: {other:?}"),
         }
     }
+    // One colon before a fraction is Excel's minutes-and-seconds entry form
+    // (m:ss.0): twelve minutes and half a second. LibreOffice rejects it.
     assert_expected(
         DateSystem::Excel1900,
         "=\"12:00.5\"+0",
-        "oracle: lo-verified",
-        Expected::Error(ExcelErrorKind::Value),
+        "Excel m:ss.0 entry",
+        Expected::Number((720.0 + 0.5) / 86_400.0),
     );
 }
 

@@ -596,6 +596,7 @@ impl<'a> Interpreter<'a> {
                 op_id,
                 left_id,
                 right_id,
+                ..
             } => match data_store.resolve_ast_string(*op_id) {
                 "," => Some(self.union_areas(side(*left_id), || side(*right_id))),
                 " " if self.arena_may_have_areas(*left_id, data_store, sheet_registry)
@@ -688,6 +689,7 @@ impl<'a> Interpreter<'a> {
                 op_id,
                 left_id,
                 right_id,
+                ..
             }) => match data_store.resolve_ast_string(*op_id) {
                 "," => true,
                 " " => {
@@ -842,6 +844,7 @@ impl<'a> Interpreter<'a> {
                 op_id,
                 left_id,
                 right_id,
+                ..
             } => {
                 let op = data_store.resolve_ast_string(*op_id);
                 if op != ":" && op != " " {
@@ -1131,9 +1134,9 @@ impl<'a> Interpreter<'a> {
     /// Evaluates a cell formula from its root. A root `+`/`-` is the formula's
     /// last operation, whose result Excel compensates to exactly 0 when it
     /// lands within binary conversion error of zero (`=0.5-0.4-0.1` is 0,
-    /// `=1*(0.5-0.4-0.1)` keeps -2.78E-17). The parsed AST does not record
-    /// outer parentheses, so `=(0.1+0.2-0.3)`, which Excel leaves alone, is
-    /// compensated too.
+    /// `=1*(0.5-0.4-0.1)` keeps -2.78E-17). Outer parentheses are the last
+    /// operation of `=(0.1+0.2-0.3)`, which Excel leaves alone (its residue
+    /// 5.55E-17 stays); the parser records them ([`ASTNode::is_parenthesized`]).
     pub(crate) fn evaluate_formula_ast(
         &self,
         node: &ASTNode,
@@ -1142,7 +1145,9 @@ impl<'a> Interpreter<'a> {
             return self.with_legacy_context(None).evaluate_formula_ast(node);
         }
         match &node.node_type {
-            ASTNodeType::BinaryOp { op, left, right } if matches!(op.as_str(), "+" | "-") => {
+            ASTNodeType::BinaryOp { op, left, right }
+                if matches!(op.as_str(), "+" | "-") && !node.is_parenthesized() =>
+            {
                 self.eval_binary(op, left, right, true)
             }
             _ => self.evaluate_ast(node),
@@ -1425,7 +1430,11 @@ impl<'a> Interpreter<'a> {
                 op_id,
                 left_id,
                 right_id,
+                parenthesized,
             } => {
+                // An operation in parentheses is not the formula's last
+                // operation: the parentheses come after it.
+                let final_step = final_step && !*parenthesized;
                 let op = data_store.resolve_ast_string(*op_id);
                 if op == " " {
                     let intersection = self

@@ -461,7 +461,8 @@ pub struct SumProductFn;
 ///
 /// # Remarks
 /// - Input shapes must be broadcast-compatible; otherwise `SUMPRODUCT` returns `#VALUE!`.
-/// - Non-numeric values are treated as `0` during multiplication.
+/// - Non-numeric array and range entries (text, even numeric text such as `"5"`, logicals and
+///   blanks) are treated as `0` during multiplication; coerce them first (`--(A1:A3="x")`).
 /// - Any explicit error value in the inputs propagates immediately.
 ///
 /// # Examples
@@ -543,33 +544,37 @@ impl Function for SumProductFn {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(0.0)));
         }
 
-        // Helper: materialize an argument to a 2D array of LiteralValue
-        let to_array = |ah: &ArgumentHandle<'_, 'b>| -> Result<Vec<Vec<LiteralValue>>, ExcelError> {
-            match resolve_aggregate_argument(ah, ctx)? {
-                AggregateArgument::Range(rv) => {
-                    let mut rows: Vec<Vec<LiteralValue>> = Vec::new();
-                    rv.for_each_row(&mut |row| {
-                        rows.push(row.to_vec());
-                        Ok(())
-                    })?;
-                    Ok(rows)
+        // Helper: materialize an argument to a 2D array of LiteralValue, and
+        // whether it is an array or a range (rather than a single value).
+        let to_array =
+            |ah: &ArgumentHandle<'_, 'b>| -> Result<(Vec<Vec<LiteralValue>>, bool), ExcelError> {
+                match resolve_aggregate_argument(ah, ctx)? {
+                    AggregateArgument::Range(rv) => {
+                        let mut rows: Vec<Vec<LiteralValue>> = Vec::new();
+                        rv.for_each_row(&mut |row| {
+                            rows.push(row.to_vec());
+                            Ok(())
+                        })?;
+                        Ok((rows, true))
+                    }
+                    AggregateArgument::ReferenceError(error) => Err(error),
+                    AggregateArgument::Scalar(v) => Ok(match v {
+                        LiteralValue::Array(arr) => (arr, true),
+                        other => (vec![vec![other]], false),
+                    }),
                 }
-                AggregateArgument::ReferenceError(error) => Err(error),
-                AggregateArgument::Scalar(v) => Ok(match v {
-                    LiteralValue::Array(arr) => arr,
-                    other => vec![vec![other]],
-                }),
-            }
-        };
+            };
 
         // Collect arrays and shapes
         let mut arrays: Vec<Vec<Vec<LiteralValue>>> = Vec::with_capacity(args.len());
         let mut shapes: Vec<(usize, usize)> = Vec::with_capacity(args.len());
+        let mut entries_of_arrays: Vec<bool> = Vec::with_capacity(args.len());
         for a in args.iter() {
-            let arr = to_array(a)?;
+            let (arr, is_array) = to_array(a)?;
             let shape = (arr.len(), arr.first().map(|r| r.len()).unwrap_or(0));
             arrays.push(arr);
             shapes.push(shape);
+            entries_of_arrays.push(is_array);
         }
 
         // Compute broadcast target shape across all args
@@ -587,7 +592,11 @@ impl Function for SumProductFn {
         for r in 0..target.0 {
             for c in 0..target.1 {
                 let mut prod = 1.0f64;
-                for (arr, &shape) in arrays.iter().zip(shapes.iter()) {
+                for ((arr, &shape), &is_array) in arrays
+                    .iter()
+                    .zip(shapes.iter())
+                    .zip(entries_of_arrays.iter())
+                {
                     let (rr, cc) = project_index((r, c), shape);
                     let lv = arr
                         .get(rr)
@@ -597,6 +606,14 @@ impl Function for SumProductFn {
                     match lv {
                         LiteralValue::Error(e) => {
                             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+                        }
+                        // Microsoft: "SUMPRODUCT treats non-numeric array entries
+                        // as if they were zeros". Text in an array or a range is
+                        // never read as a number ({"5"} and {"$5"} count 0, unlike
+                        // --{"5"}), nor is a logical ({TRUE} counts 0, unlike
+                        // --(A1:A3="x")).
+                        LiteralValue::Text(_) | LiteralValue::Boolean(_) if is_array => {
+                            prod *= 0.0;
                         }
                         _ => match crate::coercion::to_number_lenient(&lv) {
                             Ok(n) => {

@@ -1742,6 +1742,32 @@ impl ASTNode {
         self.contains_volatile
     }
 
+    /// The source token of an operation written in parentheses: a `Paren`
+    /// token spanning `start..end`, from the opening to the closing
+    /// parenthesis. The parser gives it to a binary operation it reads inside
+    /// parentheses (`(A1-B1)`).
+    pub fn parentheses_token(start: usize, end: usize) -> Token {
+        Token::new_with_span(
+            "(".to_string(),
+            TokenType::Paren,
+            TokenSubType::Open,
+            start,
+            end,
+        )
+    }
+
+    /// Whether this binary operation was written in parentheses
+    /// (`=(0.1+0.2-0.3)`). Excel compiles the parentheses into the formula
+    /// after the operator, so a formula wrapped in them does not end with the
+    /// operator: its final `+` or `-` is not compensated to exactly 0.
+    pub fn is_parenthesized(&self) -> bool {
+        matches!(self.node_type, ASTNodeType::BinaryOp { .. })
+            && self
+                .source_token
+                .as_ref()
+                .is_some_and(|token| token.token_type == TokenType::Paren)
+    }
+
     pub fn fingerprint(&self) -> u64 {
         self.calculate_hash()
     }
@@ -1772,6 +1798,9 @@ impl ASTNode {
             ASTNodeType::BinaryOp { op, left, right } => {
                 hasher.write(&[4]); // Discriminant for BinaryOp
                 hasher.write(op.as_bytes());
+                if self.is_parenthesized() {
+                    hasher.write(b"()");
+                }
                 left.hash_node(hasher);
                 right.hash_node(hasher);
             }
@@ -2695,8 +2724,9 @@ impl Parser {
                 self.parse_function(span)
             }
             TokenType::Paren if token.subtype == TokenSubType::Open => {
+                let open = self.tokens[self.position];
                 self.position += 1;
-                let expr = self.parse_expression()?;
+                let mut expr = self.parse_expression()?;
                 self.skip_whitespace();
                 if self.position >= self.tokens.len()
                     || self.tokens[self.position].token_type != TokenType::Paren
@@ -2707,7 +2737,14 @@ impl Parser {
                         position: Some(self.position),
                     });
                 }
+                let close = self.tokens[self.position];
                 self.position += 1;
+                // An operation in parentheses records them: Excel's last
+                // operation is then the parentheses, not the operator (see
+                // `ASTNode::is_parenthesized`).
+                if matches!(expr.node_type, ASTNodeType::BinaryOp { .. }) {
+                    expr.source_token = Some(ASTNode::parentheses_token(open.start, close.end));
+                }
                 Ok(expr)
             }
             TokenType::Array if token.subtype == TokenSubType::Open => {

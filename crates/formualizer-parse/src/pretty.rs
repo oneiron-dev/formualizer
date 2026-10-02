@@ -11,14 +11,26 @@ use crate::tokenizer::Associativity;
 /// - References printed via .normalise()
 /// - Array literals: {1, 2; 3, 4}
 pub fn pretty_print(ast: &ASTNode) -> String {
-    pretty_print_node(ast, false)
+    pretty_print_root(ast, false)
 }
 
 /// Formula text as Excel shows it for a formula entered without extra
 /// whitespace: `=SUM(A1,2)+1`, with no spaces around operators or after
 /// argument separators.
 pub fn excel_formula_text(ast: &ASTNode) -> String {
-    format!("={}", pretty_print_node(ast, true))
+    format!("={}", pretty_print_root(ast, true))
+}
+
+/// A whole formula. Parentheses around the whole formula are kept
+/// (`=(0.1+0.2-0.3)`): they are its last operation, so Excel does not
+/// compensate the final `+`/`-` to zero (see `ASTNode::is_parenthesized`).
+fn pretty_print_root(ast: &ASTNode, compact: bool) -> String {
+    let text = pretty_print_node(ast, compact);
+    if ast.is_parenthesized() {
+        format!("({text})")
+    } else {
+        text
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -387,6 +399,10 @@ mod excel_text_tests {
             "=SUM(A1:B2,{1,2;3,4})"
         );
         assert_eq!(excel_text("=(1+2)*3"), "=(1+2)*3");
+        // Parentheses around the whole formula are its last operation.
+        assert_eq!(excel_text("=(0.1+0.2-0.3)"), "=(0.1+0.2-0.3)");
+        assert_eq!(excel_text("=((1+2))"), "=(1+2)");
+        assert_eq!(excel_text("=(1)"), "=1");
         assert_eq!(excel_text("=IF(A1>=1,,-A1%)"), "=IF(A1>=1,,-A1%)");
         assert_eq!(excel_text("=A1:A3 B1:B3"), "=A1:A3 B1:B3");
     }

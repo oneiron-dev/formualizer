@@ -24,6 +24,8 @@
 //! - Multiple columns in same row have AND relationship
 //! - Supports comparison operators (>, <, >=, <=, <>) and wildcards (*, ?, ~ escape),
 //!   which also apply after "=" and "<>"
+//! - Text without an operator selects the text values beginning with it (`Dav` finds
+//!   Davolio and David; `="=Dav"` is an exact match), as in an Advanced Filter
 
 use super::utils::{ARG_ANY_ONE, criteria_match};
 use crate::args::{ArgSchema, CriteriaPredicate, parse_criteria};
@@ -140,7 +142,7 @@ fn parse_criteria_range(
             }
 
             if let Some(db_col) = db_col {
-                let pred = parse_criteria(&crit_val)?;
+                let pred = database_criterion(&crit_val, parse_criteria(&crit_val)?);
                 row_criteria.push((*db_col, pred));
                 has_any_criteria = true;
             }
@@ -152,6 +154,49 @@ fn parse_criteria_range(
     }
 
     Ok(criteria_rows)
+}
+
+/// A criteria-range cell read as a database (Advanced Filter) criterion. Text
+/// written without an operator selects the text values that begin with it:
+/// Microsoft, "Type one or more characters without an equal sign (=) to find
+/// rows with a text value in a column that begin with those characters. For
+/// example, if you type the text Dav as a criterion, Excel finds "Davolio,"
+/// "David," and "Davis."" (which is why the DSUM examples write ="=Apple" for
+/// an exact match). Wildcards keep their meaning (`sm?th` also finds
+/// smithson). Text that reads as a number, a date, a logical or an error, and
+/// criteria with an operator (`=Dav`, `<>Dav`), are read as in COUNTIF.
+fn database_criterion(cell: &LiteralValue, pred: CriteriaPredicate) -> CriteriaPredicate {
+    let LiteralValue::Text(text) = cell else {
+        return pred;
+    };
+    if text.trim_start_matches(' ').starts_with(['=', '<', '>']) {
+        return pred;
+    }
+    match pred {
+        // Plain text is compared whole by COUNTIF, so a `~` in it is a
+        // character; in the prefix pattern it is escaped to stay one.
+        CriteriaPredicate::Eq(LiteralValue::Text(t)) if !t.is_empty() => {
+            CriteriaPredicate::TextLike {
+                pattern: format!("{}*", t.replace('~', "~~")),
+                case_insensitive: true,
+            }
+        }
+        CriteriaPredicate::TextLike {
+            mut pattern,
+            case_insensitive,
+        } => {
+            // A dangling `~` at the end is a literal tilde; it stays one.
+            if pattern.chars().rev().take_while(|&c| c == '~').count() % 2 == 1 {
+                pattern.push('~');
+            }
+            pattern.push('*');
+            CriteriaPredicate::TextLike {
+                pattern,
+                case_insensitive,
+            }
+        }
+        other => other,
+    }
 }
 
 /// Check if a database row matches any of the criteria rows (OR relationship).
@@ -285,12 +330,11 @@ fn eval_d_function<'a, 'b>(
                 LiteralValue::Empty => {
                     // Empty cells are skipped for all D-functions
                 }
-                LiteralValue::Text(s) => {
-                    // Try numeric coercion for text
-                    if let Ok(n) = crate::coercion::to_number_lenient(&cell_val) {
-                        values.push(n);
-                    }
-                    // Non-numeric text is skipped
+                LiteralValue::Text(_) => {
+                    // A record's text is never a number, numeric or currency
+                    // text included: DCOUNT counts "the cells that contain
+                    // numbers" and DSUM adds "the numbers in a field"
+                    // (Microsoft), as SUM and COUNT skip text in a reference.
                 }
                 LiteralValue::Error(e) => {
                     // Propagate errors
@@ -447,11 +491,8 @@ fn eval_d_stat_function<'a, 'b>(
                 LiteralValue::Boolean(b) => {
                     values.push(if *b { 1.0 } else { 0.0 });
                 }
-                LiteralValue::Text(s) => {
-                    if let Ok(n) = crate::coercion::to_number_lenient(&cell_val) {
-                        values.push(n);
-                    }
-                }
+                // A record's text is never a number (see `eval_d_function`).
+                LiteralValue::Text(_) => {}
                 LiteralValue::Error(e) => {
                     return Ok(CalcValue::Scalar(LiteralValue::Error(e.clone())));
                 }

@@ -70,7 +70,9 @@ impl LookupHashKey {
         match value {
             LiteralValue::Number(n) => Some(Self::Number(normalize_f64_bits(*n))),
             LiteralValue::Int(i) => Some(Self::Number(normalize_f64_bits(*i as f64))),
-            LiteralValue::Text(s) => Some(Self::Text(s.to_lowercase().into_boxed_str())),
+            LiteralValue::Text(s) => Some(Self::Text(
+                crate::locale::fold_text_case(s).into_boxed_str(),
+            )),
             LiteralValue::Boolean(b) => Some(Self::Boolean(*b)),
             LiteralValue::Empty => None,
             // Temporal values are numbers in Excel: key them by their serial so

@@ -102,6 +102,9 @@ pub(crate) enum CanonicalExpr {
         op: String,
         left: Box<CanonicalExpr>,
         right: Box<CanonicalExpr>,
+        /// Written in parentheses: `(A1-B1)` and `A1-B1` end with different
+        /// operations (see `ASTNode::is_parenthesized`).
+        parenthesized: bool,
     },
     Function {
         id: CanonicalFunctionId,
@@ -567,7 +570,9 @@ fn classify_reference_returning_admission(
                 scalar: supported && child.scalar,
             }
         }
-        CanonicalExpr::Binary { op, left, right } => {
+        CanonicalExpr::Binary {
+            op, left, right, ..
+        } => {
             let left = classify_reference_returning_admission(left, admissions);
             let right = classify_reference_returning_admission(right, admissions);
             let supported = matches!(
@@ -718,6 +723,7 @@ impl Canonicalizer<'_> {
                     op: op.clone(),
                     left: Box::new(self.canonicalize_expr(left, child_context.clone())),
                     right: Box::new(self.canonicalize_expr(right, child_context)),
+                    parenthesized: ast.is_parenthesized(),
                 }
             }
             ASTNodeType::Function { name, args } => {
@@ -1320,8 +1326,17 @@ fn write_parameterized_expr_key_inner(
             write_parameterized_expr_key_inner(expr, out, next_slot, parameterize_literals);
             out.push(')');
         }
-        CanonicalExpr::Binary { op, left, right } => {
-            out.push_str("binary(");
+        CanonicalExpr::Binary {
+            op,
+            left,
+            right,
+            parenthesized,
+        } => {
+            out.push_str(if *parenthesized {
+                "binary_paren("
+            } else {
+                "binary("
+            });
             write_string_key(op, out);
             out.push(';');
             write_parameterized_expr_key_inner(left, out, next_slot, parameterize_literals);
@@ -1393,8 +1408,17 @@ fn write_expr_key(expr: &CanonicalExpr, out: &mut String) {
             write_expr_key(expr, out);
             out.push(')');
         }
-        CanonicalExpr::Binary { op, left, right } => {
-            out.push_str("binary(");
+        CanonicalExpr::Binary {
+            op,
+            left,
+            right,
+            parenthesized,
+        } => {
+            out.push_str(if *parenthesized {
+                "binary_paren("
+            } else {
+                "binary("
+            });
             write_string_key(op, out);
             out.push(';');
             write_expr_key(left, out);

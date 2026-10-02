@@ -436,7 +436,9 @@ fn values_equal_invariant(a: &LiteralValue, b: &LiteralValue) -> bool {
         // A logical never equals a number (or a date) for criteria: TRUE=1 is
         // FALSE, so COUNTIF(r,1) skips TRUE and COUNTIF(r,"<>0") counts FALSE.
         (LiteralValue::Boolean(_), _) | (_, LiteralValue::Boolean(_)) => false,
-        (LiteralValue::Text(x), LiteralValue::Text(y)) => x.to_lowercase() == y.to_lowercase(),
+        (LiteralValue::Text(x), LiteralValue::Text(y)) => {
+            crate::locale::fold_text_case(x) == crate::locale::fold_text_case(y)
+        }
         // Treat blank and empty text as equal (Excel semantics)
         (LiteralValue::Text(x), LiteralValue::Empty) if x.is_empty() => true,
         (LiteralValue::Empty, LiteralValue::Text(y)) if y.is_empty() => true,
@@ -468,7 +470,10 @@ fn text_like_match(pattern: &str, case_insensitive: bool, v: &LiteralValue) -> b
         _ => return false,
     };
     let (pat, text) = if case_insensitive {
-        (pattern.to_lowercase(), s.to_lowercase())
+        (
+            crate::locale::fold_text_case(pattern),
+            crate::locale::fold_text_case(&s),
+        )
     } else {
         (pattern.to_string(), s)
     };

@@ -1436,6 +1436,7 @@ fn compute_tree_metadata(
                     op_id: ast_string_id(data_store, op),
                     left_id: AstNodeId::from_u32(0),
                     right_id: AstNodeId::from_u32(0),
+                    parenthesized: ast.is_parenthesized(),
                 },
                 vec![
                     visit(

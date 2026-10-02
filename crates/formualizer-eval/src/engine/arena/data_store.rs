@@ -404,7 +404,12 @@ impl DataStore {
             ASTNodeType::BinaryOp { op, left, right } => {
                 let left_id = self.convert_ast_node(left, sheet_registry);
                 let right_id = self.convert_ast_node(right, sheet_registry);
-                self.asts.insert_binary_op(op, left_id, right_id)
+                self.asts.insert_binary_op_parenthesized(
+                    op,
+                    left_id,
+                    right_id,
+                    node.is_parenthesized(),
+                )
             }
 
             ASTNodeType::Function { name, args } => {
@@ -627,11 +632,17 @@ impl DataStore {
                 op_id,
                 left_id,
                 right_id,
+                parenthesized,
             } => {
                 let op = self.asts.resolve_string(*op_id).to_string();
                 let left = Box::new(self.reconstruct_ast_node(*left_id, sheet_registry)?);
                 let right = Box::new(self.reconstruct_ast_node(*right_id, sheet_registry)?);
-                ASTNodeType::BinaryOp { op, left, right }
+                // The parentheses are the one token the arena keeps.
+                return Some(ASTNode {
+                    node_type: ASTNodeType::BinaryOp { op, left, right },
+                    source_token: parenthesized.then(|| ASTNode::parentheses_token(0, 0)),
+                    contains_volatile: false,
+                });
             }
 
             AstNodeData::Function { name_id, .. } => {

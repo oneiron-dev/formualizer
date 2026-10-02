@@ -12,7 +12,8 @@ description: "SUMPRODUCT: Multiplies aligned values across arrays and returns th
 
 ## Remarks
  - Input shapes must be broadcast-compatible; otherwise `SUMPRODUCT` returns `#VALUE!`.
- - Non-numeric values are treated as `0` during multiplication.
+ - Non-numeric array and range entries (text, even numeric text such as `"5"`, logicals and
+   blanks) are treated as `0` during multiplication; coerce them first (`--(A1:A3="x")`).
  - Any explicit error value in the inputs propagates immediately.
 
 ## Examples

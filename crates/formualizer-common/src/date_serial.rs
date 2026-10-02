@@ -341,11 +341,21 @@ fn parse_month_name(text: &str) -> Option<u32> {
 ///
 /// Parsing has no locale parameter, uses English AM/PM markers, and never
 /// consults the host locale. ASCII whitespace around separators is ignored.
-/// Fractional seconds (e.g. `12:30:45.5`) are truncated to whole seconds; the
-/// serial of the text ([`parse_excel_datetime_text_to_serial_for`]) keeps them.
+/// Fractional seconds (e.g. `12:30:45.5`, or minutes and seconds `1:23.4`) are
+/// truncated to whole seconds; the fraction of a day the text stands for
+/// ([`parse_excel_time_text_to_fraction`], and the serial of the text,
+/// [`parse_excel_datetime_text_to_serial_for`]) keeps them.
 /// `24:00` and `24:00:00` are accepted as midnight (Excel compatibility).
 pub fn parse_excel_time_text(input: &str) -> Option<NaiveTime> {
     parse_time_with_fractional_seconds(input).map(|(time, _)| time)
+}
+
+/// The fraction of a day that time text stands for, fractional seconds
+/// included: `"12:00:00.5"` is (43200 + 0.5) / 86400, as TIMEVALUE and VALUE
+/// read it. Accepts the forms of [`parse_excel_time_text`].
+pub fn parse_excel_time_text_to_fraction(input: &str) -> Option<f64> {
+    parse_time_with_fractional_seconds(input)
+        .map(|(time, fraction)| time_to_fraction_with_seconds(&time, fraction))
 }
 
 /// [`parse_excel_time_text`] plus the fractional seconds it truncates
@@ -371,6 +381,10 @@ fn parse_time_with_fractional_seconds(input: &str) -> Option<(NaiveTime, f64)> {
         return Some((NaiveTime::from_hms_opt(0, 0, 0).unwrap(), 0.0));
     }
 
+    if let Some(minutes_seconds) = parse_minutes_seconds_fraction(&normalized) {
+        return Some(minutes_seconds);
+    }
+
     // Split off fractional seconds: "12:30:45.5" → "12:30:45" and 0.5
     // Find the seconds decimal point (after the second colon)
     let (normalized, fraction) = split_fractional_seconds(&normalized);
@@ -382,13 +396,38 @@ fn parse_time_with_fractional_seconds(input: &str) -> Option<(NaiveTime, f64)> {
         .map(|time| (time, fraction))
 }
 
+/// Minutes and seconds with a fraction of a second, Excel's `m:ss.0` entry
+/// form: `"1:23.4"` is 0:01:23.4 and `"0:00.5"` half a second. A fraction
+/// always belongs to the seconds, so with one colon before it the first field
+/// is minutes, not hours (`"12:00.5"` is twelve minutes and half a second, not
+/// noon); minutes may pass 59 (`"64:32.98"` is 1:04:32.98). Seconds are one or
+/// two digits below 60. Like the hours of `h:mm`, the time must fall within
+/// one day here.
+fn parse_minutes_seconds_fraction(text: &str) -> Option<(NaiveTime, f64)> {
+    let (minutes, rest) = text.split_once(':')?;
+    let (seconds, fraction) = rest.split_once('.')?;
+    let digits = |field: &str, max_len: usize| {
+        (!field.is_empty() && field.len() <= max_len && field.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| field.parse::<u32>().ok())
+            .flatten()
+    };
+    if fraction.is_empty() || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let minutes = digits(minutes, 4)?;
+    let seconds = digits(seconds, 2).filter(|&seconds| seconds < 60)?;
+    let time = NaiveTime::from_hms_opt(minutes / 60, minutes % 60, seconds)?;
+    let fraction = format!("0.{fraction}").parse::<f64>().ok()?;
+    Some((time, fraction))
+}
+
 /// Split fractional seconds from a time string: "12:30:45.125" → ("12:30:45", 0.125)
 ///
 /// Only a dot that terminates a full `HH:MM:SS` field is treated as fractional
-/// seconds. The dot must be preceded by two colons (the hour and minute
-/// separators), so `"12:00.5"` — a single colon, i.e. a malformed time — is
-/// left untouched and subsequently rejected by the parser as `#VALUE!` rather
-/// than silently accepted as `12:00`.
+/// seconds here: the dot must be preceded by two colons (the hour and minute
+/// separators). One colon before the dot is the minutes-and-seconds form
+/// ([`parse_minutes_seconds_fraction`]); anything else is left untouched and
+/// rejected by the parser as `#VALUE!`.
 fn split_fractional_seconds(text: &str) -> (String, f64) {
     // Find pattern: digits followed by '.' followed by digits, where this
     // appears after the second ':' (seconds position) or before a space/AM/PM
@@ -1229,10 +1268,46 @@ mod tests {
     }
 
     #[test]
-    fn malformed_single_colon_time_with_dot_is_rejected() {
-        // "12:00.5" has a single colon, so the dot does not terminate an
-        // HH:MM:SS field. It must not be silently accepted as 12:00 (#290).
-        assert_eq!(parse_excel_time_text("12:00.5"), None);
+    fn single_colon_time_with_fraction_is_minutes_and_seconds() {
+        // "12:00.5" has a single colon before the fraction: Excel's mm:ss.0
+        // form, twelve minutes and half a second, never 12:00 (#290).
+        assert_eq!(
+            parse_excel_time_text("12:00.5"),
+            Some(NaiveTime::from_hms_opt(0, 12, 0).unwrap())
+        );
+        assert_eq!(
+            parse_excel_time_text_to_fraction("0:00.5"),
+            Some(0.5 / 86_400.0)
+        );
+        assert_eq!(
+            parse_excel_time_text_to_fraction("1:23.4"),
+            Some(83.4 / 86_400.0)
+        );
+        assert_eq!(
+            parse_excel_datetime_text_to_serial_for(DateSystem::Excel1900, "0:00.5"),
+            Some(0.5 / 86_400.0)
+        );
+        // Minutes may pass 59 (64:32.98 is 1:04:32.98); seconds stay below
+        // 60, the time within a day, and the fraction needs digits.
+        assert_eq!(
+            parse_excel_time_text_to_fraction("64:32.98"),
+            Some((3_872.0 + 0.98) / 86_400.0)
+        );
+        for text in [
+            "1:60.5",
+            "1:23.",
+            "1:23.4x",
+            "1440:00.5",
+            "1:2:3.4.5",
+            ":00.5",
+        ] {
+            assert_eq!(parse_excel_time_text(text), None, "{text}");
+        }
+        // TIMEVALUE's fraction keeps fractional seconds.
+        assert_eq!(
+            parse_excel_time_text_to_fraction("12:00:00.5"),
+            Some((43_200.0 + 0.5) / 86_400.0)
+        );
         // The well-formed HH:MM:SS.f case still truncates.
         assert_eq!(
             parse_excel_time_text("12:00:00.5"),

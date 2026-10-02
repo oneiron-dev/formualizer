@@ -381,3 +381,67 @@ fn wildcard_eq_and_ne_stay_complements_under_unicode_case() {
         }
     }
 }
+
+#[test]
+fn case_folding_keeps_every_character_one_character() {
+    // COUNTIF compares text case-insensitively: "ΟΣ" matches "οσ" and "*σ"
+    // (a capital sigma folds to "σ" wherever it stands, and a final "ς" to
+    // "σ" too), and "İ" (U+0130) is one character to "?", not "i" plus a
+    // combining dot. The scalar matcher and the cached masks agree, for text
+    // ingested into the base lanes and for text set over it (overlay).
+    let cells = ["\u{39f}\u{3a3}", "\u{130}", "\u{3bf}\u{3c2}", "x"];
+    let cases = [
+        ("*\u{3c3}", 2.0),
+        ("=\u{3bf}\u{3c3}", 2.0),
+        ("<>\u{3bf}\u{3c3}", 2.0),
+        ("\u{39f}\u{3a3}", 2.0),
+        ("=?", 2.0),
+        ("=??", 2.0),
+        ("<>?", 2.0),
+        ("=\u{130}", 1.0),
+    ];
+    for overlay in [false, true] {
+        let mut engine = Engine::new(TestWorkbook::new(), arrow_eval_config());
+        {
+            let mut ingest = engine.begin_bulk_ingest_arrow();
+            ingest.add_sheet("S", 1, 2);
+            for cell in cells {
+                let value = if overlay { "pad" } else { cell };
+                ingest
+                    .append_row("S", &[LiteralValue::Text(value.into())])
+                    .unwrap();
+            }
+            ingest.finish().unwrap();
+        }
+        if overlay {
+            for (row, cell) in cells.iter().enumerate() {
+                engine
+                    .set_cell_value("S", row as u32 + 1, 1, LiteralValue::Text((*cell).into()))
+                    .unwrap();
+            }
+        }
+        let n = cells.len() as u32;
+        let range = ReferenceType::range(Some("S".into()), Some(1), Some(1), Some(n), Some(1));
+        for (criterion, expected) in cases {
+            let pred = crate::args::parse_criteria(&LiteralValue::Text(criterion.into())).unwrap();
+            let view = engine.resolve_range_view(&range, "S").unwrap();
+            let mask = engine.build_criteria_mask(&view, 0, &pred).unwrap();
+            let mut hits = 0.0;
+            for row in 0..n as usize {
+                let scalar = crate::builtins::criteria_match(&pred, &view.get_cell(row, 0));
+                assert_eq!(
+                    mask_bit(&mask, row),
+                    scalar,
+                    "overlay={overlay} mask {criterion} row={row}"
+                );
+                hits += f64::from(u8::from(scalar));
+            }
+            assert_eq!(hits, expected, "overlay={overlay} matcher {criterion}");
+            assert_eq!(
+                eval_in_c1(&mut engine, &format!("=COUNTIF(A1:A{n},\"{criterion}\")")),
+                LiteralValue::Number(expected),
+                "overlay={overlay} COUNTIF {criterion}"
+            );
+        }
+    }
+}

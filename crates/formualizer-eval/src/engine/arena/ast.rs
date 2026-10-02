@@ -66,6 +66,8 @@ pub enum AstNodeData {
         op_id: StringId,
         left_id: AstNodeId,
         right_id: AstNodeId,
+        /// Written in parentheses (`(A1-B1)`), see `ASTNode::is_parenthesized`.
+        parenthesized: bool,
     },
 
     /// Function call
@@ -366,11 +368,24 @@ impl AstArena {
 
     /// Insert a binary operation node
     pub fn insert_binary_op(&mut self, op: &str, left: AstNodeId, right: AstNodeId) -> AstNodeId {
+        self.insert_binary_op_parenthesized(op, left, right, false)
+    }
+
+    /// Insert a binary operation node, `parenthesized` when it was written in
+    /// parentheses.
+    pub fn insert_binary_op_parenthesized(
+        &mut self,
+        op: &str,
+        left: AstNodeId,
+        right: AstNodeId,
+        parenthesized: bool,
+    ) -> AstNodeId {
         let op_id = self.strings.intern(op);
         self.insert(AstNodeData::BinaryOp {
             op_id,
             left_id: left,
             right_id: right,
+            parenthesized,
         })
     }
 
@@ -624,6 +639,7 @@ mod tests {
                 op_id,
                 left_id,
                 right_id,
+                ..
             }) => {
                 assert_eq!(arena.resolve_string(*op_id), "+");
                 assert_eq!(*left_id, left);

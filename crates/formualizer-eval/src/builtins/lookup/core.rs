@@ -488,7 +488,7 @@ pub struct VLookupFn;
 /// Max args: 4
 /// Variadic: false
 /// Signature: VLOOKUP(arg1: any@scalar, arg2: any@range, arg3: number@scalar, arg4?: logical@scalar)
-/// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=any,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberStrict,max=None,repeating=None,default=false}; arg4{kinds=logical,required=false,shape=scalar,by_ref=false,coercion=Logical,max=None,repeating=None,default=true}
+/// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=any,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=logical,required=false,shape=scalar,by_ref=false,coercion=Logical,max=None,repeating=None,default=true}
 /// Caps: PURE, LOOKUP
 /// [formualizer-docgen:schema:end]
 impl Function for VLookupFn {
@@ -525,13 +525,13 @@ impl Function for VLookupFn {
                     repeating: None,
                     default: None,
                 },
-                // col_index_num (strict number)
+                // col_index_num (a number; numeric and date text convert)
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Number],
                     required: true,
                     by_ref: false,
                     shape: ShapeKind::Scalar,
-                    coercion: CoercionPolicy::NumberStrict,
+                    coercion: CoercionPolicy::NumberLenientText,
                     max: None,
                     repeating: None,
                     default: None,
@@ -570,12 +570,20 @@ impl Function for VLookupFn {
 
         // A reference, or an array value; an error in its place is the result.
         let table = lookup_table(&args[1])?;
-        let col_index = match args[2].value()?.into_literal() {
-            LiteralValue::Int(i) => i,
-            LiteralValue::Number(n) => n as i64,
-            _ => {
+        // col_index_num is a number parameter: text that reads as a number ("2"),
+        // date text and a logical convert like any number argument, also per
+        // element of an array index ({"2",2}); other text is #VALUE! and an
+        // error is the result.
+        let col_index = match crate::coercion::to_number_argument(&args[2].value()?.into_literal())
+        {
+            Ok(n) => n as i64,
+            Err(error) => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                    ExcelError::new(ExcelErrorKind::Value),
+                    if error.kind == ExcelErrorKind::Value {
+                        ExcelError::new(ExcelErrorKind::Value)
+                    } else {
+                        error
+                    },
                 )));
             }
         };
@@ -753,7 +761,7 @@ pub struct HLookupFn;
 /// Max args: 4
 /// Variadic: false
 /// Signature: HLOOKUP(arg1: any@scalar, arg2: any@range, arg3: number@scalar, arg4?: logical@scalar)
-/// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=any,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberStrict,max=None,repeating=None,default=false}; arg4{kinds=logical,required=false,shape=scalar,by_ref=false,coercion=Logical,max=None,repeating=None,default=true}
+/// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=any,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=logical,required=false,shape=scalar,by_ref=false,coercion=Logical,max=None,repeating=None,default=true}
 /// Caps: PURE, LOOKUP
 /// [formualizer-docgen:schema:end]
 impl Function for HLookupFn {
@@ -790,13 +798,13 @@ impl Function for HLookupFn {
                     repeating: None,
                     default: None,
                 },
-                // row_index_num (strict number)
+                // row_index_num (a number; numeric and date text convert)
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Number],
                     required: true,
                     by_ref: false,
                     shape: ShapeKind::Scalar,
-                    coercion: CoercionPolicy::NumberStrict,
+                    coercion: CoercionPolicy::NumberLenientText,
                     max: None,
                     repeating: None,
                     default: None,
@@ -835,12 +843,20 @@ impl Function for HLookupFn {
 
         // A reference, or an array value; an error in its place is the result.
         let table = lookup_table(&args[1])?;
-        let row_index = match args[2].value()?.into_literal() {
-            LiteralValue::Int(i) => i,
-            LiteralValue::Number(n) => n as i64,
-            _ => {
+        // row_index_num is a number parameter: text that reads as a number ("2"),
+        // date text and a logical convert like any number argument, also per
+        // element of an array index ({"2",2}); other text is #VALUE! and an
+        // error is the result.
+        let row_index = match crate::coercion::to_number_argument(&args[2].value()?.into_literal())
+        {
+            Ok(n) => n as i64,
+            Err(error) => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                    ExcelError::new(ExcelErrorKind::Value),
+                    if error.kind == ExcelErrorKind::Value {
+                        ExcelError::new(ExcelErrorKind::Value)
+                    } else {
+                        error
+                    },
                 )));
             }
         };

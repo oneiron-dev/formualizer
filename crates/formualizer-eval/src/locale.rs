@@ -37,6 +37,39 @@ impl Locale {
     }
 }
 
+/// The lowercase of `c` under Unicode's simple case mapping, which Excel's
+/// case functions use (LOWER): each character maps to one character, so the
+/// text keeps its length. Sigma lowercases to "σ" wherever it stands.
+pub(crate) fn simple_lowercase(c: char) -> char {
+    let mut lower = c.to_lowercase();
+    match (lower.next(), lower.next()) {
+        (Some(l), None) => l,
+        // "İ" is the one character whose full lowercase is longer ("i" and a
+        // combining dot above); its simple lowercase is "i".
+        _ if c == '\u{130}' => 'i',
+        _ => c,
+    }
+}
+
+/// `text` folded for Excel's case-insensitive text matching (criteria and
+/// lookups): every character becomes its simple lowercase
+/// ([`simple_lowercase`]), so folding never changes how many characters the
+/// text has ("İ" is one character to the `?` wildcard, not "i" and a combining
+/// dot) and a capital sigma folds to "σ" wherever it stands; the final sigma
+/// "ς", which has the same capital, folds to "σ" too. `str::to_lowercase`
+/// does neither: "ΟΣ" became "ος" and no longer matched "οσ" or "*σ".
+pub fn fold_text_case(text: &str) -> String {
+    if text.is_ascii() {
+        return text.to_ascii_lowercase();
+    }
+    text.chars()
+        .map(|c| match simple_lowercase(c) {
+            'ς' => 'σ',
+            lower => lower,
+        })
+        .collect()
+}
+
 /// The decimal number `text` spells (`"5"`, `"-2.5E-1"`, `".5"`), when it is
 /// finite. Every reading of numeric text goes through here.
 ///

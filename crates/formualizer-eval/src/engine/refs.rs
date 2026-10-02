@@ -338,6 +338,7 @@ fn index_read_operands_arena(
                 op_id,
                 left_id,
                 right_id,
+                ..
             }) if store.resolve_ast_string(*op_id) == "," => {
                 let (left, right) = (*left_id, *right_id);
                 flatten(store, left, out);

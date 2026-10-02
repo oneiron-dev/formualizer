@@ -251,7 +251,11 @@ impl ReferenceAdjuster {
 
         Some(ASTNode {
             node_type: changed_node_type,
-            source_token: None,
+            // Parentheses around an operation stay recorded.
+            source_token: ast
+                .is_parenthesized()
+                .then(|| ast.source_token.clone())
+                .flatten(),
             contains_volatile: ast.contains_volatile,
         })
     }

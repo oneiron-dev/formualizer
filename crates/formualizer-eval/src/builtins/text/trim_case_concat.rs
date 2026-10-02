@@ -1,6 +1,7 @@
 use super::{super::utils::ARG_ANY_ONE, scalar_text_value};
 use crate::args::{ArgSchema, ShapeKind};
 use crate::function::Function;
+use crate::locale::simple_lowercase;
 use crate::traits::{ArgumentHandle, CalcValue, FunctionContext, ResolvedArgument};
 use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
@@ -83,19 +84,6 @@ fn simple_uppercase(c: char) -> char {
             '\u{1FB3}' | '\u{1FC3}' | '\u{1FF3}' => char::from_u32(c as u32 + 9).unwrap_or(c),
             _ => c,
         },
-    }
-}
-
-/// The lowercase of `c` under Unicode's simple case mapping (see
-/// [`simple_uppercase`]). Sigma lowercases to "σ" wherever it stands.
-fn simple_lowercase(c: char) -> char {
-    let mut lower = c.to_lowercase();
-    match (lower.next(), lower.next()) {
-        (Some(l), None) => l,
-        // "İ" is the one character whose full lowercase is longer ("i" and a
-        // combining dot above); its simple lowercase is "i".
-        _ if c == '\u{130}' => 'i',
-        _ => c,
     }
 }
 

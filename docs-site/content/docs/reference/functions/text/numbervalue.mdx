@@ -14,9 +14,10 @@ Parses text using explicit decimal and group separators, independent of the
  - The decimal separator defaults to `.`.
  - The group separator defaults to `,`.
  - Only the first character of a separator argument is used.
- - Spaces are ignored anywhere in the text (`" 3 000 "` is `3000`); a tab, line feed or
-   no-break space is no space and returns `#VALUE!`, as in VALUE. A space that is itself
-   a separator is read as that separator.
+ - Spaces are ignored anywhere in the text (`" 3 000 "` is `3000`), and so are tabs,
+   line feeds and carriage returns; a no-break space is a character like any other.
+   A space group separator is ignored like any space, also after the decimal separator
+   (`NUMBERVALUE("1.2 3","."," ")` is `1.23`); a space decimal separator is read as one.
  - A group separator before the decimal separator is ignored; one after it,
    or a second decimal separator, returns `#VALUE!`.
  - Percent suffixes are supported and scale the result by 100 per suffix.
