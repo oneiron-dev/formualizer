@@ -354,3 +354,131 @@ fn numbers_become_text_rounding_ties_away_from_zero() {
         );
     }
 }
+
+#[test]
+fn integer_results_become_the_same_text_as_equal_numbers() {
+    // SEQUENCE hands back whole numbers as the engine's integer variant;
+    // Excel has one kind of number, so the text keeps 15 significant digits
+    // whichever variant holds it.
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    let cases = [
+        ("=CONCAT(SEQUENCE(1,1,2^53))", "9007199254740990"),
+        ("=SEQUENCE(1,1,2^53)&\"\"", "9007199254740990"),
+        (
+            "=TEXTJOIN(\",\",TRUE,SEQUENCE(1,1,-2^53))",
+            "-9007199254740990",
+        ),
+        ("=LEFT(SEQUENCE(1,1,10^15+5),16)", "1000000000000010"),
+        ("=RIGHT(SEQUENCE(1,1,2^53),3)", "990"),
+        ("=MID(SEQUENCE(1,1,2^53),14,3)", "990"),
+        ("=VALUETOTEXT(SEQUENCE(1,1,2^53))", "9007199254740990"),
+        ("=CONCAT(SEQUENCE(1,1,123))", "123"),
+    ];
+    for (row, (formula, _)) in cases.iter().enumerate() {
+        set_formula(&mut engine, row as u32 + 1, 3, formula);
+    }
+    set_formula(&mut engine, 1, 4, "=EXACT(SEQUENCE(1,1,2^53),2^53)");
+    set_formula(&mut engine, 2, 4, "=LEN(SEQUENCE(1,1,2^53))");
+    set_formula(&mut engine, 3, 4, "=FIND(\"990\",SEQUENCE(1,1,2^53))");
+
+    engine.evaluate_all().expect("evaluate formulas");
+
+    for (row, (formula, expected)) in cases.iter().enumerate() {
+        assert_eq!(
+            engine.get_cell_value("Sheet1", row as u32 + 1, 3),
+            Some(LiteralValue::Text((*expected).into())),
+            "{formula}"
+        );
+    }
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 4),
+        Some(LiteralValue::Boolean(true))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 2, 4),
+        Some(LiteralValue::Number(16.0))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 3, 4),
+        Some(LiteralValue::Number(14.0))
+    );
+}
+
+#[test]
+fn numbers_past_1e99_round_their_15_digits_again_to_14() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    let cases = [
+        ("=1.23456789012355E99&\"\"", "1.2345678901236E+99"),
+        ("=CONCAT(1.23456789012355E99)", "1.2345678901236E+99"),
+        ("=9.999999999999946E99&\"\"", "1E+100"),
+        ("=-9.999999999999946E99&\"\"", "-1E+100"),
+        ("=1.000000000000045E-99&\"\"", "1.0000000000001E-99"),
+        ("=9.999999999999946E-99&\"\"", "1E-98"),
+        ("=1.234567890123455E98&\"\"", "1.23456789012346E+98"),
+    ];
+    for (row, (formula, _)) in cases.iter().enumerate() {
+        set_formula(&mut engine, row as u32 + 1, 3, formula);
+    }
+
+    engine.evaluate_all().expect("evaluate formulas");
+
+    for (row, (formula, expected)) in cases.iter().enumerate() {
+        assert_eq!(
+            engine.get_cell_value("Sheet1", row as u32 + 1, 3),
+            Some(LiteralValue::Text((*expected).into())),
+            "{formula}"
+        );
+    }
+}
+
+#[test]
+fn rept_refuses_results_past_32767_characters_without_overflow() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    // 1/3 is the 17 characters 0.333333333333333; this count times 17 wraps
+    // a 64-bit product to 1920.
+    set_formula(&mut engine, 1, 3, "=REPT(1/3,1085102592571150000+200)");
+    set_formula(&mut engine, 2, 3, "=REPT(\"ab\",2^62)");
+    set_formula(&mut engine, 3, 3, "=REPT(\"ab\",16384)");
+    set_formula(&mut engine, 4, 3, "=LEN(REPT(\"ab\",16383))");
+    // The limit counts characters, not UTF-8 bytes.
+    set_formula(&mut engine, 5, 3, "=LEN(REPT(\"é\",32767))");
+    set_formula(&mut engine, 6, 3, "=REPT(\"é\",32768)");
+
+    engine.evaluate_all().expect("evaluate formulas");
+
+    for row in [1, 2, 3, 6] {
+        match engine.get_cell_value("Sheet1", row, 3) {
+            Some(LiteralValue::Error(e)) => assert_eq!(e.kind, ExcelErrorKind::Value, "row {row}"),
+            other => panic!("row {row}: expected #VALUE!, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 4, 3),
+        Some(LiteralValue::Number(32766.0))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 5, 3),
+        Some(LiteralValue::Number(32767.0))
+    );
+}
+
+#[test]
+fn valuetotext_converts_errors_to_their_text() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    set_formula(&mut engine, 1, 3, "=VALUETOTEXT(1/0)");
+    set_formula(&mut engine, 2, 3, "=VALUETOTEXT(1/0,0)");
+    set_formula(&mut engine, 3, 3, "=VALUETOTEXT(NA(),1)");
+    set_formula(&mut engine, 4, 3, "=VALUETOTEXT(\"x\"+1,0)");
+    set_formula(&mut engine, 5, 3, "=ISTEXT(VALUETOTEXT(1/0,0))");
+
+    engine.evaluate_all().expect("evaluate formulas");
+
+    assert_text(&engine, 1, 3, "#DIV/0!");
+    assert_text(&engine, 2, 3, "#DIV/0!");
+    assert_text(&engine, 3, 3, "#N/A");
+    assert_text(&engine, 4, 3, "#VALUE!");
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 5, 3),
+        Some(LiteralValue::Boolean(true))
+    );
+}

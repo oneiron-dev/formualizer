@@ -27,7 +27,7 @@ fn coerce_text(v: &LiteralValue) -> String {
         LiteralValue::Text(s) => s.clone(),
         LiteralValue::Empty => String::new(),
         LiteralValue::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-        LiteralValue::Int(i) => i.to_string(),
+        LiteralValue::Int(i) => crate::coercion::int_to_text(*i),
         LiteralValue::Number(f) => crate::coercion::number_to_text(*f),
         other => other.to_string(),
     }
@@ -432,10 +432,11 @@ fn value_to_text_repr(v: &LiteralValue, strict: bool) -> String {
             }
         }
         LiteralValue::Number(n) => crate::coercion::number_to_text(*n),
-        LiteralValue::Int(i) => i.to_string(),
+        LiteralValue::Int(i) => crate::coercion::int_to_text(*i),
         LiteralValue::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
         LiteralValue::Empty => String::new(),
-        LiteralValue::Error(e) => e.to_string(),
+        // The code alone (`#N/A`), without the engine's diagnostic message.
+        LiteralValue::Error(e) => e.kind.to_string(),
         LiteralValue::Array(arr) => {
             // For arrays, use array syntax
             let rows: Vec<String> = arr
@@ -472,8 +473,7 @@ pub struct ValueToTextFn;
 /// # Remarks
 /// - Concise mode (`0`) returns natural text for scalars.
 /// - Strict mode (`1`) adds explicit quoting for text and serializes arrays with braces.
-/// - In concise mode, error values are propagated as errors.
-/// - In strict mode, error values are rendered as their error text.
+/// - Error values are converted to their error text (`#DIV/0!`) in both modes.
 ///
 /// # Examples
 ///
@@ -496,7 +496,7 @@ pub struct ValueToTextFn;
 ///   - VALUE
 /// faq:
 ///   - q: "How are errors handled in concise vs strict mode?"
-///     a: "Concise mode returns the error, while strict mode converts the error to its text form."
+///     a: "Both modes convert the error to its text form, such as #DIV/0!, so the result is text."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: VALUETOTEXT
@@ -547,17 +547,8 @@ impl Function for ValueToTextFn {
 
         let strict = format == 1;
 
-        // Handle error propagation for the value itself
-        if let LiteralValue::Error(e) = &value {
-            // In strict mode, errors become their text representation
-            // In concise mode, propagate the error
-            if strict {
-                return Ok(CalcValue::Scalar(LiteralValue::Text(e.to_string())));
-            } else {
-                return Ok(CalcValue::Scalar(LiteralValue::Error(e.clone())));
-            }
-        }
-
+        // An error value is converted too, in both formats: its text is the
+        // error code (`#DIV/0!`), so ISTEXT(VALUETOTEXT(1/0)) is TRUE.
         let result = value_to_text_repr(&value, strict);
         Ok(CalcValue::Scalar(LiteralValue::Text(result)))
     }

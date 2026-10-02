@@ -235,8 +235,9 @@ pub fn to_logical(value: &LiteralValue) -> Result<bool, ExcelError> {
 
 /// Excel's text for a number used where text is needed (`&`, CONCAT, LEFT,
 /// TEXTJOIN, ...), whatever the cell's display format. It keeps 15
-/// significant digits (14 from 1E+99 up and below 1E-98) and writes the
-/// number out in full up to 20 integer digits, or below 1 while that takes
+/// significant digits (from 1E+99 up and below 1E-98 those 15 are rounded
+/// again, to 14) and writes the number out in full up to 20 integer
+/// digits, or below 1 while that takes
 /// at most 20 characters; beyond that it uses E notation
 /// (`0.333333333333333`, `1234567890123460`, `1.23456789012346E-05`,
 /// `1.23456789012346E+20`). Like all of Excel's number formatting it rounds
@@ -251,7 +252,18 @@ pub fn number_to_text(n: f64) -> String {
     }
     let (mut digits, mut exponent) = significant_digits(n.abs(), 15);
     if exponent.abs() > 98 {
-        (digits, exponent) = significant_digits(n.abs(), 14);
+        // Excel reaches 14 digits from the 15 it has already rounded to, not
+        // from the binary value: 1.23456789012355E+99 is
+        // `1.2345678901236E+99`, and a carry moves the exponent
+        // (9.99999999999995E+99 is `1E+100`).
+        let fifteen: u64 = digits.parse().expect("15 decimal digits");
+        let fourteen = (fifteen + 5) / 10;
+        if fourteen < 100_000_000_000_000 {
+            digits = fourteen.to_string();
+        } else {
+            digits = "1".into();
+            exponent += 1;
+        }
     }
     let digits = digits.trim_end_matches('0');
     let sign = if n < 0.0 { "-" } else { "" };
@@ -270,6 +282,18 @@ pub fn number_to_text(n: f64) -> String {
         format!("{sign}{}.{}", &digits[..int_len], &digits[int_len..])
     } else {
         format!("{sign}{digits}{}", "0".repeat(int_len - digits.len()))
+    }
+}
+
+/// `number_to_text` for a number the engine holds as an integer. Excel has
+/// only one kind of number, so the text is the same as for the equal double:
+/// 2^53 is `9007199254740990`, not `9007199254740992`.
+pub fn int_to_text(i: i64) -> String {
+    if i.unsigned_abs() < 1_000_000_000_000_000 {
+        // Up to 15 digits an integer is its own text.
+        i.to_string()
+    } else {
+        number_to_text(i as f64)
     }
 }
 
@@ -323,7 +347,7 @@ pub fn to_text_invariant(value: &LiteralValue) -> String {
     match value {
         LiteralValue::Text(s) => s.clone(),
         LiteralValue::Number(n) => number_to_text(*n),
-        LiteralValue::Int(i) => i.to_string(),
+        LiteralValue::Int(i) => int_to_text(*i),
         LiteralValue::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.into(),
         LiteralValue::Error(e) => e.to_string(),
         LiteralValue::Empty => "".into(),
@@ -519,6 +543,100 @@ mod tests {
             (123456789012.3455, "123456789012.346"),
         ] {
             assert_eq!(number_to_text(n), text, "{n:e}");
+        }
+    }
+
+    #[test]
+    fn number_to_text_rounds_the_15_digits_again_at_extreme_exponents() {
+        // Excel's renderings around 1E±98, 1E±99 and 1E±100, as tabulated by
+        // Apache POI's NumberToTextConversionExamples (raw double bits). From
+        // 1E+99 up and below 1E-98 the 15-digit result is rounded half up to
+        // 14 digits, and a carry moves the exponent.
+        for (bits, text) in [
+            (0x544C_E634_5CF3_209C_u64, "1.23456789012345E+98"),
+            (0x544C_E634_5CF3_209D, "1.23456789012346E+98"),
+            (0x544C_E634_5CF3_20DF, "1.23456789012347E+98"),
+            (0x544C_E634_5CF3_2121, "1.23456789012348E+98"),
+            (0x5482_0FE0_BA17_F5E9, "1.2345678901236E+99"),
+            (0x5482_0FE0_BA17_F5EA, "1.2345678901236E+99"),
+            (0x5482_0FE0_BA17_F784, "1.2345678901237E+99"),
+            (0x5482_0FE0_BA17_F785, "1.2345678901237E+99"),
+            (0x5482_0FE0_BA17_F920, "1.2345678901238E+99"),
+            (0x5482_0FE0_BA17_F921, "1.2345678901238E+99"),
+            (0x547D_42AE_A287_9F19, "9.99999999999997E+98"),
+            (0x547D_42AE_A287_9F1A, "9.99999999999998E+98"),
+            (0x547D_42AE_A287_9F2A, "9.99999999999999E+98"),
+            (0x547D_42AE_A287_9F2B, "1E+99"),
+            (0x547D_42AE_A287_A0A0, "1E+99"),
+            (0x547D_42AE_A287_A0A1, "1.0000000000001E+99"),
+            (0x547D_42AE_A287_A3D8, "1.0000000000001E+99"),
+            (0x547D_42AE_A287_A3D9, "1.0000000000002E+99"),
+            (0x547D_42AE_A287_A710, "1.0000000000002E+99"),
+            (0x547D_42AE_A287_A711, "1.0000000000003E+99"),
+            (0x54B2_49AD_2594_C2F9, "9.9999999999997E+99"),
+            (0x54B2_49AD_2594_C2FA, "9.9999999999998E+99"),
+            (0x54B2_49AD_2594_C32D, "9.9999999999998E+99"),
+            (0x54B2_49AD_2594_C32E, "9.9999999999999E+99"),
+            (0x54B2_49AD_2594_C360, "9.9999999999999E+99"),
+            (0x54B2_49AD_2594_C361, "1E+100"),
+            (0x54B2_49AD_2594_C464, "1E+100"),
+            (0x54B2_49AD_2594_C465, "1.0000000000001E+100"),
+            (0x54B2_49AD_2594_C667, "1.0000000000001E+100"),
+            (0x54B2_49AD_2594_C668, "1.0000000000002E+100"),
+            (0x54B2_49AD_2594_C86A, "1.0000000000002E+100"),
+            (0x54B2_49AD_2594_C86B, "1.0000000000003E+100"),
+            (0x2B95_DF5C_A28E_F4A8, "1.00000000000003E-98"),
+            (0x2B95_DF5C_A28E_F4A7, "1.00000000000002E-98"),
+            (0x2B95_DF5C_A28E_F42C, "1E-98"),
+            (0x2B95_DF5C_A28E_F3EC, "1E-98"),
+            (0x2B95_DF5C_A28E_F3EB, "9.9999999999999E-99"),
+            (0x2B95_DF5C_A28E_F3AE, "9.9999999999999E-99"),
+            (0x2B95_DF5C_A28E_F3AD, "9.9999999999998E-99"),
+            (0x2B95_DF5C_A28E_F371, "9.9999999999998E-99"),
+            (0x2B95_DF5C_A28E_F370, "9.9999999999997E-99"),
+            (0x2B61_7F7D_4ED8_C7F5, "1.0000000000003E-99"),
+            (0x2B61_7F7D_4ED8_C7F4, "1.0000000000002E-99"),
+            (0x2B61_7F7D_4ED8_C609, "1.0000000000002E-99"),
+            (0x2B61_7F7D_4ED8_C608, "1.0000000000001E-99"),
+            (0x2B61_7F7D_4ED8_C41C, "1.0000000000001E-99"),
+            (0x2B61_7F7D_4ED8_C41B, "1E-99"),
+            (0x2B61_7F7D_4ED8_C323, "1E-99"),
+            (0x2B61_7F7D_4ED8_C322, "9.9999999999999E-100"),
+            (0x2B61_7F7D_4ED8_C2F2, "9.9999999999999E-100"),
+            (0x2B61_7F7D_4ED8_C2F1, "9.9999999999998E-100"),
+            (0x2B61_7F7D_4ED8_C2C1, "9.9999999999998E-100"),
+            (0x2B61_7F7D_4ED8_C2C0, "9.9999999999997E-100"),
+            (0x0036_3199_16D6_7853, "1.2345678901235E-307"),
+        ] {
+            let n = f64::from_bits(bits);
+            assert_eq!(number_to_text(n), text, "{n:e}");
+            assert_eq!(number_to_text(-n), format!("-{text}"), "{:e}", -n);
+        }
+    }
+
+    #[test]
+    fn int_to_text_matches_the_equal_double() {
+        for (i, text) in [
+            (0_i64, "0"),
+            (-7, "-7"),
+            (999_999_999_999_999, "999999999999999"),
+            (-999_999_999_999_999, "-999999999999999"),
+            (1_000_000_000_000_000, "1000000000000000"),
+            (1_000_000_000_000_005, "1000000000000010"),
+            (1 << 53, "9007199254740990"),
+            (-(1 << 53), "-9007199254740990"),
+            (12_345_678_901_234_567, "12345678901234600"),
+            (i64::MAX, "9223372036854780000"),
+            (i64::MIN, "-9223372036854780000"),
+        ] {
+            assert_eq!(int_to_text(i), text, "{i}");
+            assert_eq!(int_to_text(i), number_to_text(i as f64), "{i}");
+        }
+        for value in [
+            LiteralValue::Int(1 << 53),
+            LiteralValue::Number(2f64.powi(53)),
+        ] {
+            assert_eq!(to_text_invariant(&value), "9007199254740990", "{value:?}");
         }
     }
 

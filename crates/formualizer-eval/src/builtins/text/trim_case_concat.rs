@@ -59,7 +59,7 @@ fn literal_to_text(v: &LiteralValue) -> Result<String, ExcelError> {
                 "FALSE".into()
             }
         }
-        LiteralValue::Int(i) => i.to_string(),
+        LiteralValue::Int(i) => crate::coercion::int_to_text(*i),
         LiteralValue::Number(f) => crate::coercion::number_to_text(*f),
         LiteralValue::Error(e) => return Err(e.clone()),
         other => other.to_string(),
@@ -761,7 +761,7 @@ impl Function for TextJoinFn {
                             "FALSE".to_string()
                         }
                     }
-                    LiteralValue::Int(i) => i.to_string(),
+                    LiteralValue::Int(i) => crate::coercion::int_to_text(*i),
                     LiteralValue::Number(f) => crate::coercion::number_to_text(*f),
                     value => value.to_string(),
                 };

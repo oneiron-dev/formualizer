@@ -386,10 +386,12 @@ impl Function for ReptFn {
             )));
         }
 
-        // Excel limits result to 32767 characters
+        // Excel limits the result to 32,767 characters (UTF-16 code units,
+        // Excel's character). The product is checked: a huge count must not
+        // wrap around to a small length.
         let max_result_len = 32767;
-        let result_len = text.len() * (count as usize);
-        if result_len > max_result_len {
+        let result_len = (text.encode_utf16().count() as u64).checked_mul(count as u64);
+        if result_len.is_none_or(|len| len > max_result_len) {
             return Ok(CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_value(),
             )));

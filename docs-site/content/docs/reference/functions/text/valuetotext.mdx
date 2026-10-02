@@ -12,8 +12,7 @@ description: "VALUETOTEXT: Converts a value to text representation."
 ## Remarks
  - Concise mode (`0`) returns natural text for scalars.
  - Strict mode (`1`) adds explicit quoting for text and serializes arrays with braces.
- - In concise mode, error values are propagated as errors.
- - In strict mode, error values are rendered as their error text.
+ - Error values are converted to their error text (`#DIV/0!`) in both modes.
 
 ## Examples
 
@@ -50,7 +49,7 @@ description: "VALUETOTEXT: Converts a value to text representation."
 ## FAQ
 
 ### How are errors handled in concise vs strict mode?
-Concise mode returns the error, while strict mode converts the error to its text form.
+Both modes convert the error to its text form, such as #DIV/0!, so the result is text.
 
 ## Runtime metadata
 

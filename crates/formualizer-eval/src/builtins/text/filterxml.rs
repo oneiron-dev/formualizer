@@ -34,7 +34,7 @@ fn to_text(arg: &ArgumentHandle<'_, '_>) -> Result<String, ExcelError> {
         LiteralValue::Text(s) => s,
         LiteralValue::Empty => String::new(),
         LiteralValue::Boolean(b) => if b { "TRUE" } else { "FALSE" }.into(),
-        LiteralValue::Int(i) => i.to_string(),
+        LiteralValue::Int(i) => crate::coercion::int_to_text(i),
         LiteralValue::Number(n) => crate::coercion::number_to_text(n),
         LiteralValue::Error(e) => return Err(e),
         other => other.to_string(),
