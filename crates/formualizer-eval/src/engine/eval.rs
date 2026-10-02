@@ -27151,25 +27151,13 @@ where
         name: &str,
         current_sheet: &str,
     ) -> Option<Result<Vec<ReferenceType>, ExcelError>> {
-        use formualizer_parse::parser::ASTNodeType;
         let current_id = self.graph.sheet_id(current_sheet)?;
         let named = self.graph.resolve_name_entry(name, current_id)?;
+        // A union, an intersection with one, or a name for another name
+        // (which may be one); `evaluate_ast_as_areas` declines anything else.
         let NamedDefinition::Formula { ast, .. } = &named.definition else {
             return None;
         };
-        // A union, or a name for another name (which may be one).
-        if !matches!(
-            &ast.node_type,
-            ASTNodeType::BinaryOp { op, .. } if op == ","
-        ) && !matches!(
-            &ast.node_type,
-            ASTNodeType::Reference {
-                reference: ReferenceType::NamedRange(_),
-                ..
-            }
-        ) {
-            return None;
-        }
         let sheet_id = match named.scope {
             NameScope::Sheet(id) => id,
             NameScope::Workbook => current_id,

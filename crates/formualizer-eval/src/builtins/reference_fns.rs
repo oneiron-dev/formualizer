@@ -448,9 +448,11 @@ impl IndexFn {
 ///   cross).
 /// - `area_num` (reference form) picks the area of a multi-area reference in which `row_num`
 ///   and `column_num` select: a union such as `(A1:B2,D1:E2)`, or a name defined as one,
-///   numbers its areas in the order written. It defaults to 1, and a single range or array
-///   is area 1 only. An area below 1 returns `#VALUE!`, an area past the last one returns
-///   `#REF!`, and a union whose areas lie on different sheets returns `#VALUE!`.
+///   numbers its areas in the order written, and the intersection of such a reference with
+///   another, as in `(A1:B2,D1:E2) A2:E2`, has each area's overlap in that order. It
+///   defaults to 1, and a single range or array is area 1 only. An area below 1 returns
+///   `#VALUE!`, an area past the last one returns `#REF!`, and a union whose areas lie on
+///   different sheets returns `#VALUE!`. Only the selected area is read.
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -577,7 +579,9 @@ impl Function for IndexFn {
         } else {
             // Handle array literal. A multi-area reference has no value of its
             // own: an index dispatch did not lift is #VALUE!, as for a range.
-            if args.len() < 2 || args[0].reference_areas().is_some() {
+            if args.len() < 2
+                || matches!(args[0].reference_areas(), Some(Ok(areas)) if areas.len() > 1)
+            {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new(ExcelErrorKind::Value),
                 )));
@@ -1910,6 +1914,86 @@ mod tests {
         assert_eq!(
             error_kind("=INDEX({1,2;3,4},2,2,\"x\")"),
             ExcelErrorKind::Value
+        );
+    }
+
+    #[test]
+    fn index_oversized_row_or_column_is_ref_error() {
+        // A row_num or column_num past the selected area is #REF!, however
+        // large: it never wraps onto a cell of the grid (2^32 + 1 is not row
+        // 1) and never overflows, in a union area, a single range, a whole
+        // column and the whole-row/whole-column (0) forms.
+        let wb = TestWorkbook::new()
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Int(1))
+            .with_cell_a1("Sheet1", "B1", LiteralValue::Int(2))
+            .with_cell_a1("Sheet1", "A2", LiteralValue::Int(3))
+            .with_cell_a1("Sheet1", "B2", LiteralValue::Int(4))
+            .with_cell_a1("Sheet1", "D1", LiteralValue::Int(10))
+            .with_cell_a1("Sheet1", "D2", LiteralValue::Int(30))
+            .with_function(std::sync::Arc::new(IndexFn))
+            .with_function(std::sync::Arc::new(crate::builtins::math::aggregate::SumFn));
+        let error_kind = |formula: &str| match evaluate_formula(formula, &wb).unwrap() {
+            LiteralValue::Error(err) => err.kind,
+            other => panic!("{formula}: expected an error, got {other:?}"),
+        };
+        for formula in [
+            "=INDEX((A1:B2,D1:E2),4294967297,1,2)",
+            "=INDEX((A1:B2,D1:E2),1,4294967297,2)",
+            "=INDEX((A2:B2,D2:E2),4294967295,1,2)",
+            "=INDEX((A2:B2,D2:E2),1,4294967295,2)",
+            "=INDEX(A1:B2,4294967297,1)",
+            "=INDEX(A1:B2,1,4294967297)",
+            "=INDEX(A1:B2,4294967296,2)",
+            "=INDEX(A1:B2,4294967297)",
+            "=INDEX(A1:A2,4294967297)",
+            "=INDEX(A1:B1,4294967297)",
+            "=INDEX(A:A,4294967295)",
+            "=INDEX(1:1,1,4294967295)",
+            "=INDEX(A1:B2,1E300,1)",
+            "=SUM(INDEX(A1:B2,0,4294967297))",
+            "=SUM(INDEX(A1:B2,4294967297,0))",
+            "=SUM(INDEX((A1:B2,D1:E2),0,4294967297,2))",
+        ] {
+            assert_eq!(error_kind(formula), ExcelErrorKind::Ref, "{formula}");
+        }
+        // The largest in-range indexes still select.
+        let value = |formula: &str| as_number(&evaluate_formula(formula, &wb).unwrap());
+        assert_eq!(value("=INDEX((A1:B2,D1:E2),2,1,2)"), 30.0);
+        assert_eq!(value("=INDEX(A1:B2,2,2)"), 4.0);
+    }
+
+    #[test]
+    fn index_area_num_selects_an_area_of_an_intersection() {
+        // Space is the intersection operator: (A1:B2,D1:E2) A2:E2 is the
+        // reference with the areas A2:B2 and D2:E2, each area's overlap with
+        // the other operand in order, and INDEX's area_num numbers those.
+        let wb = TestWorkbook::new()
+            .with_cell_a1("Sheet1", "A2", LiteralValue::Int(3))
+            .with_cell_a1("Sheet1", "B2", LiteralValue::Int(4))
+            .with_cell_a1("Sheet1", "D1", LiteralValue::Int(10))
+            .with_cell_a1("Sheet1", "E1", LiteralValue::Int(20))
+            .with_cell_a1("Sheet1", "D2", LiteralValue::Int(30))
+            .with_cell_a1("Sheet1", "E2", LiteralValue::Int(40))
+            .with_function(std::sync::Arc::new(IndexFn))
+            .with_function(std::sync::Arc::new(crate::builtins::math::aggregate::SumFn));
+        let value = |formula: &str| as_number(&evaluate_formula(formula, &wb).unwrap());
+        let error_kind = |formula: &str| match evaluate_formula(formula, &wb).unwrap() {
+            LiteralValue::Error(err) => err.kind,
+            other => panic!("{formula}: expected an error, got {other:?}"),
+        };
+        assert_eq!(value("=INDEX(((A1:B2,D1:E2) A2:E2),1,1,2)"), 30.0);
+        assert_eq!(value("=INDEX(((A1:B2,D1:E2) A2:E2),1,2,1)"), 4.0);
+        assert_eq!(value("=INDEX((A2:E2 (A1:B2,D1:E2)),1,2,2)"), 40.0);
+        assert_eq!(value("=SUM(INDEX(((A1:B2,D1:E2) A1:E1),0,0,2))"), 30.0);
+        // An area that does not overlap leaves no area behind.
+        assert_eq!(value("=INDEX(((A1:B2,D1:E2) D1:E2),2,2,1)"), 40.0);
+        assert_eq!(
+            error_kind("=INDEX(((A1:B2,D1:E2) A2:E2),1,1,3)"),
+            ExcelErrorKind::Ref
+        );
+        assert_eq!(
+            error_kind("=INDEX(((A1:B2,D1:E2) G1:G2),1,1)"),
+            ExcelErrorKind::Null
         );
     }
 

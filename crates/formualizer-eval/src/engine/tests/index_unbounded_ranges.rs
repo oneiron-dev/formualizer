@@ -887,6 +887,338 @@ fn static_index_self_loop_classification_reads_only_the_selected_union_area() {
     }
 }
 
+/// An engine for every FormulaPlane mode and both cycle detections.
+fn engines_in_every_mode() -> Vec<(String, Engine<TestWorkbook>)> {
+    use crate::engine::{CycleConfig, CycleDetection, CyclePolicy};
+    let mut engines = Vec::new();
+    for mode in [
+        FormulaPlaneMode::Off,
+        FormulaPlaneMode::AuthoritativeExperimental,
+    ] {
+        for detection in [CycleDetection::Static, CycleDetection::Runtime] {
+            let config = EvalConfig::default()
+                .with_formula_plane_mode(mode)
+                .with_cycle(CycleConfig {
+                    detection,
+                    policy: CyclePolicy::Error,
+                });
+            engines.push((
+                format!("{mode:?}/{detection:?}"),
+                Engine::new(TestWorkbook::new(), config),
+            ));
+        }
+    }
+    engines
+}
+
+fn define_formula_name(engine: &mut Engine<TestWorkbook>, name: &str, formula: &str) {
+    use crate::engine::named_range::{NameScope, NamedDefinition};
+    engine
+        .define_name(
+            name,
+            NamedDefinition::Formula {
+                ast: parse(formula).unwrap(),
+                dependencies: Vec::new(),
+                range_deps: Vec::new(),
+            },
+            NameScope::Workbook,
+        )
+        .unwrap();
+}
+
+fn assert_error_in(
+    engine: &Engine<TestWorkbook>,
+    label: &str,
+    row: u32,
+    col: u32,
+    kind: ExcelErrorKind,
+) {
+    match engine.get_cell_value("Sheet1", row, col) {
+        Some(LiteralValue::Error(error)) => {
+            assert_eq!(error.kind, kind, "{label} Sheet1!R{row}C{col}")
+        }
+        other => panic!("{label} Sheet1!R{row}C{col}: expected {kind:?}, got {other:?}"),
+    }
+}
+
+#[test]
+fn index_union_area_numbers_count_every_area_of_a_name() {
+    // Areas are numbered as INDEX evaluates its reference: a name defined as
+    // two areas contributes areas 1 and 2, so the column after it in the
+    // union is area 3. Selecting the formula's own cell there is circular;
+    // selecting an area of the name is not, though the union holds the
+    // formula's column.
+    for (label, mut engine) in engines_in_every_mode() {
+        for (col, value) in [(2, 7), (3, 12), (4, 42), (8, 5)] {
+            engine
+                .set_cell_value("Sheet1", 1, col, LiteralValue::Int(value))
+                .unwrap();
+        }
+        define_formula_name(&mut engine, "Areas", "=Sheet1!$B:$B,Sheet1!$C:$C");
+        for (row, col, formula) in [
+            (1, 4, "=INDEX((Areas,D:D),1,1,3)"),
+            (1, 5, "=INDEX((Areas,E:E),1,1,2)"),
+            (1, 6, "=INDEX((Areas,F:F),1,1,1)"),
+            (2, 7, "=INDEX((Areas,G:G),2,1,3)"),
+            (3, 8, "=INDEX((Areas,H:H),1,1,3)"),
+        ] {
+            engine
+                .set_cell_formula("Sheet1", row, col, parse(formula).unwrap())
+                .unwrap();
+        }
+        engine.evaluate_all().unwrap();
+        assert_error_in(&engine, &label, 1, 4, ExcelErrorKind::Circ);
+        assert_number(&engine, "Sheet1", 1, 5, 12.0);
+        assert_number(&engine, "Sheet1", 1, 6, 7.0);
+        assert_error_in(&engine, &label, 2, 7, ExcelErrorKind::Circ);
+        assert_number(&engine, "Sheet1", 3, 8, 5.0);
+    }
+}
+
+#[test]
+fn index_union_area_function_keeps_legacy_single_value_arguments() {
+    // A function written as an area of a union evaluates its arguments as it
+    // would anywhere else in an ordinary (legacy) formula: INDEX's row_num
+    // K9:K10 in row 10 is implicitly intersected to K10 = 2, so the inner
+    // INDEX is A2.
+    for (label, mut engine) in engines_in_every_mode() {
+        for (row, col, value) in [
+            (1, 1, 1),
+            (1, 2, 2),
+            (2, 1, 3),
+            (2, 2, 4),
+            (9, 11, 1),
+            (10, 11, 2),
+        ] {
+            engine
+                .set_cell_value("Sheet1", row, col, LiteralValue::Int(value))
+                .unwrap();
+        }
+        for (col, formula) in [
+            (10, "=INDEX((INDEX(A1:B2,K9:K10,1),B1),1,1,1)"),
+            (12, "=INDEX((INDEX(A1:B2,K9:K10,1),B1),1,1,2)"),
+            (13, "=INDEX((B1,INDEX(A1:B2,K9:K10,2)),1,1,2)"),
+            (14, "=INDEX(INDEX(A1:B2,K9:K10,1),1,1)"),
+        ] {
+            engine
+                .set_cell_formula("Sheet1", 10, col, parse(formula).unwrap())
+                .unwrap();
+        }
+        engine.use_legacy_array_semantics();
+        engine.evaluate_all().unwrap();
+        for (col, expected) in [(10, 3.0), (12, 2.0), (13, 4.0), (14, 3.0)] {
+            match engine.get_cell_value("Sheet1", 10, col) {
+                Some(LiteralValue::Number(n)) => assert_eq!(n, expected, "{label} col {col}"),
+                Some(LiteralValue::Int(i)) => {
+                    assert_eq!(i as f64, expected, "{label} col {col}")
+                }
+                other => panic!("{label} Sheet1!R10C{col}: expected {expected}, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn index_area_selector_coercion_keeps_the_selection_static() {
+    // area_num "2" selects area 2 as 2 does, and row_num "1" row 1: neither
+    // reads the formula's own cell, so neither is circular. An area_num read
+    // from a cell (F1) is known only when the formula runs, but whichever
+    // area it selects, row 1 of it is not the formula's cell either; changing
+    // the cell switches the area. Each formula sits alone in its column.
+    for (label, mut engine) in engines_in_every_mode() {
+        for (col, value) in [(2, 7), (4, 42), (6, 2), (7, 7), (8, 7), (9, 7)] {
+            engine
+                .set_cell_value("Sheet1", 1, col, LiteralValue::Int(value))
+                .unwrap();
+        }
+        for (col, formula) in [
+            (2, "=INDEX((B:B,D:D),1,1,\"2\")"),
+            (7, "=INDEX((G:G,D:D),1,1,F1)"),
+            (8, "=INDEX((H:H,D:D),\"1\",1,TRUE)"),
+            (9, "=INDEX((I:I,D:D),1,\"1\",-\"-2\")"),
+        ] {
+            engine
+                .set_cell_formula("Sheet1", 100, col, parse(formula).unwrap())
+                .unwrap();
+        }
+        engine.evaluate_all().unwrap();
+        for (col, expected) in [(2, 42.0), (7, 42.0), (8, 7.0), (9, 42.0)] {
+            match engine.get_cell_value("Sheet1", 100, col) {
+                Some(LiteralValue::Number(n)) => assert_eq!(n, expected, "{label} col {col}"),
+                Some(LiteralValue::Int(i)) => {
+                    assert_eq!(i as f64, expected, "{label} col {col}")
+                }
+                other => panic!("{label} Sheet1!R100C{col}: expected {expected}, got {other:?}"),
+            }
+        }
+        engine
+            .set_cell_value("Sheet1", 1, 6, LiteralValue::Int(1))
+            .unwrap();
+        engine.evaluate_all().unwrap();
+        assert_number(&engine, "Sheet1", 100, 7, 7.0);
+    }
+}
+
+#[test]
+fn index_unselected_union_area_is_no_dependency() {
+    // INDEX reads only the area it selects, so a constant area_num leaves the
+    // other areas out of the formula's dependencies whatever their size: a
+    // cell, a small range and a large range holding the formula's own cell
+    // are no self-reference, and a formula in an unselected area that reads
+    // INDEX's result is no cycle. Edits to the selected area still
+    // recalculate; selecting the formula's own cell stays circular.
+    for (label, mut engine) in engines_in_every_mode() {
+        engine
+            .set_cell_value("Sheet1", 1, 4, LiteralValue::Int(42))
+            .unwrap();
+        for (row, col, formula) in [
+            (1, 1, "=INDEX((A1,D1),1,1,2)"),
+            (2, 1, "=INDEX((A1:A2,D1:D2),1,1,2)"),
+            (50, 1, "=INDEX((A1:A100,D1:D100),1,1,2)"),
+            (1, 2, "=B100+1"),
+            (100, 2, "=INDEX((B:B,D:D),1,1,2)"),
+            (1, 3, "=INDEX(C1:C2,1,1,2)"),
+        ] {
+            engine
+                .set_cell_formula("Sheet1", row, col, parse(formula).unwrap())
+                .unwrap();
+        }
+        engine.evaluate_all().unwrap();
+        for (row, col, expected) in [
+            (1, 1, 42.0),
+            (2, 1, 42.0),
+            (50, 1, 42.0),
+            (100, 2, 42.0),
+            (1, 2, 43.0),
+        ] {
+            match engine.get_cell_value("Sheet1", row, col) {
+                Some(LiteralValue::Number(n)) => {
+                    assert_eq!(n, expected, "{label} R{row}C{col}")
+                }
+                Some(LiteralValue::Int(i)) => {
+                    assert_eq!(i as f64, expected, "{label} R{row}C{col}")
+                }
+                other => panic!("{label} Sheet1!R{row}C{col}: expected {expected}, got {other:?}"),
+            }
+        }
+        // Area 2 of a single range is outside it.
+        assert_error_in(&engine, &label, 1, 3, ExcelErrorKind::Ref);
+
+        engine
+            .set_cell_value("Sheet1", 1, 4, LiteralValue::Int(50))
+            .unwrap();
+        engine.evaluate_all().unwrap();
+        for (row, col) in [(1, 1), (2, 1), (50, 1), (100, 2)] {
+            assert_number(&engine, "Sheet1", row, col, 50.0);
+        }
+        assert_number(&engine, "Sheet1", 1, 2, 51.0);
+
+        let error = engine
+            .set_cell_formula("Sheet1", 3, 1, parse("=INDEX((A3,D1),1,1,1)").unwrap())
+            .unwrap_err();
+        assert_eq!(error.kind, ExcelErrorKind::Circ, "{label}");
+    }
+}
+
+#[test]
+fn index_through_a_volatile_name_recalculates_after_edits() {
+    // A name holding OFFSET is volatile like the function: what it refers to
+    // is known only when it is evaluated, so formulas using it recalculate
+    // every time and read the current value of the cell OFFSET reaches.
+    for (label, mut engine) in engines_in_every_mode() {
+        for (row, col, value) in [(1, 1, 10), (2, 1, 20), (1, 2, 1), (1, 4, 42)] {
+            engine
+                .set_cell_value("Sheet1", row, col, LiteralValue::Int(value))
+                .unwrap();
+        }
+        define_formula_name(
+            &mut engine,
+            "Dyn",
+            "=OFFSET(Sheet1!$A$1,Sheet1!$B$1,0),Sheet1!$D$1",
+        );
+        define_formula_name(&mut engine, "Shifted", "=OFFSET(Sheet1!$A$1,Sheet1!$B$1,0)");
+        for (row, formula) in [
+            (1, "=INDEX(Dyn,1,1,1)"),
+            (2, "=INDEX(Dyn,1,1,2)"),
+            (3, "=Shifted"),
+            (4, "=SUM(Shifted)"),
+        ] {
+            engine
+                .set_cell_formula("Sheet1", row, 6, parse(formula).unwrap())
+                .unwrap();
+        }
+        engine.evaluate_all().unwrap();
+        for (row, expected) in [(1, 20.0), (2, 42.0), (3, 20.0), (4, 20.0)] {
+            assert_number(&engine, "Sheet1", row, 6, expected);
+        }
+
+        engine
+            .set_cell_value("Sheet1", 2, 1, LiteralValue::Int(21))
+            .unwrap();
+        engine.evaluate_all().unwrap();
+        for (row, expected) in [(1, 21.0), (2, 42.0), (3, 21.0), (4, 21.0)] {
+            match engine.get_cell_value("Sheet1", row, 6) {
+                Some(LiteralValue::Number(n)) => assert_eq!(n, expected, "{label} row {row}"),
+                Some(LiteralValue::Int(i)) => {
+                    assert_eq!(i as f64, expected, "{label} row {row}")
+                }
+                other => panic!("{label} Sheet1!R{row}C6: expected {expected}, got {other:?}"),
+            }
+        }
+
+        engine
+            .set_cell_value("Sheet1", 1, 2, LiteralValue::Int(0))
+            .unwrap();
+        engine.evaluate_all().unwrap();
+        assert_number(&engine, "Sheet1", 1, 6, 10.0);
+        assert_number(&engine, "Sheet1", 3, 6, 10.0);
+    }
+}
+
+#[test]
+fn index_area_num_selects_an_area_of_an_intersection() {
+    // Space intersects references: (A1:B2,D1:E3) A2:E2 has the areas A2:B2
+    // and D2:E2, which area_num numbers like a union's; so does a name
+    // defined as such an intersection.
+    for mode in [
+        FormulaPlaneMode::Off,
+        FormulaPlaneMode::AuthoritativeExperimental,
+    ] {
+        let mut engine = multi_area_engine(mode);
+        define_formula_name(
+            &mut engine,
+            "Crossed",
+            "=(Sheet1!$A$1:$B$2,Sheet1!$D$1:$E$3) Sheet1!$A$2:$E$2",
+        );
+        for (row, formula) in [
+            (1, "=INDEX(((A1:B2,D1:E3) A2:E2),1,1,2)"),
+            (2, "=INDEX(((A1:B2,D1:E3) A2:E2),1,2,1)"),
+            (3, "=INDEX(Crossed,1,2,2)"),
+            (4, "=SUM(INDEX(((A1:B2,D1:E3) A1:E1),0,0,2))"),
+            (5, "=INDEX(((A1:B2,D1:E3) A2:E2),1,1,3)"),
+            (6, "=INDEX(((A1:B2,D1:E3) G1:G2),1,1)"),
+        ] {
+            engine
+                .set_cell_formula("Sheet1", row, 12, parse(formula).unwrap())
+                .unwrap();
+        }
+        engine.evaluate_all().unwrap();
+        assert_number(&engine, "Sheet1", 1, 12, 30.0);
+        assert_number(&engine, "Sheet1", 2, 12, 4.0);
+        assert_number(&engine, "Sheet1", 3, 12, 40.0);
+        assert_number(&engine, "Sheet1", 4, 12, 30.0);
+        assert_error(&engine, 5, 12, ExcelErrorKind::Ref);
+        assert_error(&engine, 6, 12, ExcelErrorKind::Null);
+
+        // Each area is a dependency.
+        engine
+            .set_cell_value("Sheet1", 2, 4, LiteralValue::Int(31))
+            .unwrap();
+        engine.evaluate_all().unwrap();
+        assert_number(&engine, "Sheet1", 1, 12, 31.0);
+    }
+}
+
 #[test]
 fn offset_whole_column_and_row_clamped() {
     let mut engine = new_engine();

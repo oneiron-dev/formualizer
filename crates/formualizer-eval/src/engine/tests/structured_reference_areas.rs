@@ -539,6 +539,81 @@ fn structured_references_compose_with_reference_operators() {
     assert_eq!(engine.get_cell_value("Other", 1, 1), Some(n(12.0)));
 }
 
+/// A structured reference in a union is the area it selects, so INDEX's
+/// area_num numbers it like an A1 range and ` ` intersects it like one
+/// (Sales[Item] is A2:A4, Sales[Qty] B2:B4, both on Sheet1).
+#[test]
+fn index_area_num_selects_among_structured_reference_areas() {
+    let mut engine = engine();
+    let n = LiteralValue::Number;
+    let text = |s: &str| LiteralValue::Text(s.into());
+    assert_eq!(
+        eval(&mut engine, 1, 7, "=INDEX((Sales[Item],Sales[Qty]),2,1,2)"),
+        n(2.0)
+    );
+    assert_eq!(
+        eval(&mut engine, 2, 7, "=INDEX((Sales[Item],Sales[Qty]),3,1)"),
+        text("c")
+    );
+    assert_eq!(
+        eval(&mut engine, 3, 7, "=INDEX((A2:A4,Sales[Qty]),3,1,2)"),
+        n(3.0)
+    );
+    assert_eq!(
+        eval(
+            &mut engine,
+            4,
+            7,
+            "=SUM(INDEX((Sales[Item],Sales[Qty]),0,1,2))"
+        ),
+        n(6.0)
+    );
+    // The intersection with row 3 has the areas A3 and B3.
+    assert_eq!(
+        eval(
+            &mut engine,
+            5,
+            7,
+            "=INDEX(((Sales[Item],Sales[Qty]) 3:3),1,1,2)"
+        ),
+        n(2.0)
+    );
+    assert_error(
+        eval(&mut engine, 6, 7, "=INDEX((Sales[Item],Sales[Qty]),1,1,3)"),
+        ExcelErrorKind::Ref,
+        "area past the last",
+    );
+
+    // From another sheet the table's areas stay on its sheet: with a plain
+    // reference to that sheet they are one union, with a cell of the
+    // formula's own sheet the areas lie on two sheets (#VALUE!).
+    engine.add_sheet("Other").unwrap();
+    for (row, formula) in [
+        (1, "=INDEX((Sheet1!A2:A4,Sales[Qty]),2,1,2)"),
+        (2, "=INDEX((Sales[Item],Sales[Qty]),3,1,2)"),
+        (3, "=INDEX((Sales[Qty],A1),1,1,1)"),
+    ] {
+        engine
+            .set_cell_formula("Other", row, 1, parse(formula).unwrap())
+            .unwrap();
+        engine.evaluate_cell("Other", row, 1).unwrap();
+    }
+    assert_eq!(engine.get_cell_value("Other", 1, 1), Some(n(2.0)));
+    assert_eq!(engine.get_cell_value("Other", 2, 1), Some(n(3.0)));
+    assert_error(
+        engine.get_cell_value("Other", 3, 1).unwrap(),
+        ExcelErrorKind::Value,
+        "areas on two sheets",
+    );
+
+    // Editing a cell of the selected area recalculates.
+    engine.set_cell_value("Sheet1", 3, 2, n(20.0)).unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(engine.get_cell_value("Sheet1", 1, 7), Some(n(20.0)));
+    assert_eq!(engine.get_cell_value("Sheet1", 5, 7), Some(n(20.0)));
+    assert_eq!(engine.get_cell_value("Other", 1, 1), Some(n(20.0)));
+}
+
 /// T at A1:C5 (A, B, C; totals row) with a formula in A3. A `#This Row`
 /// reference built at run time (INDIRECT) is read at the formula's row by
 /// CELL, ISFORMULA and FORMULATEXT, like the same reference written directly.

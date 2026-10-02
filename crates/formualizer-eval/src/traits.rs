@@ -1705,39 +1705,23 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
     }
 
     /// The areas of a multi-area reference argument, numbered in the order
-    /// written: a union such as `(A1:B2,D1:E2)` or a name defined as one.
-    /// `None` for any other argument, a single range included.
+    /// written: a union such as `(A1:B2,D1:E2)`, a name defined as one, or an
+    /// intersection with such a reference (see
+    /// [`Interpreter::evaluate_ast_as_areas`]). `None` for any other
+    /// argument, a single range included.
     pub(crate) fn reference_areas(&self) -> Option<Result<Vec<ReferenceType>, ExcelError>> {
-        // Only a union or a name can hold several areas; check the node itself
-        // before rebuilding an arena argument's AST.
-        let candidate = match &self.expr {
-            ArgumentExpr::Ast(node) => {
-                matches!(
-                    &node.node_type,
-                    ASTNodeType::BinaryOp { op, .. } if op == ","
-                ) || matches!(
-                    &node.node_type,
-                    ASTNodeType::Reference {
-                        reference: ReferenceType::NamedRange(_),
-                        ..
-                    }
-                )
-            }
-            ArgumentExpr::Arena { id, data_store, .. } => match data_store.get_node(*id) {
-                Some(crate::engine::arena::AstNodeData::BinaryOp { op_id, .. }) => {
-                    data_store.resolve_ast_string(*op_id) == ","
-                }
-                Some(crate::engine::arena::AstNodeData::Reference { ref_type, .. }) => matches!(
-                    ref_type,
-                    crate::engine::arena::CompactRefType::NamedRange(_)
-                ),
-                _ => false,
-            },
-        };
-        if !candidate {
-            return None;
+        match &self.expr {
+            ArgumentExpr::Ast(node) => self.interp.evaluate_ast_as_areas(node),
+            // The arena form keeps a legacy formula's argument contexts for a
+            // function inside the union.
+            ArgumentExpr::Arena {
+                id,
+                data_store,
+                sheet_registry,
+            } => self
+                .interp
+                .evaluate_arena_ast_as_areas(*id, data_store, sheet_registry),
         }
-        self.interp.evaluate_ast_as_areas(self.ast())
     }
 
     /* tiny validator helper for macro */

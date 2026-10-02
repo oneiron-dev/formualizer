@@ -849,6 +849,17 @@ impl DependencyGraph {
             self.add_range_dependent_edges(vertex, &range_dependencies, sheet_id);
         }
 
+        // A name whose formula holds a volatile function (OFFSET, INDIRECT,
+        // NOW, ...) is volatile, and so is every formula that uses it: what it
+        // reads is known only when it is evaluated (OFFSET's target is no
+        // dependency of the name), so it and its dependents recalculate every
+        // time, as a cell holding the formula would.
+        let volatile = matches!(
+            definition,
+            NamedDefinition::Formula { ast, .. } if self.is_ast_volatile(ast)
+        );
+        self.mark_volatile(vertex, volatile);
+
         Ok(dependencies
             .iter()
             .filter(|vid| {

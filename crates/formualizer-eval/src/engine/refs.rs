@@ -175,6 +175,175 @@ pub(crate) fn reference_only_argument(name: &str, index: usize, cell_info: Optio
         .any(|f| name.eq_ignore_ascii_case(f))
 }
 
+/// A constant INDEX selector (row_num, column_num or area_num) as the whole
+/// number INDEX reads it: a number, a logical or numeric text, truncated, with
+/// any leading signs. `None` for anything that is not such a constant (a cell,
+/// an array, date text, ...): its value is known only when the formula runs.
+pub(crate) fn static_index_value(value: &formualizer_common::LiteralValue) -> Option<i64> {
+    use formualizer_common::LiteralValue;
+    match value {
+        LiteralValue::Int(_)
+        | LiteralValue::Number(_)
+        | LiteralValue::Boolean(_)
+        | LiteralValue::Text(_) => crate::coercion::to_number_lenient(value)
+            .ok()
+            .filter(|number| number.is_finite())
+            .map(|number| number.trunc() as i64),
+        _ => None,
+    }
+}
+
+/// [`static_index_value`] of a selector written in a formula.
+pub(crate) fn static_index_tree(node: &ASTNode) -> Option<i64> {
+    match &node.node_type {
+        ASTNodeType::Literal(value) => static_index_value(value),
+        ASTNodeType::UnaryOp { op, expr } if op == "+" => static_index_tree(expr),
+        ASTNodeType::UnaryOp { op, expr } if op == "-" => static_index_tree(expr)?.checked_neg(),
+        _ => None,
+    }
+}
+
+fn static_index_arena(store: &DataStore, id: AstNodeId) -> Option<i64> {
+    match store.get_node(id)? {
+        AstNodeData::Literal(value) => static_index_value(&store.retrieve_value(*value)),
+        AstNodeData::UnaryOp { op_id, expr_id } => match store.resolve_ast_string(*op_id) {
+            "+" => static_index_arena(store, *expr_id),
+            "-" => static_index_arena(store, *expr_id)?.checked_neg(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The area INDEX selects when its area_num is constant: area 1 when absent
+/// or omitted.
+fn static_index_area(name: &str, arg_count: usize, area: Option<Option<i64>>) -> Option<i64> {
+    if !name.eq_ignore_ascii_case("INDEX") || !(2..=4).contains(&arg_count) {
+        return None;
+    }
+    area.unwrap_or(Some(1))
+}
+
+/// Numbers the operands of INDEX's reference argument (those of its `,`
+/// unions, in the order written) and keeps the ones INDEX may read. Areas are
+/// numbered while each operand is a cell or a range, one area each; an
+/// operand whose area is known and is not `area` is never read, because INDEX
+/// reads only the area it selects. From the first operand whose number of
+/// areas the formula alone does not settle (a name, which may be defined as
+/// several areas and be redefined later, a function, ...), every operand is
+/// kept. `single_area` gives a cell or range operand's sheet as written; the
+/// areas of a union lie on one sheet (it is `#VALUE!` otherwise), so operands
+/// are left out only when every cell or range names the same sheet, which the
+/// selected area then still ties the formula to. `None` when every operand
+/// is kept.
+fn index_read_operands<T: Copy, S: PartialEq>(
+    operands: &[T],
+    area: i64,
+    single_area: impl Fn(T) -> Option<S>,
+) -> Option<Vec<T>> {
+    let sheets: Vec<Option<S>> = operands
+        .iter()
+        .map(|&operand| single_area(operand))
+        .collect();
+    let mut written = sheets.iter().flatten();
+    if let Some(first) = written.next()
+        && written.any(|sheet| sheet != first)
+    {
+        return None;
+    }
+    let mut number = Some(1i64);
+    let mut read = Vec::with_capacity(operands.len());
+    for (&operand, sheet) in operands.iter().zip(&sheets) {
+        match number {
+            Some(current) if sheet.is_some() => {
+                if current == area {
+                    read.push(operand);
+                }
+                number = current.checked_add(1);
+            }
+            _ => {
+                read.push(operand);
+                number = None;
+            }
+        }
+    }
+    (read.len() < operands.len()).then_some(read)
+}
+
+/// The operands of INDEX's reference argument it may read (see
+/// [`index_read_operands`]); `None` when every one may be read.
+fn index_read_operands_tree<'a>(name: &str, args: &'a [ASTNode]) -> Option<Vec<&'a ASTNode>> {
+    let area = static_index_area(
+        name,
+        args.len(),
+        args.get(3).map(|area| match area.node_type {
+            ASTNodeType::Omitted => Some(1),
+            _ => static_index_tree(area),
+        }),
+    )?;
+    fn flatten<'a>(node: &'a ASTNode, out: &mut Vec<&'a ASTNode>) {
+        match &node.node_type {
+            ASTNodeType::BinaryOp { op, left, right } if op == "," => {
+                flatten(left, out);
+                flatten(right, out);
+            }
+            _ => out.push(node),
+        }
+    }
+    let mut operands = Vec::new();
+    flatten(&args[0], &mut operands);
+    index_read_operands(&operands, area, |operand: &ASTNode| {
+        match &operand.node_type {
+            ASTNodeType::Reference {
+                reference: ReferenceType::Cell { sheet, .. } | ReferenceType::Range { sheet, .. },
+                ..
+            } => Some(sheet.as_ref().map(|sheet| sheet.to_ascii_uppercase())),
+            _ => None,
+        }
+    })
+}
+
+/// The arena form of [`index_read_operands_tree`].
+fn index_read_operands_arena(
+    store: &DataStore,
+    name: &str,
+    args: &[AstNodeId],
+) -> Option<Vec<AstNodeId>> {
+    let area = static_index_area(
+        name,
+        args.len(),
+        args.get(3).map(|&area| match store.get_node(area) {
+            Some(AstNodeData::Omitted) => Some(1),
+            _ => static_index_arena(store, area),
+        }),
+    )?;
+    fn flatten(store: &DataStore, id: AstNodeId, out: &mut Vec<AstNodeId>) {
+        match store.get_node(id) {
+            Some(AstNodeData::BinaryOp {
+                op_id,
+                left_id,
+                right_id,
+            }) if store.resolve_ast_string(*op_id) == "," => {
+                let (left, right) = (*left_id, *right_id);
+                flatten(store, left, out);
+                flatten(store, right, out);
+            }
+            _ => out.push(id),
+        }
+    }
+    let mut operands = Vec::new();
+    flatten(store, args[0], &mut operands);
+    index_read_operands(&operands, area, |operand| match store.get_node(operand) {
+        Some(AstNodeData::Reference {
+            ref_type:
+                crate::engine::arena::CompactRefType::Cell { sheet, .. }
+                | crate::engine::arena::CompactRefType::Range { sheet, .. },
+            ..
+        }) => Some(*sheet),
+        _ => None,
+    })
+}
+
 fn tree_cell_info(name: &str, args: &[ASTNode]) -> Option<String> {
     if !name.eq_ignore_ascii_case("CELL") {
         return None;
@@ -271,7 +440,17 @@ pub(crate) fn visit_tree_references<C>(
                     }
                     _ => {
                         let cell_info = tree_cell_info(name, args);
+                        // INDEX reads only the area it selects.
+                        let index_operands = index_read_operands_tree(name, args);
                         for (index, arg) in args.iter().enumerate().rev() {
+                            if index == 0
+                                && let Some(operands) = &index_operands
+                            {
+                                for operand in operands.iter().rev() {
+                                    stack.push(Frame::Node(operand));
+                                }
+                                continue;
+                            }
                             // Names and tables keep their definition dependency.
                             if matches!(
                                 arg.node_type,
@@ -351,7 +530,25 @@ pub(crate) fn visit_arena_references<C>(
             } else {
                 None
             };
+            // INDEX reads only the area it selects.
+            let index_operands = store
+                .get_args(ast_id)
+                .and_then(|args| index_read_operands_arena(store, &name, args));
             for index in 0..arg_count {
+                if index == 0
+                    && let Some(operands) = &index_operands
+                {
+                    for &operand in operands {
+                        visit_arena_references(
+                            operand,
+                            context,
+                            data_store,
+                            sheet_registry,
+                            visitor,
+                        )?;
+                    }
+                    continue;
+                }
                 let store = data_store(context);
                 let child = store.get_args(ast_id).expect("args disappeared")[index];
                 if matches!(
@@ -452,6 +649,90 @@ mod tests {
         assert!(seen.0[7].starts_with("table:Table1"));
         assert!(seen.0[8].starts_with("external:"));
         assert_eq!(seen.0[9], "3d");
+    }
+
+    struct Arena<'s> {
+        seen: Seen,
+        store: &'s DataStore,
+        sheets: &'s SheetRegistry,
+    }
+
+    fn arena_store<'a>(arena: &'a Arena<'_>) -> &'a DataStore {
+        arena.store
+    }
+
+    fn arena_sheets<'a>(arena: &'a Arena<'_>) -> &'a SheetRegistry {
+        arena.sheets
+    }
+
+    fn record_arena(
+        arena: &mut Arena<'_>,
+        reference: SemanticReference<'_>,
+    ) -> Result<(), ExcelError> {
+        record(&mut arena.seen, reference)
+    }
+
+    #[test]
+    fn index_reads_only_the_area_it_selects() {
+        // With a constant area_num (1 when absent), an area of INDEX's union
+        // that is numbered and not selected is no dependency. A name may hold
+        // several areas, so the areas from it on stay dependencies; so do all
+        // of them when area_num is known only at run time.
+        let cases: [(&str, &[&str]); 13] = [
+            ("=INDEX((A1,B1:B2,C1),1,1,2)", &["finite"]),
+            ("=INDEX((A1,B1:B2,C1),1,1,\"3\")", &["cell:Current:1:3"]),
+            ("=INDEX((A1,B1:B2,C1),1,1,TRUE)", &["cell:Current:1:1"]),
+            ("=INDEX((A1,B1),1,1)", &["cell:Current:1:1"]),
+            ("=INDEX((A1,B1),1,1,)", &["cell:Current:1:1"]),
+            ("=INDEX(((A1,B1),C1),1,1,-(-3))", &["cell:Current:1:3"]),
+            ("=INDEX(A1:A3,1,1,2)", &[]),
+            (
+                "=INDEX((A1,Areas,C1),1,1,2)",
+                &["name:Areas", "cell:Current:1:3"],
+            ),
+            (
+                "=INDEX((A1,B1),1,1,F1)",
+                &["cell:Current:1:1", "cell:Current:1:2", "cell:Current:1:6"],
+            ),
+            (
+                "=INDEX(((A1,B1) A1:B1),1,1,2)",
+                &["cell:Current:1:1", "cell:Current:1:2", "finite"],
+            ),
+            (
+                "=SUM(A1,B1)+INDEX((C1,D1),1,1,2)",
+                &["cell", "cell", "cell:Current:1:4"],
+            ),
+            // Areas on different sheets make the union #VALUE!: all are kept.
+            ("=INDEX((A1,Data!B1),1,1,1)", &["cell:Current", "cell:Name"]),
+            (
+                "=INDEX((Data!A1,Data!B1),1,1,1)",
+                &["cell:Name(\"Data\"):1:1"],
+            ),
+        ];
+        let sheets = SheetRegistry::new();
+        let mut store = DataStore::new();
+        for (formula, expected) in cases {
+            let ast = parse(formula).unwrap();
+            let mut seen = Seen::default();
+            visit_tree_references(&ast, &mut seen, no_bindings, record).unwrap();
+            assert_eq!(seen.0.len(), expected.len(), "{formula}: {:?}", seen.0);
+            for (label, prefix) in seen.0.iter().zip(expected) {
+                assert!(label.starts_with(prefix), "{formula}: {label} vs {prefix}");
+            }
+
+            let id = store.store_ast(&ast, &sheets);
+            let mut arena = Arena {
+                seen: Seen::default(),
+                store: &store,
+                sheets: &sheets,
+            };
+            visit_arena_references(id, &mut arena, arena_store, arena_sheets, record_arena)
+                .unwrap();
+            assert_eq!(arena.seen.0.len(), expected.len(), "arena {formula}");
+            for (label, prefix) in arena.seen.0.iter().zip(expected) {
+                assert!(label.starts_with(prefix), "arena {formula}: {label}");
+            }
+        }
     }
 
     #[test]

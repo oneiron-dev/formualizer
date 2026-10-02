@@ -474,46 +474,35 @@ impl<'a> Interpreter<'a> {
 
     /// The areas of a multi-area reference, numbered in the order they are
     /// written: a union of references joined by the `,` reference operator
-    /// (`(A1:B2,D1:E2)`), or a name defined as one. `None` for anything else,
-    /// a single range included. Each area evaluates as a reference, and the
-    /// first that fails is the result. A union's areas must lie on one sheet,
-    /// so areas on different sheets are `#VALUE!`.
+    /// (`(A1:B2,D1:E2)`), a name defined as one, or the intersection (the ` `
+    /// operator) of such a reference with another, which holds each area's
+    /// overlap with each area of the other. `None` for anything else, a single
+    /// range included. Each area evaluates as a reference (a structured
+    /// reference as the cells it selects), and the first that fails is the
+    /// result. A union's areas must lie on one sheet, so areas on
+    /// different sheets are `#VALUE!`; an intersection with no overlap is
+    /// `#NULL!`.
     pub(crate) fn evaluate_ast_as_areas(
         &self,
         node: &ASTNode,
     ) -> Option<Result<Vec<ReferenceType>, ExcelError>> {
+        // A single area is the cells it selects: a structured reference is
+        // its A1 area on the table's sheet, as for `:` and ` `.
+        let side = |side: &ASTNode| match self.evaluate_ast_as_areas(side) {
+            Some(areas) => areas,
+            None => self
+                .evaluate_ast_as_reference(side)
+                .and_then(|area| self.reference_as_area(area))
+                .map(|area| vec![area]),
+        };
         match &node.node_type {
             ASTNodeType::BinaryOp { op, left, right } if op == "," => {
-                let mut areas = Vec::new();
-                for side in [left.as_ref(), right.as_ref()] {
-                    let side_areas = match self.evaluate_ast_as_areas(side) {
-                        Some(side_areas) => side_areas,
-                        None => self.evaluate_ast_as_reference(side).map(|area| vec![area]),
-                    };
-                    match side_areas {
-                        Ok(side_areas) => areas.extend(side_areas),
-                        Err(error) => return Some(Err(error)),
-                    }
-                }
-                let sheet_of = |area: &ReferenceType| -> String {
-                    match area {
-                        ReferenceType::Cell {
-                            sheet: Some(sheet), ..
-                        }
-                        | ReferenceType::Range {
-                            sheet: Some(sheet), ..
-                        } => sheet.clone(),
-                        _ => self.current_sheet.to_string(),
-                    }
-                };
-                let mut sheets = areas.iter().map(sheet_of);
-                if let Some(first) = sheets.next()
-                    && sheets.any(|sheet| !sheet.eq_ignore_ascii_case(&first))
-                {
-                    return Some(Err(ExcelError::new(ExcelErrorKind::Value)
-                        .with_message("The areas of a reference must lie on one sheet")));
-                }
-                Some(Ok(areas))
+                Some(self.union_areas(side(left), || side(right)))
+            }
+            ASTNodeType::BinaryOp { op, left, right }
+                if op == " " && (self.may_have_areas(left) || self.may_have_areas(right)) =>
+            {
+                Some(Self::intersect_areas(side(left), || side(right)))
             }
             ASTNodeType::Reference {
                 reference: ReferenceType::NamedRange(name),
@@ -523,6 +512,154 @@ impl<'a> Interpreter<'a> {
             }
             _ => None,
         }
+    }
+
+    /// The arena form of [`Self::evaluate_ast_as_areas`]. An area that is a
+    /// function call evaluates with its arguments in the context a legacy
+    /// formula gives them, as anywhere else in the formula
+    /// ([`Self::with_arena_call_handles`]).
+    pub(crate) fn evaluate_arena_ast_as_areas(
+        &self,
+        node_id: AstNodeId,
+        data_store: &DataStore,
+        sheet_registry: &SheetRegistry,
+    ) -> Option<Result<Vec<ReferenceType>, ExcelError>> {
+        let side = |side: AstNodeId| match self.evaluate_arena_ast_as_areas(
+            side,
+            data_store,
+            sheet_registry,
+        ) {
+            Some(areas) => areas,
+            None => self
+                .evaluate_arena_ast_as_reference(side, data_store, sheet_registry)
+                .and_then(|area| self.reference_as_area(area))
+                .map(|area| vec![area]),
+        };
+        match data_store.get_node(node_id)? {
+            AstNodeData::BinaryOp {
+                op_id,
+                left_id,
+                right_id,
+            } => match data_store.resolve_ast_string(*op_id) {
+                "," => Some(self.union_areas(side(*left_id), || side(*right_id))),
+                " " if self.arena_may_have_areas(*left_id, data_store, sheet_registry)
+                    || self.arena_may_have_areas(*right_id, data_store, sheet_registry) =>
+                {
+                    Some(Self::intersect_areas(side(*left_id), || side(*right_id)))
+                }
+                _ => None,
+            },
+            AstNodeData::Reference {
+                ref_type: ref_type @ CompactRefType::NamedRange(_),
+                ..
+            } => match data_store.reconstruct_reference_type_for_eval(ref_type, sheet_registry) {
+                ReferenceType::NamedRange(name) if self.resolve_local_name(&name).is_none() => {
+                    self.context.resolve_name_areas(&name, self.current_sheet)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether a reference expression can hold several areas: a union, a name
+    /// (which may be defined as one) or an intersection involving either.
+    fn may_have_areas(&self, node: &ASTNode) -> bool {
+        match &node.node_type {
+            ASTNodeType::BinaryOp { op, .. } if op == "," => true,
+            ASTNodeType::BinaryOp { op, left, right } if op == " " => {
+                self.may_have_areas(left) || self.may_have_areas(right)
+            }
+            ASTNodeType::Reference {
+                reference: ReferenceType::NamedRange(name),
+                ..
+            } => self.resolve_local_name(name).is_none(),
+            _ => false,
+        }
+    }
+
+    /// The arena form of [`Self::may_have_areas`].
+    fn arena_may_have_areas(
+        &self,
+        node_id: AstNodeId,
+        data_store: &DataStore,
+        sheet_registry: &SheetRegistry,
+    ) -> bool {
+        match data_store.get_node(node_id) {
+            Some(AstNodeData::BinaryOp {
+                op_id,
+                left_id,
+                right_id,
+            }) => match data_store.resolve_ast_string(*op_id) {
+                "," => true,
+                " " => {
+                    self.arena_may_have_areas(*left_id, data_store, sheet_registry)
+                        || self.arena_may_have_areas(*right_id, data_store, sheet_registry)
+                }
+                _ => false,
+            },
+            Some(AstNodeData::Reference {
+                ref_type: ref_type @ CompactRefType::NamedRange(_),
+                ..
+            }) => match data_store.reconstruct_reference_type_for_eval(ref_type, sheet_registry) {
+                ReferenceType::NamedRange(name) => self.resolve_local_name(&name).is_none(),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// The areas of a `,` union of `left` and `right`: those of `left`, then
+    /// those of `right`, all on one sheet (`#VALUE!` otherwise).
+    fn union_areas(
+        &self,
+        left: Result<Vec<ReferenceType>, ExcelError>,
+        right: impl FnOnce() -> Result<Vec<ReferenceType>, ExcelError>,
+    ) -> Result<Vec<ReferenceType>, ExcelError> {
+        let mut areas = left?;
+        areas.extend(right()?);
+        let sheet_of = |area: &ReferenceType| -> String {
+            match area {
+                ReferenceType::Cell {
+                    sheet: Some(sheet), ..
+                }
+                | ReferenceType::Range {
+                    sheet: Some(sheet), ..
+                } => sheet.clone(),
+                _ => self.current_sheet.to_string(),
+            }
+        };
+        let mut sheets = areas.iter().map(sheet_of);
+        if let Some(first) = sheets.next()
+            && sheets.any(|sheet| !sheet.eq_ignore_ascii_case(&first))
+        {
+            return Err(ExcelError::new(ExcelErrorKind::Value)
+                .with_message("The areas of a reference must lie on one sheet"));
+        }
+        Ok(areas)
+    }
+
+    /// The areas of the intersection of `left` and `right`: the overlap of
+    /// each area of `left` with each area of `right`, in that order, leaving
+    /// out the pairs that do not overlap (`#NULL!` when none does).
+    fn intersect_areas(
+        left: Result<Vec<ReferenceType>, ExcelError>,
+        right: impl FnOnce() -> Result<Vec<ReferenceType>, ExcelError>,
+    ) -> Result<Vec<ReferenceType>, ExcelError> {
+        let left = left?;
+        let right = right()?;
+        let mut areas = Vec::new();
+        for left in &left {
+            for right in &right {
+                if let Some(area) = crate::reference::intersect_references(left, right)? {
+                    areas.push(area);
+                }
+            }
+        }
+        if areas.is_empty() {
+            return Err(ExcelError::new(ExcelErrorKind::Null));
+        }
+        Ok(areas)
     }
 
     pub(crate) fn try_evaluate_ast_as_reference(

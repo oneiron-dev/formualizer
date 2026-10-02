@@ -1,6 +1,5 @@
 use super::*;
 use crate::engine::used_extent::{ExtentPolicy, OpenRangeBounds, resolve_used_extent};
-use formualizer_common::LiteralValue;
 use formualizer_parse::parser::{ASTNode, ASTNodeType, ReferenceType};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -383,17 +382,9 @@ impl DependencyGraph {
             return RangeSelfUse::IncludedOrUnknown;
         };
 
-        fn static_index(node: &ASTNode) -> Option<i64> {
-            match &node.node_type {
-                ASTNodeType::Literal(LiteralValue::Int(value)) => Some(*value),
-                ASTNodeType::Literal(LiteralValue::Number(value)) if value.is_finite() => {
-                    Some(*value as i64)
-                }
-                ASTNodeType::UnaryOp { op, expr } if op == "+" => static_index(expr),
-                ASTNodeType::UnaryOp { op, expr } if op == "-" => static_index(expr)?.checked_neg(),
-                _ => None,
-            }
-        }
+        // A constant selector reads as INDEX reads it at run time (numbers,
+        // logicals and numeric text, truncated).
+        use crate::engine::refs::static_index_tree as static_index;
 
         fn matching_range(
             graph: &DependencyGraph,
@@ -493,15 +484,60 @@ impl DependencyGraph {
             Some(contains)
         }
 
-        /// The areas of INDEX's reference in the order written: those of a
-        /// `,` union, or the reference itself.
-        fn union_areas<'n>(node: &'n ASTNode, areas: &mut Vec<&'n ASTNode>) {
+        /// The operands of INDEX's reference in the order written: those of
+        /// a `,` union, or the reference itself.
+        fn union_operands<'n>(node: &'n ASTNode, operands: &mut Vec<&'n ASTNode>) {
             match &node.node_type {
                 ASTNodeType::BinaryOp { op, left, right } if op == "," => {
-                    union_areas(left, areas);
-                    union_areas(right, areas);
+                    union_operands(left, operands);
+                    union_operands(right, operands);
                 }
-                _ => areas.push(node),
+                _ => operands.push(node),
+            }
+        }
+
+        /// How many areas a reference operand has, when the workbook fixes
+        /// it: a cell or a range is one area, a `,` union adds up its
+        /// operands, and a name has the areas of its definition, read on the
+        /// name's own sheet when it is a sheet-level name. `None` for
+        /// anything else (a function, an intersection, a constant, ...).
+        fn static_area_count(
+            graph: &DependencyGraph,
+            node: &ASTNode,
+            sheet: SheetId,
+            depth: u8,
+        ) -> Option<i64> {
+            use crate::engine::named_range::{NameScope, NamedDefinition};
+            if depth > 16 {
+                return None;
+            }
+            match &node.node_type {
+                ASTNodeType::BinaryOp { op, left, right } if op == "," => {
+                    static_area_count(graph, left, sheet, depth + 1)?
+                        .checked_add(static_area_count(graph, right, sheet, depth + 1)?)
+                }
+                ASTNodeType::Reference {
+                    reference: ReferenceType::Cell { .. } | ReferenceType::Range { .. },
+                    ..
+                } => Some(1),
+                ASTNodeType::Reference {
+                    reference: ReferenceType::NamedRange(name),
+                    ..
+                } => {
+                    let named = graph.resolve_name_entry(name, sheet)?;
+                    match &named.definition {
+                        NamedDefinition::Cell(_) | NamedDefinition::Range(_) => Some(1),
+                        NamedDefinition::Formula { ast, .. } => {
+                            let sheet = match named.scope {
+                                NameScope::Sheet(id) => id,
+                                NameScope::Workbook => sheet,
+                            };
+                            static_area_count(graph, ast, sheet, depth + 1)
+                        }
+                        NamedDefinition::Literal(_) => None,
+                    }
+                }
+                _ => None,
             }
         }
 
@@ -545,20 +581,32 @@ impl DependencyGraph {
                             None
                         }
                     });
-                    let mut areas = Vec::new();
-                    union_areas(&args[0], &mut areas);
+                    // The areas are numbered as the formula runs: a name in the
+                    // union contributes every area of its definition. Past an
+                    // operand whose areas are not fixed, the numbers are unknown.
+                    let mut operands = Vec::new();
+                    union_operands(&args[0], &mut operands);
+                    let sheet = graph.get_vertex_sheet_id(dependent);
+                    let mut first = Some(1i64);
                     let mut use_kind = RangeSelfUse::NoMatch;
-                    for (number, node) in (1..).zip(areas) {
-                        use_kind = use_kind.merge(match area {
-                            Some(area) if area == number => {
-                                visit(graph, node, dependent, range_sheet, range, selection)
-                            }
-                            Some(_)
-                                if matching_range(graph, node, dependent, range_sheet, range) =>
-                            {
-                                RangeSelfUse::Excluded
-                            }
-                            _ => visit(graph, node, dependent, range_sheet, range, None),
+                    for node in operands {
+                        let numbers = first.and_then(|first| {
+                            let count = static_area_count(graph, node, sheet, 0)?;
+                            Some(first..first.checked_add(count)?)
+                        });
+                        first = numbers.as_ref().map(|numbers| numbers.end);
+                        let selected = match (area, &numbers) {
+                            (Some(area), Some(numbers)) => numbers.contains(&area),
+                            _ => true,
+                        };
+                        use_kind = use_kind.merge(if selected {
+                            // Whichever area INDEX selects, row_num and
+                            // column_num select within it.
+                            visit(graph, node, dependent, range_sheet, range, selection)
+                        } else if matching_range(graph, node, dependent, range_sheet, range) {
+                            RangeSelfUse::Excluded
+                        } else {
+                            visit(graph, node, dependent, range_sheet, range, None)
                         });
                     }
                     for arg in &args[1..] {
