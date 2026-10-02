@@ -445,6 +445,12 @@ impl<'a> RangeView<'a> {
         &self.sheet().name
     }
 
+    /// Whether this view reads a workbook sheet's cells, rather than values
+    /// materialized for it (an array constant or a computed array).
+    pub(crate) fn is_sheet_backed(&self) -> bool {
+        matches!(self.backing, RangeBacking::Borrowed(_))
+    }
+
     pub fn kind_probe(&self) -> RangeKind {
         if self.is_empty() {
             return RangeKind::Empty;

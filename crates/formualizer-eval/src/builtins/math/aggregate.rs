@@ -22,6 +22,11 @@ pub struct SumFn;
 /// # Remarks
 /// - If any argument evaluates to an error, `SUM` propagates the first error it encounters.
 /// - Unparseable text literals (e.g., `"foo"`) will result in a `#VALUE!` error.
+/// - Numbers are added in order, a range row by row. Like a formula's final
+///   `+`/`-`, the addition of the last number of a cell or range argument
+///   compensates a cancellation to exactly 0 (`SUM(A1:A3)` is 0 for 123.45,
+///   56.78 and -180.23); values given directly, such as
+///   `SUM(123.45,56.78,-180.23)`, are added without compensation.
 ///
 /// # Examples
 ///
@@ -110,12 +115,38 @@ impl Function for SumFn {
                         }
                     }
 
+                    // Excel adds a range's numbers one by one, row by row, and
+                    // compensates its addition of a reference's last number
+                    // like a formula's final `+` (Microsoft, "Example when a
+                    // value reaches zero"): for 2.558, -1.333 and -1.225 in
+                    // A1:A3, SUM(A1:A3), SUM(A1,A2,A3) and SUM(A1,A2,A3,0) are
+                    // 0. A cancellation before a reference's last number is
+                    // kept (a range ending in a 0 cell keeps its 5.68E-14), and
+                    // so is one by a value given directly: SUM(A1,--A2,--A3)
+                    // and SUM(2.558-1.333,-1.225) keep -2.22E-16. An array is
+                    // such a value.
+                    let mut last = None;
                     for res in view.numbers_slices() {
-                        let (_, _, num_cols) = res?;
-                        for col in num_cols {
-                            total += arrow::compute::kernels::aggregate::sum(col.as_ref())
-                                .unwrap_or(0.0);
+                        let (_, row_len, num_cols) = res?;
+                        let cols: Vec<&arrow_array::Float64Array> = num_cols
+                            .iter()
+                            .map(|col| col.as_ref())
+                            .filter(|col| col.null_count() < col.len())
+                            .collect();
+                        for row in 0..row_len {
+                            for col in &cols {
+                                if col.is_valid(row) {
+                                    let value = col.value(row);
+                                    last = Some((total, value));
+                                    total += value;
+                                }
+                            }
                         }
+                    }
+                    if let Some((before, value)) = last
+                        && arg.resolved_as_reference()
+                    {
+                        total = crate::coercion::snap_cancellation(total, before, value);
                     }
                 }
                 AggregateArgument::ReferenceError(e) => {

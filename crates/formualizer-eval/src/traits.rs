@@ -1224,6 +1224,22 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         resolved
     }
 
+    /// Whether this argument, once resolved ([`Self::resolve_once`] or
+    /// [`Self::resolve_reference_or_value`]), is a reference: a cell, a range,
+    /// a name for one, a function returning one or an expression whose value
+    /// reads a sheet's cells (an intersection, a name bound by LET), rather
+    /// than a value such as a number, a computed result or an array. False
+    /// before resolution.
+    pub(crate) fn resolved_as_reference(&self) -> bool {
+        match self.cached_reference_or_value.get() {
+            Some(Ok(crate::function::FunctionResolution::Reference(_))) => true,
+            Some(Ok(crate::function::FunctionResolution::Value(CalcValue::Range(view)))) => {
+                view.is_sheet_backed()
+            }
+            _ => false,
+        }
+    }
+
     fn compute_reference_or_value(
         &self,
     ) -> Result<crate::function::FunctionResolution<'b>, ExcelError> {
