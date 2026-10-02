@@ -26,7 +26,9 @@ pub struct RowFn;
 /// # Remarks
 /// - With a multi-row range argument, `ROW` returns the vertical array of its row numbers.
 /// - Without arguments, it uses the row of the formula cell.
-/// - Full-column references such as `A:A` return `1`.
+/// - Full-column references such as `A:A` return `1` as a single value; as an
+///   array, the row numbers of the rows read for whole columns (through the
+///   sheet's last used row), aligned with the column's values.
 /// - Invalid references return an error (`#REF!`/`#VALUE!` depending on context).
 /// - A computed value instead of a reference (`IF(A1:C1<>"",A1:C1)` in an array
 ///   formula) gives, element by element, the element's error or `#VALUE!`.
@@ -144,17 +146,16 @@ impl Function for RowFn {
         // Row numbers (1-based) spanned by the reference.
         let (first, last) = match &reference {
             ReferenceType::Cell { row, .. } => (*row as i64, *row as i64),
+            // A whole column (A:A) starts at row 1 and ends where it is read.
             ReferenceType::Range {
-                start_row: Some(sr),
-                end_row,
-                ..
-            } => (*sr as i64, end_row.map_or(*sr as i64, |er| er as i64)),
-            // Full-column references like A:A use first row
-            ReferenceType::Range {
-                start_row: None,
-                end_row: None,
-                ..
-            } => (1, 1),
+                start_row, end_row, ..
+            } => {
+                let first = start_row.map_or(1, i64::from);
+                (
+                    first,
+                    open_axis_end(&args[0], &reference, *end_row, first, true, ctx)?,
+                )
+            }
             // Fallback: resolve the reference and use the view extent
             _ => match ctx.resolve_range_view(&reference, ctx.current_sheet()) {
                 Ok(view) => {
@@ -342,7 +343,9 @@ pub struct ColumnFn;
 /// # Remarks
 /// - With a range argument, `COLUMN` returns the first column in that reference.
 /// - Without arguments, it uses the column of the formula cell.
-/// - Full-row references such as `5:5` return `1`.
+/// - Full-row references such as `5:5` return `1` as a single value; as an
+///   array, the column numbers of the columns read for whole rows (through the
+///   sheet's last used column), aligned with the row's values.
 /// - Invalid references return an error (`#REF!`/`#VALUE!` depending on context).
 /// - A computed value instead of a reference (`IF(A1:C1<>"",A1:C1)` in an array
 ///   formula) gives, element by element, the element's error or `#VALUE!`.
@@ -460,17 +463,16 @@ impl Function for ColumnFn {
         // Column numbers (1-based) spanned by the reference.
         let (first, last) = match &reference {
             ReferenceType::Cell { col, .. } => (*col as i64, *col as i64),
+            // A whole row (5:5) starts at column 1 and ends where it is read.
             ReferenceType::Range {
-                start_col: Some(sc),
-                end_col,
-                ..
-            } => (*sc as i64, end_col.map_or(*sc as i64, |ec| ec as i64)),
-            // Full-row references like 1:1 use first column
-            ReferenceType::Range {
-                start_col: None,
-                end_col: None,
-                ..
-            } => (1, 1),
+                start_col, end_col, ..
+            } => {
+                let first = start_col.map_or(1, i64::from);
+                (
+                    first,
+                    open_axis_end(&args[0], &reference, *end_col, first, false, ctx)?,
+                )
+            }
             // Fallback: resolve the reference and use the view extent
             _ => match ctx.resolve_range_view(&reference, ctx.current_sheet()) {
                 Ok(view) => {
@@ -572,6 +574,42 @@ fn non_reference_result<'b>(
         ),
         other => crate::traits::CalcValue::Scalar(element(other)),
     })
+}
+
+/// The last row (`rows`) or column index of `reference`, a range whose axis
+/// ends at `end` or, for a whole column (row) such as `A:A` (`5:5`), runs to
+/// the sheet's end. Evaluated as an array, such an axis gives the indexes of
+/// the cells the engine reads for it: whole columns of a sheet all end at the
+/// sheet's last used row (whole rows at its last used column), so `ROW(A:A)`
+/// lines up element by element with `A:A`'s values, as in
+/// `SMALL(IF(A:A="x",ROW(A:A)),2)`. As a single value only `first` is needed,
+/// as it is when the context cannot read the whole axis. Only cancellation
+/// is an error.
+fn open_axis_end(
+    arg: &ArgumentHandle<'_, '_>,
+    reference: &ReferenceType,
+    end: Option<u32>,
+    first: i64,
+    rows: bool,
+    ctx: &dyn FunctionContext<'_>,
+) -> Result<i64, ExcelError> {
+    if let Some(end) = end {
+        return Ok(i64::from(end));
+    }
+    if arg.in_legacy_value_context() {
+        return Ok(first);
+    }
+    let view = match ctx.resolve_range_view(reference, ctx.current_sheet()) {
+        Ok(view) if !view.is_empty() => view,
+        Err(error) if error.kind == ExcelErrorKind::Cancelled => return Err(error),
+        _ => return Ok(first),
+    };
+    let (start, len) = if rows {
+        (view.start_row(), view.dims().0)
+    } else {
+        (view.start_col(), view.dims().1)
+    };
+    Ok((start as i64 + len as i64).max(first))
 }
 
 /// ROW/COLUMN result: a single index, or for a multi-row (multi-column)
@@ -815,12 +853,12 @@ mod tests {
     }
 
     #[test]
-    fn row_full_column_reference_returns_first_row() {
+    fn row_full_column_reference_returns_first_row_as_a_single_value() {
         let wb = TestWorkbook::new().with_function(Arc::new(RowFn));
-        let ctx = wb.interpreter();
+        let ctx = wb.interpreter().as_legacy_formula();
         let f = ctx.context.get_function("", "ROW").unwrap();
 
-        // ROW(A:A) -> 1
+        // ROW(A:A) -> 1 in a formula entered without the array flag
         let col_range_ref = ASTNode::new(
             ASTNodeType::Reference {
                 original: "A:A".into(),
@@ -1031,12 +1069,12 @@ mod tests {
     }
 
     #[test]
-    fn column_full_row_reference_returns_first_column() {
+    fn column_full_row_reference_returns_first_column_as_a_single_value() {
         let wb = TestWorkbook::new().with_function(Arc::new(ColumnFn));
-        let ctx = wb.interpreter();
+        let ctx = wb.interpreter().as_legacy_formula();
         let f = ctx.context.get_function("", "COLUMN").unwrap();
 
-        // COLUMN(5:5) -> 1
+        // COLUMN(5:5) -> 1 in a formula entered without the array flag
         let row_range_ref = ASTNode::new(
             ASTNodeType::Reference {
                 original: "5:5".into(),

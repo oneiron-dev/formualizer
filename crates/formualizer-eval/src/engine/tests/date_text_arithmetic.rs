@@ -248,6 +248,39 @@ fn datevalue_month_name_text_ignores_only_surrounding_spaces() {
 }
 
 #[test]
+fn datevalue_ignores_the_time_in_date_and_time_text() {
+    // Microsoft's DATEVALUE: "Time information in the date_text argument is
+    // ignored." DATEVALUE("1/2/2023 6:00") is 44928.
+    for formula in [
+        "=DATEVALUE(\"1/2/2023 6:00\")",
+        "=DATEVALUE(\" 1/2/2023 6:00 \")",
+        "=DATEVALUE(\"1/2/2023 6:00 PM\")",
+        "=DATEVALUE(\"1/2/2023 23:59:59\")",
+        "=DATEVALUE(\"2023-01-02 06:00\")",
+        "=DATEVALUE(\"Jan 2, 2023 6:00\")",
+    ] {
+        assert_eq!(
+            eval_formula(DateSystem::Excel1900, formula)
+                .as_serial_number_for(DateSystem::Excel1900),
+            Some(44928.0),
+            "{formula}"
+        );
+    }
+    // The text must still be date and time text, with only spaces around it.
+    for formula in [
+        "=DATEVALUE(\"1/2/2023 6:00\"&CHAR(10))",
+        "=DATEVALUE(\"1/2/2023 6:00 XM\")",
+    ] {
+        assert_expected(
+            DateSystem::Excel1900,
+            formula,
+            "rule: not date text",
+            Expected::Error(ExcelErrorKind::Value),
+        );
+    }
+}
+
+#[test]
 fn criteria_read_linefeed_text_as_text_like_the_cells() {
     // A3 holds the text "5"&CHAR(10), which is not numeric text. As a
     // criterion it is the same text, so a cell matches its own value, and it
@@ -330,6 +363,52 @@ fn currency_and_parenthesized_numeric_text_is_a_number() {
         ("=\"inf\"+0", Expected::Error(ExcelErrorKind::Value)),
     ] {
         assert_expected(DateSystem::Excel1900, formula, "en-US currency", expected);
+    }
+}
+
+#[test]
+fn criteria_keep_nonprinting_characters_and_quote_marks_like_the_cells() {
+    // A1 holds CHAR(10)&"=5": the line feed is a character of the text, not
+    // whitespace before an "=" operator, so the criterion A1 matches A1 and
+    // not the number 5. Likewise "TRUE"&CHAR(10) is no logical, and quote
+    // marks are characters of the text they stand in.
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    let sheet = "Sheet1";
+    for (row, value) in [
+        (1, LiteralValue::Text("\n=5".into())),
+        (2, LiteralValue::Number(5.0)),
+        (3, LiteralValue::Text("TRUE\n".into())),
+        (4, LiteralValue::Boolean(true)),
+        (5, LiteralValue::Text("\"x\"".into())),
+        (6, LiteralValue::Text("x".into())),
+    ] {
+        engine.set_cell_value(sheet, row, 1, value).unwrap();
+    }
+    let cases = [
+        ("=COUNTIF(A1,A1)", 1.0),
+        ("=COUNTIF(A2,A1)", 0.0),
+        ("=COUNTIF(A1:A6,CHAR(10)&\"=5\")", 1.0),
+        ("=COUNTIFS(A1:A6,A1)", 1.0),
+        ("=COUNTIF(A3,A3)", 1.0),
+        ("=COUNTIF(A4,A3)", 0.0),
+        ("=COUNTIF(A1:A6,CHAR(9)&\"TRUE\")", 0.0),
+        ("=COUNTIF(A5,A5)", 1.0),
+        ("=COUNTIF(A1:A6,\"\"\"x\"\"\")", 1.0),
+        ("=COUNTIF(A1:A6,\"=\"\"x\"\"\")", 1.0),
+        ("=COUNTIF(A1:A6,\"x\")", 1.0),
+    ];
+    for (row, (formula, _)) in (10u32..).zip(cases.iter()) {
+        engine
+            .set_cell_formula(sheet, row, 1, parse(formula).unwrap())
+            .unwrap();
+    }
+    engine.evaluate_all().unwrap();
+    for (row, (formula, expected)) in (10u32..).zip(cases.iter()) {
+        assert_eq!(
+            engine.get_cell_value(sheet, row, 1),
+            Some(LiteralValue::Number(*expected)),
+            "{formula}"
+        );
     }
 }
 
@@ -714,7 +793,7 @@ fn functions_with_their_own_dispatch_read_date_text_in_the_workbook_context() {
         spill_at_clock(
             DateSystem::Excel1904,
             (2026, 10, 2),
-            "=MAKEARRAY(\"1/2/1904\",1,LAMBDA(r,c,r))",
+            "=MAKEARRAY(\"1/2/1904\",1,LAMBDA(i,j,i))",
             2,
             1
         ),
@@ -724,7 +803,7 @@ fn functions_with_their_own_dispatch_read_date_text_in_the_workbook_context() {
         spill_at_clock(
             DateSystem::Excel1904,
             (2026, 10, 2),
-            "=ROWS(MAKEARRAY(\"1/2/1904\",1,LAMBDA(r,c,r)))",
+            "=ROWS(MAKEARRAY(\"1/2/1904\",1,LAMBDA(i,j,i)))",
             1,
             1
         ),
@@ -742,7 +821,7 @@ fn functions_with_their_own_dispatch_read_date_text_in_the_workbook_context() {
             spill_at_clock(
                 system,
                 (year, 6, 1),
-                "=MAKEARRAY(\"Jan 3\",1,LAMBDA(r,c,r))",
+                "=MAKEARRAY(\"Jan 3\",1,LAMBDA(i,j,i))",
                 rows + 1,
                 1
             ),

@@ -27526,37 +27526,9 @@ where
         let formula_bounds = self.formula_col_bounds_for_rows(sheet, start_row, end_row);
         Self::union_used_bounds(arrow_bounds, formula_bounds)
     }
-}
 
-// Override EvaluationContext to provide thread pool access
-impl<R> crate::traits::EvaluationContext for Engine<R>
-where
-    R: EvaluationContext,
-{
-    fn is_value_name(&self, name: &str, current_sheet: &str) -> bool {
-        let Some(current_id) = self.graph.sheet_id(current_sheet) else {
-            return false;
-        };
-        match self.graph.resolve_name_entry(name, current_id) {
-            // A formula holds a value unless it evaluates to a reference: `=Konst`
-            // for a name holding a value, or `=IF(TRUE,42)`, holds a value too.
-            Some(named) => match &named.definition {
-                NamedDefinition::Formula { ast, .. } => {
-                    !self.yields_reference(ast)
-                        || self.resolve_name_reference(name, current_sheet).is_none()
-                }
-                NamedDefinition::Literal(_) => true,
-                _ => false,
-            },
-            None => false,
-        }
-    }
-
-    fn resolve_name_reference(
-        &self,
-        name: &str,
-        current_sheet: &str,
-    ) -> Option<Result<ReferenceType, ExcelError>> {
+    /// [`EvaluationContext::resolve_name_reference`], computed afresh.
+    fn resolve_name_reference_once(&self, name: &str, current_sheet: &str) -> NameReference {
         let current_id = self.graph.sheet_id(current_sheet)?;
         let named = self.graph.resolve_name_entry(name, current_id)?;
         // A name for a cell or range is that reference (INDEX(Years,2) picks
@@ -27612,6 +27584,98 @@ where
             Ok(result) => result,
             Err(err) => Some(Err(err)),
         }
+    }
+}
+
+/// What a defined name resolves to as a reference (see
+/// [`EvaluationContext::resolve_name_reference`]).
+type NameReference = Option<Result<ReferenceType, ExcelError>>;
+
+thread_local! {
+    /// The names resolved so far by the name resolution running on this
+    /// thread, by lowercase name and the sheet they are resolved for. Present
+    /// only while a resolution runs, during which no cell value changes.
+    static NAME_REFERENCES: std::cell::RefCell<Option<FxHashMap<(String, String), NameReference>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `resolve()`'s result for `name` on `sheet`, computed once per outermost
+/// name resolution on this thread. A name met again while it runs (the next
+/// link of an alias chain, checked as a reference and again for holding a
+/// value) reuses its first result instead of resolving its chain anew, so a
+/// chain of names costs work linear in its length rather than doubling with
+/// each link. A name that refers to itself still stops at
+/// `in_named_formula`'s depth guard, as its resolution never completes.
+fn memoized_name_reference(
+    name: &str,
+    sheet: &str,
+    resolve: impl FnOnce() -> NameReference,
+) -> NameReference {
+    struct Outermost(bool);
+    impl Drop for Outermost {
+        fn drop(&mut self) {
+            if self.0 {
+                NAME_REFERENCES.with(|memo| *memo.borrow_mut() = None);
+            }
+        }
+    }
+    let key = (name.to_lowercase(), sheet.to_string());
+    let (_outermost, known) = NAME_REFERENCES.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        match memo.as_ref() {
+            Some(resolved) => (Outermost(false), resolved.get(&key).cloned()),
+            None => {
+                *memo = Some(FxHashMap::default());
+                (Outermost(true), None)
+            }
+        }
+    });
+    if let Some(known) = known {
+        return known;
+    }
+    let resolved = resolve();
+    NAME_REFERENCES.with(|memo| {
+        if let Some(memo) = memo.borrow_mut().as_mut() {
+            memo.insert(key, resolved.clone());
+        }
+    });
+    resolved
+}
+
+// Override EvaluationContext to provide thread pool access
+impl<R> crate::traits::EvaluationContext for Engine<R>
+where
+    R: EvaluationContext,
+{
+    fn is_value_name(&self, name: &str, current_sheet: &str) -> bool {
+        let Some(current_id) = self.graph.sheet_id(current_sheet) else {
+            return false;
+        };
+        match self.graph.resolve_name_entry(name, current_id) {
+            // A formula holds a value unless it evaluates to a reference: `=Konst`
+            // for a name holding a value, or `=IF(TRUE,42)`, holds a value too.
+            Some(named) => match &named.definition {
+                NamedDefinition::Formula { ast, .. } => {
+                    !self.yields_reference(ast)
+                        || self.resolve_name_reference(name, current_sheet).is_none()
+                }
+                NamedDefinition::Literal(_) => true,
+                _ => false,
+            },
+            None => false,
+        }
+    }
+
+    fn resolve_name_reference(
+        &self,
+        name: &str,
+        current_sheet: &str,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        // Each name resolves once while a name resolves, so a chain of names
+        // costs work linear in its length (see `memoized_name_reference`).
+        memoized_name_reference(name, current_sheet, || {
+            self.resolve_name_reference_once(name, current_sheet)
+        })
     }
 
     fn resolve_name_reference_array(

@@ -962,6 +962,8 @@ pub struct IndirectFn;
 /// - `a1_style` defaults to `TRUE` (A1 style parsing).
 /// - `a1_style=FALSE` (R1C1 parsing) is currently not implemented and returns `#N/IMPL!`.
 /// - Invalid or unresolved references return `#REF!`; so does a number, logical or blank `ref_text`.
+/// - A defined name must be defined as a reference: a name that holds a value
+///   (`={1,2,3}`, `=5`, a formula that evaluates to no reference) is `#REF!`.
 /// - An error in `ref_text` or `a1_style` is returned unchanged.
 /// - The function is volatile because target references can change without direct dependency links.
 ///
@@ -1028,10 +1030,18 @@ impl Function for IndirectFn {
     ) -> Option<Result<ReferenceType, ExcelError>> {
         // A structured reference spelled at run time is the cells it selects,
         // `#This Row` at the formula's row, like one written in the formula.
+        // Excel takes the name of a name defined as a reference; a name that
+        // holds a value has no cells to refer to.
+        let holds_value = |name: &str| {
+            args[0]
+                .interpreter()
+                .context
+                .is_value_name(name, ctx.current_sheet())
+        };
         Some(
             indirect_text_reference(args)
                 .and_then(|reference| crate::traits::reference_as_area(ctx, reference))
-                .and_then(|reference| indirect_reference_exists(reference, ctx)),
+                .and_then(|reference| indirect_reference_exists(reference, ctx, holds_value)),
         )
     }
 
@@ -1153,10 +1163,12 @@ fn indirect_text_reference(args: &[ArgumentHandle<'_, '_>]) -> Result<ReferenceT
 
 /// INDIRECT's reference when it exists: an address past row 1,048,576 or
 /// column 16,384, or a name or table that is not defined, is `#REF!` (not
-/// `#NAME?`) wherever INDIRECT is used.
+/// `#NAME?`) wherever INDIRECT is used. So is a name that holds a value
+/// (`holds_value`) rather than a reference.
 fn indirect_reference_exists(
     reference: ReferenceType,
     ctx: &dyn FunctionContext<'_>,
+    holds_value: impl Fn(&str) -> bool,
 ) -> Result<ReferenceType, ExcelError> {
     let off_grid = |row: Option<u32>, col: Option<u32>| {
         row.is_some_and(|row| row == 0 || row > EXCEL_MAX_ROW)
@@ -1171,6 +1183,7 @@ fn indirect_reference_exists(
             end_col,
             ..
         } => !off_grid(*start_row, *start_col) && !off_grid(*end_row, *end_col),
+        ReferenceType::NamedRange(name) if holds_value(name) => false,
         ReferenceType::NamedRange(_) | ReferenceType::Table(_) => {
             match ctx.resolve_range_view(&reference, ctx.current_sheet()) {
                 Err(error) if error.kind == ExcelErrorKind::Cancelled => return Err(error),

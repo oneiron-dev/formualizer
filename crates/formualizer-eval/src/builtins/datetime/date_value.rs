@@ -38,6 +38,7 @@ use formualizer_macros::func_caps;
 ///
 /// # Remarks
 /// - Accepted formats are a fixed supported subset (for example `YYYY-MM-DD`, `MM/DD/YYYY`, and month-name forms).
+/// - A time after the date (`"1/2/2023 6:00"`) is ignored, as Excel ignores it.
 /// - Parsing is not locale-driven; ambiguous text may parse differently than Excel locales.
 /// - The returned serial uses the workbook's date system (Excel 1900 or Excel 1904).
 ///
@@ -118,14 +119,20 @@ impl Function for DateValueFn {
             }
         };
 
-        if let Some(date) = formualizer_common::parse_excel_date_text_in_year(
-            &date_text,
-            Some(args[0].current_year()),
-        )
-        .or_else(|| parse_legacy_datevalue_text(&date_text))
-        // Date text names a day of the date system's range (January 1, 1900
-        // or 1904 through December 31, 9999); other text is #VALUE!.
-        .filter(|date| formualizer_common::is_excel_date_text_in_range(system, date))
+        let current_year = Some(args[0].current_year());
+        if let Some(date) =
+            formualizer_common::parse_excel_date_text_in_year(&date_text, current_year)
+                .or_else(|| parse_legacy_datevalue_text(&date_text))
+                // Date and time text is its date: Microsoft documents that
+                // "time information in the date_text argument is ignored"
+                // (DATEVALUE("1/2/2023 6:00") is 44928).
+                .or_else(|| {
+                    formualizer_common::parse_excel_datetime_text_in_year(&date_text, current_year)
+                        .map(|datetime| datetime.date())
+                })
+                // Date text names a day of the date system's range (January 1, 1900
+                // or 1904 through December 31, 9999); other text is #VALUE!.
+                .filter(|date| formualizer_common::is_excel_date_text_in_range(system, date))
         {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
                 date_to_serial_for(system, &date),

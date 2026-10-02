@@ -650,12 +650,15 @@ fn arrays_of_references_are_recognised_by_value() {
     assert_number("=SUMPRODUCT(N(IF(TRUE,OFFSET(B1,{0;1},0))))", 3.0);
     // A LET binding.
     assert_number(
-        "=LET(r,OFFSET(B1,{0;1;2},0),SUMPRODUCT(SUBTOTAL(9,r)))",
+        "=LET(area,OFFSET(B1,{0;1;2},0),SUMPRODUCT(SUBTOTAL(9,area)))",
         6.0,
     );
-    assert_number("=LET(r,OFFSET(B1,{0;1;2},0),SUMPRODUCT(N(r)))", 6.0);
-    assert_error("=LET(r,OFFSET(B1,{0;1;2},0),r)", ExcelErrorKind::Value);
-    assert_number("=LET(r,B1:B3,SUM(r))", 6.0);
+    assert_number("=LET(area,OFFSET(B1,{0;1;2},0),SUMPRODUCT(N(area)))", 6.0);
+    assert_error(
+        "=LET(area,OFFSET(B1,{0;1;2},0),area)",
+        ExcelErrorKind::Value,
+    );
+    assert_number("=LET(area,B1:B3,SUM(area))", 6.0);
     // A defined name whose formula is a lifted OFFSET or INDIRECT.
     let mut engine = engine();
     for (name, formula) in [
@@ -831,26 +834,35 @@ fn row_and_column_of_a_name_holding_a_value_lift_like_a_computed_array() {
 fn let_and_lambda_keep_references_for_row_and_column() {
     // LET and LAMBDA keep references, so ROW/COLUMN of a bound range give its
     // row and column numbers.
-    assert_eq!(spill("=LET(r,A1:C1,COLUMN(r))", 1, 3), "{1,2,3}");
-    assert_number("=LET(r,B2:B3,SUM(ROW(r)))", 5.0);
+    assert_eq!(spill("=LET(area,A1:C1,COLUMN(area))", 1, 3), "{1,2,3}");
+    assert_number("=LET(area,B2:B3,SUM(ROW(area)))", 5.0);
     assert_eq!(spill("=LET(d,B1:B3,ROW(d)-MIN(ROW(d))+1)", 3, 1), "{1;2;3}");
-    assert_eq!(spill("=LET(r,A1:C1,s,r,COLUMN(s))", 1, 3), "{1,2,3}");
-    assert_eq!(spill("=LET(r,IF(TRUE,B2:B3),ROW(r))", 2, 1), "{2;3}");
-    assert_eq!(spill("=LAMBDA(r,COLUMN(r))(A1:C1)", 1, 3), "{1,2,3}");
-    assert_eq!(spill("=LET(f,LAMBDA(r,ROW(r)),f(B2:B3))", 2, 1), "{2;3}");
+    assert_eq!(spill("=LET(area,A1:C1,s,area,COLUMN(s))", 1, 3), "{1,2,3}");
+    assert_eq!(spill("=LET(area,IF(TRUE,B2:B3),ROW(area))", 2, 1), "{2;3}");
+    assert_eq!(spill("=LAMBDA(area,COLUMN(area))(A1:C1)", 1, 3), "{1,2,3}");
+    assert_eq!(
+        spill("=LET(f,LAMBDA(area,ROW(area)),f(B2:B3))", 2, 1),
+        "{2;3}"
+    );
     // MAP, BYROW and BYCOL give the LAMBDA each cell, row or column of a range
     // as a reference.
-    assert_eq!(spill("=BYROW(A1:C3,LAMBDA(r,ROW(r)))", 3, 1), "{1;2;3}");
-    assert_eq!(spill("=BYCOL(A1:C3,LAMBDA(c,COLUMN(c)))", 1, 3), "{1,2,3}");
+    assert_eq!(
+        spill("=BYROW(A1:C3,LAMBDA(area,ROW(area)))", 3, 1),
+        "{1;2;3}"
+    );
+    assert_eq!(
+        spill("=BYCOL(A1:C3,LAMBDA(col,COLUMN(col)))", 1, 3),
+        "{1,2,3}"
+    );
     assert_eq!(spill("=MAP(B2:B3,LAMBDA(x,ROW(x)))", 2, 1), "{2;3}");
     // An eta-reduced function receives the references the same way.
     assert_eq!(spill("=MAP(B2:B3,ROW)", 2, 1), "{2;3}");
     assert_eq!(spill("=BYCOL(A1:C3,COLUMN)", 1, 3), "{1,2,3}");
     // The bound values are the cells' values.
-    assert_number("=LET(r,B1:B3,SUM(r))", 6.0);
-    assert_number("=SUM(BYROW(B1:C2,LAMBDA(r,SUM(r))))", 90103.0);
+    assert_number("=LET(area,B1:B3,SUM(area))", 6.0);
+    assert_number("=SUM(BYROW(B1:C2,LAMBDA(area,SUM(area))))", 90103.0);
     assert_number("=SUM(MAP(B1:B3,LAMBDA(x,x*2)))", 12.0);
-    assert_number("=SUM(BYROW({1,2;3,4},LAMBDA(r,SUM(r))))", 10.0);
+    assert_number("=SUM(BYROW({1,2;3,4},LAMBDA(area,SUM(area))))", 10.0);
     // A local bound to a value is a computed array, and functions that take a
     // reference or a value read its value.
     assert_eq!(
@@ -859,8 +871,8 @@ fn let_and_lambda_keep_references_for_row_and_column() {
     );
     assert_number("=LET(a,{1,2;3,4},VLOOKUP(3,a,2,0))", 4.0);
     assert_number("=LET(a,{1,2,3},MATCH(2,a,0))", 2.0);
-    assert_number("=LET(r,B1:B3,MATCH(2,r,0))", 2.0);
-    assert_number("=LET(r,B1:B3,ROWS(r))", 3.0);
+    assert_number("=LET(area,B1:B3,MATCH(2,area,0))", 2.0);
+    assert_number("=LET(area,B1:B3,ROWS(area))", 3.0);
 }
 
 #[test]
@@ -874,12 +886,12 @@ fn let_and_lambda_keep_references_when_evaluated_from_the_formula_tree() {
     }
     let interpreter = wb.interpreter();
     for (formula, expected) in [
-        ("=SUM(LET(r,B2:D2,COLUMN(r)))", 9.0),
-        ("=SUM(LAMBDA(r,ROW(r))(B2:B3))", 5.0),
-        ("=LET(f,LAMBDA(r,COLUMN(r)),SUM(f(B1:C1)))", 5.0),
-        ("=SUM(BYROW(A2:C3,LAMBDA(r,ROW(r))))", 5.0),
+        ("=SUM(LET(area,B2:D2,COLUMN(area)))", 9.0),
+        ("=SUM(LAMBDA(area,ROW(area))(B2:B3))", 5.0),
+        ("=LET(f,LAMBDA(area,COLUMN(area)),SUM(f(B1:C1)))", 5.0),
+        ("=SUM(BYROW(A2:C3,LAMBDA(area,ROW(area))))", 5.0),
         ("=SUM(MAP(B2:B3,LAMBDA(x,ROW(x))))", 5.0),
-        ("=SUM(LET(r,B2:B3,r))", 10.0),
+        ("=SUM(LET(area,B2:B3,area))", 10.0),
     ] {
         let ast = parse(formula).unwrap();
         assert_eq!(
@@ -927,7 +939,10 @@ fn row_and_column_of_an_array_of_references_give_one_result_per_reference() {
     assert_number("=SUM(ROW(OFFSET(A1,{1;2;3},0)))", 9.0);
     // The same array of references through IF, a LET name or a defined name.
     assert_eq!(spill("=ROW(IF(TRUE,OFFSET(A1,{0;2},0)))", 2, 1), "{1;3}");
-    assert_eq!(spill("=LET(r,OFFSET(A1,{1;2},0),ROW(r))", 2, 1), "{2;3}");
+    assert_eq!(
+        spill("=LET(area,OFFSET(A1,{1;2},0),ROW(area))", 2, 1),
+        "{2;3}"
+    );
     let mut engine = engine();
     engine
         .define_name(
@@ -1042,4 +1057,159 @@ fn row_and_column_propagate_cancellation() {
             result.map(|value| value.into_literal())
         );
     }
+}
+
+/// Define `{prefix}0` as `first` and each next of `links` names as `link` of
+/// the one before (`{prefix}1` is `link("{prefix}0")`, and so on).
+fn define_name_chain(
+    engine: &mut Engine<TestWorkbook>,
+    prefix: &str,
+    first: &str,
+    link: impl Fn(&str) -> String,
+    links: usize,
+) {
+    for index in 0..=links {
+        let formula = if index == 0 {
+            first.to_string()
+        } else {
+            link(&format!("{prefix}{}", index - 1))
+        };
+        engine
+            .define_name(
+                &format!("{prefix}{index}"),
+                NamedDefinition::Formula {
+                    ast: parse(&formula).unwrap(),
+                    dependencies: Vec::new(),
+                    range_deps: Vec::new(),
+                },
+                NameScope::Workbook,
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn long_chains_of_names_resolve_in_linear_time() {
+    // Each name of a chain is resolved once per resolution of the chain:
+    // checking a link first as a reference and then for holding a value used
+    // to resolve the rest of the chain twice, doubling the work per link.
+    const LINKS: usize = 40;
+    let mut engine = engine();
+    let alias = |name: &str| format!("={name}");
+    let choose = |name: &str| format!("=IF(TRUE,{name})");
+    define_name_chain(&mut engine, "Chain", "=42", alias, LINKS);
+    define_name_chain(&mut engine, "ArrayChain", "={1,2,3}", alias, LINKS);
+    define_name_chain(&mut engine, "RangeChain", "=Sheet1!$B$1:$B$3", alias, LINKS);
+    define_name_chain(&mut engine, "IfChain", "=IF(TRUE,42)", choose, LINKS);
+    define_name_chain(
+        &mut engine,
+        "IfRangeChain",
+        "=Sheet1!$B$1:$B$3",
+        choose,
+        LINKS,
+    );
+    let value_error = || LiteralValue::Error(ExcelErrorKind::Value.into());
+    let started = std::time::Instant::now();
+    for (formula, expected) in [
+        ("=COLUMN(Chain40)", value_error()),
+        ("=Chain40+1", LiteralValue::Number(43.0)),
+        ("=ISREF(Chain40)", LiteralValue::Boolean(false)),
+        ("=SUM(ArrayChain40)", LiteralValue::Number(6.0)),
+        ("=ISREF(ArrayChain40)", LiteralValue::Boolean(false)),
+        ("=SUM(ROW(RangeChain40))", LiteralValue::Number(6.0)),
+        ("=SUM(RangeChain40)", LiteralValue::Number(6.0)),
+        ("=ISREF(RangeChain40)", LiteralValue::Boolean(true)),
+        ("=COLUMN(IfChain40)", value_error()),
+        ("=IfChain40+1", LiteralValue::Number(43.0)),
+        ("=SUM(ROW(IfRangeChain40))", LiteralValue::Number(6.0)),
+        ("=SUM(IfRangeChain40)", LiteralValue::Number(6.0)),
+        (
+            "=ROWS(INDIRECT(\"RangeChain40\"))",
+            LiteralValue::Number(3.0),
+        ),
+    ] {
+        let value = match eval(&mut engine, formula) {
+            LiteralValue::Error(error) => LiteralValue::Error(error.kind.into()),
+            LiteralValue::Int(i) => LiteralValue::Number(i as f64),
+            other => other,
+        };
+        assert_eq!(value, expected, "{formula}");
+    }
+    // Doubling per link would take 2^40 resolutions.
+    let elapsed = started.elapsed();
+    assert!(elapsed.as_secs() < 30, "chains took {elapsed:?}");
+}
+
+#[test]
+fn indirect_of_a_name_holding_a_value_is_ref() {
+    // INDIRECT takes "a name defined as a reference" (Microsoft); a name for
+    // a constant, an array or a computed value names no cells: #REF!, and
+    // ROW/COLUMN of it do not invent coordinates.
+    let mut engine = engine_with_aliased_names();
+    for formula in [
+        "=ROW(INDIRECT(\"Konst\"))",
+        "=COLUMN(INDIRECT(\"Konst\"))",
+        "=SUM(INDIRECT(\"Konst\"))",
+        "=INDIRECT(\"Konst1\")",
+        "=SUM(INDIRECT(\"Calc\"))",
+        "=INDIRECT(\"AliasValue\")",
+        "=SUM(INDIRECT(\"TrueValue\"))",
+    ] {
+        match eval(&mut engine, formula) {
+            LiteralValue::Error(error) => assert_eq!(error.kind, ExcelErrorKind::Ref, "{formula}"),
+            other => panic!("{formula} = {other:?}, expected #REF!"),
+        }
+    }
+    // Names defined as references still resolve.
+    for (formula, expected) in [
+        ("=SUM(INDIRECT(\"Amounts\"))", 6.0),
+        ("=SUM(ROW(INDIRECT(\"AliasRange\")))", 6.0),
+        ("=SUM(INDIRECT(\"TrueRange\"))", 5.0),
+        ("=SUM(INDIRECT(\"IndirectRange\"))", 6.0),
+    ] {
+        assert_eq!(
+            eval(&mut engine, formula),
+            LiteralValue::Number(expected),
+            "{formula}"
+        );
+    }
+}
+
+#[test]
+fn row_and_column_of_whole_columns_and_rows_give_their_index_sequences() {
+    // Evaluated as arrays, ROW(A:A) and COLUMN(2:2) are their row and column
+    // numbers, element by element with the values of A:A and 2:2, not 1.
+    for (formula, expected) in [
+        ("=SUM(IF(A:A=\"a\",ROW(A:A)))", 4.0),
+        ("=INDEX(B:B,SMALL(IF(A:A=\"a\",ROW(A:A)),2))", 3.0),
+        ("=SUMPRODUCT((A:A=\"b\")*ROW(A:A))", 2.0),
+        ("=MAX(LET(data,C:C,IF(ISNUMBER(data),ROW(data))))", 2.0),
+        ("=SUM(IF(ISNUMBER(2:2),COLUMN(2:2)))", 5.0),
+        (
+            "=SUM(LAMBDA(data,IF(ISNUMBER(data),COLUMN(data)))(3:3))",
+            2.0,
+        ),
+        ("=SUM(IF($A:$B=\"b\",ROW($A:$B)))", 2.0),
+    ] {
+        assert_number(formula, expected);
+    }
+    // A formula entered without the array flag takes the first row (column);
+    // an array formula gets the sequence.
+    let values: Vec<Option<f64>> = file_values(
+        &[
+            (10, 8, "=ROW(A:A)"),
+            (10, 9, "=COLUMN(2:2)"),
+            (11, 8, "=SUM(IF(A:A=\"a\",ROW(A:A)))"),
+        ],
+        &[(11, 8, 1)],
+        &[(10, 8), (10, 9), (11, 8)],
+    )
+    .into_iter()
+    .map(|value| match value {
+        Some(LiteralValue::Number(n)) => Some(n),
+        Some(LiteralValue::Int(i)) => Some(i as f64),
+        _ => None,
+    })
+    .collect();
+    assert_eq!(values, vec![Some(1.0), Some(1.0), Some(4.0)]);
 }

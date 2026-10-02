@@ -227,13 +227,13 @@ fn ifs_whole_axis_ranges_from_let_lambda_and_xlookup_keep_full_size() {
         engine.get_cell_value("Sheet1", 1, 10).unwrap()
     };
     for (formula, expected) in [
-        ("=LET(c,A:A,SUMIFS(B:B,c,\"A\"))", 10.0),
-        ("=LET(c,A:A,AVERAGEIFS(B:B,c,\"A\"))", 10.0),
-        ("=LET(c,A:A,COUNTIFS(c,\"A\",B:B,\">0\"))", 1.0),
-        ("=LET(c,A:A,d,c,SUMIFS(B:B,d,\"B\"))", 30.0),
-        ("=LAMBDA(r,SUMIFS(B:B,r,\"A\"))(A:A)", 10.0),
-        ("=LET(f,LAMBDA(r,SUMIFS(B:B,r,\"C\")),f(A:A))", 20.0),
-        ("=LET(r,Sheet3!2:2,SUMIFS(Sheet3!3:3,r,\"A\"))", 0.0),
+        ("=LET(col,A:A,SUMIFS(B:B,col,\"A\"))", 10.0),
+        ("=LET(col,A:A,AVERAGEIFS(B:B,col,\"A\"))", 10.0),
+        ("=LET(col,A:A,COUNTIFS(col,\"A\",B:B,\">0\"))", 1.0),
+        ("=LET(col,A:A,d,col,SUMIFS(B:B,d,\"B\"))", 30.0),
+        ("=LAMBDA(area,SUMIFS(B:B,area,\"A\"))(A:A)", 10.0),
+        ("=LET(f,LAMBDA(area,SUMIFS(B:B,area,\"C\")),f(A:A))", 20.0),
+        ("=LET(area,Sheet3!2:2,SUMIFS(Sheet3!3:3,area,\"A\"))", 0.0),
         (
             "=SUMIFS(XLOOKUP(\"Amt\",Sheet3!A1:B1,Sheet3!A:B),Sheet3!A:A,\"A\")",
             10.0,
@@ -243,8 +243,8 @@ fn ifs_whole_axis_ranges_from_let_lambda_and_xlookup_keep_full_size() {
             10.0,
         ),
         // Bounded ranges through the same paths keep their own size.
-        ("=LET(c,A1:A3,SUMIFS(B1:B3,c,\"B\"))", 30.0),
-        ("=LAMBDA(r,SUMIFS(B1:B3,r,\"B\"))(A1:A3)", 30.0),
+        ("=LET(col,A1:A3,SUMIFS(B1:B3,col,\"B\"))", 30.0),
+        ("=LAMBDA(area,SUMIFS(B1:B3,area,\"B\"))(A1:A3)", 30.0),
     ] {
         assert_eq!(
             eval(&mut engine, formula),
@@ -254,11 +254,11 @@ fn ifs_whole_axis_ranges_from_let_lambda_and_xlookup_keep_full_size() {
     }
     for formula in [
         // Sheet4 uses only rows 1-3, but its whole column A is not B1:B3's shape.
-        "=LET(c,Sheet4!A:A,SUMIFS(Sheet4!B1:B3,c,\"A\"))",
-        "=LAMBDA(r,SUMIFS(Sheet4!B1:B3,r,\"A\"))(Sheet4!A:A)",
+        "=LET(col,Sheet4!A:A,SUMIFS(Sheet4!B1:B3,col,\"A\"))",
+        "=LAMBDA(area,SUMIFS(Sheet4!B1:B3,area,\"A\"))(Sheet4!A:A)",
         // XLOOKUP gives Sheet3!A:A, not the four rows Sheet3 uses.
         "=SUMIFS(Sheet3!B1:B4,XLOOKUP(\"Cat\",Sheet3!A1:B1,Sheet3!A:B),\"A\")",
-        "=LET(c,A1:A2,COUNTIFS(c,\"A\",B1:B3,\">0\"))",
+        "=LET(col,A1:A2,COUNTIFS(col,\"A\",B1:B3,\">0\"))",
     ] {
         match eval(&mut engine, formula) {
             LiteralValue::Error(e) => {
@@ -294,18 +294,21 @@ fn let_lambda_and_xlookup_results_are_references() {
         engine.get_cell_value("Sheet1", 1, 10).unwrap()
     };
     for (formula, expected) in [
-        ("=LET(c,A:A,ROWS(c))", LiteralValue::Number(1_048_576.0)),
-        ("=LAMBDA(r,ROWS(r))(2:2)", LiteralValue::Number(1.0)),
-        ("=LAMBDA(r,COLUMNS(r))(2:2)", LiteralValue::Number(16_384.0)),
-        ("=LET(c,B2,ISREF(c))", LiteralValue::Boolean(true)),
-        ("=LET(c,B2,ROW(c))", LiteralValue::Number(2.0)),
-        ("=LAMBDA(r,ROW(r))(B3)", LiteralValue::Number(3.0)),
+        ("=LET(col,A:A,ROWS(col))", LiteralValue::Number(1_048_576.0)),
+        ("=LAMBDA(area,ROWS(area))(2:2)", LiteralValue::Number(1.0)),
         (
-            "=LET(c,B1:B3,SUM(OFFSET(c,1,0,2)))",
+            "=LAMBDA(area,COLUMNS(area))(2:2)",
+            LiteralValue::Number(16_384.0),
+        ),
+        ("=LET(col,B2,ISREF(col))", LiteralValue::Boolean(true)),
+        ("=LET(col,B2,ROW(col))", LiteralValue::Number(2.0)),
+        ("=LAMBDA(area,ROW(area))(B3)", LiteralValue::Number(3.0)),
+        (
+            "=LET(col,B1:B3,SUM(OFFSET(col,1,0,2)))",
             LiteralValue::Number(50.0),
         ),
         (
-            "=LET(c,A1:A3,SUMIF(c,\"B\",B1:B3))",
+            "=LET(col,A1:A3,SUMIF(col,\"B\",B1:B3))",
             LiteralValue::Number(30.0),
         ),
         ("=LET(x,5,x*2)", LiteralValue::Number(10.0)),

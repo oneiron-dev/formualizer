@@ -119,7 +119,9 @@ fn sumifs_overlay_and_fastpath_parity() {
     let c1_rng = range_ref(sheet, 1, 2, 8, 2);
     let c1_eq1 = lit_text("=1");
     let c2_rng = range_ref(sheet, 1, 3, 8, 3);
-    let c2_eq_aa = lit_text("=\"aa\"");
+    // Quote marks in a criterion are characters of its text: ="aa" would
+    // look for the text "aa" with its quote marks.
+    let c2_eq_aa = lit_text("=aa");
 
     let fun = engine.get_function("", "SUMIFS").expect("SUMIFS");
     let got_fast = {

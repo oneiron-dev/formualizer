@@ -239,14 +239,14 @@ fn let_range_binding_feeds_aggregates_engine() {
             .unwrap();
     }
     engine
-        .set_cell_formula("Sheet1", 1, 1, parse("=LET(r,B1:B3,SUM(r))").unwrap())
+        .set_cell_formula("Sheet1", 1, 1, parse("=LET(area,B1:B3,SUM(area))").unwrap())
         .unwrap();
     engine
         .set_cell_formula(
             "Sheet1",
             2,
             1,
-            parse("=LET(r,B1:B3,SUM(r)+COUNT(r))").unwrap(),
+            parse("=LET(area,B1:B3,SUM(area)+COUNT(area))").unwrap(),
         )
         .unwrap();
 
@@ -279,7 +279,7 @@ fn let_range_binding_shadows_workbook_name_engine() {
             .unwrap();
     }
     engine
-        .set_cell_formula("Sheet1", 1, 1, parse("=LET(r,B1:B3,SUM(r))").unwrap())
+        .set_cell_formula("Sheet1", 1, 1, parse("=LET(area,B1:B3,SUM(area))").unwrap())
         .unwrap();
     engine
         .set_cell_formula("Sheet1", 2, 1, parse("=SUM(r)").unwrap())

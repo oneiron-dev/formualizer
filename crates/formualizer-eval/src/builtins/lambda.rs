@@ -14,14 +14,64 @@ fn value_error(msg: impl Into<String>) -> ExcelError {
     ExcelError::new(ExcelErrorKind::Value).with_message(msg.into())
 }
 
-fn local_name_from_ast(node: &ASTNode) -> Result<String, ExcelError> {
+/// The LET name or LAMBDA parameter (`parameter`) written as `node`. It
+/// follows Excel's rules for names (see [`is_valid_local_name`]); any other
+/// argument in its place is `#VALUE!`.
+fn local_name_from_ast(node: &ASTNode, parameter: bool) -> Result<String, ExcelError> {
     match &node.node_type {
         ASTNodeType::Reference {
             reference: ReferenceType::NamedRange(name),
             ..
-        } => Ok(name.clone()),
+        } if is_valid_local_name(name, parameter) => Ok(name.clone()),
+        ASTNodeType::Reference {
+            reference: ReferenceType::NamedRange(name),
+            ..
+        } => Err(value_error(format!("{name} is not a valid name"))),
         _ => Err(value_error("Expected a local name identifier")),
     }
+}
+
+/// Whether `name` may name a LET variable or, when `parameter`, a LAMBDA
+/// parameter. Microsoft gives them the Name Manager's rules ("Names in
+/// formulas"): a letter, `_` or `\` first, at most 255 characters, and
+/// neither `C`, `c`, `R` nor `r` (the LET page: `c` "conflicts with R1C1 style
+/// references") nor anything else that is a cell reference, in A1 (`B2`) or
+/// R1C1 (`R1C1`, `RC2`) style. A LAMBDA parameter has no period either. A
+/// workbook file spells these names with the `_xlpm.` prefix, which is no
+/// part of the name.
+fn is_valid_local_name(name: &str, parameter: bool) -> bool {
+    let name = match name.get(..6) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("_xlpm.") => &name[6..],
+        _ => name,
+    };
+    let Some(first) = name.chars().next() else {
+        return false;
+    };
+    (first.is_alphabetic() || first == '_' || first == '\\')
+        && name.chars().count() <= 255
+        && !(parameter && name.contains('.'))
+        && !is_r1c1_reference(name)
+        && formualizer_common::parse_a1_1based(name).is_err()
+}
+
+/// Whether `name` is an R1C1-style reference to a cell, row or column: `R`,
+/// `C`, `RC`, each letter optionally followed by a row or column number
+/// (`R2`, `C3`, `R2C3`, `RC3`), in either case.
+fn is_r1c1_reference(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    let skip_digits = |text: &str| text.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let rest = match upper.strip_prefix('R') {
+        Some(after_row) => {
+            let after_number = &after_row[after_row.len() - skip_digits(after_row)..];
+            if after_number.is_empty() {
+                return true;
+            }
+            after_number
+        }
+        None => upper.as_str(),
+    };
+    rest.strip_prefix('C')
+        .is_some_and(|after_column| skip_digits(after_column) == 0)
 }
 
 fn binding_from_calc_value(cv: CalcValue<'_>) -> LocalBinding {
@@ -45,7 +95,7 @@ fn binding_from_calc_value(cv: CalcValue<'_>) -> LocalBinding {
 }
 
 /// What a LET name is bound to. A name bound to a reference stays that
-/// reference, as in Excel (`LET(c,A:A,ROWS(c))` is 1048576); an array of
+/// reference, as in Excel (`LET(col,A:A,ROWS(col))` is 1048576); an array of
 /// references, which reads as an error, binds its references; anything else
 /// binds its value.
 fn let_binding(value: &ArgumentHandle<'_, '_>) -> Result<LocalBinding, ExcelError> {
@@ -191,7 +241,7 @@ impl Function for LetFn {
         let mut env: LocalEnv = args[0].current_env();
 
         for pair_idx in (0..args.len() - 1).step_by(2) {
-            let name = match local_name_from_ast(args[pair_idx].ast()) {
+            let name = match local_name_from_ast(args[pair_idx].ast(), false) {
                 Ok(name) => name,
                 Err(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
             };
@@ -372,7 +422,7 @@ impl Function for LambdaFn {
         let mut params = Vec::new();
         let mut seen = HashSet::new();
         for arg in &args[..args.len() - 1] {
-            let name = match local_name_from_ast(arg.ast()) {
+            let name = match local_name_from_ast(arg.ast(), true) {
                 Ok(name) => name,
                 Err(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
             };
@@ -601,7 +651,7 @@ impl GridOrigin {
 /// An array argument of MAP, BYROW or BYCOL as rows of values, with its
 /// origin when it is a reference to a block of cells: a range given to these
 /// helpers passes the LAMBDA a reference to each cell, row or column, as
-/// LAMBDA keeps references (`BYROW(A1:C3,LAMBDA(r,ROW(r)))` is {1;2;3}).
+/// LAMBDA keeps references (`BYROW(A1:C3,LAMBDA(area,ROW(area)))` is {1;2;3}).
 /// Any other array passes values.
 fn grid_with_origin(
     arg: &ArgumentHandle<'_, '_>,
@@ -1086,6 +1136,51 @@ mod tests {
         match v {
             LiteralValue::Error(e) => assert_eq!(e.kind, ExcelErrorKind::Value),
             other => panic!("expected #VALUE!, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn let_and_lambda_names_follow_excel_name_rules() {
+        // Microsoft: LET names are names the Name Manager accepts ("c"
+        // conflicts with R1C1 references), and a LAMBDA parameter has no
+        // period; such a name in their place is #VALUE!.
+        for formula in [
+            "=LET(c,1,c)",
+            "=LET(r,1,r)",
+            "=LET(C,1,C)",
+            "=LET(R,1,R)",
+            "=LET(rc,1,rc)",
+            "=LET(x,1,rc2,2,x)",
+            "=LAMBDA(c,c)(1)",
+            "=LAMBDA(x,r,x)(1,2)",
+            "=LAMBDA(foo.bar,foo.bar)(1)",
+            "=LAMBDA(_xlpm.a.b,1)(1)",
+        ] {
+            match eval(formula) {
+                LiteralValue::Error(e) => assert_eq!(e.kind, ExcelErrorKind::Value, "{formula}"),
+                other => panic!("{formula}: expected #VALUE!, got {other:?}"),
+            }
+        }
+        // Valid names: a period in a LET name, names that merely start like a
+        // reference, and the `_xlpm.` prefix a workbook file writes.
+        for (formula, expected) in [
+            ("=LET(foo.bar,1,foo.bar+1)", 2.0),
+            ("=LET(rate,1,cr,2,rate+cr)", 3.0),
+            ("=LET(_x,1,_x+1)", 2.0),
+            ("=LAMBDA(_xlpm.x,_xlpm.x+1)(1)", 2.0),
+            ("=LET(_xlpm.total,1,_xlpm.total+1)", 2.0),
+        ] {
+            assert_eq!(eval(formula), LiteralValue::Number(expected), "{formula}");
+        }
+    }
+
+    #[test]
+    fn r1c1_references_are_recognised() {
+        for name in ["R", "c", "RC", "r12", "C3", "R2C3", "rc4", "R5c"] {
+            assert!(is_r1c1_reference(name), "{name}");
+        }
+        for name in ["Rate", "CR", "R1X", "RCC", "C1R1", "R_1", ""] {
+            assert!(!is_r1c1_reference(name), "{name}");
         }
     }
 

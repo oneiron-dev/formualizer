@@ -199,7 +199,7 @@ fn sum_compensates_the_last_number_of_each_reference() {
                 // An intersection of references, and a name LET binds to a
                 // reference, are references.
                 (10, 6, "=SUM(A2:A4 A1:A4)"),
-                (11, 6, "=LET(r,A2:A4,SUM(r))"),
+                (11, 6, "=LET(area,A2:A4,SUM(area))"),
             ],
         );
         for row in 1..=11 {

@@ -114,7 +114,7 @@ pub trait CustomCallable: Send + Sync {
     ) -> Result<CalcValue<'ctx>, ExcelError>;
 
     /// Invokes with the arguments of a call written in a formula
-    /// (`LAMBDA(r,ROWS(r))(A:A)`), where an argument written as a reference is
+    /// (`LAMBDA(area,ROWS(area))(A:A)`), where an argument written as a reference is
     /// bound as that reference. The default passes each argument's value.
     fn invoke_bindings<'ctx>(
         &self,

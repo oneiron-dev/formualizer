@@ -64,13 +64,13 @@ pub(crate) fn probe_range_dimensions<C: EvaluationContext + ?Sized>(
 #[derive(Clone)]
 pub enum LocalBinding {
     Value(LiteralValue),
-    /// A reference (`LET(c,A:A,...)`, a LAMBDA called with `B1:B3`). As in
+    /// A reference (`LET(col,A:A,...)`, a LAMBDA called with `B1:B3`). As in
     /// Excel, the name stays that reference: it reads as the referenced cells,
     /// and a parameter that takes a reference (SUMIFS's ranges, ROW, OFFSET)
     /// receives the reference itself, a whole column at its full height.
     Reference(ReferenceType),
     Callable(Arc<dyn crate::traits::CustomCallable>),
-    /// An array of references (`LET(r,OFFSET(A1,{0;1},0),...)`). It has no
+    /// An array of references (`LET(area,OFFSET(A1,{0;1},0),...)`). It has no
     /// value of its own (`#VALUE!`); reference parameters and N/T read each
     /// reference (see `ArgumentHandle::reference_array`).
     #[allow(clippy::type_complexity)]
@@ -2077,7 +2077,7 @@ impl<'a> Interpreter<'a> {
     }
 
     /// What a LAMBDA parameter receives for a call argument: a reference stays
-    /// a reference (`LAMBDA(r,ROWS(r))(A:A)` is 1048576), anything else passes
+    /// a reference (`LAMBDA(area,ROWS(area))(A:A)` is 1048576), anything else passes
     /// its value.
     fn call_argument(&self, arg: &ArgumentHandle<'_, 'a>) -> Result<LocalBinding, ExcelError> {
         Ok(match arg.bindable_reference()? {

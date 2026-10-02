@@ -516,22 +516,28 @@ fn let_names_bound_to_ranges_intersect_like_the_range() {
     // (IF's test) or as an operand it intersects with the formula cell, as
     // A1:A3 written there does (row 2: A2 = 0; row 3: A3 = 1).
     assert_eq!(
-        legacy(2, "=LET(r,A1:A3,IF(r,\"yes\",\"no\"))"),
+        legacy(2, "=LET(area,A1:A3,IF(area,\"yes\",\"no\"))"),
         legacy(2, "=IF(A1:A3,\"yes\",\"no\")")
     );
-    assert_eq!(legacy(2, "=LET(r,A1:A3,IF(r,\"yes\",\"no\"))"), text("no"));
-    assert_eq!(legacy(3, "=LET(r,A1:A3,IF(r,\"yes\",\"no\"))"), text("yes"));
     assert_eq!(
-        legacy(2, "=LET(r,A1:A3,IF(r=0,\"yes\",\"no\"))"),
+        legacy(2, "=LET(area,A1:A3,IF(area,\"yes\",\"no\"))"),
+        text("no")
+    );
+    assert_eq!(
+        legacy(3, "=LET(area,A1:A3,IF(area,\"yes\",\"no\"))"),
         text("yes")
     );
     assert_eq!(
-        error_kind(legacy(5, "=LET(r,A1:A3,IF(r,\"yes\",\"no\"))")),
+        legacy(2, "=LET(area,A1:A3,IF(area=0,\"yes\",\"no\"))"),
+        text("yes")
+    );
+    assert_eq!(
+        error_kind(legacy(5, "=LET(area,A1:A3,IF(area,\"yes\",\"no\"))")),
         ExcelErrorKind::Value
     );
     // A reference parameter still takes the whole range.
-    assert_eq!(legacy(5, "=LET(r,B1:B3,SUM(r))"), number(60.0));
-    assert_eq!(legacy(5, "=LET(r,A1:A3,COUNTIFS(r,1))"), number(2.0));
+    assert_eq!(legacy(5, "=LET(area,B1:B3,SUM(area))"), number(60.0));
+    assert_eq!(legacy(5, "=LET(area,A1:A3,COUNTIFS(area,1))"), number(2.0));
 }
 
 #[test]

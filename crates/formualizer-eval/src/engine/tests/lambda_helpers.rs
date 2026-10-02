@@ -74,7 +74,7 @@ fn error_kind(value: LiteralValue) -> ExcelErrorKind {
 fn lambda_immediate_invocation() {
     assert_eq!(single("=LAMBDA(x,x*2)(5)"), n(10.0));
     assert_eq!(single("=LAMBDA(x,y,x+y)(3,4)"), n(7.0));
-    assert_eq!(single("=LAMBDA(r,SUM(r))(A1:B2)"), n(10.0));
+    assert_eq!(single("=LAMBDA(area,SUM(area))(A1:B2)"), n(10.0));
     assert_eq!(single("=LET(k,10,LAMBDA(x,x+k)(1))"), n(11.0));
 }
 
@@ -134,15 +134,15 @@ fn reduce_may_return_an_array() {
 #[test]
 fn byrow_and_bycol_reduce_each_line() {
     assert_eq!(
-        spill("=BYROW(A1:B2,LAMBDA(r,SUM(r)))", 2, 1),
+        spill("=BYROW(A1:B2,LAMBDA(area,SUM(area)))", 2, 1),
         vec![vec![n(3.0)], vec![n(7.0)]]
     );
     assert_eq!(
-        spill("=BYCOL(A1:B2,LAMBDA(c,SUM(c)))", 1, 2),
+        spill("=BYCOL(A1:B2,LAMBDA(col,SUM(col)))", 1, 2),
         vec![vec![n(4.0), n(6.0)]]
     );
     assert_eq!(
-        error_kind(single("=BYROW(A1:B2,LAMBDA(r,r*2))")),
+        error_kind(single("=BYROW(A1:B2,LAMBDA(area,area*2))")),
         ExcelErrorKind::Calc
     );
 }
@@ -150,15 +150,15 @@ fn byrow_and_bycol_reduce_each_line() {
 #[test]
 fn makearray_builds_from_indices() {
     assert_eq!(
-        spill("=MAKEARRAY(2,2,LAMBDA(r,c,r*c))", 2, 2),
+        spill("=MAKEARRAY(2,2,LAMBDA(i,j,i*j))", 2, 2),
         vec![vec![n(1.0), n(2.0)], vec![n(2.0), n(4.0)]]
     );
     assert_eq!(
-        spill("=MAKEARRAY(1,3,LAMBDA(r,c,c))", 1, 3),
+        spill("=MAKEARRAY(1,3,LAMBDA(i,j,j))", 1, 3),
         vec![vec![n(1.0), n(2.0), n(3.0)]]
     );
     assert_eq!(
-        error_kind(single("=MAKEARRAY(0,2,LAMBDA(r,c,r))")),
+        error_kind(single("=MAKEARRAY(0,2,LAMBDA(i,j,i))")),
         ExcelErrorKind::Value
     );
 }

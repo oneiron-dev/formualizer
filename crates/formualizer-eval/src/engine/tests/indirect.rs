@@ -199,9 +199,16 @@ fn indirect_a1_argument_is_coerced_as_logical() {
     engine
         .define_name(
             "MyValue",
-            NamedDefinition::Literal(LiteralValue::Number(77.0)),
+            NamedDefinition::Formula {
+                ast: parse("=Sheet1!$Z$1"),
+                dependencies: Vec::new(),
+                range_deps: Vec::new(),
+            },
             NameScope::Workbook,
         )
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 1, 26, LiteralValue::Number(77.0))
         .unwrap();
     engine
         .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(42.0))
@@ -377,11 +384,27 @@ fn indirect_supports_quoted_sheet_and_ranges() {
 
 #[test]
 fn indirect_supports_named_ranges_and_maps_missing_name_to_ref() {
+    // INDIRECT takes "a name defined as a reference" (Microsoft): a name for a
+    // constant names no cells, so it is #REF! like an unknown name.
     let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
 
     engine
         .define_name(
             "MyValue",
+            NamedDefinition::Formula {
+                ast: parse("=Sheet1!$Z$1"),
+                dependencies: Vec::new(),
+                range_deps: Vec::new(),
+            },
+            NameScope::Workbook,
+        )
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 1, 26, LiteralValue::Number(77.0))
+        .unwrap();
+    engine
+        .define_name(
+            "MyConstant",
             NamedDefinition::Literal(LiteralValue::Number(77.0)),
             NameScope::Workbook,
         )
@@ -393,6 +416,9 @@ fn indirect_supports_named_ranges_and_maps_missing_name_to_ref() {
     engine
         .set_cell_formula("Sheet1", 1, 2, parse("=INDIRECT(\"UnknownName\")"))
         .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 1, 3, parse("=INDIRECT(\"MyConstant\")"))
+        .unwrap();
 
     engine.evaluate_all().unwrap();
 
@@ -400,9 +426,11 @@ fn indirect_supports_named_ranges_and_maps_missing_name_to_ref() {
         engine.get_cell_value("Sheet1", 1, 1),
         Some(LiteralValue::Number(77.0))
     );
-    match engine.get_cell_value("Sheet1", 1, 2) {
-        Some(LiteralValue::Error(err)) => assert_eq!(err.kind, ExcelErrorKind::Ref),
-        other => panic!("expected #REF! error, got {other:?}"),
+    for col in [2, 3] {
+        match engine.get_cell_value("Sheet1", 1, col) {
+            Some(LiteralValue::Error(err)) => assert_eq!(err.kind, ExcelErrorKind::Ref),
+            other => panic!("expected #REF! error, got {other:?}"),
+        }
     }
 }
 
@@ -418,9 +446,16 @@ fn indirect_a1_false_resolves_named_range() {
     engine
         .define_name(
             "MyValue",
-            NamedDefinition::Literal(LiteralValue::Number(77.0)),
+            NamedDefinition::Formula {
+                ast: parse("=Sheet1!$Z$1"),
+                dependencies: Vec::new(),
+                range_deps: Vec::new(),
+            },
             NameScope::Workbook,
         )
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 1, 26, LiteralValue::Number(77.0))
         .unwrap();
 
     engine

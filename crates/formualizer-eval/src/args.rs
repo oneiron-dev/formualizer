@@ -117,8 +117,12 @@ fn criteria_serial(text: &str) -> Option<f64> {
     criteria_number(text).or_else(|| crate::coercion::argument_date_text_serial(text))
 }
 
-/// An Excel error value written as criteria text (`#N/A`, `#DIV/0!`).
+/// An Excel error value written as criteria text (`#N/A`, `#DIV/0!`). The
+/// caller drops the spaces around it; any other whitespace there leaves text.
 fn criteria_error(text: &str) -> Option<ExcelErrorKind> {
+    if text.starts_with(char::is_whitespace) || text.ends_with(char::is_whitespace) {
+        return None;
+    }
     ExcelErrorKind::try_parse(text).filter(|kind| {
         matches!(
             kind,
@@ -150,28 +154,25 @@ fn is_criteria_pattern(text: &str) -> bool {
 pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError> {
     match v {
         LiteralValue::Text(s) => {
-            let s_trim = s.trim();
-
-            // Text criteria keep their spaces: "="&A9 with A9 = "   2E" matches
-            // only "   2E". Numbers are read without the spaces around them.
-            let unquote = |t: &str| -> String {
-                let trimmed = t.trim();
-                if let Some(inner) = trimmed.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
-                    inner.replace("\"\"", "\"")
-                } else {
-                    t.to_string()
-                }
-            };
+            // A criterion is its text as written. A line feed, tab, no-break
+            // space or quote mark is a character of the text it compares
+            // with, wherever it stands: a cell holding CHAR(10)&"=5" matches
+            // itself (COUNTIF(A1,A1) is 1) and not the number 5, and """x"""
+            // matches the text "x" with its quote marks. Only spaces are
+            // ignored: before the operator, and around a number, a logical or
+            // an error name. Text keeps its spaces: "="&A9 with A9 = "   2E"
+            // matches only "   2E".
+            let spaced = s.trim_matches(' ');
 
             // Operators: >=, <=, <>, >, <, =
             let ops = [">=", "<=", "<>", ">", "<", "="];
             for op in ops.iter() {
-                if let Some(rhs) = s.trim_start().strip_prefix(op) {
-                    let rhs_trim = rhs.trim();
+                if let Some(rhs) = s.trim_start_matches(' ').strip_prefix(op) {
+                    let rhs_value = rhs.trim_matches(' ');
                     // Try numeric parse for comparisons. Like the cells it is
                     // compared with, a criterion number, date or time ignores
                     // only the spaces around it: "=5"&CHAR(10) is text.
-                    if let Some(n) = criteria_serial(rhs.trim_matches(' ')) {
+                    if let Some(n) = criteria_serial(rhs_value) {
                         return Ok(match *op {
                             ">=" => CriteriaPredicate::Ge(n),
                             "<=" => CriteriaPredicate::Le(n),
@@ -182,13 +183,13 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
                             _ => unreachable!(),
                         });
                     }
-                    // Fallback: non-numeric equals/neq text (support Excel-style quoted strings: ="aa")
-                    // An error spelled out ("<>#N/A") compares against error cells.
-                    let lit = match criteria_error(rhs_trim) {
+                    // Fallback: non-numeric equals/neq text. An error spelled
+                    // out ("<>#N/A") compares against error cells.
+                    let lit = match criteria_error(rhs_value) {
                         Some(kind) if matches!(*op, "=" | "<>") => {
                             LiteralValue::Error(ExcelError::new(kind))
                         }
-                        _ => LiteralValue::Text(unquote(rhs)),
+                        _ => LiteralValue::Text(rhs.to_string()),
                     };
                     // Wildcards apply after "=" and "<>" as they do with no operator.
                     if let LiteralValue::Text(t) = &lit
@@ -216,14 +217,14 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
                         "<>" => CriteriaPredicate::Ne(lit),
                         ">=" | "<=" | ">" | "<" => {
                             // Non-numeric compare: not fully supported; degrade to equality on full expression
-                            CriteriaPredicate::Eq(LiteralValue::Text(s_trim.to_string()))
+                            CriteriaPredicate::Eq(LiteralValue::Text(spaced.to_string()))
                         }
                         _ => unreachable!(),
                     });
                 }
             }
 
-            let plain = unquote(s);
+            let plain = s.clone();
 
             // Wildcards * or ? => TextLike (where ~ escapes the next character)
             if is_criteria_pattern(&plain) {
@@ -233,7 +234,7 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
                 });
             }
             // Booleans TRUE/FALSE
-            let lower = plain.trim().to_ascii_lowercase();
+            let lower = spaced.to_ascii_lowercase();
             if lower == "true" {
                 return Ok(CriteriaPredicate::Eq(LiteralValue::Boolean(true)));
             } else if lower == "false" {
@@ -244,10 +245,10 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
             // the spaces around it are ignored, as for the cells: "5"&CHAR(10)
             // is a text criterion that matches the text "5"&CHAR(10) and not
             // the number 5.
-            if let Some(n) = criteria_serial(plain.trim_matches(' ')) {
+            if let Some(n) = criteria_serial(spaced) {
                 return Ok(CriteriaPredicate::Eq(LiteralValue::Number(n)));
             }
-            if let Some(kind) = criteria_error(plain.trim()) {
+            if let Some(kind) = criteria_error(spaced) {
                 return Ok(CriteriaPredicate::Eq(LiteralValue::Error(ExcelError::new(
                     kind,
                 ))));
@@ -798,6 +799,51 @@ mod criteria_tests {
         let two = parse_criteria(&text("=日?")).unwrap();
         assert!(criteria_match(&two, &text("日本")));
         assert!(!criteria_match(&two, &text("日本語")));
+    }
+
+    #[test]
+    fn criteria_keep_nonprinting_characters_and_quote_marks_as_text() {
+        // A line feed, tab or no-break space before an operator, logical or
+        // error name is a character of the text, not whitespace to skip: the
+        // criterion matches the cell holding the same text and nothing else.
+        for (criterion, other) in [
+            ("\n=5", LiteralValue::Number(5.0)),
+            ("\t>4", LiteralValue::Number(5.0)),
+            ("\u{a0}<>x", text("y")),
+            ("TRUE\n", LiteralValue::Boolean(true)),
+            ("\tFALSE", LiteralValue::Boolean(false)),
+            ("#N/A\n", LiteralValue::Error(ExcelError::new_na())),
+        ] {
+            let pred = parse_criteria(&text(criterion)).unwrap();
+            assert!(criteria_match(&pred, &text(criterion)), "{criterion:?}");
+            assert!(!criteria_match(&pred, &other), "{criterion:?}");
+        }
+        // After an operator too: ="\t#N/A" is the text "\t#N/A".
+        let pred = parse_criteria(&text("=\t#N/A")).unwrap();
+        assert!(criteria_match(&pred, &text("\t#N/A")));
+        assert!(!criteria_match(
+            &pred,
+            &LiteralValue::Error(ExcelError::new_na())
+        ));
+        // Quote marks are characters too: """x""" matches "x" with its quote
+        // marks, and ="x" the same text.
+        for criterion in ["\"x\"", "=\"x\""] {
+            let pred = parse_criteria(&text(criterion)).unwrap();
+            assert!(criteria_match(&pred, &text("\"x\"")), "{criterion:?}");
+            assert!(!criteria_match(&pred, &text("x")), "{criterion:?}");
+        }
+        // Spaces around an operator's value, a logical or an error name are
+        // ignored as before.
+        let cases = [
+            (" =5", LiteralValue::Number(5.0)),
+            (" TRUE ", LiteralValue::Boolean(true)),
+            (" #N/A ", LiteralValue::Error(ExcelError::new_na())),
+            ("<> #N/A", LiteralValue::Number(1.0)),
+        ];
+        for (criterion, cell) in cases {
+            let pred = parse_criteria(&text(criterion)).unwrap();
+            assert!(criteria_match(&pred, &cell), "{criterion:?}");
+        }
     }
 
     #[test]
