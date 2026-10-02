@@ -105,8 +105,9 @@ fn find_semantic_empty(
 /// when no number is at or above a numeric lookup value, exact-or-next-larger
 /// returns the first blank met. A blank lookup value is an exact match for an
 /// empty entry, as in the exact mode, and otherwise searches as the number 0.
-/// Candidates are ordered by their own values (numbers exactly, with no
-/// lookup tolerance), so the nearer of two close numbers wins.
+/// Numbers compare by their exact values, with the lookup value as with each
+/// other, so the nearer of two close numbers wins and a number just past the
+/// lookup value is not an exact match.
 ///
 /// The lookup array holds `written_len` entries, of which `cell` reads the
 /// first `len`; the rest (the unused tail of a whole column or row) are blank

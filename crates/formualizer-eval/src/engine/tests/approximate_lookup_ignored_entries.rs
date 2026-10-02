@@ -917,16 +917,19 @@ fn match_rejects_a_two_dimensional_lookup_array() {
     }
 }
 
-/// A lookup tells apart numbers that differ within 15 significant digits,
-/// however close to zero they are: 5E-13 is above 0, so an ascending
-/// approximate lookup for 0 has nothing at or below it, exact-or-next-smaller
-/// misses, and an exact lookup finds no 0. A difference past the 15th
-/// significant digit is floating-point noise and still matches.
+/// Lookups compare numbers by their exact values, with no tolerance: 5E-13
+/// and 1E-13 are above 0, so an ascending approximate lookup for 0 has
+/// nothing at or below it (the logicals beside 1E-13 are skipped, not taken
+/// for 0), exact-or-next-smaller misses, and an exact lookup finds no 0.
+/// 0.1+0.2 is 0.30000000000000004: above 0.3 to an approximate search and not
+/// 0.3 to an exact one, though `(0.1+0.2)=0.3` is TRUE, the `=` operator
+/// rounding both sides to 15 significant digits.
 #[test]
-fn numbers_differing_within_15_digits_are_not_equal() {
+fn lookups_compare_numbers_exactly() {
     let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
-    // X1:X2 = 5E-13, 1 with Y1:Y2 = 10, 20.
-    for (row, key, payload) in [(1, 0.0000000000005, 10), (2, 1.0, 20)] {
+    // X1:X2 = 5E-13, 1 with Y1:Y2 = 10, 20; X3:X4 = 0.1, =0.1+0.2 with
+    // Y3:Y4 = 30, 40.
+    for (row, key, payload) in [(1, 0.0000000000005, 10), (2, 1.0, 20), (3, 0.1, 30)] {
         engine
             .set_cell_value("Sheet1", row, 24, LiteralValue::Number(key))
             .unwrap();
@@ -934,6 +937,12 @@ fn numbers_differing_within_15_digits_are_not_equal() {
             .set_cell_value("Sheet1", row, 25, LiteralValue::Int(payload))
             .unwrap();
     }
+    engine
+        .set_cell_formula("Sheet1", 4, 24, parse("=0.1+0.2").unwrap())
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 4, 25, LiteralValue::Int(40))
+        .unwrap();
     for formula in [
         "=MATCH(0,{0.0000000000005,1},1)",
         "=LOOKUP(0,{0.0000000000005,1},{10,20})",
@@ -944,24 +953,80 @@ fn numbers_differing_within_15_digits_are_not_equal() {
         "=MATCH(0,X1:X2,0)",
         "=VLOOKUP(0,X1:Y2,2,FALSE)",
         "=XMATCH(0,X1:X2)",
+        "=MATCH(0,{1E-13},1)",
+        "=MATCH(0,{1E-13;FALSE;TRUE},1)",
+        "=LOOKUP(0,{1E-13;FALSE;TRUE},{\"number\";\"false\";\"true\"})",
+        "=VLOOKUP(0,{1E-13,\"number\";FALSE,\"false\";TRUE,\"true\"},2,TRUE)",
+        "=HLOOKUP(0,{1E-13,FALSE,TRUE;\"number\",\"false\",\"true\"},2,TRUE)",
+        "=MATCH(0.3,X4,1)",
+        "=MATCH(0.3,X4,0)",
+        "=MATCH(0.1+0.2,{0.1,0.3},0)",
+        "=VLOOKUP(0.3,X4:Y4,2,FALSE)",
+        "=XMATCH(0.3,X3:X4)",
     ] {
         assert_na(eval_at(&mut engine, formula), formula);
     }
-    assert_eq!(
-        eval_at(
-            &mut engine,
-            "=XLOOKUP(0,{0.0000000000005,1},{10,20},\"NF\",-1)"
-        ),
-        Some(LiteralValue::Text("NF".into()))
-    );
+    for formula in [
+        "=XLOOKUP(0,{0.0000000000005,1},{10,20},\"NF\",-1)",
+        "=XLOOKUP(0,{1E-13},{10},\"NF\",-1)",
+    ] {
+        assert_eq!(
+            eval_at(&mut engine, formula),
+            Some(LiteralValue::Text("NF".into())),
+            "{formula}"
+        );
+    }
     for (formula, expected) in [
         ("=XLOOKUP(0,{0.0000000000005,1},{10,20},\"NF\",1)", 10.0),
         ("=MATCH(0.0000000000005,X1:X2,0)", 1.0),
         ("=MATCH(0.0000000000005,X1:X2,1)", 1.0),
-        // 0.1+0.2 is 0.30000000000000004: noise past the 15th digit.
-        ("=MATCH(0.1+0.2,{0.1,0.3},0)", 2.0),
-        ("=MATCH(0.3,{0.1,0.1+0.2},1)", 2.0),
+        // 0.30000000000000004 is above 0.3: the last entry at or below 0.3 is
+        // 0.1, and it is the next larger entry, not an exact match.
+        ("=MATCH(0.3,X3:X4,1)", 1.0),
+        ("=VLOOKUP(0.3,X3:Y4,2,TRUE)", 30.0),
+        ("=LOOKUP(0.3,X3:X4,Y3:Y4)", 30.0),
+        ("=XLOOKUP(0.3,X3:X4,Y3:Y4,\"NF\",-1)", 30.0),
+        ("=XLOOKUP(0.3,X3:X4,Y3:Y4,\"NF\",1)", 40.0),
+        // The same computation finds itself.
+        ("=MATCH(0.1+0.2,X3:X4,0)", 2.0),
+        ("=MATCH(0.1+0.2,X3:X4,1)", 2.0),
+        ("=XLOOKUP(0.1+0.2,X3:X4,Y3:Y4,\"NF\",-1)", 40.0),
     ] {
         assert_number(eval_at(&mut engine, formula), expected, formula);
+    }
+    // Control: the = operator still compares to 15 significant digits.
+    assert_eq!(
+        eval_at(&mut engine, "=(0.1+0.2)=0.3"),
+        Some(LiteralValue::Boolean(true))
+    );
+}
+
+/// An exact lookup over a column long enough for the engine's lookup index
+/// still compares exactly: the number one step above 3 is not 3, though the
+/// index files near-integers under the integer.
+#[test]
+fn exact_lookup_over_a_long_column_compares_exactly() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    let above_three = f64::from_bits(3.0f64.to_bits() + 1);
+    for row in 1..=200u32 {
+        let key = match row {
+            5 => LiteralValue::Number(above_three),
+            150 => LiteralValue::Int(3),
+            _ => LiteralValue::Int(1000 + row as i64),
+        };
+        engine.set_cell_value("Sheet1", row, 24, key).unwrap();
+        engine
+            .set_cell_value("Sheet1", row, 25, LiteralValue::Int(row as i64))
+            .unwrap();
+    }
+    for (formula, expected) in [
+        ("=MATCH(3,X1:X200,0)", 150.0),
+        ("=VLOOKUP(3,X1:Y200,2,FALSE)", 150.0),
+        ("=XLOOKUP(3,X1:X200,Y1:Y200)", 150.0),
+        ("=XMATCH(3,X:X)", 150.0),
+    ] {
+        for _ in 0..3 {
+            assert_number(eval_at(&mut engine, formula), expected, formula);
+        }
     }
 }

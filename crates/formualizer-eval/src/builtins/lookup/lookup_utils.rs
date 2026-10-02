@@ -29,17 +29,18 @@ pub fn value_to_f64_lenient(v: &LiteralValue, date_system: DateSystem) -> Option
     }
 }
 
-/// Whether two numbers are the same lookup key.
+/// Whether two numbers are the same lookup key: only when their stored
+/// values are identical.
 ///
-/// Excel keeps 15 significant digits, so two numbers that differ within them
-/// are different keys however close to zero they are: 5E-13 is not 0, and a
-/// lookup for 0 neither finds it as an exact match nor counts it as the
-/// largest value at or below 0. A difference past the 15th significant digit
-/// is floating-point noise (`0.1+0.2` against `0.3`) and does not separate
-/// two numbers, as with the `=` operator; a difference of 1E-12 or more
-/// always does.
+/// Excel's lookups compare numbers by their exact binary values, with no
+/// tolerance. Unlike the `=` operator, which rounds both sides to 15
+/// significant digits (`0.1+0.2=0.3` is TRUE), `MATCH(0.1+0.2,{0.3},0)` is
+/// `#N/A`, and 5E-13 is not 0 however close to zero it is. Microsoft's "How to
+/// correct a #N/A error in the VLOOKUP function" documents the consequence: a
+/// floating-point value that differs from the key only past what the cell
+/// shows is not found, and the remedy is to round both sides.
 pub(crate) fn lookup_numbers_equal(x: f64, y: f64) -> bool {
-    x == y || ((x - y).abs() < 1e-12 && crate::coercion::same_to_15_digits(x, y))
+    x == y
 }
 
 /// Case-insensitive text equality (no wildcards).
@@ -176,6 +177,11 @@ pub fn equals_maybe_wildcard(
 /// the number 0 or 1 here and numeric-looking text is not a number, so a
 /// numeric search skips both, as it skips blanks and errors. A blank lookup
 /// value searches as the number 0.
+///
+/// Numbers compare by their exact values, with no equality tolerance (see
+/// [`lookup_numbers_equal`]): 1E-13 is above 0, so `MATCH(0,{1E-13},1)` has
+/// nothing at or below 0 and is `#N/A`, and 0.1+0.2 (0.30000000000000004) is
+/// above 0.3.
 pub fn cmp_for_approximate(
     value: &LiteralValue,
     needle: &LiteralValue,
@@ -187,7 +193,9 @@ pub fn cmp_for_approximate(
         }
         (LiteralValue::Boolean(a), LiteralValue::Boolean(b)) => Some(a.cmp(b) as i32),
         (v, n) if is_numeric_exact_value(v) && searches_numbers(n) => {
-            cmp_for_lookup(v, n, date_system)
+            let x = value_to_f64_lenient(v, date_system)?;
+            let y = value_to_f64_lenient(n, date_system)?;
+            x.partial_cmp(&y).map(|ordering| ordering as i32)
         }
         _ => None,
     }
@@ -1352,6 +1360,54 @@ mod tests {
         ] {
             let reference = ReferenceType::from_string(text).unwrap();
             assert_eq!(reference_extent(&reference), Some(expected), "{text}");
+        }
+    }
+
+    /// Lookups compare numbers by their exact values in every mode; only the
+    /// `=` operator rounds to 15 significant digits.
+    #[test]
+    fn lookup_numbers_compare_exactly() {
+        let d = DateSystem::Excel1900;
+        let sum = 0.1 + 0.2;
+        assert!(lookup_numbers_equal(0.3, 0.3));
+        assert!(lookup_numbers_equal(0.0, -0.0));
+        assert!(!lookup_numbers_equal(sum, 0.3));
+        assert!(!lookup_numbers_equal(0.0, 1e-13));
+        assert_eq!(
+            cmp_for_lookup(&LiteralValue::Number(sum), &LiteralValue::Number(0.3), d),
+            Some(1)
+        );
+        assert_eq!(
+            cmp_for_lookup(&LiteralValue::Int(3), &LiteralValue::Number(3.0), d),
+            Some(0)
+        );
+        for (value, needle, expected) in [
+            (LiteralValue::Number(1e-13), LiteralValue::Int(0), Some(1)),
+            (LiteralValue::Number(-1e-13), LiteralValue::Int(0), Some(-1)),
+            (LiteralValue::Number(1e-13), LiteralValue::Empty, Some(1)),
+            (LiteralValue::Number(-0.0), LiteralValue::Empty, Some(0)),
+            (
+                LiteralValue::Number(sum),
+                LiteralValue::Number(0.3),
+                Some(1),
+            ),
+            (
+                LiteralValue::Number(0.3),
+                LiteralValue::Number(sum),
+                Some(-1),
+            ),
+            (
+                LiteralValue::Number(sum),
+                LiteralValue::Number(sum),
+                Some(0),
+            ),
+            (LiteralValue::Boolean(false), LiteralValue::Int(0), None),
+        ] {
+            assert_eq!(
+                cmp_for_approximate(&value, &needle, d),
+                expected,
+                "{value:?} against {needle:?}"
+            );
         }
     }
 }
