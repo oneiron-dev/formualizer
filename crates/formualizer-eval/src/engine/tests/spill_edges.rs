@@ -153,6 +153,126 @@ fn whole_column_arrays_keep_legacy_formula_semantics() {
 }
 
 #[test]
+fn whole_columns_through_functions_spill_past_the_last_row() {
+    // Microsoft's sheet-edge example: =VLOOKUP(A:A,A:C,2,FALSE) in E2 looks
+    // up every row of column A, 1,048,576 results that cannot spill from row
+    // 2. So do functions lifted over a whole column, IF and CHOOSE selecting
+    // one by a constant, IFERROR of one, a 0 row of INDEX, SORT, and
+    // TRANSPOSE (16,384 columns at most) even from row 1. Reductions,
+    // selections and an unselected branch return single values.
+    let mut engine = Engine::new(TestWorkbook::new(), serial_eval_config());
+    for r in 1..=3u32 {
+        for c in 1..=3u32 {
+            engine
+                .set_cell_value("Sheet1", r, c, LiteralValue::Int((r * 10 + c) as i64))
+                .unwrap();
+        }
+    }
+    let spilling = [
+        (2, 5, "=VLOOKUP(A:A,A:C,2,FALSE)"),
+        (2, 6, "=IF(TRUE,A:A)"),
+        (2, 7, "=INDEX(A:A,0)"),
+        (2, 8, "=ABS(A:A)"),
+        (2, 9, "=IFERROR(A:A*1,0)"),
+        (2, 10, "=CHOOSE(2,1,A:A)"),
+        (2, 11, "=SORT(A:A)"),
+        (1, 12, "=TRANSPOSE(A:A)"),
+        (2, 13, "=INDEX(A:C,0,2)"),
+        (2, 14, "=COUNTIF(A:A,A:A)"),
+    ];
+    let single = [
+        (2, 16, "=VLOOKUP(A2,A:C,2,FALSE)", 22.0),
+        (2, 17, "=IF(FALSE,A:A,1)", 1.0),
+        (2, 18, "=SUM(ABS(A:A))", 63.0),
+        (2, 19, "=INDEX(A:A,2)", 21.0),
+        (2, 20, "=CHOOSE(1,5,A:A)", 5.0),
+    ];
+    for (r, c, f) in spilling
+        .iter()
+        .copied()
+        .chain(single.iter().map(|s| (s.0, s.1, s.2)))
+    {
+        engine
+            .set_cell_formula("Sheet1", r, c, parse(f).unwrap())
+            .unwrap();
+    }
+    engine.evaluate_all().unwrap();
+    for (r, c, f) in spilling {
+        assert_spill(engine.get_cell_value("Sheet1", r, c), f);
+        assert_eq!(engine.get_cell_value("Sheet1", r + 1, c), None, "{f}");
+    }
+    for (r, c, f, v) in single {
+        assert_eq!(
+            engine.get_cell_value("Sheet1", r, c),
+            Some(LiteralValue::Number(v)),
+            "{f}"
+        );
+    }
+
+    // In a workbook file only dynamic arrays spill: an ordinary formula
+    // takes the implicit intersection (VLOOKUP looks up A2).
+    let mut engine = Engine::new(TestWorkbook::new(), serial_eval_config());
+    for r in 1..=3u32 {
+        for c in 1..=3u32 {
+            engine
+                .set_cell_value("Sheet1", r, c, LiteralValue::Int((r * 10 + c) as i64))
+                .unwrap();
+        }
+    }
+    engine
+        .set_cell_formula("Sheet1", 2, 5, parse("=VLOOKUP(A:A,A:C,2,FALSE)").unwrap())
+        .unwrap();
+    engine.use_legacy_array_semantics();
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 2, 5),
+        Some(LiteralValue::Number(22.0))
+    );
+}
+
+#[test]
+fn blocked_spill_extent_is_the_result_that_could_not_spill() {
+    // A1 =SEQUENCE(C1) is blocked by A2; E2 =A:A runs past the sheet's edge.
+    let mut engine = Engine::new(TestWorkbook::new(), serial_eval_config());
+    engine
+        .set_cell_value("Sheet1", 1, 3, LiteralValue::Int(3))
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 2, 1, LiteralValue::Text("x".into()))
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("=SEQUENCE(C1)").unwrap())
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 2, 5, parse("=A:A").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_spill(engine.get_cell_value("Sheet1", 1, 1), "blocked");
+    assert_eq!(engine.blocked_spill_extent("Sheet1", 1, 1), Some((3, 1)));
+    assert_spill(engine.get_cell_value("Sheet1", 2, 5), "sheet edge");
+    assert_eq!(engine.blocked_spill_extent("Sheet1", 2, 5), None);
+    // Still blocked, with a two-row result.
+    engine
+        .set_cell_value("Sheet1", 1, 3, LiteralValue::Int(2))
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(engine.blocked_spill_extent("Sheet1", 1, 1), Some((2, 1)));
+    // Without the blocker it spills.
+    engine
+        .set_cell_value("Sheet1", 2, 1, LiteralValue::Empty)
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 1, 1, parse("=SEQUENCE(C1)").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 2, 1),
+        Some(LiteralValue::Number(2.0))
+    );
+    assert_eq!(engine.blocked_spill_extent("Sheet1", 1, 1), None);
+}
+
+#[test]
 fn spill_values_update_dependents() {
     let wb = TestWorkbook::new();
     let mut engine = Engine::new(wb, serial_eval_config());

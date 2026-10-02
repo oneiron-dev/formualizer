@@ -519,8 +519,9 @@ fn typed_text_controls_fail_instead_of_silent_corruption() {
 }
 #[test]
 fn modern_scalar_errors_are_cached_as_value_errors() {
-    // Excel caches #SPILL! and #CALC! as #VALUE!; the summary keeps the kind.
-    // New functions are spelled as Excel saves them (_xlfn.).
+    // Excel caches #SPILL! and #CALC! as #VALUE! and tags the cell with the
+    // rich error (vm); the summary keeps the kind. New functions are spelled
+    // as Excel saves them (_xlfn.).
     for (formula, token) in [
         (
             " cm=\"1\"><f t=\"array\" ref=\"A1\">_xlfn.SEQUENCE(2)</f>",
@@ -534,7 +535,7 @@ fn modern_scalar_errors_are_cached_as_value_errors() {
         let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
         assert_eq!(out.summary.errors, 1);
         assert_eq!(out.summary.error_summary[token].count, 1);
-        assert!(member(&out.bytes, SHEET).contains("t=\"e\""));
+        assert!(member(&out.bytes, SHEET).contains("t=\"e\" vm=\"1\""));
         assert!(member(&out.bytes, SHEET).contains("</f><v>#VALUE!</v>"));
         assert_eq!(
             data(&out.bytes, 0),
@@ -544,10 +545,11 @@ fn modern_scalar_errors_are_cached_as_value_errors() {
         assert_eq!(again.bytes, out.bytes);
         assert_eq!(again.summary.errors, 1);
     }
-    // As Excel saved it: a #SPILL! cached as #VALUE! and tagged #SPILL!.
+    // As Excel saved it: a #SPILL! cached as #VALUE! and tagged #SPILL! of
+    // a two-row result.
     let rows = "<row r=\"1\"><c r=\"A1\" t=\"e\" cm=\"1\" vm=\"1\"><f t=\"array\" ref=\"A1\">_xlfn.SEQUENCE(2)</f><v>#VALUE!</v></c></row>\
         <row r=\"2\"><c r=\"A2\"><v>7</v></c></row>";
-    let input = pack(&with_rich_errors(parts(rows), &[8]));
+    let input = pack(&with_rich_values(parts(rows), &[(8, 0, 1)]));
     let out = recalculate_xlsx_bytes(&input, Default::default()).unwrap();
     assert_eq!((out.summary.errors, out.cache_cells_changed), (1, 0));
     assert_eq!(out.bytes, input);
@@ -883,7 +885,16 @@ fn misplaced_arrays_and_rich_value_metadata_stay_unsupported() {
 const RICH_RELS: &str = "http://schemas.microsoft.com/office/2017/06/relationships";
 /// Excel's tags for cached errors without a legacy code: value metadata `i`
 /// (cell `vm="i+1"`) is an `_error` rich value with `errorType` codes[i].
-fn with_rich_errors(mut p: BTreeMap<String, String>, codes: &[u32]) -> BTreeMap<String, String> {
+fn with_rich_errors(p: BTreeMap<String, String>, codes: &[u32]) -> BTreeMap<String, String> {
+    let values: Vec<_> = codes.iter().map(|&code| (code, 0, 0)).collect();
+    with_rich_values(p, &values)
+}
+/// As [`with_rich_errors`], each rich value (`errorType`, `colOffset`,
+/// `rwOffset`) with Excel's `subType` 3.
+fn with_rich_values(
+    mut p: BTreeMap<String, String>,
+    codes: &[(u32, u32, u32)],
+) -> BTreeMap<String, String> {
     let ct = p.get_mut("[Content_Types].xml").unwrap();
     *ct = ct.replace("</Types>","<Override PartName=\"/xl/metadata.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml\"/><Override PartName=\"/xl/richData/rdrichvalue.xml\" ContentType=\"application/vnd.ms-excel.rdrichvalue+xml\"/><Override PartName=\"/xl/richData/rdrichvaluestructure.xml\" ContentType=\"application/vnd.ms-excel.rdrichvaluestructure+xml\"/></Types>");
     let rel = p.get_mut("xl/_rels/workbook.xml.rels").unwrap();
@@ -898,7 +909,7 @@ fn with_rich_errors(mut p: BTreeMap<String, String>, codes: &[u32]) -> BTreeMap<
     p.insert("xl/metadata.xml".into(), format!("<metadata xmlns=\"{MAIN}\" xmlns:xlrd=\"http://schemas.microsoft.com/office/spreadsheetml/2017/richdata\" xmlns:xda=\"http://schemas.microsoft.com/office/spreadsheetml/2017/dynamicarray\">{types}<valueMetadata count=\"{n}\">{records}</valueMetadata></metadata>"));
     let values: String = codes
         .iter()
-        .map(|c| format!("<rv s=\"0\"><v>0</v><v>{c}</v><v>0</v><v>3</v></rv>"))
+        .map(|(c, col, row)| format!("<rv s=\"0\"><v>{col}</v><v>{c}</v><v>{row}</v><v>3</v></rv>"))
         .collect();
     p.insert("xl/richData/rdrichvalue.xml".into(), format!("<rvData xmlns=\"http://schemas.microsoft.com/office/spreadsheetml/2017/richdata\" count=\"{n}\">{values}</rvData>"));
     p.insert("xl/richData/rdrichvaluestructure.xml".into(), "<rvStructures xmlns=\"http://schemas.microsoft.com/office/spreadsheetml/2017/richdata\" count=\"1\"><s t=\"_error\"><k n=\"colOffset\" t=\"i\"/><k n=\"errorType\" t=\"i\"/><k n=\"rwOffset\" t=\"i\"/><k n=\"subType\" t=\"i\"/></s></rvStructures>".into());
@@ -906,18 +917,18 @@ fn with_rich_errors(mut p: BTreeMap<String, String>, codes: &[u32]) -> BTreeMap<
 }
 #[test]
 fn rich_error_tags_are_kept_only_while_the_cell_holds_that_error() {
-    // vm 1 tags #SPILL! (errorType 8), vm 2 #CALC! (13), vm 3 #CONNECT! (9).
-    // A1 still spills into A2's value, B1 is now 2, C1 is now a genuine
-    // #VALUE!, D1 is still #CALC!, E1 is a #SPILL! tagged #CONNECT!.
-    // Functions newer than the 2007 file format are saved with Excel's
-    // _xlfn. prefix.
+    // vm 1 tags #SPILL! (errorType 8) of a two-row result (rwOffset 1), vm 2
+    // #CALC! (13), vm 3 #CONNECT! (9). A1 still spills its two rows into
+    // A2's value, B1 is now 2, C1 is now a genuine #VALUE!, D1 is still
+    // #CALC!, E1 is a #SPILL! tagged #CONNECT!. Functions newer than the
+    // 2007 file format are saved with Excel's _xlfn. prefix.
     let rows = "<row r=\"1\"><c r=\"A1\" t=\"e\" cm=\"1\" vm=\"1\"><f t=\"array\" ref=\"A1\">_xlfn.SEQUENCE(2)</f><v>#VALUE!</v></c>\
         <c r=\"B1\" t=\"e\" vm=\"1\"><f>1+1</f><v>#VALUE!</v></c>\
         <c r=\"C1\" t=\"e\" vm=\"1\"><f>&quot;a&quot;+1</f><v>#VALUE!</v></c>\
         <c r=\"D1\" t=\"e\" vm=\"2\"><f>_xlfn._xlws.FILTER(A2:A2,FALSE)</f><v>#VALUE!</v></c>\
         <c r=\"E1\" vm=\"3\" t=\"e\" cm=\"1\"><f t=\"array\" ref=\"E1\">_xlfn.SEQUENCE(2)</f><v>#VALUE!</v></c></row>\
         <row r=\"2\"><c r=\"A2\"><v>7</v></c><c r=\"E2\"><v>7</v></c></row>";
-    let mut p = with_rich_errors(parts(rows), &[8, 13, 9]);
+    let mut p = with_rich_values(parts(rows), &[(8, 0, 1), (13, 0, 0), (9, 0, 0)]);
     let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
     let sheet = member(&out.bytes, SHEET);
     for expected in [
@@ -926,14 +937,30 @@ fn rich_error_tags_are_kept_only_while_the_cell_holds_that_error() {
         "<c r=\"B1\" ><f>1+1</f><v>2</v>",
         "<c r=\"C1\" t=\"e\"><f>",
         "<c r=\"D1\" t=\"e\" vm=\"2\">",
-        "<c r=\"E1\" t=\"e\" cm=\"1\">",
+        // E1 is tagged as the #SPILL! it is, with a new rich value: the saved
+        // ones carry Excel's subType, which names the reason.
+        "<c r=\"E1\" vm=\"4\" t=\"e\" cm=\"1\">",
     ] {
         assert!(sheet.contains(expected), "{expected} in {sheet}");
     }
     assert_eq!(out.summary.errors, 4);
     assert!(!sheet.contains("ca=\"1\""), "{sheet}");
-    for part in ["xl/metadata.xml", "xl/richData/rdrichvalue.xml"] {
-        assert_eq!(member(&out.bytes, part), p[part]);
+    let values = member(&out.bytes, "xl/richData/rdrichvalue.xml");
+    assert!(
+        values.contains("count=\"4\"")
+            && values.ends_with("<v>3</v></rv><rv s=\"1\"><v>0</v><v>8</v><v>1</v></rv></rvData>"),
+        "{values}"
+    );
+    let structures = member(&out.bytes, "xl/richData/rdrichvaluestructure.xml");
+    assert!(structures.ends_with("count=\"2\"><s t=\"_error\"><k n=\"colOffset\" t=\"i\"/><k n=\"errorType\" t=\"i\"/><k n=\"rwOffset\" t=\"i\"/><k n=\"subType\" t=\"i\"/></s><s t=\"_error\"><k n=\"colOffset\" t=\"i\"/><k n=\"errorType\" t=\"i\"/><k n=\"rwOffset\" t=\"i\"/></s></rvStructures>"), "{structures}");
+    let metadata = member(&out.bytes, "xl/metadata.xml");
+    for expected in [
+        "<futureMetadata name=\"XLRICHVALUE\" count=\"4\">",
+        "<bk><extLst><ext uri=\"{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}\"><xlrd:rvb xmlns:xlrd=\"http://schemas.microsoft.com/office/spreadsheetml/2017/richdata\" i=\"3\"/></ext></extLst></bk></futureMetadata>",
+        "<valueMetadata count=\"4\">",
+        "<bk><rc t=\"2\" v=\"3\"/></bk></valueMetadata>",
+    ] {
+        assert!(metadata.contains(expected), "{expected} in {metadata}");
     }
     let again = recalculate_xlsx_bytes(&out.bytes, Default::default()).unwrap();
     assert_eq!(again.bytes, out.bytes);
@@ -957,9 +984,10 @@ fn rich_values_other_than_error_tags_stay_unsupported() {
         )
         .is_ok()
     );
-    // A tag on a value that no formula computes, or outside the records.
+    // A tag on a value that is not an error, on an empty cell, or outside
+    // the records.
     for cell in [
-        "<c r=\"A1\" t=\"e\" vm=\"1\"><v>#VALUE!</v></c>",
+        "<c r=\"A1\" vm=\"1\"><v>5</v></c>",
         "<c r=\"A1\" vm=\"1\"/>",
         "<c r=\"A1\" t=\"e\" vm=\"2\"><f>1+1</f><v>#VALUE!</v></c>",
         "<c r=\"A1\" t=\"e\" vm=\"0\"><f>1+1</f><v>#VALUE!</v></c>",
@@ -1073,6 +1101,185 @@ fn documented_rich_error_variants_are_admitted() {
         *text = text.replace(from, to);
         reject(&bad);
     }
+}
+const RICH: &str = "http://schemas.microsoft.com/office/spreadsheetml/2017/richdata";
+#[test]
+fn new_spill_and_calc_errors_are_saved_with_their_rich_errors() {
+    // Without its rich error a cached #VALUE! means #VALUE!. A1 is a new
+    // #CALC! and B1 reads it; the package had no metadata or rich data, so
+    // the writer adds them ([MS-XLSX] errorType 13), with their content
+    // types and workbook relationships.
+    let rows = "<row r=\"1\"><c r=\"A1\"><f>_xlfn._xlws.FILTER(C1:C1,FALSE)</f><v>5</v></c>\
+        <c r=\"B1\"><f>A1</f><v>5</v></c><c r=\"C1\"><v>1</v></c></row>";
+    let out = recalculate_xlsx_bytes(&pack(&parts(rows)), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<c r=\"A1\" t=\"e\" vm=\"1\"><f>_xlfn._xlws.FILTER(C1:C1,FALSE)</f><v>#VALUE!</v>",
+        "<c r=\"B1\" t=\"e\" vm=\"1\"><f>A1</f><v>#VALUE!</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected} in {sheet}");
+    }
+    assert_eq!(out.cache_cells_changed, 2);
+    assert_eq!(out.worksheet_parts_changed, 1);
+    let declaration = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n";
+    assert_eq!(
+        member(&out.bytes, "xl/metadata.xml"),
+        format!(
+            "{declaration}<metadata xmlns=\"{MAIN}\" xmlns:xlrd=\"{RICH}\"><metadataTypes count=\"1\"><metadataType name=\"XLRICHVALUE\" minSupportedVersion=\"120000\" copy=\"1\" pasteAll=\"1\" pasteValues=\"1\" merge=\"1\" splitFirst=\"1\" rowColShift=\"1\" clearFormats=\"1\" clearComments=\"1\" assign=\"1\" coerce=\"1\"/></metadataTypes><futureMetadata name=\"XLRICHVALUE\" count=\"1\"><bk><extLst><ext uri=\"{{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}}\"><xlrd:rvb xmlns:xlrd=\"{RICH}\" i=\"0\"/></ext></extLst></bk></futureMetadata><valueMetadata count=\"1\"><bk><rc t=\"1\" v=\"0\"/></bk></valueMetadata></metadata>"
+        )
+    );
+    assert_eq!(
+        member(&out.bytes, "xl/richData/rdrichvalue.xml"),
+        format!(
+            "{declaration}<rvData xmlns=\"{RICH}\" count=\"1\"><rv s=\"0\"><v>13</v></rv></rvData>"
+        )
+    );
+    assert_eq!(
+        member(&out.bytes, "xl/richData/rdrichvaluestructure.xml"),
+        format!(
+            "{declaration}<rvStructures xmlns=\"{RICH}\" count=\"1\"><s t=\"_error\"><k n=\"errorType\" t=\"i\"/></s></rvStructures>"
+        )
+    );
+    let types = member(&out.bytes, "[Content_Types].xml");
+    for (part, content) in [
+        (
+            "xl/metadata.xml",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml",
+        ),
+        (
+            "xl/richData/rdrichvalue.xml",
+            "application/vnd.ms-excel.rdrichvalue+xml",
+        ),
+        (
+            "xl/richData/rdrichvaluestructure.xml",
+            "application/vnd.ms-excel.rdrichvaluestructure+xml",
+        ),
+    ] {
+        let expected = format!("<Override PartName=\"/{part}\" ContentType=\"{content}\"/>");
+        assert!(types.contains(&expected), "{expected} in {types}");
+    }
+    let rels = member(&out.bytes, "xl/_rels/workbook.xml.rels");
+    for expected in [
+        format!(
+            "<Relationship Id=\"rId2\" Type=\"{RICH_RELS}/rdRichValueStructure\" Target=\"richData/rdrichvaluestructure.xml\"/>"
+        ),
+        format!(
+            "<Relationship Id=\"rId3\" Type=\"{RICH_RELS}/rdRichValue\" Target=\"richData/rdrichvalue.xml\"/>"
+        ),
+        format!(
+            "<Relationship Id=\"rId4\" Type=\"{OFFICE}/sheetMetadata\" Target=\"metadata.xml\"/></Relationships>"
+        ),
+    ] {
+        assert!(rels.contains(&expected), "{expected} in {rels}");
+    }
+    assert_eq!(
+        data(&out.bytes, 0),
+        Data::Error(calamine::CellErrorType::Value)
+    );
+    assert_eq!(member(&out.bytes, "custom/opaque.bin"), "do not touch");
+    let again = recalculate_xlsx_bytes(&out.bytes, Default::default()).unwrap();
+    assert_eq!(again.bytes, out.bytes);
+
+    // A dynamic array of a whole column from row 2 is a new #SPILL! (no
+    // spill range past the sheet's edge). The saved metadata gains the rich
+    // value type, its future-metadata block after the dynamic-array one and
+    // the value metadata after the cell metadata.
+    let rows = "<row r=\"1\"><c r=\"A1\"><v>1</v></c></row>\
+        <row r=\"2\"><c r=\"A2\"><v>2</v></c><c r=\"B2\" cm=\"1\"><f t=\"array\" ref=\"B2\">A:A*2</f><v>2</v></c></row>";
+    let input = pack(&with_metadata(parts(rows), XLDAPR));
+    let out = recalculate_xlsx_bytes(&input, Default::default()).unwrap();
+    assert!(member(&out.bytes, SHEET).contains(
+        "<c r=\"B2\" cm=\"1\" t=\"e\" vm=\"1\"><f t=\"array\" ref=\"B2\">A:A*2</f><v>#VALUE!</v>"
+    ));
+    let metadata = member(&out.bytes, "xl/metadata.xml");
+    for expected in [
+        "<metadataTypes count=\"2\"><metadataType name=\"XLDAPR\"",
+        "cellMeta=\"1\"/><metadataType name=\"XLRICHVALUE\"",
+        "</futureMetadata><futureMetadata name=\"XLRICHVALUE\" count=\"1\"><bk><extLst><ext uri=\"{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}\"><xlrd:rvb xmlns:xlrd=\"http://schemas.microsoft.com/office/spreadsheetml/2017/richdata\" i=\"0\"/></ext></extLst></bk></futureMetadata><cellMetadata",
+        "</cellMetadata><valueMetadata count=\"1\"><bk><rc t=\"2\" v=\"0\"/></bk></valueMetadata></metadata>",
+    ] {
+        assert!(metadata.contains(expected), "{expected} in {metadata}");
+    }
+    assert!(
+        member(&out.bytes, "xl/richData/rdrichvalue.xml")
+            .ends_with("<rv s=\"0\"><v>0</v><v>8</v><v>0</v></rv></rvData>")
+    );
+    let types = member(&out.bytes, "[Content_Types].xml");
+    assert_eq!(types.matches("/xl/metadata.xml").count(), 1, "{types}");
+    let rels = member(&out.bytes, "xl/_rels/workbook.xml.rels");
+    assert_eq!(rels.matches("sheetMetadata").count(), 1, "{rels}");
+    assert!(rels.contains("Id=\"rId2\" Type=\"http://schemas.microsoft.com/office/2017/06/relationships/rdRichValueStructure\""), "{rels}");
+    let again = recalculate_xlsx_bytes(&out.bytes, Default::default()).unwrap();
+    assert_eq!(again.bytes, out.bytes);
+
+    // A cell tagged #SPILL! that is now #CALC! is tagged #CALC!.
+    let rows = "<row r=\"1\"><c r=\"A1\" t=\"e\" vm=\"1\"><f>_xlfn._xlws.FILTER(C1:C1,FALSE)</f><v>#VALUE!</v></c><c r=\"C1\"><v>1</v></c></row>";
+    let out = recalculate_xlsx_bytes(
+        &pack(&with_rich_errors(parts(rows), &[8])),
+        Default::default(),
+    )
+    .unwrap();
+    assert!(member(&out.bytes, SHEET).contains("<c r=\"A1\" t=\"e\" vm=\"2\">"));
+    assert!(
+        member(&out.bytes, "xl/richData/rdrichvalue.xml")
+            .ends_with("<rv s=\"1\"><v>13</v></rv></rvData>")
+    );
+    assert_eq!(out.cache_cells_changed, 1);
+}
+#[test]
+fn spill_tags_record_the_size_of_the_result_that_could_not_spill() {
+    // Excel saved A1 =SEQUENCE(C1) blocked by A2 with C1 = 2: its #SPILL!
+    // counts one additional row (rwOffset 1). With C1 = 3 the result has
+    // three rows, and the tag must say so ([MS-XLSX] 2.3.6.1.3.7).
+    let rows = |n: u32| {
+        format!(
+            "<row r=\"1\"><c r=\"A1\" t=\"e\" cm=\"1\" vm=\"1\"><f t=\"array\" ref=\"A1\">_xlfn.SEQUENCE(C1)</f><v>#VALUE!</v></c><c r=\"C1\"><v>{n}</v></c></row>\
+             <row r=\"2\"><c r=\"A2\"><v>7</v></c></row>"
+        )
+    };
+    let unchanged = pack(&with_rich_values(parts(&rows(2)), &[(8, 0, 1)]));
+    let out = recalculate_xlsx_bytes(&unchanged, Default::default()).unwrap();
+    assert_eq!(out.bytes, unchanged);
+    let out = recalculate_xlsx_bytes(
+        &pack(&with_rich_values(parts(&rows(3)), &[(8, 0, 1)])),
+        Default::default(),
+    )
+    .unwrap();
+    assert!(member(&out.bytes, SHEET).contains("<c r=\"A1\" t=\"e\" cm=\"1\" vm=\"2\">"));
+    assert!(
+        member(&out.bytes, "xl/richData/rdrichvalue.xml")
+            .ends_with("<rv s=\"1\"><v>0</v><v>8</v><v>2</v></rv></rvData>")
+    );
+    assert_eq!(out.cache_cells_changed, 1);
+    let again = recalculate_xlsx_bytes(&out.bytes, Default::default()).unwrap();
+    assert_eq!(again.bytes, out.bytes);
+}
+#[test]
+fn value_cells_keep_the_rich_error_they_hold() {
+    // D1 holds C1's #CALC! pasted as a value: Paste Values keeps the value's
+    // rich error (XLRICHVALUE pasteValues), so its cached #VALUE! is #CALC!.
+    // B1 handles the error and E1 reads it.
+    let rows = "<row r=\"1\"><c r=\"B1\"><f>IFERROR(D1,42)</f><v>0</v></c>\
+        <c r=\"C1\" t=\"e\" vm=\"1\"><f>_xlfn._xlws.FILTER(A1:A1,FALSE)</f><v>#VALUE!</v></c>\
+        <c r=\"D1\" t=\"e\" vm=\"1\"><v>#VALUE!</v></c><c r=\"E1\"><f>D1</f><v>0</v></c></row>";
+    let out = recalculate_xlsx_bytes(
+        &pack(&with_rich_errors(parts(rows), &[13])),
+        Default::default(),
+    )
+    .unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "<c r=\"B1\"><f>IFERROR(D1,42)</f><v>42</v>",
+        "<c r=\"C1\" t=\"e\" vm=\"1\">",
+        "<c r=\"D1\" t=\"e\" vm=\"1\"><v>#VALUE!</v></c>",
+        "<c r=\"E1\" t=\"e\" vm=\"2\"><f>D1</f><v>#VALUE!</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected} in {sheet}");
+    }
+    assert_eq!(out.summary.error_summary["#CALC!"].count, 2);
+    // The engine has no #CONNECT!.
+    let connect = "<row r=\"1\"><c r=\"A1\"><f>IFERROR(D1,42)</f><v>0</v></c><c r=\"D1\" t=\"e\" vm=\"1\"><v>#VALUE!</v></c></row>";
+    reject(&with_rich_errors(parts(connect), &[9]));
 }
 #[test]
 fn extension_markup_outside_cells_is_not_workbook_or_cell_metadata() {
@@ -2260,9 +2467,11 @@ fn whole_columns_span_the_grid() {
 fn dynamic_arrays_over_whole_columns_run_past_the_sheet() {
     // A dynamic array of a whole column times a scalar has 1,048,576 rows:
     // from row 2 it cannot spill (#SPILL!, cached as #VALUE!), as Excel saved
-    // B2 with its #SPILL! tag; C2 was cached as a number. Without the array
-    // flag D2 and E2 are legacy formulas: the operator's whole-column operand
-    // takes row 2's cell (A2*2 = 4), inside SUM as well.
+    // B2 with its #SPILL! tag (no spill range past the sheet's edge); C2 was
+    // cached as a number and is tagged now, as is B3, which reads B2's
+    // error. Without the array flag D2 and E2 are legacy formulas: the
+    // operator's whole-column operand takes row 2's cell (A2*2 = 4), inside
+    // SUM as well.
     let rows = "<row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"H1\"><v>1</v></c></row>\
         <row r=\"2\"><c r=\"A2\"><v>2</v></c><c r=\"B2\" t=\"e\" cm=\"1\" vm=\"1\"><f t=\"array\" ref=\"B2\">SUMPRODUCT(--(A:A=1))*H:J</f><v>#VALUE!</v></c>\
         <c r=\"C2\" cm=\"1\"><f t=\"array\" ref=\"C2\">A:A*2</f><v>2</v></c>\
@@ -2273,14 +2482,20 @@ fn dynamic_arrays_over_whole_columns_run_past_the_sheet() {
     let sheet = member(&out.bytes, SHEET);
     for expected in [
         "<c r=\"B2\" t=\"e\" cm=\"1\" vm=\"1\"><f t=\"array\" ref=\"B2\">SUMPRODUCT(--(A:A=1))*H:J</f><v>#VALUE!</v>",
-        "<c r=\"C2\" cm=\"1\" t=\"e\"><f t=\"array\" ref=\"C2\">A:A*2</f><v>#VALUE!</v>",
+        "<c r=\"C2\" cm=\"1\" t=\"e\" vm=\"2\"><f t=\"array\" ref=\"C2\">A:A*2</f><v>#VALUE!</v>",
         "<c r=\"D2\"><f>A:A*2</f><v>4</v>",
         "<f>SUM(A:A*2)</f><v>4</v>",
-        "<c r=\"B3\" t=\"e\"><f>B2</f><v>#VALUE!</v>",
+        "<c r=\"B3\" t=\"e\" vm=\"2\"><f>B2</f><v>#VALUE!</v>",
     ] {
         assert!(sheet.contains(expected), "{expected} in {sheet}");
     }
     assert_eq!(out.summary.error_summary["#SPILL!"].count, 3);
+    assert!(
+        member(&out.bytes, "xl/richData/rdrichvalue.xml")
+            .ends_with("<rv s=\"1\"><v>0</v><v>8</v><v>0</v></rv></rvData>")
+    );
+    let again = recalculate_xlsx_bytes(&out.bytes, Default::default()).unwrap();
+    assert_eq!(again.bytes, out.bytes);
 }
 #[test]
 fn arrays_larger_than_ten_thousand_cells_fill_their_extent() {

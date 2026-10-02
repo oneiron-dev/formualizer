@@ -38,7 +38,7 @@ pub(crate) enum Lift {
 }
 
 impl Lift {
-    fn lifts(self, index: usize) -> bool {
+    pub(crate) fn lifts(self, index: usize) -> bool {
         match self {
             Lift::All => true,
             Lift::Only(positions) => positions.contains(&index),

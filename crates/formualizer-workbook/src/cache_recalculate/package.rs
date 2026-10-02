@@ -1,6 +1,7 @@
 //! Bounded package admission and relationship-aware workbook discovery.
 mod content_types;
 mod rewrite;
+use super::rich::{METADATA, RICH, Record, RichError, RichTags, STRUCTURES, VALUES};
 use super::{IoError, XlsxRecalculateOptions, checkpoint, unsupported, xml};
 use formualizer_common::ExcelErrorKind;
 pub(super) use rewrite::rewrite;
@@ -9,9 +10,6 @@ use std::io::{Cursor, Read};
 use zip::ZipArchive;
 
 pub(super) type Archive<'a> = ZipArchive<Cursor<&'a [u8]>>;
-/// The error each value-metadata record (a cell's 1-based `vm`) tags the
-/// cell's cached error as; `None` for a kind the engine never produces.
-pub(super) type ValueErrors = Vec<Option<ExcelErrorKind>>;
 #[derive(Debug)]
 pub(super) struct Relationship {
     pub kind: String,
@@ -200,7 +198,7 @@ fn audit_directory(
 pub(super) fn admit<'a>(
     bytes: &'a [u8],
     options: &XlsxRecalculateOptions,
-) -> Result<(Archive<'a>, ValueErrors), IoError> {
+) -> Result<(Archive<'a>, RichTags), IoError> {
     checkpoint(&options.cancel)?;
     if bytes.len() > options.limits.max_input_bytes {
         return Err(unsupported("input byte limit", "XLSX package"));
@@ -276,16 +274,15 @@ pub(super) fn admit<'a>(
         }
     }
     let rich_errors = rich_errors(&mut archive, options)?;
-    let value_errors = if archive.index_for_name("xl/metadata.xml").is_some() {
+    let records = if archive.index_for_name(METADATA).is_some() {
         cell_metadata(&mut archive, options, &rich_errors)?
     } else {
         Vec::new()
     };
-    Ok((archive, value_errors))
+    Ok((archive, RichTags::new(records)))
 }
-const RICH: &str = "http://schemas.microsoft.com/office/spreadsheetml/2017/richdata";
-const RICH_STRUCTURES: &str = "xl/richData/rdrichvaluestructure.xml";
-const RICH_VALUES: &str = "xl/richData/rdrichvalue.xml";
+const RICH_STRUCTURES: &str = STRUCTURES;
+const RICH_VALUES: &str = VALUES;
 const RICH_TYPES: &str = "xl/richData/rdRichValueTypes.xml";
 /// The rich-data parts of an error-only package; the types part holds only
 /// global key flags.
@@ -298,13 +295,13 @@ fn metadata_refusal(part: &str) -> IoError {
 /// `errorType` names the real error ([MS-XLSX] 2.3.6.1.3: 8 #SPILL!,
 /// 13 #CALC!); its other keys describe the error (`subType`, a spill's
 /// offsets, a #FIELD!'s `field` name) and a rich value may carry a fallback
-/// (`fb`). Returns that error per rich value; any rich value that is not
-/// such an error (images, linked data types) or whose keys index another
-/// rich value, array or property bag is unsupported.
+/// (`fb`). Returns that error per rich value (see [`Record`]); any rich
+/// value that is not such an error (images, linked data types) or whose keys
+/// index another rich value, array or property bag is unsupported.
 fn rich_errors(
     archive: &mut Archive<'_>,
     options: &XlsxRecalculateOptions,
-) -> Result<Vec<Option<ExcelErrorKind>>, IoError> {
+) -> Result<Vec<Record>, IoError> {
     let has = |archive: &Archive<'_>, name| archive.index_for_name(name).is_some();
     if has(archive, RICH_TYPES) {
         let data = read_part(archive, RICH_TYPES, options.limits.max_worksheet_bytes)?;
@@ -316,8 +313,10 @@ fn rich_errors(
     if !has(archive, RICH_VALUES) && !has(archive, RICH_STRUCTURES) {
         return Ok(Vec::new());
     }
-    // Per structure, the position of `errorType` among its keys.
-    let mut structures: Vec<(usize, Option<usize>)> = Vec::new();
+    // Per structure, its keys (lowercase name and type) and the position of
+    // `errorType` among them.
+    type Keys = Vec<(String, String)>;
+    let mut structures: Vec<(Keys, Option<usize>)> = Vec::new();
     let data = read_part(archive, RICH_STRUCTURES, options.limits.max_worksheet_bytes)?;
     xml::walk(&data, options, |path, node| {
         if !matches!(node.kind, xml::Kind::Open { .. }) {
@@ -328,21 +327,19 @@ fn rich_errors(
         } else if xml::path_is(path, RICH, &["rvStructures", "s"])
             && node.value("t") == Some("_error")
         {
-            structures.push((0, None));
+            structures.push((Vec::new(), None));
             Ok(())
         } else if xml::path_is(path, RICH, &["rvStructures", "s", "k"])
             && !matches!(node.value("t"), Some("a" | "r" | "spb"))
         {
             let (keys, error_type) = structures.last_mut().expect("open structure");
             // Key names are case-insensitive ([MS-XLSX] CT_Key).
-            if node
-                .value("n")
-                .is_some_and(|n| n.eq_ignore_ascii_case("errorType"))
-                && (node.value("t") != Some("i") || error_type.replace(*keys).is_some())
-            {
+            let name = node.value("n").unwrap_or_default().to_ascii_lowercase();
+            let kind = node.value("t").unwrap_or_default().to_owned();
+            if name == "errortype" && (kind != "i" || error_type.replace(keys.len()).is_some()) {
                 return Err(metadata_refusal(RICH_STRUCTURES));
             }
-            *keys += 1;
+            keys.push((name, kind));
             Ok(())
         } else {
             Err(metadata_refusal(RICH_STRUCTURES))
@@ -387,19 +384,36 @@ fn rich_errors(
     })?;
     values
         .into_iter()
-        .map(|(s, fields, _)| {
-            let &(keys, error_type) = structures
+        .map(|(s, fields, fallback)| {
+            let (keys, error_type) = structures
                 .get(s)
                 .ok_or_else(|| metadata_refusal(RICH_VALUES))?;
             let code = error_type
-                .filter(|_| fields.len() == keys)
+                .filter(|_| fields.len() == keys.len())
                 .and_then(|i| fields[i].trim().parse::<i64>().ok())
                 .ok_or_else(|| metadata_refusal(RICH_VALUES))?;
-            Ok(match code {
-                8 => Some(ExcelErrorKind::Spill),
-                13 => Some(ExcelErrorKind::Calc),
-                _ => None,
-            })
+            let field = |name: &str| {
+                let i = keys.iter().position(|(n, _)| n == name)?;
+                fields[i].trim().parse::<u32>().ok()
+            };
+            let error = RichError::from_error_type(code).map(|kind| RichError {
+                kind,
+                offsets: (kind == ExcelErrorKind::Spill)
+                    .then(|| field("coloffset").zip(field("rwoffset")))
+                    .flatten(),
+            });
+            // Other cells holding the error may share a rich value that has
+            // just the keys the writer writes for it.
+            let shared = !fallback
+                && error.is_some_and(|error| {
+                    let wanted = RichError::keys(error.kind);
+                    keys.len() == wanted.len()
+                        && keys.iter().all(|(n, t)| {
+                            t == "i" && wanted.iter().any(|w| w.eq_ignore_ascii_case(n))
+                        })
+                        && (error.kind != ExcelErrorKind::Spill || error.offsets.is_some())
+                });
+            Ok((error, shared))
         })
         .collect()
 }
@@ -408,13 +422,13 @@ fn rich_errors(
 /// is a dynamic array; it does not change the formula or its cached value.
 /// A cell's `vm` indexes value metadata of type XLRICHVALUE, which points at a
 /// rich value; only the error tags of [`rich_errors`] are supported. Returns
-/// the error each value-metadata record tags.
+/// the error each value-metadata record (a cell's `vm` - 1) tags.
 fn cell_metadata(
     archive: &mut Archive<'_>,
     options: &XlsxRecalculateOptions,
-    rich_errors: &[Option<ExcelErrorKind>],
-) -> Result<ValueErrors, IoError> {
-    const PART: &str = "xl/metadata.xml";
+    rich_errors: &[Record],
+) -> Result<Vec<Record>, IoError> {
+    const PART: &str = METADATA;
     let data = read_part(archive, PART, options.limits.max_worksheet_bytes)?;
     let mut types = Vec::new();
     // Rich value index per XLRICHVALUE future-metadata block.

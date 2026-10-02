@@ -2,12 +2,13 @@
 //! Unsupported package/formula cases fail before any output is published.
 mod calc_always;
 mod package;
+mod rich;
 mod sheet;
 mod xml;
 
 use super::recalculate::{DEFAULT_ERROR_LOCATION_LIMIT, RecalculateStatus, RecalculateSummary};
 use crate::{CalamineAdapter, IoError, SpreadsheetReader, workbook::WBResolver};
-use formualizer_common::{CellAddress, DateSystem, ExcelErrorKind, LiteralValue};
+use formualizer_common::{CellAddress, DateSystem, ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_eval::engine::ingest::EngineLoadStream;
 use formualizer_eval::engine::inspect::{SnapshotOptions, Staleness};
 use formualizer_eval::engine::{CancelToken, Engine, EvalConfig, FormulaParsePolicy};
@@ -66,7 +67,8 @@ impl Default for XlsxRecalculateOptions {
         }
     }
 }
-/// `cache_cells_changed` counts physical caches actually patched, not engine deltas.
+/// `cache_cells_changed` counts physical caches (and their rich error tags)
+/// actually patched, not engine deltas.
 #[derive(Debug, Clone)]
 pub struct XlsxRecalculateResult {
     pub bytes: Vec<u8>,
@@ -276,27 +278,63 @@ fn child(cell: &sheet::Cell, local: &str) -> String {
         None => local.to_owned(),
     }
 }
-/// Excel keeps a cell's `vm` rich-error tag only while the cell's value is
-/// that error. Removes the tag (and the space before it) when `value` is no
-/// longer the tagged error; returns whether it did.
-fn untag_stale_error(
+/// The rich error Excel saves with a cached #SPILL! or #CALC! (see
+/// [`rich`]): a #SPILL! counts the additional columns and rows of a dynamic
+/// array's result that could not spill into cells that were not empty
+/// (`blocked`: its rows and columns). A result past the sheet's edge and an
+/// error read from another cell show no spill range, as Excel saves them.
+fn rich_error(value: &LiteralValue, blocked: Option<(u32, u32)>) -> Option<rich::RichError> {
+    let LiteralValue::Error(error) = value else {
+        return None;
+    };
+    match error.kind {
+        ExcelErrorKind::Spill => Some(rich::RichError {
+            kind: error.kind,
+            offsets: Some(blocked.map_or((0, 0), |(rows, cols)| {
+                (cols.saturating_sub(1), rows.saturating_sub(1))
+            })),
+        }),
+        ExcelErrorKind::Calc => Some(rich::RichError {
+            kind: error.kind,
+            offsets: None,
+        }),
+        _ => None,
+    }
+}
+/// Excel tags a cached #SPILL! or #CALC! with its rich error (the cell's
+/// `vm`) and keeps a cell's tag only while the cell holds that error. Points
+/// the cell's tag at a record of `wanted`, adding the attribute or one, or
+/// removes it (and the space before it); returns whether the tag changed.
+fn retag(
     xml: &[u8],
     cell: &sheet::Cell,
-    value: &LiteralValue,
-    value_errors: &[Option<ExcelErrorKind>],
+    wanted: Option<rich::RichError>,
+    tags: &mut rich::RichTags,
     patches: &mut Vec<Patch>,
 ) -> bool {
-    let Some((index, span)) = &cell.value_metadata else {
-        return false;
-    };
-    if matches!(value, LiteralValue::Error(e) if value_errors[index - 1] == Some(e.kind)) {
+    let current = cell.value_metadata.as_ref();
+    if current.map(|(vm, _)| tags.get(*vm)) == wanted.map(Some) {
         return false;
     }
-    let start = span.start - usize::from(xml[span.start - 1].is_ascii_whitespace());
-    patches.push(Patch {
-        span: start..span.end,
-        replacement: Vec::new(),
-    });
+    match (current, wanted) {
+        (None, None) => return false,
+        (Some((_, span)), None) => {
+            let start = span.start - usize::from(xml[span.start - 1].is_ascii_whitespace());
+            patches.push(Patch {
+                span: start..span.end,
+                replacement: Vec::new(),
+            });
+        }
+        (Some((_, span)), Some(error)) => patches.push(Patch {
+            span: span.clone(),
+            replacement: format!("vm=\"{}\"", tags.tag(error)).into_bytes(),
+        }),
+        // The cell's start tag ends at `open_end` with `>`.
+        (None, Some(error)) => patches.push(Patch {
+            span: cell.open_end - 1..cell.open_end - 1,
+            replacement: format!(" vm=\"{}\"", tags.tag(error)).into_bytes(),
+        }),
+    }
     true
 }
 fn apply_patches(bytes: &[u8], mut patches: Vec<Patch>, limit: usize) -> Result<Vec<u8>, IoError> {
@@ -363,7 +401,7 @@ pub fn recalculate_xlsx_bytes(
     bytes: &[u8],
     options: XlsxRecalculateOptions,
 ) -> Result<XlsxRecalculateResult, IoError> {
-    let (mut archive, value_errors) = package::admit(bytes, &options)?;
+    let (mut archive, mut tags) = package::admit(bytes, &options)?;
     let (sheets, date_system, extension, defined_names) =
         package::discover(&mut archive, &options)?;
     let mut plans = Vec::new();
@@ -377,13 +415,7 @@ pub fn recalculate_xlsx_bytes(
             &sheet.part,
             options.limits.max_worksheet_bytes,
         )?;
-        let scan = sheet::scan(
-            &data,
-            &options,
-            value_errors.len(),
-            &mut observed,
-            &mut logical_cells,
-        )?;
+        let scan = sheet::scan(&data, &options, &tags, &mut observed, &mut logical_cells)?;
         formula_count = formula_count
             .checked_add(scan.cells.len())
             .ok_or_else(|| unsupported("formula count overflow", "workbook"))?;
@@ -436,7 +468,7 @@ pub fn recalculate_xlsx_bytes(
     let ingest_bytes = if view_parts.is_empty() {
         bytes.to_vec()
     } else {
-        package::rewrite(bytes, &mut archive, &view_parts, &options)?
+        package::rewrite(bytes, &mut archive, &view_parts, &[], &options)?
     };
     let opened = if let Some(cancel) = options.cancel.clone() {
         CalamineAdapter::open_bytes_cancellable(ingest_bytes, cancel)
@@ -498,6 +530,20 @@ pub fn recalculate_xlsx_bytes(
     ingested?;
     drop(adapter);
     checkpoint(&options.cancel)?;
+    // A value cell's cached #VALUE! that a rich value tags stands for the
+    // tagged error.
+    for (sheet, (_, scan)) in sheets.iter().zip(&plans) {
+        for &(row, col, kind) in &scan.tagged {
+            engine
+                .set_cell_value(
+                    &sheet.name,
+                    row,
+                    col,
+                    LiteralValue::Error(ExcelError::new(kind)),
+                )
+                .map_err(IoError::Engine)?;
+        }
+    }
     // Only array formulas produce arrays; a formula stored without the array
     // flag takes the implicit intersection of an array or range result.
     engine.use_legacy_array_semantics();
@@ -625,15 +671,19 @@ pub fn recalculate_xlsx_bytes(
                     errors.locations_truncated += 1;
                 }
             }
-            let untagged = untag_stale_error(&data, cell, &value, &value_errors, &mut patches);
+            let wanted = rich_error(
+                &value,
+                engine.blocked_spill_extent(&sheet.name, cell.row, cell.col),
+            );
             let cache = Cache::from_value(value, engine.config.date_system)?;
             let stale = !cache.matches(cell);
             if stale {
                 cache_patches(&data, cell, &cache, &mut patches);
             }
+            let retagged = retag(&data, cell, wanted, &mut tags, &mut patches);
             // A flag is not a cache: only patched values (and a value's
-            // removed rich-error tag) count.
-            changed += usize::from(stale || untagged);
+            // rich-error tag) count.
+            changed += usize::from(stale || retagged);
             if calc_always.cells[s][index] && !cell.calc_always {
                 patches.push(calc_always_patch(cell));
             }
@@ -645,7 +695,7 @@ pub fn recalculate_xlsx_bytes(
             &scan,
             &array_results,
             &calc_always.members[s],
-            &value_errors,
+            &mut tags,
             &mut patches,
         )?;
         if !patches.is_empty() {
@@ -660,26 +710,49 @@ pub fn recalculate_xlsx_bytes(
             replacements.insert(sheet.part.clone(), patched);
         }
     }
+    let worksheet_parts_changed = replacements.len();
+    // The rich values of the errors newly tagged.
+    let edits = tags.finish(&mut archive, &options)?;
+    for (part, patched) in edits.replaced {
+        let saved = archive
+            .by_name(&part)
+            .map_err(|e| IoError::from_backend("zip", e))?
+            .size();
+        expanded = usize::try_from(saved)
+            .ok()
+            .and_then(|saved| expanded.checked_sub(saved))
+            .and_then(|n| n.checked_add(patched.len()))
+            .ok_or_else(|| unsupported("expanded output overflow", "workbook"))?;
+        replacements.insert(part, patched);
+    }
+    for (_, added) in &edits.added {
+        expanded = expanded
+            .checked_add(added.len())
+            .ok_or_else(|| unsupported("expanded output overflow", "workbook"))?;
+    }
+    if expanded > options.limits.max_expanded_bytes {
+        return Err(unsupported("expanded output byte limit", "workbook"));
+    }
     summary.status = if summary.errors == 0 {
         RecalculateStatus::Success
     } else {
         RecalculateStatus::ErrorsFound
     };
     checkpoint(&options.cancel)?;
-    if replacements.is_empty() {
+    if replacements.is_empty() && edits.added.is_empty() {
         if bytes.len() > options.limits.max_output_bytes {
             return Err(unsupported("output byte limit", "XLSX package"));
         }
         return Ok(empty_result(summary));
     }
-    let output = package::rewrite(bytes, &mut archive, &replacements, &options)?;
+    let output = package::rewrite(bytes, &mut archive, &replacements, &edits.added, &options)?;
     checkpoint(&options.cancel)?;
     Ok(XlsxRecalculateResult {
         bytes: output,
         summary,
         formula_cells: formula_count,
         cache_cells_changed: changed,
-        worksheet_parts_changed: replacements.len(),
+        worksheet_parts_changed,
     })
 }
 
@@ -710,7 +783,7 @@ fn array_member_patches(
     scan: &sheet::Scan,
     results: &BTreeMap<usize, (u32, u32)>,
     flags: &[bool],
-    value_errors: &[Option<ExcelErrorKind>],
+    tags: &mut rich::RichTags,
     patches: &mut Vec<Patch>,
 ) -> Result<usize, IoError> {
     let mut changed = 0;
@@ -747,7 +820,7 @@ fn array_member_patches(
     for (member, &flag) in scan.members.iter().zip(flags) {
         seen.insert((member.cell.row, member.cell.col));
         let value = value_at(member.anchor, member.cell.row, member.cell.col);
-        let untagged = untag_stale_error(data, &member.cell, &value, value_errors, patches);
+        let wanted = rich_error(&value, None);
         let cache = Cache::from_value(value, engine.config.date_system)?;
         let mark = flag && !member.marked;
         if mark {
@@ -762,9 +835,10 @@ fn array_member_patches(
         if stale {
             cache_patches(data, &member.cell, &cache, patches);
         }
+        let retagged = retag(data, &member.cell, wanted, tags, patches);
         // A marker alone is not a cache: only patched values (and a value's
-        // removed rich-error tag) count.
-        changed += usize::from(stale || untagged);
+        // rich-error tag) count.
+        changed += usize::from(stale || retagged);
     }
     // Positions without a cell element cannot receive a value.
     for &index in results.keys() {

@@ -1137,12 +1137,18 @@ fn fit_array_formula_result(value: LiteralValue, rows: u32, cols: u32) -> Litera
     }
 }
 
-/// The rows and columns of the array a formula built from references and
-/// element-wise operators yields. A whole column (row) has every row (column)
-/// of the grid, and an operator's result is as large as its larger operand
-/// in each direction (Excel pads the smaller with #N/A). Functions, names and
-/// other references count as one cell, so this is a lower bound.
-fn arena_operator_result_extent(
+/// The rows and columns of the array a formula yields, as far as its
+/// references fix them. A whole column (row) has every row (column) of the
+/// grid. An element-wise operator's result is as large as its larger operand
+/// in each direction (Excel pads the smaller with #N/A), and so is a function
+/// lifted over the arrays its single-value parameters receive (`ABS(A:A)`,
+/// `VLOOKUP(A:A,A:C,2,FALSE)`; see [`crate::lift::lift_spec`]). IF and CHOOSE
+/// yield the branch a constant selects (else at least their lifted test or
+/// index), IFERROR and IFNA at least their value, INDEX a whole column or row
+/// of its array for a constant 0 row or column, SORT and SORTBY their array
+/// and TRANSPOSE its array turned. Other functions (reductions, selections),
+/// names and other references count as one cell, so this is a lower bound.
+fn arena_result_extent(
     data_store: &crate::engine::arena::DataStore,
     root: AstNodeId,
 ) -> (u64, u64) {
@@ -1170,7 +1176,7 @@ fn arena_operator_result_extent(
         Some(AstNodeData::UnaryOp { op_id, expr_id })
             if data_store.resolve_ast_string(*op_id) != "@" =>
         {
-            arena_operator_result_extent(data_store, *expr_id)
+            arena_result_extent(data_store, *expr_id)
         }
         Some(AstNodeData::BinaryOp {
             op_id,
@@ -1181,12 +1187,99 @@ fn arena_operator_result_extent(
             "+" | "-" | "*" | "/" | "^" | "&" | "=" | "<>" | "<" | ">" | "<=" | ">="
         ) =>
         {
-            let left = arena_operator_result_extent(data_store, *left_id);
-            let right = arena_operator_result_extent(data_store, *right_id);
-            (left.0.max(right.0), left.1.max(right.1))
+            broadcast_extent(
+                arena_result_extent(data_store, *left_id),
+                arena_result_extent(data_store, *right_id),
+            )
         }
         Some(AstNodeData::Array { rows, cols, .. }) => (u64::from(*rows), u64::from(*cols)),
+        Some(AstNodeData::Function { name_id, .. }) => {
+            // Names are usually stored as Excel spells them; normalize
+            // (case, _xlfn. prefixes) only when needed.
+            let name = data_store.resolve_ast_string(*name_id);
+            let name = if name.starts_with('_') || name.bytes().any(|b| b.is_ascii_lowercase()) {
+                std::borrow::Cow::Owned(
+                    crate::formula_plane::template_canonical::normalize_function_name(name),
+                )
+            } else {
+                std::borrow::Cow::Borrowed(name)
+            };
+            let args = data_store.get_args(root).unwrap_or(&[]);
+            function_result_extent(data_store, &name, args)
+        }
         _ => (1, 1),
+    }
+}
+
+fn broadcast_extent(a: (u64, u64), b: (u64, u64)) -> (u64, u64) {
+    (a.0.max(b.0), a.1.max(b.1))
+}
+
+/// The extent of a call to the builtin `name` (normalized) with `args`; see
+/// [`arena_result_extent`].
+fn function_result_extent(
+    data_store: &crate::engine::arena::DataStore,
+    name: &str,
+    args: &[AstNodeId],
+) -> (u64, u64) {
+    use crate::engine::arena::AstNodeData;
+    let node = |i: usize| args.get(i).and_then(|&id| data_store.get_node(id));
+    let extent = |i: usize| match (args.get(i), node(i)) {
+        (Some(&id), Some(n)) if !matches!(n, AstNodeData::Omitted) => {
+            arena_result_extent(data_store, id)
+        }
+        _ => (1, 1),
+    };
+    // A number or logical constant.
+    let constant = |i: usize| match node(i) {
+        Some(AstNodeData::Literal(value)) => match data_store.retrieve_value(*value) {
+            LiteralValue::Number(n) => Some(n),
+            LiteralValue::Int(n) => Some(n as f64),
+            LiteralValue::Boolean(b) => Some(f64::from(u8::from(b))),
+            _ => None,
+        },
+        _ => None,
+    };
+    match name {
+        // A constant test selects one branch whole; otherwise the result is
+        // at least as large as the test lifted over.
+        "IF" => match constant(0) {
+            Some(test) if test != 0.0 => extent(1),
+            Some(_) => extent(2),
+            None => extent(0),
+        },
+        "CHOOSE" => match constant(0).map(f64::trunc) {
+            Some(index) if index >= 1.0 && (index as usize) < args.len() => extent(index as usize),
+            _ => extent(0),
+        },
+        "IFERROR" | "IFNA" => extent(0),
+        // Row (column) 0 selects every row (column) of the array.
+        "INDEX" => {
+            let array = extent(0);
+            let whole = |i: usize| constant(i).is_some_and(|n| n.trunc() == 0.0);
+            let selected = (
+                if whole(1) { array.0 } else { 1 },
+                if whole(2) { array.1 } else { 1 },
+            );
+            broadcast_extent(selected, broadcast_extent(extent(1), extent(2)))
+        }
+        "SORT" | "SORTBY" => extent(0),
+        "TRANSPOSE" => {
+            let (rows, cols) = extent(0);
+            (cols, rows)
+        }
+        // N and T read the first cell of a reference; only an array value
+        // lifts them.
+        "N" | "T" => match node(0) {
+            Some(AstNodeData::Reference { .. }) => (1, 1),
+            _ => extent(0),
+        },
+        _ => match crate::lift::lift_spec(name) {
+            Some(spec) => (0..args.len())
+                .filter(|&i| spec.lifts(i))
+                .fold((1, 1), |acc, i| broadcast_extent(acc, extent(i))),
+            None => (1, 1),
+        },
     }
 }
 
@@ -1264,6 +1357,10 @@ pub struct Engine<R> {
     staged_formula_index: StagedFormulaIndex,
     // Occupancy invalidation only: never a formula/read dependency.
     blocked_pending_spills: Vec<(VertexId, CellRef, Region)>,
+    /// The result size (rows, cols) of each dynamic array whose last
+    /// evaluation could not spill because cells of its spill range were not
+    /// empty (a spill collision); see [`Engine::blocked_spill_extent`].
+    blocked_spill_extents: FxHashMap<VertexId, (u32, u32)>,
     /// Legacy array semantics, as a workbook file stores formulas: `None`
     /// lets every formula spill. `Some` spills only declared dynamic arrays,
     /// fits declared legacy (CSE) arrays to their extent and takes the
@@ -3189,6 +3286,7 @@ where
             staged_formulas: std::collections::HashMap::new(),
             staged_formula_index: StagedFormulaIndex::default(),
             blocked_pending_spills: Vec::new(),
+            blocked_spill_extents: FxHashMap::default(),
             array_formula_shapes: None,
             spill_writes: Vec::new(),
             row_visibility: FxHashMap::default(),
@@ -3360,6 +3458,7 @@ where
             staged_formulas: std::collections::HashMap::new(),
             staged_formula_index: StagedFormulaIndex::default(),
             blocked_pending_spills: Vec::new(),
+            blocked_spill_extents: FxHashMap::default(),
             array_formula_shapes: None,
             spill_writes: Vec::new(),
             row_visibility: FxHashMap::default(),
@@ -5241,21 +5340,20 @@ where
         // A dynamic array spills from its cell; one that would run past the
         // last row or column of the sheet is #SPILL!. Whole columns and rows
         // are evaluated over their used part only, so their full extent comes
-        // from the formula.
-        if cell.coord.row() > 0 || cell.coord.col() > 0 {
-            let (rows, cols) = arena_operator_result_extent(self.graph.data_store(), ast_id);
-            if u64::from(cell.coord.row()) + rows > u64::from(EXCEL_MAX_ROWS)
-                || u64::from(cell.coord.col()) + cols > u64::from(EXCEL_MAX_COLUMNS)
-            {
-                return LiteralValue::Error(
-                    ExcelError::new(ExcelErrorKind::Spill)
-                        .with_message("Spill exceeds sheet bounds")
-                        .with_extra(formualizer_common::ExcelErrorExtra::Spill {
-                            expected_rows: u32::try_from(rows).unwrap_or(u32::MAX),
-                            expected_cols: u32::try_from(cols).unwrap_or(u32::MAX),
-                        }),
-                );
-            }
+        // from the formula (TRANSPOSE(A:A) runs past the last column even
+        // from A1).
+        let (rows, cols) = arena_result_extent(self.graph.data_store(), ast_id);
+        if u64::from(cell.coord.row()) + rows > u64::from(EXCEL_MAX_ROWS)
+            || u64::from(cell.coord.col()) + cols > u64::from(EXCEL_MAX_COLUMNS)
+        {
+            return LiteralValue::Error(
+                ExcelError::new(ExcelErrorKind::Spill)
+                    .with_message("Spill exceeds sheet bounds")
+                    .with_extra(formualizer_common::ExcelErrorExtra::Spill {
+                        expected_rows: u32::try_from(rows).unwrap_or(u32::MAX),
+                        expected_cols: u32::try_from(cols).unwrap_or(u32::MAX),
+                    }),
+            );
         }
         result.into_literal()
     }
@@ -5361,6 +5459,33 @@ where
         self.graph
             .get_vertex_for_cell(&cell)
             .is_some_and(|vertex| self.volatile_redirtied.contains(&vertex))
+    }
+
+    /// The rows and columns of the array result of the dynamic-array formula
+    /// at `sheet`!(`row`, `col`) (1-based) whose last evaluation was #SPILL!
+    /// because cells of its spill range were not empty. `None` when it
+    /// spilled, did not return an array, or could not spill for another
+    /// reason (the sheet's edge). A file writer records this intended spill
+    /// range with the error ([MS-XLSX] 2.3.6.1.3.7, colOffset and rwOffset).
+    pub fn blocked_spill_extent(&self, sheet: &str, row: u32, col: u32) -> Option<(u32, u32)> {
+        if self.blocked_spill_extents.is_empty() || row == 0 || col == 0 {
+            return None;
+        }
+        let sheet_id = self.graph.sheet_id(sheet)?;
+        let cell = crate::reference::CellRef::new(
+            sheet_id,
+            crate::reference::Coord::new(row - 1, col - 1, true, true),
+        );
+        let vertex = self.graph.get_vertex_for_cell(&cell)?;
+        self.blocked_spill_extents.get(&vertex).copied()
+    }
+
+    /// A formula is being evaluated again: its spill is no longer blocked
+    /// unless this evaluation finds it so.
+    fn forget_blocked_spill(&mut self, vertex_id: VertexId) {
+        if !self.blocked_spill_extents.is_empty() {
+            self.blocked_spill_extents.remove(&vertex_id);
+        }
     }
 
     /// Register the saved values of a linked workbook under its book token
@@ -20229,6 +20354,7 @@ where
             return Err(ExcelError::new(formualizer_common::ExcelErrorKind::Ref)
                 .with_message(format!("Vertex not found: {vertex_id:?}")));
         }
+        self.forget_blocked_spill(vertex_id);
         if self.active_resource_ledger.is_some()
             && matches!(
                 self.graph.get_vertex_kind(vertex_id),
@@ -20452,6 +20578,7 @@ where
                                     if e.kind != ExcelErrorKind::Spill {
                                         return Err(e);
                                     }
+                                    self.blocked_spill_extents.insert(vertex_id, (h, w));
                                     // If commit fails, mark as error
                                     self.clear_spill_projection_and_mirror(
                                         vertex_id,
@@ -20501,6 +20628,7 @@ where
                                 Ok(top_left)
                             }
                             Err(e) => {
+                                self.blocked_spill_extents.insert(vertex_id, (h, w));
                                 self.clear_spill_projection_and_mirror(
                                     vertex_id,
                                     delta.as_deref_mut(),
@@ -26002,6 +26130,7 @@ where
     ) {
         // Scalar/error result: store value and ensure any previous spill is cleared.
         // This mirrors the sequential behavior in `evaluate_vertex_impl`.
+        self.forget_blocked_spill(vertex_id);
         let spill_cells = self
             .graph
             .spill_cells_for_anchor(vertex_id)
@@ -26075,6 +26204,7 @@ where
         overwritable_formulas: Option<&rustc_hash::FxHashSet<VertexId>>,
     ) -> Result<(), ExcelError> {
         // Keep behavior consistent with the sequential spill path in `evaluate_vertex_impl`.
+        self.forget_blocked_spill(vertex_id);
         self.graph
             .set_kind(vertex_id, crate::engine::vertex::VertexKind::FormulaArray);
 
@@ -26180,6 +26310,7 @@ where
                     if e.kind != ExcelErrorKind::Spill {
                         return Err(e);
                     }
+                    self.blocked_spill_extents.insert(vertex_id, (h, w));
                     self.clear_spill_projection_and_mirror(vertex_id, delta.as_deref_mut());
                     let err_val = LiteralValue::Error(e.clone());
                     if let Some(d) = delta.as_deref_mut()
@@ -26212,6 +26343,7 @@ where
                 Ok(())
             }
             Err(e) => {
+                self.blocked_spill_extents.insert(vertex_id, (h, w));
                 self.clear_spill_projection_and_mirror(vertex_id, delta.as_deref_mut());
                 let spill_err = ExcelError::new(ExcelErrorKind::Spill)
                     .with_message(e.message.unwrap_or_else(|| "Spill blocked".to_string()))
@@ -29494,6 +29626,9 @@ where
     ) -> Result<Vec<Effect>, ExcelError> {
         let kind = self.graph.get_vertex_kind(vertex_id);
         let is_formula = matches!(kind, VertexKind::FormulaScalar | VertexKind::FormulaArray);
+        if is_formula {
+            self.forget_blocked_spill(vertex_id);
+        }
 
         // If this vertex's cell is currently covered by a spill from a different
         // anchor, ignore the computed result.  Formula vertices are exempt:
@@ -29566,7 +29701,7 @@ where
         // Hard cap to avoid vertex explosion from huge dynamic arrays.
         let spill_cells = (h as u64).saturating_mul(w as u64);
         if spill_cells > self.config.spill.max_spill_cells as u64 {
-            return self.plan_spill_error_effects(vertex_id, "SpillTooLarge", h, w);
+            return self.plan_spill_error_effects(vertex_id, "SpillTooLarge", h, w, false);
         }
 
         // Bounds check to avoid out-of-range writes (align to AbsCoord capacity).
@@ -29575,7 +29710,13 @@ where
         let end_row = anchor.coord.row().saturating_add(h).saturating_sub(1);
         let end_col = anchor.coord.col().saturating_add(w).saturating_sub(1);
         if end_row > PACKED_MAX_ROW || end_col > PACKED_MAX_COL {
-            return self.plan_spill_error_effects(vertex_id, "Spill exceeds sheet bounds", h, w);
+            return self.plan_spill_error_effects(
+                vertex_id,
+                "Spill exceeds sheet bounds",
+                h,
+                w,
+                false,
+            );
         }
 
         let mut targets = Vec::new();
@@ -29611,7 +29752,7 @@ where
                 )?;
             }
             if occupied {
-                return self.plan_spill_error_effects(vertex_id, "Spill blocked", h, w);
+                return self.plan_spill_error_effects(vertex_id, "Spill blocked", h, w, true);
             }
         }
 
@@ -29632,7 +29773,7 @@ where
                     &targets,
                     overwritable_formulas,
                 ) {
-                    return self.plan_spill_error_effects(vertex_id, "Spill blocked", h, w);
+                    return self.plan_spill_error_effects(vertex_id, "Spill blocked", h, w, true);
                 }
 
                 // Arrow-canonical mode: graph planning cannot see non-empty value blockers because
@@ -29672,6 +29813,7 @@ where
                                     "BlockedByValue",
                                     h,
                                     w,
+                                    true,
                                 );
                             }
                         }
@@ -29709,20 +29851,26 @@ where
             }
             Err(e) => {
                 let msg = e.message.unwrap_or_else(|| "Spill blocked".to_string());
-                self.plan_spill_error_effects(vertex_id, &msg, h, w)
+                self.plan_spill_error_effects(vertex_id, &msg, h, w, true)
             }
         }
     }
 
-    /// Build the effect list for a spill that failed validation.
+    /// Build the effect list for a spill that failed validation; `blocked`:
+    /// cells of the spill range were not empty.
     fn plan_spill_error_effects(
         &mut self,
         vertex_id: VertexId,
         message: &str,
         expected_rows: u32,
         expected_cols: u32,
+        blocked: bool,
     ) -> Result<Vec<Effect>, ExcelError> {
         self.spill_mgr.release_owner(vertex_id);
+        if blocked {
+            self.blocked_spill_extents
+                .insert(vertex_id, (expected_rows, expected_cols));
+        }
         let spill_err = ExcelError::new(ExcelErrorKind::Spill)
             .with_message(message)
             .with_extra(formualizer_common::ExcelErrorExtra::Spill {

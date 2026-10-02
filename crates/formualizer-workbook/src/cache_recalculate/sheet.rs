@@ -1,5 +1,7 @@
 //! Formula locations/cache spans without a rich cell graph.
+use super::rich::RichTags;
 use super::{IoError, XlsxRecalculateOptions, unsupported, xml};
+use formualizer_common::ExcelErrorKind;
 use formualizer_common::coord::parse_a1_1based;
 use std::{collections::HashMap, ops::Range};
 
@@ -62,6 +64,10 @@ pub(super) struct Member {
 pub(super) struct Scan {
     pub cells: Vec<Cell>,
     pub members: Vec<Member>,
+    /// Value cells (no formula) holding an error that a rich value tags
+    /// (row, column, error), such as a #CALC! pasted as a value: the cached
+    /// #VALUE! stands for that error.
+    pub tagged: Vec<(u32, u32, ExcelErrorKind)>,
 }
 /// Calamine's fast scalar reader consumes just one raw ASCII text event.
 /// Literal cells must satisfy that assumption; formula caches may instead be
@@ -115,12 +121,13 @@ fn integer(value: &str) -> Result<u32, IoError> {
 pub(super) fn scan(
     bytes: &[u8],
     options: &XlsxRecalculateOptions,
-    value_metadata_records: usize,
+    tags: &RichTags,
     observed: &mut usize,
     logical_cells: &mut u64,
 ) -> Result<Scan, IoError> {
     let mut cells = Vec::new();
     let mut members = Vec::new();
+    let mut tagged = Vec::new();
     let mut extents: Vec<(u32, u32, u32, u32, usize)> = Vec::new();
     let mut current: Option<Cell> = None;
     let mut row = 0;
@@ -245,14 +252,14 @@ pub(super) fn scan(
                     }
                     // `cm` (dynamic-array cell metadata) is admitted only on
                     // array formulas, `vm` (a rich error tagging the cached
-                    // error) only on formula results; checked when the cell
-                    // closes.
+                    // error) only on formula results and cached errors;
+                    // checked when the cell closes.
                     let value_metadata = match node.attribute("", "vm") {
                         Some(vm) => Some((
                             vm.value
                                 .parse()
                                 .ok()
-                                .filter(|i| (1..=value_metadata_records).contains(i))
+                                .filter(|i| (1..=tags.len()).contains(i))
                                 .filter(|_| !*empty)
                                 .ok_or_else(|| {
                                     unsupported("dynamic/rich cell metadata", "worksheet")
@@ -478,10 +485,24 @@ pub(super) fn scan(
                             "worksheet",
                         ));
                     }
-                    if (cell.dynamic_array && cell.formula_kind != "array")
-                        || (cell.value_metadata.is_some() && !cell.has_formula)
-                    {
+                    if cell.dynamic_array && cell.formula_kind != "array" {
                         return Err(unsupported("dynamic/rich cell metadata", "worksheet"));
+                    }
+                    // Value metadata belongs to the value: a value cell keeps
+                    // the rich error of the error it holds (Paste Values keeps
+                    // XLRICHVALUE metadata, `pasteValues`). Its cached #VALUE!
+                    // stands for that error, which the engine must know.
+                    if let Some((vm, _)) = &cell.value_metadata
+                        && !cell.has_formula
+                    {
+                        match tags.get(*vm) {
+                            Some(error) if cell.kind.as_deref() == Some("e") => {
+                                tagged.push((cell.row, cell.col, error.kind));
+                            }
+                            _ => {
+                                return Err(unsupported("dynamic/rich cell metadata", "worksheet"));
+                            }
+                        }
                     }
                     if cell.has_formula {
                         if cell.formula_kind != "shared" && cell.formula_text.trim().is_empty() {
@@ -559,5 +580,9 @@ pub(super) fn scan(
             }
         }
     }
-    Ok(Scan { cells, members })
+    Ok(Scan {
+        cells,
+        members,
+        tagged,
+    })
 }
