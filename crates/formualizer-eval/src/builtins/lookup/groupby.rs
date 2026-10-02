@@ -134,7 +134,11 @@ fn key_part(v: &LiteralValue) -> String {
         LiteralValue::Boolean(b) => format!("B{b}"),
         LiteralValue::Error(e) => format!("X{}", e.kind),
         LiteralValue::Empty => "E".to_string(),
-        other => format!("N{}", number(other).to_bits()),
+        // Excel has no negative zero: a -0 key (`ROUND(-0.4,0)`) is the 0 group.
+        other => format!(
+            "N{}",
+            crate::coercion::normalize_zero(number(other)).to_bits()
+        ),
     }
 }
 

@@ -167,14 +167,29 @@ pub(crate) enum LegacyContext {
     Array,
 }
 
+/// A function's result as the rest of the formula sees it.
+///
 /// A function's error is its value: ISNUMBER(SEARCH("x",#REF!)) is FALSE and
 /// IF(FALSE,...) never sees it. Only cancellation aborts the formula.
-fn error_as_value<'a>(
+///
+/// Excel has no negative zero, so a scalar `-0` (ROUND(-0.4,0), TRUNC(-0.5))
+/// is plain 0 before it reaches another function.
+fn function_result<'a>(
     result: Result<crate::traits::CalcValue<'a>, ExcelError>,
 ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+    use crate::traits::CalcValue;
     match result {
         Err(error) if error.kind != ExcelErrorKind::Cancelled => {
-            Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)))
+            Ok(CalcValue::Scalar(LiteralValue::Error(error)))
+        }
+        Ok(CalcValue::Scalar(LiteralValue::Number(n))) => Ok(CalcValue::Scalar(
+            LiteralValue::Number(crate::coercion::normalize_zero(n)),
+        )),
+        Ok(CalcValue::AnnotatedScalar(LiteralValue::Number(n), format)) => {
+            Ok(CalcValue::AnnotatedScalar(
+                LiteralValue::Number(crate::coercion::normalize_zero(n)),
+                format,
+            ))
         }
         other => other,
     }
@@ -1419,7 +1434,7 @@ impl<'a> Interpreter<'a> {
                     );
                     let _call_dates = self.enter_function_call();
 
-                    return error_as_value(self.with_arena_call_handles(
+                    return function_result(self.with_arena_call_handles(
                         fun.as_ref(),
                         args,
                         data_store,
@@ -2050,7 +2065,7 @@ impl<'a> Interpreter<'a> {
                 self.current_sheet,
             );
             let _call_dates = self.enter_function_call();
-            return error_as_value(fun.dispatch(&handles, &fctx));
+            return function_result(fun.dispatch(&handles, &fctx));
         }
 
         if let Some(callable) = self.resolve_local_callable(name) {

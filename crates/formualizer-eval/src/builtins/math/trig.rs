@@ -741,7 +741,11 @@ impl Function for Atan2Fn {
                     "#DIV/0!",
                 )))
             } else {
-                Ok(LiteralValue::Number(y.atan2(x)))
+                // Excel has no negative zero: a y_num of 0 is +0, so the
+                // result lies in (-pi, pi] and ATAN2(-1,0) is pi, never -pi.
+                Ok(LiteralValue::Number(
+                    crate::coercion::normalize_zero(y).atan2(x),
+                ))
             }
         })
     }

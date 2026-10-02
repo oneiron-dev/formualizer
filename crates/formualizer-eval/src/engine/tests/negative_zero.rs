@@ -180,3 +180,41 @@ fn nonzero_negative_function_results_keep_their_sign_in_text() {
     assert_eq!(value(&engine, 3, 1), text("-1,0"));
     assert_eq!(value(&engine, 4, 1), text("-0.x"));
 }
+
+#[test]
+fn function_zero_results_reach_other_functions_as_zero() {
+    // A1 = 0. ATAN2 lies in (-pi, pi]: a y_num of 0 with x_num < 0 is pi,
+    // whether the 0 is a function's scalar result, an array element or -A1.
+    let engine = engine_with(&[
+        (1, 1, "0"),
+        (1, 2, "=ATAN2(-1,ROUND(-0.4,0))"),
+        (2, 2, "=INDEX(ATAN2(-1,ROUND({-0.4,1},0)),1,1)"),
+        (3, 2, "=ATAN2(-1,-A1)"),
+        (4, 2, "=ATAN2(-1,TRUNC(-0.5))"),
+        // Nonzero negatives keep their sign, however small.
+        (5, 2, "=ATAN2(-1,-1E-300)"),
+    ]);
+    let pi = std::f64::consts::PI;
+    assert_eq!(number(value(&engine, 1, 2)), pi);
+    assert_eq!(number(value(&engine, 2, 2)), pi);
+    assert_eq!(number(value(&engine, 3, 2)), pi);
+    assert_eq!(number(value(&engine, 4, 2)), pi);
+    assert_eq!(number(value(&engine, 5, 2)), -pi);
+}
+
+#[test]
+fn groupby_puts_a_negative_zero_key_in_the_zero_group() {
+    // ROUND({-0.4;0.4},0) is {0;0}: one group whose sum is 1 + 2.
+    let engine = engine_with(&[
+        (1, 1, "=ROWS(GROUPBY(ROUND({-0.4;0.4},0),{1;2},SUM,0,0))"),
+        (
+            2,
+            1,
+            "=INDEX(GROUPBY(ROUND({-0.4;0.4},0),{1;2},SUM,0,0),1,2)",
+        ),
+        (3, 1, "=ROWS(GROUPBY(ROUND({-1.4;0.4},0),{1;2},SUM,0,0))"),
+    ]);
+    assert_eq!(number(value(&engine, 1, 1)), 1.0);
+    assert_eq!(number(value(&engine, 2, 1)), 3.0);
+    assert_eq!(number(value(&engine, 3, 1)), 2.0);
+}
