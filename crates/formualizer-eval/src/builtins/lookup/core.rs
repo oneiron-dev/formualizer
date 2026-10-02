@@ -2,23 +2,16 @@
 //!
 //! Implementation notes:
 //! - MATCH supports match_type: 0 exact, 1 approximate (largest <= lookup), -1 approximate (smallest >= lookup)
-//! - Approximate modes assume data sorted ascending (1) or descending (-1).
-//! - Unsorted-data behavior: both MATCH and VLOOKUP/HLOOKUP approximate modes
-//!   validate ascending/descending order and return #N/A when the data is not
-//!   sorted. This matches LibreOffice behavior and prevents silently wrong
-//!   results. Excel documents approximate results on unsorted data as "may not
-//!   be correct" rather than erroring; we choose safety. See issue #283.
-//!   A text lookup value is exempt: it bisects like Excel without the order
-//!   check (see `approximate_search_checks_order`).
-//! - Binary search used for approximate modes for efficiency; linear scan for exact or when data has fewer than 8 searchable elements to avoid overhead.
+//! - Approximate modes expect data sorted ascending (1) or descending (-1) but, like Excel, do not
+//!   check it: they run Excel's bisection over the reference as written (a whole column is 1,048,576
+//!   rows), so unsorted data gives whatever entry the probes reach, or #N/A.
 //! - VLOOKUP/HLOOKUP wrap MATCH logic; VLOOKUP: vertical first column; HLOOKUP: horizontal first row.
 //! - Error handling: lookup-value errors propagate; error cells in approximate lookup vectors are skipped.
 //! - Type coercion: text comparison is case-insensitive. Approximate modes compare the lookup
 //!   value only with entries of its own type (number, text or logical); the others are skipped.
 
 use super::lookup_utils::{
-    SearchedVector, approximate_search_checks_order, cmp_for_approximate, excel_approximate_search,
-    find_exact_index,
+    SearchedVector, excel_approximate_search, find_exact_index, reference_extent,
 };
 use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
 use crate::engine::{DateSystem, lookup_index_cache::LookupAxis};
@@ -28,96 +21,25 @@ use formualizer_common::ArgKind;
 use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
 
-/// Approximate search over a lookup vector, returning a position in the
-/// *original* vector.
+/// Approximate search over a lookup vector of `len` cells (at least the
+/// slice's length; a whole-column reference is longer than the cells read
+/// from it), returning a position in the *original* vector.
 ///
-/// Entries the search must ignore — blanks, and entries outside the needle's
-/// value class — are projected out first, so they neither occupy a matchable
-/// position nor disturb the binary search's ordering assumption. Error cells
-/// in the lookup vector are skipped by the same projection.
-///
-/// Like the reference-backed MATCH path, this validates that the projected
-/// vector is ordered for the requested mode (ascending for `mode == 1`,
-/// descending for `mode == -1`) and returns `None` (surfaces as `#N/A`) when it
-/// is not. This keeps the array-literal MATCH branch consistent with the
-/// reference branch and with VLOOKUP/HLOOKUP, all of which refuse unsorted
-/// approximate data rather than returning a silently wrong row. (#283)
-/// A text lookup value skips the check and bisects like Excel (see
-/// [`approximate_search_checks_order`]).
+/// This is Excel's bisection ([`excel_approximate_search`]): blanks, errors
+/// and entries of another type are skipped, and unsorted data is searched
+/// rather than rejected.
 fn binary_search_match(
     slice: &[LiteralValue],
     needle: &LiteralValue,
     mode: i32,
+    len: usize,
     date_system: DateSystem,
 ) -> Result<Option<usize>, ExcelError> {
     if mode == 0 || slice.is_empty() {
         return Ok(None);
     }
     let searched = SearchedVector::new(slice, needle, date_system)?;
-    if !approximate_search_checks_order(needle) {
-        return Ok(excel_approximate_search(&searched, needle, mode == -1));
-    }
-
-    let is_sorted = match mode {
-        1 => searched.is_sorted_ascending(),
-        -1 => searched.is_sorted_descending(),
-        _ => return Ok(None),
-    };
-    if !is_sorted {
-        return Ok(None);
-    }
-
-    Ok(binary_search_searched(&searched, needle, mode, date_system)
-        .map(|i| searched.original_position(i)))
-}
-
-/// Same search, but over an already-projected vector and returning an index
-/// into that projection.
-fn binary_search_searched(
-    searched: &SearchedVector<'_>,
-    needle: &LiteralValue,
-    mode: i32,
-    date_system: DateSystem,
-) -> Option<usize> {
-    if mode == 0 || searched.is_empty() {
-        return None;
-    }
-    // Only ascending binary search currently (mode 1); descending path kept linear for now.
-    if mode == 1 {
-        // largest <= needle
-        let mut lo = 0usize;
-        let mut hi = searched.len();
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            match cmp_for_approximate(searched.get(mid), needle, date_system) {
-                Some(c) => {
-                    if c > 0 {
-                        hi = mid;
-                    } else {
-                        lo = mid + 1;
-                    }
-                }
-                None => unreachable!(
-                    "SearchedVector contains only entries comparable with the lookup value"
-                ),
-            }
-        }
-        if lo == 0 { None } else { Some(lo - 1) }
-    } else {
-        // -1 mode handled via linear fallback since semantics differ (smallest >=)
-        let mut best: Option<usize> = None;
-        for i in 0..searched.len() {
-            if let Some(c) = cmp_for_approximate(searched.get(i), needle, date_system) {
-                if c == 0 {
-                    return Some(i);
-                }
-                if c >= 0 && best.is_none_or(|b| i > b) {
-                    best = Some(i);
-                }
-            }
-        }
-        best
-    }
+    Ok(excel_approximate_search(&searched, len, needle, mode == -1))
 }
 
 #[derive(Debug)]
@@ -132,7 +54,7 @@ pub struct MatchFn;
 /// - Exact matching never selects a blank candidate. A blank lookup value retains numeric-zero semantics and can select a real numeric zero, but not blank, text, or boolean candidates.
 /// - `match_type=1` looks for the largest value less than or equal to the lookup value.
 /// - `match_type=-1` looks for the smallest value greater than or equal to the lookup value.
-/// - Approximate modes require sorted data. MATCH detects unsorted input and returns `#N/A`, matching the same guard applied by VLOOKUP and HLOOKUP. A text lookup value is not checked: it bisects like Excel, so text keys out of text order (such as "1".."10") give Excel's answer.
+/// - Approximate modes expect sorted data but do not check it: like Excel they bisect the lookup array, so unsorted data gives whichever entry the search reaches, or `#N/A`.
 /// - If no match is found, returns `#N/A`.
 ///
 /// # Examples
@@ -163,8 +85,8 @@ pub struct MatchFn;
 ///   - XLOOKUP
 ///   - VLOOKUP
 /// faq:
-///   - q: "Why does MATCH with match_type 1 or -1 return #N/A on unsorted data?"
-///     a: "Approximate modes assume ordered lookup data; this implementation treats detected unsorted inputs as no valid match and returns #N/A. A text lookup value is not checked and bisects like Excel."
+///   - q: "What does MATCH with match_type 1 or -1 return on unsorted data?"
+///     a: "Like Excel, approximate modes run a binary search without checking the order, so the result on unsorted data follows the search path and may be a wrong position or #N/A."
 ///   - q: "When are wildcards interpreted in MATCH?"
 ///     a: "Wildcard patterns (*, ?, ~ escapes) are only applied in exact mode (match_type=0) for text lookup values."
 /// ```
@@ -323,78 +245,28 @@ impl Function for MatchFn {
                         return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
                     }
 
-                    // Project out the entries an approximate search ignores
-                    // (blanks and entries outside the needle's value class)
-                    // before both the sortedness guard and the search itself.
-                    let searched =
-                        match SearchedVector::new(&values, &lookup_value, ctx.date_system()) {
-                            Ok(searched) => searched,
-                            Err(error) => {
-                                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                                    error,
-                                )));
-                            }
-                        };
-
-                    // A text search bisects like Excel, without the #283 order check.
-                    if !approximate_search_checks_order(&lookup_value) {
-                        let idx = excel_approximate_search(&searched, &lookup_value, mt == -1);
-                        return Ok(crate::traits::CalcValue::Scalar(match idx {
-                            Some(i) => LiteralValue::Int((i + 1) as i64),
-                            None => LiteralValue::Error(ExcelError::new(ExcelErrorKind::Na)),
-                        }));
-                    }
-
-                    // Lightweight unsorted detection for approximate modes
-                    let is_sorted = if mt == 1 {
-                        searched.is_sorted_ascending()
-                    } else if mt == -1 {
-                        searched.is_sorted_descending()
-                    } else {
-                        true
+                    // A one-column or one-row reference is searched over its
+                    // written length; the view of a whole column stops at the
+                    // last used row.
+                    let len = match (reference_extent(&r), rv.dims()) {
+                        (Some((rows, 1)), (_, 1)) => rows,
+                        (Some((1, cols)), (1, _)) => cols,
+                        _ => values.len(),
                     };
-                    if !is_sorted {
-                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                            ExcelError::new(ExcelErrorKind::Na),
-                        )));
-                    }
-                    let idx = if searched.len() < 8 {
-                        // linear small
-                        let mut best: Option<usize> = None;
-                        for i in 0..searched.len() {
-                            if let Some(c) = cmp_for_approximate(
-                                searched.get(i),
-                                &lookup_value,
-                                ctx.date_system(),
-                            ) {
-                                // compare candidate to needle
-                                if mt == 1 {
-                                    // v <= needle
-                                    if (c == 0 || c == -1) && (best.is_none() || i > best.unwrap())
-                                    {
-                                        best = Some(i);
-                                    }
-                                } else {
-                                    // -1, v >= needle. Excel returns the *first*
-                                    // entry of an exact-match run on a descending
-                                    // range, but the *last* entry that still
-                                    // qualifies when the needle falls between two
-                                    // values. This mirrors the >= 8 path.
-                                    if c == 0 {
-                                        best = Some(i);
-                                        break;
-                                    }
-                                    if c == 1 && (best.is_none() || i > best.unwrap()) {
-                                        best = Some(i);
-                                    }
-                                }
-                            }
+                    let idx = match binary_search_match(
+                        &values,
+                        &lookup_value,
+                        mt,
+                        len,
+                        ctx.date_system(),
+                    ) {
+                        Ok(idx) => idx,
+                        Err(error) => {
+                            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                                error,
+                            )));
                         }
-                        best
-                    } else {
-                        binary_search_searched(&searched, &lookup_value, mt, ctx.date_system())
                     };
-                    let idx = idx.map(|i| searched.original_position(i));
                     match idx {
                         Some(i) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Int(
                             (i + 1) as i64,
@@ -435,7 +307,7 @@ impl Function for MatchFn {
                 let wildcard_mode = matches!(lookup_value, LiteralValue::Text(ref s) if s.contains('*') || s.contains('?') || s.contains('~'));
                 find_exact_index(&values, &lookup_value, wildcard_mode, ctx.date_system())
             } else {
-                binary_search_match(&values, &lookup_value, mt, ctx.date_system())?
+                binary_search_match(&values, &lookup_value, mt, values.len(), ctx.date_system())?
             };
             match idx {
                 Some(i) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Int(
@@ -494,7 +366,7 @@ pub struct VLookupFn;
 /// - `range_lookup` defaults to `TRUE`, matching Excel and LibreOffice.
 /// - When `range_lookup=TRUE`, approximate match logic is used against the first column.
 /// - In exact mode, a blank candidate never matches. A blank lookup value matches a real numeric zero, but not blank, text, or boolean candidates.
-/// - Approximate matching assumes the first column is sorted ascending. Unsorted data is detected and returns `#N/A` rather than a silently wrong row, matching LibreOffice Calc (#283). A text lookup value is not checked: it bisects like Excel.
+/// - Approximate matching expects the first column sorted ascending but, like Excel, does not check it: it bisects the column as written (a whole column is 1,048,576 rows), so unsorted data gives whichever row the search reaches, or `#N/A`.
 /// - Numeric `range_lookup` values use logical coercion: zero is exact and nonzero is approximate.
 /// - If the lookup value is not found, returns `#N/A`.
 /// - If `col_index_num` is invalid, returns `#REF!` (or `#VALUE!` if non-numeric).
@@ -672,11 +544,10 @@ impl Function for VLookupFn {
                         first_col.push(row[0].clone());
                         Ok(())
                     })?;
-                    if first_col.is_empty() {
-                        None
-                    } else {
-                        binary_search_match(&first_col, &lookup_value, 1, ctx.date_system())?
-                    }
+                    // A whole-column table is searched over all its rows, not
+                    // just the used ones the view holds.
+                    let len = reference_extent(&table_ref).map_or(rows, |(rows, _)| rows);
+                    binary_search_match(&first_col, &lookup_value, 1, len, ctx.date_system())?
                 };
 
                 match row_idx_opt {
@@ -717,7 +588,13 @@ impl Function for VLookupFn {
                     let wildcard_mode = matches!(lookup_value, LiteralValue::Text(ref s) if s.contains('*') || s.contains('?') || s.contains('~'));
                     find_exact_index(&first_col, &lookup_value, wildcard_mode, ctx.date_system())
                 } else {
-                    binary_search_match(&first_col, &lookup_value, 1, ctx.date_system())?
+                    binary_search_match(
+                        &first_col,
+                        &lookup_value,
+                        1,
+                        first_col.len(),
+                        ctx.date_system(),
+                    )?
                 };
 
                 match row_idx_opt {
@@ -754,7 +631,7 @@ pub struct HLookupFn;
 /// - `range_lookup` defaults to `TRUE`, matching Excel and LibreOffice.
 /// - When `range_lookup=TRUE`, approximate match logic is used against the first row.
 /// - In exact mode, a blank candidate never matches. A blank lookup value matches a real numeric zero, but not blank, text, or boolean candidates.
-/// - Approximate matching assumes the first row is sorted ascending. Unsorted data is detected and returns `#N/A` rather than a silently wrong column, matching LibreOffice Calc (#283). A text lookup value is not checked: it bisects like Excel.
+/// - Approximate matching expects the first row sorted ascending but, like Excel, does not check it: it bisects the row as written, so unsorted data gives whichever column the search reaches, or `#N/A`.
 /// - Numeric `range_lookup` values use logical coercion: zero is exact and nonzero is approximate.
 /// - If the lookup value is not found, returns `#N/A`.
 /// - If `row_index_num` is invalid, returns `#REF!` (or `#VALUE!` if non-numeric).
@@ -918,7 +795,8 @@ impl Function for HLookupFn {
                         }
                         Ok(())
                     })?;
-                    binary_search_match(&first_row, &lookup_value, 1, ctx.date_system())?
+                    let len = reference_extent(&table_ref).map_or(cols, |(_, cols)| cols);
+                    binary_search_match(&first_row, &lookup_value, 1, len, ctx.date_system())?
                 } else {
                     let wildcard_mode = matches!(lookup_value, LiteralValue::Text(ref s) if s.contains('*') || s.contains('?') || s.contains('~'));
                     if !wildcard_mode
@@ -966,7 +844,13 @@ impl Function for HLookupFn {
                 // First row values for lookup
                 let first_row: Vec<LiteralValue> = table.first().cloned().unwrap_or_default();
                 let col_idx_opt = if approximate {
-                    binary_search_match(&first_row, &lookup_value, 1, ctx.date_system())?
+                    binary_search_match(
+                        &first_row,
+                        &lookup_value,
+                        1,
+                        first_row.len(),
+                        ctx.date_system(),
+                    )?
                 } else {
                     let wildcard_mode = matches!(lookup_value, LiteralValue::Text(ref s) if s.contains('*') || s.contains('?') || s.contains('~'));
                     find_exact_index(&first_row, &lookup_value, wildcard_mode, ctx.date_system())
@@ -1111,7 +995,8 @@ mod tests {
             .into_literal();
         assert!(matches!(v_desc2, LiteralValue::Error(e) if e.kind == ExcelErrorKind::Na));
 
-        // Unsorted detection: 10, 30, 20, 40, 50 (not sorted ascending)
+        // Unsorted 10, 30, 20, 40, 50 is bisected, not rejected: the probes
+        // reach 20 then 40, so the answer is 20's position, not 30's.
         let wb3 = TestWorkbook::new()
             .with_function(Arc::new(MatchFn))
             .with_cell_a1("Sheet1", "A1", LiteralValue::Int(10))
@@ -1135,8 +1020,9 @@ mod tests {
             .dispatch(&args_unsorted, &ctx3.function_context(None))
             .unwrap()
             .into_literal();
-        assert!(matches!(v_unsorted, LiteralValue::Error(e) if e.kind == ExcelErrorKind::Na));
-        // Unsorted detection descending: 50, 30, 40, 20, 10
+        assert_eq!(v_unsorted, LiteralValue::Int(3));
+        // Descending 50, 30, 40, 20, 10: the probes reach 40 (not below 30)
+        // then 20, so the answer is 40's position.
         let wb4 = TestWorkbook::new()
             .with_function(Arc::new(MatchFn))
             .with_cell_a1("Sheet1", "A1", LiteralValue::Int(50))
@@ -1161,7 +1047,7 @@ mod tests {
             .dispatch(&args_unsorted_desc, &ctx4.function_context(None))
             .unwrap()
             .into_literal();
-        assert!(matches!(v_unsorted_desc, LiteralValue::Error(e) if e.kind == ExcelErrorKind::Na));
+        assert_eq!(v_unsorted_desc, LiteralValue::Int(3));
     }
 
     #[test]
@@ -1602,9 +1488,11 @@ mod tests {
     }
 
     #[test]
-    fn vlookup_approximate_returns_na_on_unsorted_data() {
-        // Regression test for #283: VLOOKUP with range_lookup=TRUE on unsorted
-        // data must return #N/A rather than silently wrong results.
+    fn vlookup_approximate_follows_the_bisection_on_unsorted_data() {
+        // Excel does not check that the first column is sorted: it bisects
+        // 30,10,50,20,40. For 25 the probes reach 50 then 30, both above it,
+        // so the answer is #N/A; for 45 they reach 50, 30 and 10, and the
+        // last entry not above 45 is row 2.
         let wb = TestWorkbook::new()
             .with_function(Arc::new(VLookupFn))
             .with_cell_a1("Sheet1", "A1", LiteralValue::Int(30))
@@ -1643,8 +1531,21 @@ mod tests {
             .into_literal();
         assert!(
             matches!(v, LiteralValue::Error(ref e) if e.kind == ExcelErrorKind::Na),
-            "VLOOKUP on unsorted data should return #N/A, got {v:?}"
+            "VLOOKUP(25) on 30,10,50,20,40 should return #N/A, got {v:?}"
         );
+
+        let needle = lit(LiteralValue::Int(45));
+        let args = vec![
+            ArgumentHandle::new(&needle, &ctx),
+            ArgumentHandle::new(&table, &ctx),
+            ArgumentHandle::new(&two, &ctx),
+            ArgumentHandle::new(&true_lit, &ctx),
+        ];
+        let v = f
+            .dispatch(&args, &ctx.function_context(None))
+            .unwrap()
+            .into_literal();
+        assert_eq!(v, LiteralValue::Text("b".into()));
     }
 
     #[test]
@@ -1691,9 +1592,9 @@ mod tests {
     }
 
     #[test]
-    fn hlookup_approximate_returns_na_on_unsorted_data() {
-        // Regression test for #283: HLOOKUP with range_lookup=TRUE on unsorted
-        // first-row data must return #N/A, mirroring VLOOKUP.
+    fn hlookup_approximate_follows_the_bisection_on_unsorted_data() {
+        // The first row 30,10,50,20,40 is bisected as VLOOKUP bisects a
+        // column: #N/A for 25, column 2 for 45.
         let wb = TestWorkbook::new()
             .with_function(Arc::new(HLookupFn))
             .with_cell_a1("Sheet1", "A1", LiteralValue::Int(30))
@@ -1732,8 +1633,21 @@ mod tests {
             .into_literal();
         assert!(
             matches!(v, LiteralValue::Error(ref e) if e.kind == ExcelErrorKind::Na),
-            "HLOOKUP on unsorted data should return #N/A, got {v:?}"
+            "HLOOKUP(25) on 30,10,50,20,40 should return #N/A, got {v:?}"
         );
+
+        let needle = lit(LiteralValue::Int(45));
+        let args = vec![
+            ArgumentHandle::new(&needle, &ctx),
+            ArgumentHandle::new(&table, &ctx),
+            ArgumentHandle::new(&two, &ctx),
+            ArgumentHandle::new(&true_lit, &ctx),
+        ];
+        let v = f
+            .dispatch(&args, &ctx.function_context(None))
+            .unwrap()
+            .into_literal();
+        assert_eq!(v, LiteralValue::Text("b".into()));
     }
 
     #[test]
@@ -1942,8 +1856,14 @@ mod tests {
             LiteralValue::Int(30),
         ];
         assert_eq!(
-            binary_search_match(&ascending, &LiteralValue::Int(25), 1, DateSystem::Excel1900)
-                .unwrap(),
+            binary_search_match(
+                &ascending,
+                &LiteralValue::Int(25),
+                1,
+                ascending.len(),
+                DateSystem::Excel1900
+            )
+            .unwrap(),
             Some(4)
         );
 
@@ -1960,6 +1880,7 @@ mod tests {
                 &descending,
                 &LiteralValue::Int(25),
                 -1,
+                descending.len(),
                 DateSystem::Excel1900
             )
             .unwrap(),
@@ -1974,17 +1895,25 @@ mod tests {
             LiteralValue::Empty,
             LiteralValue::Int(20),
         ];
+        // Unsorted data is bisected, not rejected: the midpoint error moves on
+        // to 30, above 25, and the lower half holds 10.
         assert_eq!(
-            binary_search_match(&unsorted, &LiteralValue::Int(25), 1, DateSystem::Excel1900)
-                .unwrap(),
-            None
+            binary_search_match(
+                &unsorted,
+                &LiteralValue::Int(25),
+                1,
+                unsorted.len(),
+                DateSystem::Excel1900
+            )
+            .unwrap(),
+            Some(1)
         );
     }
 
     #[test]
-    fn hlookup_approximate_array_literal_returns_na_on_unsorted_data() {
-        // Regression test for #283: the array-literal HLOOKUP path must apply
-        // the same sortedness guard as the reference path.
+    fn hlookup_approximate_array_literal_follows_the_bisection_on_unsorted_data() {
+        // The array-literal HLOOKUP path bisects like the reference path: the
+        // probes for 25 reach 50 then 30, both above it, so #N/A.
         let wb = TestWorkbook::new().with_function(Arc::new(HLookupFn));
         let ctx = wb.interpreter();
         let f = ctx.context.get_function("", "HLOOKUP").unwrap();
@@ -2022,7 +1951,7 @@ mod tests {
             .into_literal();
         assert!(
             matches!(v, LiteralValue::Error(ref e) if e.kind == ExcelErrorKind::Na),
-            "HLOOKUP array-literal on unsorted data should return #N/A, got {v:?}"
+            "HLOOKUP(25) array-literal on 30,10,50,20,40 should return #N/A, got {v:?}"
         );
     }
 
@@ -2066,11 +1995,9 @@ mod tests {
     }
 
     #[test]
-    fn match_approximate_array_literal_returns_na_on_unsorted_data() {
-        // Regression test for #283: MATCH's array-literal branch previously
-        // called the unguarded search, so MATCH(2.5, {3,2,1}, 1) returned 3
-        // while VLOOKUP(2.5, {3,...;...}, 2, TRUE) returned #N/A. The guard is
-        // now shared, so an ascending MATCH over descending data is #N/A.
+    fn match_approximate_array_literal_bisects_unsorted_data() {
+        // Excel answers MATCH(2.5, {3,2,1}, 1) with 3: the bisection probes 2
+        // and then 1, both not above 2.5, and never checks the order.
         let wb = TestWorkbook::new().with_function(Arc::new(MatchFn));
         let ctx = wb.interpreter();
         let f = ctx.context.get_function("", "MATCH").unwrap();
@@ -2092,10 +2019,7 @@ mod tests {
             .dispatch(&args, &ctx.function_context(None))
             .unwrap()
             .into_literal();
-        assert!(
-            matches!(v, LiteralValue::Error(ref e) if e.kind == ExcelErrorKind::Na),
-            "MATCH(2.5, {{3,2,1}}, 1) should return #N/A on unsorted data, got {v:?}"
-        );
+        assert_eq!(v, LiteralValue::Int(3));
     }
 
     #[test]

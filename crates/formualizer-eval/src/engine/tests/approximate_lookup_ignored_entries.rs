@@ -243,8 +243,8 @@ fn blank_tail_does_not_make_a_descending_range_unsorted() {
     );
 }
 
-/// Control: genuinely unsorted data is still `#N/A`. Ignoring blanks must not
-/// weaken the sortedness guard.
+/// Control: Excel bisects unsorted data rather than rejecting it, and here the
+/// probes reach 5 and then 3, both above the needle, so the answer is `#N/A`.
 /// Excel: `=MATCH(2,M1:M5,1)` => `#N/A`.
 #[test]
 fn genuinely_unsorted_data_is_still_na() {
@@ -633,8 +633,9 @@ fn numeric_text_and_logical_needles_search_their_own_type() {
 /// Excel compares text with text as text ("10" < "2"). Excel never checks the
 /// order of an approximate search: it bisects, and for "5" every probe lands
 /// on "3".."8" before settling on "5", so MATCH gives 5 and VLOOKUP the value
-/// beside it. The engine's #283 unsorted guard does not apply to a text
-/// lookup value, which bisects like Excel instead of answering #N/A.
+/// beside it. The engine bisects like Excel instead of answering #N/A. The
+/// whole column D:D is bisected over its full height, and its blank tail
+/// leads the probes down to the same "5".
 #[test]
 fn text_keys_out_of_text_order_are_bisected_not_rejected() {
     let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
@@ -684,4 +685,100 @@ fn text_keys_out_of_text_order_are_bisected_not_rejected() {
         eval(&mut engine, "=MATCH(\"0\",D1:D10,1)"),
         "MATCH(\"0\",D1:D10,1)",
     );
+}
+fn eval_at(engine: &mut Engine<TestWorkbook>, formula: &str) -> Option<LiteralValue> {
+    engine
+        .set_cell_formula("Sheet1", 30, 30, parse(formula).unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    engine.get_cell_value("Sheet1", 30, 30)
+}
+
+/// Excel's approximate MATCH, VLOOKUP and HLOOKUP bisect the lookup vector
+/// without checking its order: inclusive bounds, a floor midpoint, a probe on
+/// a skipped entry moving on to the next searched one. On unsorted data the
+/// answer is wherever the probes lead.
+#[test]
+fn unsorted_data_is_bisected_not_rejected() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    // A = 1, 2, 3, 10, 4, 4 and B = 10..60.
+    for (row, value) in [1, 2, 3, 10, 4, 4].into_iter().enumerate() {
+        let row = row as u32 + 1;
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Int(value))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", row, 2, LiteralValue::Int(row as i64 * 10))
+            .unwrap();
+    }
+    // Probes 3, 4, 4: the last entry not above 5 is row 6.
+    for (formula, expected) in [
+        ("=MATCH(5,A1:A6,1)", 6.0),
+        ("=VLOOKUP(5,A1:B6,2,TRUE)", 60.0),
+        ("=MATCH(30,{10,30,20,40,50},1)", 3.0),
+        ("=MATCH(45,{30,10,50,20,40},1)", 2.0),
+        ("=MATCH(30,{50,30,40,20,10},-1)", 3.0),
+    ] {
+        assert_number(eval_at(&mut engine, formula), expected, formula);
+    }
+    // An exact probe is kept over the inexact ones after it.
+    let titles = "{\"Winter Guard\";\"Iron man\";\"Infinity War\";\"Deadpool AGAIN\";\"Deadpool\";\"Black Cat\"}";
+    assert_number(
+        eval_at(&mut engine, &format!("=MATCH(\"Infinity War\",{titles},1)")),
+        3.0,
+        "exact probe on unsorted text",
+    );
+    assert_na(
+        eval_at(&mut engine, &format!("=MATCH(\"Black Cat\",{titles},1)")),
+        "probes above the needle on unsorted text",
+    );
+}
+
+/// A whole column or row is bisected over its full height or width, as
+/// written, not over the used cells: the blank tail moves the early probes
+/// left and changes where they land on unsorted data. A bounded range is
+/// bisected over its own length.
+#[test]
+fn whole_column_is_bisected_over_its_full_height() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    // A = 3, "h", 5, 6, 7, 8, 1, 1 with B = 10..80; row 20 holds the same
+    // keys across J20:Q20 with the payload in row 21. D = 9, 8, 1, 7, 6.
+    let keys = [
+        LiteralValue::Int(3),
+        LiteralValue::Text("h".into()),
+        LiteralValue::Int(5),
+        LiteralValue::Int(6),
+        LiteralValue::Int(7),
+        LiteralValue::Int(8),
+        LiteralValue::Int(1),
+        LiteralValue::Int(1),
+    ];
+    for (i, key) in keys.into_iter().enumerate() {
+        let i = i as u32 + 1;
+        engine.set_cell_value("Sheet1", i, 1, key.clone()).unwrap();
+        engine
+            .set_cell_value("Sheet1", i, 2, LiteralValue::Int(i as i64 * 10))
+            .unwrap();
+        engine.set_cell_value("Sheet1", 20, i + 9, key).unwrap();
+        engine
+            .set_cell_value("Sheet1", 21, i + 9, LiteralValue::Int(i as i64 * 10))
+            .unwrap();
+    }
+    for (row, value) in [9, 8, 1, 7, 6].into_iter().enumerate() {
+        engine
+            .set_cell_value("Sheet1", row as u32 + 1, 4, LiteralValue::Int(value))
+            .unwrap();
+    }
+    for (formula, expected) in [
+        ("=MATCH(6.5,A1:A8,1)", 4.0),
+        ("=MATCH(6.5,A:A,1)", 8.0),
+        ("=VLOOKUP(6.5,A1:B8,2,TRUE)", 40.0),
+        ("=VLOOKUP(6.5,A:B,2,TRUE)", 80.0),
+        ("=HLOOKUP(6.5,J20:Q21,2,TRUE)", 40.0),
+        ("=HLOOKUP(6.5,20:21,2,TRUE)", 80.0),
+        ("=MATCH(6.5,D1:D5,-1)", 2.0),
+        ("=MATCH(6.5,D:D,-1)", 4.0),
+    ] {
+        assert_number(eval_at(&mut engine, formula), expected, formula);
+    }
 }

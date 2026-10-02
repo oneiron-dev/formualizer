@@ -4,6 +4,7 @@
 use crate::engine::{DateSystem, range_view::RangeView};
 use arrow_array::Array;
 use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
+use formualizer_parse::parser::{ExternalRefKind, ReferenceType};
 
 /// Coerce a value to f64 with Excel-like rules for numeric comparisons:
 /// - Number / Int: numeric
@@ -258,20 +259,6 @@ impl<'a> SearchedVector<'a> {
         }
     }
 
-    pub fn is_sorted_ascending(&self) -> bool {
-        (1..self.len()).all(|i| {
-            cmp_for_approximate(self.get(i - 1), self.get(i), self.date_system)
-                .is_some_and(|c| c <= 0)
-        })
-    }
-
-    pub fn is_sorted_descending(&self) -> bool {
-        (1..self.len()).all(|i| {
-            cmp_for_approximate(self.get(i - 1), self.get(i), self.date_system)
-                .is_some_and(|c| c >= 0)
-        })
-    }
-
     /// The first searched entry at or after `position` in the original
     /// vector, as an index into this projection.
     fn first_at_or_after(&self, position: usize) -> Option<usize> {
@@ -283,43 +270,29 @@ impl<'a> SearchedVector<'a> {
     }
 }
 
-/// Whether the engine checks that the lookup vector is in order before an
-/// approximate search for `needle` and answers `#N/A` when it is not (#283).
+/// Excel's approximate search (`MATCH` with `match_type` 1/-1,
+/// `VLOOKUP`/`HLOOKUP` with `range_lookup` TRUE) over a lookup vector of
+/// `len` cells, of which `searched` holds the materialized prefix; cells past
+/// it (the unused tail of a whole-column reference) are blank. Returns the
+/// position in the original vector.
 ///
-/// Excel never checks the order: it bisects, and on data out of order the
-/// answer is wherever the probes lead. The engine keeps the #283 guard for
-/// numbers and logicals, but a text search bisects as Excel does (see
-/// [`excel_approximate_search`]). Text keys are often kept in an order that is
-/// not text order, such as IDs "1".."10" stored in numeric order, which Excel
-/// compares as text ("10" < "9") and still answers from, and the engine's
-/// case-insensitive comparison does not reproduce the collation Excel sorts
-/// text by (its documented sort order ignores hyphens and apostrophes, for
-/// one), so text that Excel's own sort put in order could look unsorted to
-/// the guard.
-pub fn approximate_search_checks_order(needle: &LiteralValue) -> bool {
-    !matches!(needle, LiteralValue::Text(_))
-}
-
-/// Excel's bisection for an approximate search (`MATCH` with `match_type`
-/// 1/-1, `VLOOKUP`/`HLOOKUP` with `range_lookup` TRUE) without any order
-/// check. Returns the position in the original vector.
-///
-/// Excel bisects the vector with inclusive bounds and a floor midpoint. A
-/// probe that lands on an entry the search skips (see [`cmp_for_approximate`])
-/// moves forward to the next searched entry; when there is none up to the
-/// upper bound, the search continues in the lower half. An exact hit is kept
-/// in preference to any inexact one, and the search goes on towards the end of
-/// the run of equal entries that Excel returns: the last for an ascending
-/// search, the first for a descending one. Otherwise the answer is the last
-/// probed entry below (ascending) or above (descending) the lookup value, and
-/// `None` when no probe qualified. On ordered data this is the entry the
-/// documented rule names; on data out of order it is wherever the probes lead.
+/// Excel bisects the reference as written, with inclusive bounds and a floor
+/// midpoint, and never checks that the data is sorted: on unsorted data the
+/// answer is wherever the probes lead, possibly `#N/A`. A probe that lands on
+/// an entry the search skips (see [`cmp_for_approximate`]) moves forward to
+/// the next searched entry; when there is none up to the upper bound, the
+/// search continues in the lower half. An exact hit is kept in preference to
+/// any inexact one, and the search goes on towards the end of a run of equal
+/// entries that Excel returns: the last for an ascending search, the first
+/// for a descending one. Otherwise the answer is the last probed entry below
+/// (ascending) or above (descending) the lookup value.
 pub fn excel_approximate_search(
     searched: &SearchedVector<'_>,
+    len: usize,
     needle: &LiteralValue,
     descending: bool,
 ) -> Option<usize> {
-    let len = searched.values.len();
+    let len = len.max(searched.values.len());
     if searched.is_empty() || len == 0 {
         return None;
     }
@@ -360,6 +333,46 @@ pub fn excel_approximate_search(
         }
     }
     exact.or(nearest)
+}
+
+/// The rows and columns a reference spans as written. A whole column or row
+/// (`A:A`, `1:1`) reaches the sheet edge, although the range view resolved
+/// from it stops at the last used cell. `None` for references whose extent is
+/// only known once resolved (names, tables, 3D references).
+pub(crate) fn reference_extent(reference: &ReferenceType) -> Option<(usize, usize)> {
+    const MAX_ROWS: u32 = 1_048_576;
+    const MAX_COLS: u32 = 16_384;
+    let span = |start: Option<u32>, end: Option<u32>, max: u32| {
+        let (start, end) = (start.unwrap_or(1), end.unwrap_or(max));
+        (start.max(end) - start.min(end) + 1) as usize
+    };
+    match reference {
+        ReferenceType::Cell { .. } => Some((1, 1)),
+        ReferenceType::Range {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            ..
+        } => Some((
+            span(*start_row, *end_row, MAX_ROWS),
+            span(*start_col, *end_col, MAX_COLS),
+        )),
+        ReferenceType::External(ext) => match &ext.kind {
+            ExternalRefKind::Cell { .. } => Some((1, 1)),
+            ExternalRefKind::Range {
+                start_row,
+                start_col,
+                end_row,
+                end_col,
+                ..
+            } => Some((
+                span(*start_row, *end_row, MAX_ROWS),
+                span(*start_col, *end_col, MAX_COLS),
+            )),
+        },
+        _ => None,
+    }
 }
 
 /// Detect ascending sort (strict or equal allowed) for slice according to cmp_for_lookup.
@@ -1297,5 +1310,21 @@ mod tests {
             opt_wildcard,
             raw_wildcard.as_secs_f64() / opt_wildcard.as_secs_f64()
         );
+    }
+
+    #[test]
+    fn reference_extent_counts_whole_columns_and_rows_to_the_sheet_edge() {
+        for (text, expected) in [
+            ("A:A", (1_048_576, 1)),
+            ("$C:$Z", (1_048_576, 24)),
+            ("2:3", (2, 16_384)),
+            ("A$4:A$1048576", (1_048_573, 1)),
+            ("B2:D5", (4, 3)),
+            ("B2", (1, 1)),
+            ("[1]Sort!$C:$Z", (1_048_576, 24)),
+        ] {
+            let reference = ReferenceType::from_string(text).unwrap();
+            assert_eq!(reference_extent(&reference), Some(expected), "{text}");
+        }
     }
 }
