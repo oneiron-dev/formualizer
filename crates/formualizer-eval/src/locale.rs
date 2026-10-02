@@ -23,14 +23,18 @@ impl Locale {
     /// matching spreadsheet numeric-coercion behavior in numeric contexts.
     /// Like Excel it ignores only the spaces around the text; a tab, line
     /// feed or no-break space there leaves it text.
+    ///
+    /// Only finite numbers are numeric text: Excel has no NaN or infinity, so
+    /// "NaN", "inf", "Infinity" and an out-of-range "1E400" (all of which Rust's
+    /// float parser accepts) are not numbers, and `VALUE` of them is `#VALUE!`.
     pub fn parse_number_invariant(&self, s: &str) -> Option<f64> {
         let trimmed = s.trim_matches(' ');
-        if let Some(without_pct) = trimmed.strip_suffix('%') {
-            let n = without_pct.trim_end_matches(' ').parse::<f64>().ok()?;
-            Some(n / 100.0)
+        let n = if let Some(without_pct) = trimmed.strip_suffix('%') {
+            without_pct.trim_end_matches(' ').parse::<f64>().ok()? / 100.0
         } else {
-            trimmed.parse::<f64>().ok()
-        }
+            trimmed.parse::<f64>().ok()?
+        };
+        n.is_finite().then_some(n)
     }
 
     /// Case folding for comparisons; invariant = ASCII lower.
@@ -66,5 +70,27 @@ mod tests {
         assert_eq!(loc.parse_number_invariant("abc%"), None);
         assert_eq!(loc.parse_number_invariant("%"), None);
         assert_eq!(loc.parse_number_invariant("90% trailing"), None);
+    }
+
+    #[test]
+    fn parse_number_invariant_rejects_non_finite_text() {
+        let loc = Locale::invariant();
+        for text in [
+            "NaN",
+            "nan",
+            "-NaN",
+            "inf",
+            "-inf",
+            "+Infinity",
+            "infinity",
+            "NaN%",
+            "1E400",
+            "-1e400",
+        ] {
+            assert_eq!(loc.parse_number_invariant(text), None, "{text}");
+        }
+        // Finite numeric text, exponents included, still parses.
+        assert_eq!(loc.parse_number_invariant("1E+05"), Some(100000.0));
+        assert_eq!(loc.parse_number_invariant(" -2.5e-1 "), Some(-0.25));
     }
 }

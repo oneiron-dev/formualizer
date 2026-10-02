@@ -1483,12 +1483,17 @@ fn aggregate_op_from_function_num(function_num: i32) -> Option<AggregateOp> {
 }
 
 fn parse_strict_int_arg(arg: &ArgumentHandle<'_, '_>) -> Result<i32, ExcelError> {
-    let raw = arg.value()?.into_literal();
+    strict_int(&arg.value()?.into_literal())
+}
+
+/// A function number or option of SUBTOTAL and AGGREGATE: a whole number,
+/// numeric text included ("14" is 14), or the error it holds.
+pub(crate) fn strict_int(raw: &LiteralValue) -> Result<i32, ExcelError> {
     if let LiteralValue::Error(e) = raw {
-        return Err(e);
+        return Err(e.clone());
     }
 
-    let n = coerce_num(&raw)?;
+    let n = coerce_num(raw)?;
     if !n.is_finite() {
         return Err(ExcelError::new_value());
     }
@@ -2023,14 +2028,17 @@ impl Function for AggregateFn {
 }
 
 /// The k (or quart) of AGGREGATE's array form: an error is the result, and a
-/// one-cell array is its value.
+/// one-cell array is its value. A larger array is lifted before this call
+/// (one call per element); one that reaches it unlifted is `#VALUE!`, never
+/// its first element.
 fn aggregate_k(k: LiteralValue) -> Result<f64, ExcelError> {
     match k {
         LiteralValue::Error(e) => Err(e),
         LiteralValue::Array(rows) => {
-            match rows.into_iter().next().and_then(|r| r.into_iter().next()) {
-                Some(cell) => aggregate_k(cell),
-                None => Err(ExcelError::new_value()),
+            let mut cells = rows.into_iter().flatten();
+            match (cells.next(), cells.next()) {
+                (Some(cell), None) => aggregate_k(cell),
+                _ => Err(ExcelError::new_value()),
             }
         }
         other => coerce_num(&other),
@@ -2074,7 +2082,8 @@ fn aggregate_order_statistic(
         }
         14 | 15 => {
             let k = k.trunc();
-            if k < 1.0 || k as usize > nums.len() {
+            // A NaN k (no Excel number) fails every bound, like k < 1.
+            if k.is_nan() || k < 1.0 || k as usize > nums.len() {
                 return Err(ExcelError::new_num());
             }
             let k = k as usize;
@@ -2428,6 +2437,78 @@ mod tests_subtotal_aggregate {
         assert_eq!(call(14, 4, vec![vec![int(1), int(2)]]), [["#N/A", "#N/A"]]);
         // A 1x1 array k is a scalar k.
         assert_eq!(call(14, 6, vec![vec![int(2)]]), [["5"]]);
+    }
+
+    #[test]
+    fn aggregate_array_form_reads_text_function_number_and_rejects_nan_k() {
+        let wb = TestWorkbook::new().with_function(std::sync::Arc::new(AggregateFn));
+        let ctx = interp(&wb);
+        let text = |s: &str| LiteralValue::Text(s.into());
+        let num = LiteralValue::Number;
+        let row = |cells: Vec<LiteralValue>| LiteralValue::Array(vec![cells]);
+        let numbers = || row(vec![num(1.0), num(2.0), num(3.0)]);
+        let kinds = |value: LiteralValue| -> Vec<String> {
+            let cells = match value {
+                LiteralValue::Array(rows) => rows.into_iter().flatten().collect(),
+                other => vec![other],
+            };
+            cells
+                .into_iter()
+                .map(|cell| match cell {
+                    LiteralValue::Number(n) => n.to_string(),
+                    LiteralValue::Error(e) => e.kind.to_string(),
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        };
+        // A function number given as numeric text still selects the array
+        // form, so a multi-cell k is evaluated element by element in its shape.
+        for (f, expected) in [("14", ["3", "2"]), ("15", ["1", "2"])] {
+            let args = vec![text(f), num(6.0), numbers(), row(vec![num(1.0), num(2.0)])];
+            assert_eq!(kinds(aggregate(&ctx, args)), expected, "{f}");
+        }
+        let args = vec![
+            text("14"),
+            num(6.0),
+            numbers(),
+            row(vec![num(1.0), LiteralValue::Error(ExcelError::new_na())]),
+        ];
+        assert_eq!(kinds(aggregate(&ctx, args)), ["3", "#N/A"]);
+        // "NaN" is no numeric text: that element is #VALUE! (option 6 ignores
+        // errors in the data, not an invalid k), the others still compute.
+        for (f, expected) in [("14", ["#VALUE!", "3"]), ("15", ["#VALUE!", "1"])] {
+            let args = vec![
+                text(f),
+                num(6.0),
+                numbers(),
+                row(vec![text("NaN"), num(1.0)]),
+            ];
+            assert_eq!(kinds(aggregate(&ctx, args)), expected, "{f}");
+        }
+        // A numeric NaN k (no Excel number) is out of range rather than an index.
+        for f in 14..=19 {
+            assert_eq!(
+                aggregate_order_statistic(f, vec![1.0, 2.0, 3.0], Some(f64::NAN))
+                    .map_err(|e| e.kind),
+                Err(ExcelErrorKind::Num),
+                "{f}"
+            );
+        }
+        // A multi-cell k that reaches the evaluation unlifted is #VALUE!, not
+        // its first element; a one-cell array is its value.
+        assert_eq!(
+            aggregate_k(LiteralValue::Array(vec![vec![num(1.0), num(2.0)]])).map_err(|e| e.kind),
+            Err(ExcelErrorKind::Value)
+        );
+        assert_eq!(
+            aggregate_k(LiteralValue::Array(vec![vec![num(1.0)], vec![num(2.0)]]))
+                .map_err(|e| e.kind),
+            Err(ExcelErrorKind::Value)
+        );
+        assert_eq!(
+            aggregate_k(LiteralValue::Array(vec![vec![num(2.0)]])),
+            Ok(2.0)
+        );
     }
 }
 

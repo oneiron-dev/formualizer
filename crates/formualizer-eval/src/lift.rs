@@ -153,12 +153,14 @@ fn value_lift_spec(name: &str, args: &[ArgumentHandle<'_, '_>]) -> Option<Lift> 
 }
 
 /// Whether AGGREGATE's function number (each element of an array of them)
-/// selects the array form, 14 (LARGE) to 19 (QUARTILE.EXC).
+/// selects the array form, 14 (LARGE) to 19 (QUARTILE.EXC), read as AGGREGATE
+/// reads it (numeric text "14" is 14).
 fn aggregate_array_form(function_num: &ArgumentHandle<'_, '_>) -> bool {
-    let array_form = |value: &LiteralValue| match value {
-        LiteralValue::Number(n) => (14.0..20.0).contains(n),
-        LiteralValue::Int(i) => (14..=19).contains(i),
-        _ => false,
+    let array_form = |value: &LiteralValue| {
+        matches!(
+            crate::builtins::math::aggregate::strict_int(value),
+            Ok(14..=19)
+        )
     };
     match function_num.value() {
         Ok(value) => match array_rows(&value) {

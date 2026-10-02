@@ -67,6 +67,17 @@ fn lookup_and_criteria_values_lift_but_tables_and_ranges_do_not() {
     assert_number("=SUM(AGGREGATE(14,6,{0,2,0,2},{1,2})*{10,1})", 22.0);
     assert_number("=SUM(_xlfn.AGGREGATE(15,6,B1:B3,B1:B2))", 3.0);
     assert_number("=ROWS(_xlfn.AGGREGATE(16,6,B1:B3,{0;0.5;1}))", 3.0);
+    // A function number given as numeric text selects the array form too: k
+    // keeps its shape ({3,2}) and each element's own error.
+    assert_number("=SUM(AGGREGATE(\"14\",6,{1,2,3},{1,2})*{10,1})", 32.0);
+    assert_number(
+        "=SUM(--ISERROR(AGGREGATE(\"14\",6,{1,2,3},IF({1,0},1,NA()))))",
+        1.0,
+    );
+    assert_number(
+        "=SUM(IFERROR(AGGREGATE(\"15\",6,{1,2,3},{\"NaN\",1}),100))",
+        101.0,
+    );
     // A one-cell array k is its value.
     assert_number("=_xlfn.AGGREGATE(14,6,B1:B3,{2})", 2.0);
     // The reference form still reads every further argument as data.

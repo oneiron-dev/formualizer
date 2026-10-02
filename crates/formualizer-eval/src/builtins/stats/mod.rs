@@ -40,7 +40,8 @@ fn scalar_like_value(arg: &ArgumentHandle<'_, '_>) -> Result<LiteralValue, Excel
 }
 
 /// Collect numeric inputs applying Excel statistical semantics:
-/// - Range references: include only numeric cells; skip text, logical, blank. Errors propagate.
+/// - Range references and arrays (constants such as `{1,"2",TRUE}` included): include only
+///   numeric cells; skip text, logical, blank. Errors propagate.
 /// - Direct scalar arguments: attempt numeric coercion (so TRUE/FALSE, numeric text are included if
 ///   coerce_num succeeds). Non-numeric text is ignored (Excel would treat a direct non-numeric text
 ///   argument as #VALUE! in some contexts; covered by TODO for finer parity).
@@ -53,26 +54,8 @@ fn collect_numeric_stats(args: &[ArgumentHandle]) -> Result<Vec<f64>, ExcelError
 fn collect_numeric(args: &[ArgumentHandle], skip_errors: bool) -> Result<Vec<f64>, ExcelError> {
     let mut out = Vec::new();
     for a in args {
-        // Special-case: inline array literal argument should be treated like a list of direct scalar
-        // arguments (not a by-ref range). This allows boolean/text coercion per element akin to
-        // passing multiple scalars to the function.
-        if let Some(arr) = a.inline_array_literal()? {
-            for row in arr.into_iter() {
-                for cell in row.into_iter() {
-                    match cell {
-                        LiteralValue::Error(_) if skip_errors => {}
-                        LiteralValue::Error(e) => return Err(e),
-                        other => {
-                            if let Ok(n) = crate::coercion::to_number_lenient(&other) {
-                                out.push(n);
-                            }
-                        }
-                    }
-                }
-            }
-            continue;
-        }
-
+        // An array, a literal array value included, reads like a range: only its
+        // numbers count, as for the array constant a parsed `{...}` evaluates to.
         if let Ok(view) = a.range_view() {
             let date_system = a.date_system();
             view.for_each_cell(&mut |v| {
@@ -7804,7 +7787,10 @@ impl Function for FrequencyFn {
         let data = collect_numeric_stats(&args[0..1])?;
 
         // Collect bins array: like blanks and text, error entries are not bins.
-        let bins = collect_numeric(&args[1..2], true)?;
+        // A NaN is no Excel number but an error that reached here as one (an
+        // unchecked computation), so it is skipped the same way.
+        let mut bins = collect_numeric(&args[1..2], true)?;
+        bins.retain(|bin| !bin.is_nan());
 
         // Handle empty bins - return single count of all data
         if bins.is_empty() {
@@ -7816,7 +7802,11 @@ impl Function for FrequencyFn {
         // bins_array's own order; a repeated bin value takes the count at its
         // first position (the stable sort keeps it first among equals).
         let mut order: Vec<usize> = (0..bins.len()).collect();
-        order.sort_by(|&a, &b| bins[a].partial_cmp(&bins[b]).unwrap());
+        order.sort_by(|&a, &b| {
+            bins[a]
+                .partial_cmp(&bins[b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Result has bins.len() + 1 elements; the last counts values above every bin.
         let mut frequencies = vec![0usize; bins.len() + 1];
@@ -11093,12 +11083,10 @@ mod tests_basic_stats {
             )
             .unwrap()
             .into_literal();
-        // NOTE: Inline array literal is treated as a direct scalar argument (not a range reference),
-        // so boolean TRUE is coerced to 1. Dataset becomes {1,1,4}; population stdev = sqrt(6/3)=sqrt(2).
+        // An array counts only its numbers, like a range: the text and TRUE are
+        // ignored, so the dataset is {1,4} and the population stdev is 1.5.
         match out {
-            LiteralValue::Number(v) => {
-                assert!((v - 2f64.sqrt()).abs() < 1e-12, "expected sqrt(2) got {v}")
-            }
+            LiteralValue::Number(v) => assert!((v - 1.5).abs() < 1e-12, "expected 1.5 got {v}"),
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -11187,6 +11175,86 @@ mod tests_basic_stats {
         assert_eq!(
             err("=FREQUENCY({1,2},1/0)"),
             formualizer_common::ExcelErrorKind::Div
+        );
+    }
+
+    #[test]
+    fn frequency_skips_nan_bins_without_panicking() {
+        // VALUE("NaN") is #VALUE! (no numeric text), so that bin is skipped.
+        assert_eq!(
+            frequency_eval("=FREQUENCY({1,2},VALUE({\"NaN\",\"1\"}))"),
+            column(&[1.0, 1.0])
+        );
+        assert_eq!(
+            frequency_eval("=FREQUENCY({1,2},--{\"inf\",\"1\"})"),
+            column(&[1.0, 1.0])
+        );
+        // A NaN number handed in directly is skipped like the error it stands for.
+        let wb = TestWorkbook::new().with_function(std::sync::Arc::new(FrequencyFn));
+        let ctx = interp(&wb);
+        let data = ASTNode::new(
+            ASTNodeType::Literal(LiteralValue::Array(vec![vec![
+                LiteralValue::Number(1.0),
+                LiteralValue::Number(2.0),
+            ]])),
+            None,
+        );
+        let bins = ASTNode::new(
+            ASTNodeType::Literal(LiteralValue::Array(vec![vec![
+                LiteralValue::Number(f64::NAN),
+                LiteralValue::Number(1.0),
+            ]])),
+            None,
+        );
+        let f = ctx.context.get_function("", "FREQUENCY").unwrap();
+        let out = f
+            .dispatch(
+                &[
+                    ArgumentHandle::new(&data, &ctx),
+                    ArgumentHandle::new(&bins, &ctx),
+                ],
+                &ctx.function_context(None),
+            )
+            .unwrap()
+            .into_literal();
+        assert_eq!(out, column(&[1.0, 1.0]));
+    }
+
+    #[test]
+    fn frequency_literal_array_bins_ignore_text_and_logicals() {
+        // A literal array value reads like the parsed constant {"2",1,TRUE}:
+        // its text and logical entries are no bins, only 1 is.
+        let wb = TestWorkbook::new().with_function(std::sync::Arc::new(FrequencyFn));
+        let ctx = interp(&wb);
+        let array = |cells: Vec<LiteralValue>| {
+            ASTNode::new(ASTNodeType::Literal(LiteralValue::Array(vec![cells])), None)
+        };
+        let data = array(vec![
+            LiteralValue::Number(1.0),
+            LiteralValue::Number(2.0),
+            LiteralValue::Number(3.0),
+        ]);
+        let bins = array(vec![
+            LiteralValue::Text("2".into()),
+            LiteralValue::Number(1.0),
+            LiteralValue::Boolean(true),
+        ]);
+        let f = ctx.context.get_function("", "FREQUENCY").unwrap();
+        let out = f
+            .dispatch(
+                &[
+                    ArgumentHandle::new(&data, &ctx),
+                    ArgumentHandle::new(&bins, &ctx),
+                ],
+                &ctx.function_context(None),
+            )
+            .unwrap()
+            .into_literal();
+        assert_eq!(out, column(&[1.0, 2.0]));
+        // The same through a parsed formula.
+        assert_eq!(
+            frequency_eval("=FREQUENCY({1,2,3},{\"2\",1,TRUE})"),
+            column(&[1.0, 2.0])
         );
     }
 
