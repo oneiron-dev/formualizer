@@ -702,6 +702,28 @@ fn subtotal_aggregate_and_rank_parameters_lift() {
     assert_number("=SUM(_xlfn.AGGREGATE(14,6,B1:B3,{1,2}))", 5.0);
     assert_number("=SUM(_xlfn.AGGREGATE({14,15},6,B1:B3,{1,1}))", 4.0);
     assert_number("=_xlfn.AGGREGATE(9,4,B1:B3,B1:B2)", 9.0);
+    // Each function number goes with its own k: an element that selects no
+    // function is that element's error and does not keep k from lifting for
+    // the others ({3,#N/A} and {3,#VALUE!}).
+    for (formula, sum, errors, na) in [
+        ("_xlfn.AGGREGATE({14,#N/A},6,{1,2,3},{1,2})", 3.0, 1.0, 1.0),
+        ("_xlfn.AGGREGATE({14,20},6,{1,2,3},{1,2})", 3.0, 1.0, 0.0),
+        (
+            "_xlfn.AGGREGATE({14;\"15\";2.5},6,{1,2,3},{1;2;1})",
+            5.0,
+            1.0,
+            0.0,
+        ),
+    ] {
+        assert_number(&format!("=SUM(IFERROR({formula},0))"), sum);
+        assert_number(&format!("=SUM(--ISERROR({formula}))"), errors);
+        assert_number(&format!("=SUM(--ISNA({formula}))"), na);
+    }
+    // k past the count is #NUM! before its fraction is dropped: {3,#NUM!}.
+    assert_number(
+        "=SUM(IFERROR(_xlfn.AGGREGATE(14,6,{1,2,3},{1,3.1}),100))",
+        103.0,
+    );
     // RANK's ref is a reference parameter.
     assert_number("=SUM(RANK(B1,OFFSET(B1,0,0,{2,3})))", 5.0);
     assert_number("=SUM(_xlfn.RANK.EQ(B2,OFFSET(B1,0,0,{2,3})))", 3.0);

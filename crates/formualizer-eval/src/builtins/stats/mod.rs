@@ -15,7 +15,9 @@
 //! - Text/boolean coercion nuance: For Excel statistical functions, values coming from range
 //!   references should ignore text and logical values (they are skipped), while direct scalar
 //!   arguments still coerce (e.g. =STDEV(1,TRUE) treats TRUE as 1). This file now implements that
-//!   distinction. TODO(excel-nuance): refine numeric text literal vs non‑numeric text handling.
+//!   distinction. A direct argument of a number1, number2, ... list that is text no number can be
+//!   read from is #VALUE! (`collect_number_args`); paired arrays (CORREL, SLOPE, ...) drop an
+//!   observation when either of its entries is no number (`collect_paired_numbers`).
 //! - Errors encountered in any argument propagate immediately.
 //! - Empty numeric sets produce Excel-specific errors (#NUM! for LARGE/SMALL, #N/A for rank target
 //!   out of range, #DIV/0! for STDEV/VAR sample with n < 2, etc.).
@@ -40,19 +42,72 @@ fn scalar_like_value(arg: &ArgumentHandle<'_, '_>) -> Result<LiteralValue, Excel
     })
 }
 
-/// Collect numeric inputs applying Excel statistical semantics:
+/// Collect numeric inputs applying Excel statistical semantics for array-typed
+/// parameters (LARGE's and PERCENTILE's array, RANK's ref, the arrays of
+/// T.TEST, FREQUENCY, LINEST, ...):
 /// - Range references and arrays (constants such as `{1,"2",TRUE}` included): include only
 ///   numeric cells; skip text, logical, blank. Errors propagate.
 /// - Direct scalar arguments: attempt numeric coercion (so TRUE/FALSE, numeric text are included if
-///   coerce_num succeeds). Non-numeric text is ignored (Excel would treat a direct non-numeric text
-///   argument as #VALUE! in some contexts; covered by TODO for finer parity).
+///   coerce_num succeeds); a direct value that is no number is skipped.
+///
+/// The number1, number2, ... lists of MEDIAN, STDEV, VAR, MODE, ... read
+/// direct text that is no number as `#VALUE!` instead ([`collect_number_args`]).
 fn collect_numeric_stats(args: &[ArgumentHandle]) -> Result<Vec<f64>, ExcelError> {
-    collect_numeric(args, false)
+    collect_numeric(args, false, DirectNonNumber::Skipped)
+}
+
+/// The numbers of a number1, number2, ... list (MEDIAN, STDEV.S, VAR.P,
+/// MODE.SNGL, GEOMEAN, AVEDEV, DEVSQ, KURT, SKEW, PRODUCT, ...): an array or
+/// range contributes only its numbers, as for [`collect_numeric_stats`], while
+/// a value typed directly into the list counts when it converts to a number
+/// (TRUE, "3", date text) and is otherwise `#VALUE!`. Microsoft documents for
+/// these functions that "arguments that are error values or text that cannot
+/// be translated into numbers cause errors": `MEDIAN(1,"x",3)` is `#VALUE!`
+/// while `MEDIAN({1,"x",3})` is 2.
+fn collect_number_args(args: &[ArgumentHandle]) -> Result<Vec<f64>, ExcelError> {
+    collect_numeric(args, false, DirectNonNumber::Error)
+}
+
+/// How a direct scalar argument that does not convert to a number reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirectNonNumber {
+    /// Skipped, like text in an array (array-typed parameters).
+    Skipped,
+    /// `#VALUE!` (the number1, number2, ... lists).
+    Error,
+}
+
+/// The number an array element or range cell contributes to a statistical
+/// function: a number, or a date or time as its serial. Text, logicals and
+/// blanks contribute nothing (`None`); an error is returned.
+fn array_entry_number(
+    v: &LiteralValue,
+    date_system: crate::engine::DateSystem,
+) -> Result<Option<f64>, ExcelError> {
+    Ok(match v {
+        LiteralValue::Error(e) => return Err(e.clone()),
+        LiteralValue::Number(n) => Some(*n),
+        LiteralValue::Int(i) => Some(*i as f64),
+        // A date cell is a number on the sheet: SUM/AVERAGE/COUNT
+        // already include it, so dropping it here made MEDIAN,
+        // STDEV, LARGE, CORREL, ... silently disagree with SUM
+        // over the very same range.
+        LiteralValue::Date(_)
+        | LiteralValue::DateTime(_)
+        | LiteralValue::Time(_)
+        | LiteralValue::Duration(_) => crate::coercion::to_serial_strict(v, date_system).ok(),
+        _ => None,
+    })
 }
 
 /// [`collect_numeric_stats`]; with `skip_errors` an error inside an array or range is
-/// passed over like text instead of returned (a direct error argument still is).
-fn collect_numeric(args: &[ArgumentHandle], skip_errors: bool) -> Result<Vec<f64>, ExcelError> {
+/// passed over like text instead of returned (a direct error argument still is), and
+/// `direct` says how a direct argument that is no number reads.
+fn collect_numeric(
+    args: &[ArgumentHandle],
+    skip_errors: bool,
+    direct: DirectNonNumber,
+) -> Result<Vec<f64>, ExcelError> {
     let mut out = Vec::new();
     for a in args {
         // An array, a literal array value included, reads like a range: only its
@@ -60,24 +115,11 @@ fn collect_numeric(args: &[ArgumentHandle], skip_errors: bool) -> Result<Vec<f64
         if let Ok(view) = a.range_view() {
             let date_system = a.date_system();
             view.for_each_cell(&mut |v| {
-                match v {
-                    LiteralValue::Error(_) if skip_errors => {}
-                    LiteralValue::Error(e) => return Err(e.clone()),
-                    LiteralValue::Number(n) => out.push(*n),
-                    LiteralValue::Int(i) => out.push(*i as f64),
-                    // A date cell is a number on the sheet: SUM/AVERAGE/COUNT
-                    // already include it, so dropping it here made MEDIAN,
-                    // STDEV, LARGE, CORREL, ... silently disagree with SUM
-                    // over the very same range.
-                    LiteralValue::Date(_)
-                    | LiteralValue::DateTime(_)
-                    | LiteralValue::Time(_)
-                    | LiteralValue::Duration(_) => {
-                        if let Ok(n) = crate::coercion::to_serial_strict(v, date_system) {
-                            out.push(n);
-                        }
-                    }
-                    _ => {}
+                match array_entry_number(v, date_system) {
+                    Ok(Some(n)) => out.push(n),
+                    Ok(None) => {}
+                    Err(_) if skip_errors => {}
+                    Err(e) => return Err(e),
                 }
                 Ok(())
             })?;
@@ -85,15 +127,66 @@ fn collect_numeric(args: &[ArgumentHandle], skip_errors: bool) -> Result<Vec<f64
             let v = scalar_like_value(a)?;
             match v {
                 LiteralValue::Error(e) => return Err(e),
-                other => {
-                    if let Ok(n) = coerce_num(&other) {
-                        out.push(n);
-                    }
-                }
+                other => match coerce_num(&other) {
+                    Ok(n) => out.push(n),
+                    Err(_) if direct == DirectNonNumber::Skipped => {}
+                    Err(_) => return Err(ExcelError::new_value()),
+                },
             }
         }
     }
     Ok(out)
+}
+
+/// One array argument of a paired statistical function, entry by entry in
+/// row-major order: `Some` for a number (see [`array_entry_number`]), `None`
+/// for an entry that is skipped (text, a logical, a blank). An error entry is
+/// returned. A direct scalar argument is a single entry, a number when it
+/// converts to one (as [`collect_numeric_stats`] reads it).
+fn paired_entries(arg: &ArgumentHandle) -> Result<Vec<Option<f64>>, ExcelError> {
+    if let Ok(view) = arg.range_view() {
+        let date_system = arg.date_system();
+        let mut out = Vec::new();
+        view.for_each_cell(&mut |v| {
+            out.push(array_entry_number(v, date_system)?);
+            Ok(())
+        })?;
+        return Ok(out);
+    }
+    match scalar_like_value(arg)? {
+        LiteralValue::Error(e) => Err(e),
+        other => Ok(vec![coerce_num(&other).ok()]),
+    }
+}
+
+/// The numbers of two paired arrays (known_y's and known_x's of SLOPE,
+/// INTERCEPT, STEYX, RSQ and FORECAST; the arrays of CORREL, PEARSON and the
+/// covariances), as observations: entry i of one array goes with entry i of
+/// the other, and an observation counts only when both of its entries are
+/// numbers. Text, a logical or a blank in either array drops the whole pair,
+/// so `CORREL({1,"x",3,4},{10,20,"x",40})` correlates (1,10) and (4,40) and
+/// is 1, rather than pairing the numbers left over in each array.
+///
+/// Arrays with different numbers of entries have no pairs: each keeps its own
+/// numbers, and the caller's count check decides (`#N/A` unless the counts
+/// agree). Errors are returned, the first array's before the second's.
+fn collect_paired_numbers(
+    first: &ArgumentHandle,
+    second: &ArgumentHandle,
+) -> Result<(Vec<f64>, Vec<f64>), ExcelError> {
+    let firsts = paired_entries(first)?;
+    let seconds = paired_entries(second)?;
+    if firsts.len() != seconds.len() {
+        return Ok((
+            firsts.into_iter().flatten().collect(),
+            seconds.into_iter().flatten().collect(),
+        ));
+    }
+    Ok(firsts
+        .into_iter()
+        .zip(seconds)
+        .filter_map(|(a, b)| Some((a?, b?)))
+        .unzip())
 }
 
 /* ─────────────── order-statistic selection (quickselect) ───────────────
@@ -109,6 +202,19 @@ fn collect_numeric(args: &[ArgumentHandle], skip_errors: bool) -> Result<Vec<f64
  * the ±0.0 sign bit), so the selected element is bit-identical to the
  * sorted element at the same index.
  */
+
+/// The 1-based rank `k` of LARGE and SMALL (and AGGREGATE 14 and 15) among
+/// `count` numbers. Microsoft documents `#NUM!` when k is at most 0 or greater
+/// than the number of data points; the bound is checked on k as given, before
+/// its fraction is dropped, so a k of 3.1 over three numbers is `#NUM!` rather
+/// than the third. A k below 1 is `#NUM!` too (a fraction of the first rank is
+/// none), as is a NaN k, which is no Excel number.
+pub(crate) fn order_statistic_rank(k: f64, count: usize) -> Result<usize, ExcelError> {
+    if k.is_nan() || k < 1.0 || k > count as f64 {
+        return Err(ExcelError::new_num());
+    }
+    Ok(k.trunc() as usize)
+}
 
 /// k-th order statistic (0-based, ascending). Reorders `nums` in place.
 pub(crate) fn nth_smallest(nums: &mut [f64], k: usize) -> f64 {
@@ -522,20 +628,19 @@ impl Function for LARGE {
                 )));
             }
         };
-        let k = k as i64;
-        if k < 1 {
+        // A k below 1 is #NUM! before the data is read (an error in it included).
+        if k.is_nan() || k < 1.0 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_num(),
             )));
         }
         let mut nums = collect_numeric_stats(&args[..args.len() - 1])?;
-        if nums.is_empty() || k as usize > nums.len() {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
+        let k = match order_statistic_rank(k, nums.len()) {
+            Ok(k) => k,
+            Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+        };
         // k-th largest == (n-k)-th smallest: quickselect instead of full sort.
-        let idx = nums.len() - k as usize;
+        let idx = nums.len() - k;
         let v = nth_smallest(&mut nums, idx);
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(v)))
     }
@@ -628,20 +733,19 @@ impl Function for SMALL {
                 )));
             }
         };
-        let k = k as i64;
-        if k < 1 {
+        // A k below 1 is #NUM! before the data is read (an error in it included).
+        if k.is_nan() || k < 1.0 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_num(),
             )));
         }
         let mut nums = collect_numeric_stats(&args[..args.len() - 1])?;
-        if nums.is_empty() || k as usize > nums.len() {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
+        let k = match order_statistic_rank(k, nums.len()) {
+            Ok(k) => k,
+            Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+        };
         // k-th smallest: quickselect instead of full sort.
-        let v = nth_smallest(&mut nums, k as usize - 1);
+        let v = nth_smallest(&mut nums, k - 1);
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(v)))
     }
 }
@@ -715,7 +819,7 @@ impl Function for MEDIAN {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let mut nums = collect_numeric_stats(args)?;
+        let mut nums = collect_number_args(args)?;
         if nums.is_empty() {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_num(),
@@ -804,7 +908,7 @@ impl Function for StdevSample {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let nums = collect_numeric_stats(args)?;
+        let nums = collect_number_args(args)?;
         let n = nums.len();
         if n < 2 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -893,7 +997,7 @@ impl Function for StdevPop {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let nums = collect_numeric_stats(args)?;
+        let nums = collect_number_args(args)?;
         let n = nums.len();
         if n == 0 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -982,7 +1086,7 @@ impl Function for VarSample {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let nums = collect_numeric_stats(args)?;
+        let nums = collect_number_args(args)?;
         let n = nums.len();
         if n < 2 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -1071,7 +1175,7 @@ impl Function for VarPop {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let nums = collect_numeric_stats(args)?;
+        let nums = collect_number_args(args)?;
         let n = nums.len();
         if n == 0 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -1163,7 +1267,7 @@ impl Function for ModeSingleFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let mut nums = collect_numeric_stats(args)?;
+        let mut nums = collect_number_args(args)?;
         if nums.is_empty() {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_na(),
@@ -1273,7 +1377,7 @@ impl Function for ModeMultiFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let mut nums = collect_numeric_stats(args)?;
+        let mut nums = collect_number_args(args)?;
         if nums.is_empty() {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_na(),
@@ -1829,7 +1933,7 @@ impl Function for ProductFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let nums = collect_numeric_stats(args)?;
+        let nums = collect_number_args(args)?;
         if nums.is_empty() {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(0.0)));
         }
@@ -1907,7 +2011,7 @@ impl Function for GeomeanFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let nums = collect_numeric_stats(args)?;
+        let nums = collect_number_args(args)?;
         if nums.is_empty() {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_num(),
@@ -1996,7 +2100,7 @@ impl Function for HarmeanFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let nums = collect_numeric_stats(args)?;
+        let nums = collect_number_args(args)?;
         if nums.is_empty() {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_num(),
@@ -2086,7 +2190,7 @@ impl Function for AvedevFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let nums = collect_numeric_stats(args)?;
+        let nums = collect_number_args(args)?;
         if nums.is_empty() {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_num(),
@@ -2548,8 +2652,7 @@ impl Function for TrimmeanFn {
 
 /// Helper to collect two paired arrays for regression/correlation functions
 fn collect_paired_arrays(args: &[ArgumentHandle]) -> Result<(Vec<f64>, Vec<f64>), ExcelError> {
-    let y_nums = collect_numeric_stats(&args[0..1])?;
-    let x_nums = collect_numeric_stats(&args[1..2])?;
+    let (y_nums, x_nums) = collect_paired_numbers(&args[0], &args[1])?;
 
     // Arrays must have same length
     if y_nums.len() != x_nums.len() {
@@ -2868,7 +2971,7 @@ impl Function for DevsqFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let nums = collect_numeric_stats(args)?;
+        let nums = collect_number_args(args)?;
         if nums.is_empty() {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_num(),
@@ -5769,7 +5872,7 @@ impl Function for SkewFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let nums = collect_numeric_stats(args)?;
+        let nums = collect_number_args(args)?;
         let n = nums.len();
 
         // SKEW requires at least 3 data points
@@ -5866,7 +5969,7 @@ impl Function for KurtFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let nums = collect_numeric_stats(args)?;
+        let nums = collect_number_args(args)?;
         let n = nums.len();
 
         // KURT requires at least 4 data points
@@ -6110,8 +6213,7 @@ impl Function for ForecastLinearFn {
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
 
-        let y_vals = collect_numeric_stats(&args[1..2])?;
-        let x_vals = collect_numeric_stats(&args[2..3])?;
+        let (y_vals, x_vals) = collect_paired_numbers(&args[1], &args[2])?;
 
         // Arrays must have same length
         if y_vals.len() != x_vals.len() {
@@ -7785,7 +7887,7 @@ impl Function for FrequencyFn {
         // Collect bins array: like blanks and text, error entries are not bins.
         // A NaN is no Excel number but an error that reached here as one (an
         // unchecked computation), so it is skipped the same way.
-        let mut bins = collect_numeric(&args[1..2], true)?;
+        let mut bins = collect_numeric(&args[1..2], true, DirectNonNumber::Skipped)?;
         bins.retain(|bin| !bin.is_nan());
 
         // Handle empty bins - return single count of all data
@@ -9096,7 +9198,7 @@ impl Function for SkewPFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let nums = collect_numeric_stats(args)?;
+        let nums = collect_number_args(args)?;
         let n = nums.len();
         if n < 3 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -11453,6 +11555,149 @@ mod tests_basic_stats {
             .unwrap()
             .into_literal();
         assert_eq!(out, LiteralValue::Number(0.0));
+    }
+
+    /// A formula's value over A1:A4 = 1, "x", 3, 4 and B1:B4 = 10, 20, (blank), 40.
+    fn sheet_eval(formula: &str) -> LiteralValue {
+        crate::builtins::load_builtins();
+        let wb = TestWorkbook::new()
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Number(1.0))
+            .with_cell_a1("Sheet1", "A2", LiteralValue::Text("x".into()))
+            .with_cell_a1("Sheet1", "A3", LiteralValue::Number(3.0))
+            .with_cell_a1("Sheet1", "A4", LiteralValue::Number(4.0))
+            .with_cell_a1("Sheet1", "B1", LiteralValue::Number(10.0))
+            .with_cell_a1("Sheet1", "B2", LiteralValue::Number(20.0))
+            .with_cell_a1("Sheet1", "B4", LiteralValue::Number(40.0));
+        let ctx = interp(&wb);
+        ctx.evaluate_ast(&formualizer_parse::parser::parse(formula).unwrap())
+            .unwrap()
+            .into_literal()
+    }
+
+    fn assert_close(formula: &str, expected: f64) {
+        match sheet_eval(formula) {
+            LiteralValue::Number(n) => {
+                assert!(
+                    (n - expected).abs() < 1e-12,
+                    "{formula} = {n}, not {expected}"
+                )
+            }
+            other => panic!("{formula} = {other:?}, not {expected}"),
+        }
+    }
+
+    fn assert_error(formula: &str, kind: formualizer_common::ExcelErrorKind) {
+        match sheet_eval(formula) {
+            LiteralValue::Error(e) => assert_eq!(e.kind, kind, "{formula}"),
+            other => panic!("{formula} = {other:?}, not {kind:?}"),
+        }
+    }
+
+    #[test]
+    fn large_and_small_check_k_against_the_count_before_truncating() {
+        use formualizer_common::ExcelErrorKind::Num;
+        // k greater than the number of data points is #NUM!, as Microsoft
+        // documents, even when its whole part is in range.
+        for formula in [
+            "=LARGE({1,2,3},3.1)",
+            "=SMALL({1,2,3},3.1)",
+            "=LARGE({1,2,3},0.5)",
+            "=SMALL({1,2,3},-1)",
+            "=LARGE(A1:A4,3.5)",
+        ] {
+            assert_error(formula, Num);
+        }
+        assert_close("=LARGE({1,2,3},3)", 1.0);
+        assert_close("=SMALL({1,2,3},3)", 3.0);
+        assert_close("=LARGE(A1:A4,3)", 1.0);
+        // A fraction within the count is still dropped.
+        assert_close("=LARGE({1,2,3},2.5)", 2.0);
+        assert_close("=SMALL({1,2,3},1.5)", 1.0);
+        assert_eq!(
+            order_statistic_rank(f64::NAN, 3),
+            Err(ExcelError::new_num())
+        );
+        assert_eq!(order_statistic_rank(1.0, 0), Err(ExcelError::new_num()));
+    }
+
+    #[test]
+    fn paired_arrays_drop_an_observation_when_either_entry_is_no_number() {
+        use formualizer_common::ExcelErrorKind::{Div, Na};
+        // Only (1,10) and (4,40) are observations: text or a blank on either
+        // side drops the pair, not just the entry.
+        let pairs = ["{1,\"x\",3,4},{10,20,\"x\",40}", "A1:A4,B1:B4"];
+        for args in pairs {
+            assert_close(&format!("=CORREL({args})"), 1.0);
+            assert_close(&format!("=PEARSON({args})"), 1.0);
+            assert_close(&format!("=RSQ({args})"), 1.0);
+            assert_close(&format!("=SLOPE({args})"), 0.1);
+            assert_close(&format!("=INTERCEPT({args})"), 0.0);
+            assert_close(&format!("=COVARIANCE.P({args})"), 22.5);
+            assert_close(&format!("=COVARIANCE.S({args})"), 45.0);
+            assert_close(&format!("=COVAR({args})"), 22.5);
+            assert_close(&format!("=FORECAST.LINEAR(5,{args})"), 0.5);
+            assert_close(&format!("=FORECAST(5,{args})"), 0.5);
+            // Two observations leave STEYX nothing to measure.
+            assert_error(&format!("=STEYX({args})"), Div);
+        }
+        assert_close("=CORREL({1,\"x\",3},{10,20,30})", 1.0);
+        assert_close("=SLOPE({1,TRUE,3,4},{1,2,3,4})", 1.0);
+        // No observation at all.
+        assert_error("=CORREL({1,\"x\"},{\"y\",2})", Div);
+        // Arrays of different sizes keep their own numbers: #N/A unless the
+        // counts agree.
+        assert_error("=CORREL({1,2,3},{1,2})", Na);
+        assert_error("=SLOPE(A1:A4,B1:B3)", Na);
+        // Errors are returned, the first array's before the second's.
+        assert_error("=CORREL({1,#N/A,3},{1,2,#DIV/0!})", Na);
+        assert_error("=CORREL({1,\"x\",3},{1,2,#DIV/0!})", Div);
+    }
+
+    #[test]
+    fn number_lists_reject_direct_text_that_is_no_number() {
+        use formualizer_common::ExcelErrorKind::Value;
+        // "Arguments that are error values or text that cannot be translated
+        // into numbers cause errors" (MEDIAN, STDEV.P, VAR.S, MODE, ...).
+        for function in [
+            "MEDIAN",
+            "STDEV.S",
+            "STDEV.P",
+            "STDEV",
+            "STDEVP",
+            "VAR.S",
+            "VAR.P",
+            "VAR",
+            "VARP",
+            "MODE.SNGL",
+            "MODE.MULT",
+            "MODE",
+            "PRODUCT",
+            "GEOMEAN",
+            "HARMEAN",
+            "AVEDEV",
+            "DEVSQ",
+            "KURT",
+            "SKEW",
+            "SKEW.P",
+        ] {
+            assert_error(&format!("={function}(1,\"x\",3,3,4)"), Value);
+            assert_error(&format!("={function}(1,\"\",3,3,4)"), Value);
+            assert_error(&format!("={function}(1,3,3,4,IF(TRUE,\"x\"))"), Value);
+            // Text inside an array or a range is skipped instead.
+            let array = sheet_eval(&format!("={function}({{1,\"x\",3,3,4}})"));
+            let reference = sheet_eval(&format!("={function}(A1:A4,3)"));
+            let numbers = sheet_eval(&format!("={function}(1,3,3,4)"));
+            assert_eq!(array, numbers, "{function} over an array");
+            assert_eq!(reference, numbers, "{function} over a range");
+        }
+        // Numeric text, date text and logicals typed into the list count.
+        assert_close("=MEDIAN(1,\"3\",TRUE)", 1.0);
+        assert_close("=MEDIAN(1,\"1/2/1900\")", 1.5);
+        assert_close("=MEDIAN({1,\"x\",3})", 2.0);
+        assert_close("=STDEV.P(1,TRUE)", 0.0);
+        // The array parameters of LARGE and PERCENTILE are no lists: a direct
+        // value that is no number is skipped there as before.
+        assert_error("=LARGE(\"x\",1)", formualizer_common::ExcelErrorKind::Num);
     }
 }
 

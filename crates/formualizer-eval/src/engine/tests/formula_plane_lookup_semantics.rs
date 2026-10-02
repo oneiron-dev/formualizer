@@ -774,6 +774,60 @@ fn exact_boolean_lookup_value_skips_numbers_in_array_tables() {
 }
 
 #[test]
+fn exact_boolean_lookup_value_skips_numbers_in_every_search_mode() {
+    // The exact-match fallback scans (reverse and binary search modes, XMATCH)
+    // keep the type of a boolean key too: TRUE is not the number 1.
+    let mut engine = engine_with_config(EvalConfig::default());
+    let cases = [
+        ("=MATCH(TRUE,{1},0)", LookupExpected::Na),
+        (
+            "=XLOOKUP(TRUE,{1},{10},\"NF\",0,1)",
+            LookupExpected::Text("NF"),
+        ),
+        (
+            "=XLOOKUP(TRUE,{1},{10},\"NF\",0,-1)",
+            LookupExpected::Text("NF"),
+        ),
+        (
+            "=XLOOKUP(TRUE,{1},{10},\"NF\",0,2)",
+            LookupExpected::Text("NF"),
+        ),
+        (
+            "=XLOOKUP(TRUE,{1},{10},\"NF\",0,-2)",
+            LookupExpected::Text("NF"),
+        ),
+        (
+            "=XLOOKUP(FALSE,{0},{10},\"NF\",0,-1)",
+            LookupExpected::Text("NF"),
+        ),
+        (
+            "=XLOOKUP(1,{TRUE},{10},\"NF\",0,-1)",
+            LookupExpected::Text("NF"),
+        ),
+        ("=XMATCH(TRUE,{1},0,-1)", LookupExpected::Na),
+        ("=XMATCH(TRUE,{1},0,2)", LookupExpected::Na),
+        ("=XMATCH(TRUE,{1},0,-2)", LookupExpected::Na),
+        (
+            "=XLOOKUP(TRUE,{1;TRUE;1},{11;22;33},\"NF\",0,-1)",
+            LookupExpected::Number(22.0),
+        ),
+    ];
+    for (offset, (text, _)) in cases.iter().enumerate() {
+        formula(&mut engine, "Sheet1", offset as u32 + 1, 2, text);
+    }
+    engine.evaluate_all().unwrap();
+    for (offset, (text, expected)) in cases.into_iter().enumerate() {
+        assert_lookup_expected(
+            engine
+                .get_cell_value("Sheet1", offset as u32 + 1, 2)
+                .unwrap_or(LiteralValue::Empty),
+            expected,
+            text,
+        );
+    }
+}
+
+#[test]
 fn match_type_text_reads_as_its_number() {
     // A match_type given as text converts like any number argument (spaces
     // around it are ignored); text that is no number, "NaN" and "inf"

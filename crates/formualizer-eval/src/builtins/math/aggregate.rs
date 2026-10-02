@@ -2082,7 +2082,9 @@ fn aggregate_order_statistic(
     mut nums: Vec<f64>,
     k: Option<f64>,
 ) -> Result<f64, ExcelError> {
-    use crate::builtins::stats::{nth_smallest, percentile_exc, percentile_inc};
+    use crate::builtins::stats::{
+        nth_smallest, order_statistic_rank, percentile_exc, percentile_inc,
+    };
     let k = k.unwrap_or(0.0);
     match function_num {
         12 => {
@@ -2112,12 +2114,9 @@ fn aggregate_order_statistic(
             best.map(|(v, _)| v).ok_or_else(ExcelError::new_na)
         }
         14 | 15 => {
-            let k = k.trunc();
-            // A NaN k (no Excel number) fails every bound, like k < 1.
-            if k.is_nan() || k < 1.0 || k as usize > nums.len() {
-                return Err(ExcelError::new_num());
-            }
-            let k = k as usize;
+            // LARGE's and SMALL's bounds, on k as given: 3.1 over three
+            // numbers is #NUM!, and a NaN k (no Excel number) fails them too.
+            let k = order_statistic_rank(k, nums.len())?;
             let index = if function_num == 14 {
                 nums.len() - k
             } else {
@@ -2540,6 +2539,24 @@ mod tests_subtotal_aggregate {
             aggregate_k(LiteralValue::Array(vec![vec![num(2.0)]])),
             Ok(2.0)
         );
+    }
+
+    #[test]
+    fn aggregate_large_and_small_check_k_against_the_count_before_truncating() {
+        let rank = |f: i32, k: f64| {
+            aggregate_order_statistic(f, vec![1.0, 2.0, 3.0], Some(k)).map_err(|e| e.kind)
+        };
+        // LARGE/SMALL are #NUM! for k greater than the number of data points:
+        // 3.1 over three numbers is past them, not the third.
+        for f in [14, 15] {
+            assert_eq!(rank(f, 3.1), Err(ExcelErrorKind::Num), "{f}");
+            assert_eq!(rank(f, 0.5), Err(ExcelErrorKind::Num), "{f}");
+        }
+        assert_eq!(rank(14, 3.0), Ok(1.0));
+        assert_eq!(rank(15, 3.0), Ok(3.0));
+        // A fraction within the count is still dropped.
+        assert_eq!(rank(14, 2.5), Ok(2.0));
+        assert_eq!(rank(15, 1.9), Ok(1.0));
     }
 }
 

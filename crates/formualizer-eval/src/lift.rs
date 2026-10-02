@@ -152,20 +152,25 @@ fn value_lift_spec(name: &str, args: &[ArgumentHandle<'_, '_>]) -> Option<Lift> 
     lift_spec(name)
 }
 
-/// Whether AGGREGATE's function number (each element of an array of them)
-/// selects the array form, 14 (LARGE) to 19 (QUARTILE.EXC), read as AGGREGATE
-/// reads it (numeric text "14" is 14).
+/// Whether AGGREGATE's function number selects the array form, 14 (LARGE) to
+/// 19 (QUARTILE.EXC), read as AGGREGATE reads it (numeric text "14" is 14).
+///
+/// An array of function numbers is evaluated element by element, each element
+/// with its own k: it takes the array form when some element selects it and
+/// none selects the reference form (1-13). An element that selects no
+/// function (an error, 20, 2.5) is that element's error whatever its k is, so
+/// it does not keep k from lifting for the others:
+/// `AGGREGATE({14,#N/A},6,{1,2,3},{1,2})` is `{3,#N/A}`.
 fn aggregate_array_form(function_num: &ArgumentHandle<'_, '_>) -> bool {
-    let array_form = |value: &LiteralValue| {
-        matches!(
-            crate::builtins::math::aggregate::strict_int(value),
-            Ok(14..=19)
-        )
-    };
+    let selected = |value: &LiteralValue| crate::builtins::math::aggregate::strict_int(value).ok();
     match function_num.value() {
         Ok(value) => match array_rows(&value) {
-            Some(rows) => rows.iter().flatten().all(array_form),
-            None => array_form(&value.into_literal()),
+            Some(rows) => {
+                let numbers = || rows.iter().flatten().map(selected);
+                numbers().any(|n| matches!(n, Some(14..=19)))
+                    && !numbers().any(|n| matches!(n, Some(1..=13)))
+            }
+            None => matches!(selected(&value.into_literal()), Some(14..=19)),
         },
         Err(_) => false,
     }
