@@ -311,6 +311,29 @@ fn group_separators_in_numeric_text_are_skipped() {
 }
 
 #[test]
+fn currency_and_parenthesized_numeric_text_is_a_number() {
+    for (formula, expected) in [
+        // Microsoft's VALUE example.
+        ("=VALUE(\"$1,000\")", Expected::Number(1000.0)),
+        ("=\"$1,234.50\"*1", Expected::Number(1234.5)),
+        ("=--\"-$5\"", Expected::Number(-5.0)),
+        ("=\"$-5\"+0", Expected::Number(-5.0)),
+        ("=VALUE(\"($1,000)\")", Expected::Number(-1000.0)),
+        ("=\"(250)\"+0", Expected::Number(-250.0)),
+        // DOLLAR's text reads back as its number.
+        ("=DOLLAR(-1234.5)*1", Expected::Number(-1234.5)),
+        ("=SUM(\"$5\",1)", Expected::Number(6.0)),
+        ("=TEXT(\"($5)\",\"0.00\")", Expected::Text("-5.00")),
+        ("=VALUE(\"$5%\")", Expected::Error(ExcelErrorKind::Value)),
+        ("=VALUE(\"(-5)\")", Expected::Error(ExcelErrorKind::Value)),
+        ("=VALUE(\"--5\")", Expected::Error(ExcelErrorKind::Value)),
+        ("=\"inf\"+0", Expected::Error(ExcelErrorKind::Value)),
+    ] {
+        assert_expected(DateSystem::Excel1900, formula, "en-US currency", expected);
+    }
+}
+
+#[test]
 fn excel_date_shapes_and_year_less_dates_use_the_clock_year() {
     // Excel en-US reads m-d-y with dashes and y/m/d with a four-digit year.
     for (formula, serial_1900) in [("=\"03-01-01\"+0", 36951.0), ("=\"2003/1/1\"+0", 37622.0)] {
@@ -989,5 +1012,43 @@ fn lcm_of_2_to_the_53_or_more_is_num() {
             LiteralValue::Number(expected),
             "{formula}"
         );
+    }
+}
+
+#[test]
+fn number_arguments_read_currency_and_grouped_text_like_value() {
+    // A function's number parameter converts text as VALUE() does, so the
+    // en-US currency, group-separator and parenthesized forms are numbers
+    // there before any date reading, in either date system; text in a
+    // reference is still no number to SUM.
+    for system in [DateSystem::Excel1900, DateSystem::Excel1904] {
+        for (formula, expected) in [
+            ("=INT(A1)", 1234.0),
+            ("=ROUND(A1,0)", 1235.0),
+            ("=ABS(\"($5)\")", 5.0),
+            ("=MAX(\"(5)\",-10)", -5.0),
+            ("=SUM(\"1,000\",\"$5\")", 1005.0),
+            ("=AVERAGE(\"$2\",\"4\")", 3.0),
+            ("=MOD(\"1,234\",1000)", 234.0),
+            ("=SLN(\"$1,000\",0,1)", 1000.0),
+            ("=SUM(A1)", 0.0),
+        ] {
+            let actual = match eval_with_text_a1(system, "$1,234.50", formula) {
+                LiteralValue::Number(n) => n,
+                LiteralValue::Int(n) => n as f64,
+                other => panic!("{formula} ({system:?}): {other:?}"),
+            };
+            assert_eq!(actual, expected, "{formula} ({system:?})");
+        }
+        for formula in ["=INT(\"$5%\")", "=ABS(\"1,23\")", "=SUM(\"(-5)\")"] {
+            assert_value_error(system, formula);
+        }
+    }
+    // Date functions read the number before trying date text: serial 1000
+    // is September 26, 1902.
+    match eval_with_text_a1(DateSystem::Excel1900, "", "=DAY(\"$1,000\")") {
+        LiteralValue::Number(n) => assert_eq!(n, 26.0),
+        LiteralValue::Int(n) => assert_eq!(n, 26),
+        other => panic!("DAY(\"$1,000\"): {other:?}"),
     }
 }

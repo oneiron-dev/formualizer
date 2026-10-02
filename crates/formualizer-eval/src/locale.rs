@@ -2,9 +2,9 @@
 ///
 /// Milestone 0 intentionally uses an invariant locale:
 ///
-/// - Numeric parsing is ASCII/invariant only (`.` decimal separator; en-US `,` group
-///   separators in the integer part), with support for trailing percent suffix
-///   (`"90%" -> 0.9`).
+/// - Numeric parsing follows Excel for Windows in the en-US region (`.` decimal separator,
+///   `,` group separators in the integer part, `$` currency, parentheses negatives and a
+///   trailing percent suffix: `"$1,000" -> 1000`, `"(5)" -> -5`, `"90%" -> 0.9`).
 /// - Strings are case-folded with ASCII-only rules (`to_ascii_lowercase`).
 ///
 /// This means locale-dependent inputs like `"1.234,56"` are *not* interpreted as numbers.
@@ -18,23 +18,17 @@ impl Locale {
         Locale
     }
 
-    /// Parse a number using invariant rules (ASCII, dot decimal separator).
-    ///
-    /// Also supports percent-suffixed numeric text (e.g. "90%" -> 0.9),
-    /// matching spreadsheet numeric-coercion behavior in numeric contexts.
-    /// Like Excel it ignores only the spaces around the text; a tab, line
-    /// feed or no-break space there leaves it text.
+    /// Parse numeric text the way Excel for Windows reads it in the en-US
+    /// region, wherever text becomes a number (VALUE, arithmetic, numeric
+    /// arguments, criteria): see [`parse_en_us_number`]. Like Excel it
+    /// ignores only the spaces around the text; a tab, line feed or no-break
+    /// space there leaves it text.
     ///
     /// Only finite numbers are numbers (see [`parse_finite_number`]): `NaN`,
     /// `inf`, `infinity` and `1e400` give `None` (`#VALUE!` where a number is
     /// required).
     pub fn parse_number_invariant(&self, s: &str) -> Option<f64> {
-        let trimmed = s.trim_matches(' ');
-        if let Some(without_pct) = trimmed.strip_suffix('%') {
-            parse_grouped(without_pct.trim_end_matches(' ')).map(|n| n / 100.0)
-        } else {
-            parse_grouped(trimmed)
-        }
+        parse_en_us_number(s.trim_matches(' '))
     }
 
     /// Case folding for comparisons; invariant = ASCII lower.
@@ -54,31 +48,121 @@ pub fn parse_finite_number(text: &str) -> Option<f64> {
     text.parse::<f64>().ok().filter(|n| n.is_finite())
 }
 
-/// Parse a number whose integer part may carry en-US `,` group separators,
-/// as Excel reads `"1,234"`: each comma follows a digit and is followed by
-/// at least three digits (`"45627,45657"` is 4562745657; `"1,23"`, `"1,"`
-/// and `",5"` are not numbers), and none comes after the decimal point or
-/// exponent.
-fn parse_grouped(text: &str) -> Option<f64> {
-    if !text.contains(',') {
-        return parse_finite_number(text);
+/// A number written in one of the constant number formats Excel for Windows
+/// recognizes in the en-US region (Microsoft's VALUE example: `"$1,000"` is
+/// 1000). Leading and trailing spaces are already gone. The text is
+///
+/// - an optional sign and an optional `$`, in either order (`"-$5"`,
+///   `"$-5"`), or a number in parentheses, which is negative (`"(1,000)"`,
+///   `"($1,000)"`; no sign inside);
+/// - digits whose integer part may carry `,` group separators
+///   ([`parse_magnitude`]), an optional `.` fraction and `e`/`E` exponent;
+/// - an optional trailing `%` (spaces may come before it) that divides by
+///   100; a currency amount takes no `%`.
+///
+/// Anything else (`"--5"`, `"5-"`, `"$5%"`, `"1,23"`, `"inf"`) is not a
+/// number, and neither is a value beyond the double range (`"1e400"`): the
+/// digits are read by [`parse_finite_number`].
+fn parse_en_us_number(text: &str) -> Option<f64> {
+    let (negative, body) = match text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) {
+        Some(inner) => (true, inner),
+        None => (false, text),
+    };
+    let (body, percent) = match body.strip_suffix('%') {
+        Some(rest) => (rest.trim_end_matches(' '), true),
+        None => (body, false),
+    };
+    let mut rest = body;
+    let mut sign = None;
+    let mut currency = false;
+    loop {
+        if sign.is_none()
+            && !negative
+            && let Some(r) = rest.strip_prefix(['+', '-'])
+        {
+            sign = rest.chars().next();
+            rest = r;
+        } else if !currency && let Some(r) = rest.strip_prefix('$') {
+            currency = true;
+            rest = r;
+        } else {
+            break;
+        }
     }
-    let (integer, rest) = text.split_at(text.find(['.', 'e', 'E']).unwrap_or(text.len()));
-    if rest.contains(',') {
+    if currency && percent {
         return None;
     }
-    let mut groups = integer.split(',');
-    let mut plain = groups.next()?.to_owned();
-    if !plain.ends_with(|c: char| c.is_ascii_digit()) {
+    let mut n = parse_magnitude(rest)?;
+    if percent {
+        n /= 100.0;
+    }
+    if negative || sign == Some('-') {
+        n = -n;
+    }
+    // Excel has no negative zero: "-0" and "(0)" are 0.
+    Some(crate::coercion::normalize_zero(n))
+}
+
+/// Unsigned digits with an optional `.` fraction and `e`/`E` exponent. The
+/// integer part may carry en-US `,` group separators, as Excel reads
+/// `"1,234"`: each comma follows a digit and is followed by at least three
+/// digits (`"45627,45657"` is 4562745657; `"1,23"`, `"1,"` and `",5"` are not
+/// numbers), and none comes after the decimal point or exponent.
+fn parse_magnitude(text: &str) -> Option<f64> {
+    let bytes = text.as_bytes();
+    let mut plain = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut digits = 0;
+    // Digits since the last group separator, once one has been seen.
+    let mut group: Option<usize> = None;
+    while let Some(&b) = bytes.get(i) {
+        match b {
+            b'0'..=b'9' => {
+                plain.push(b as char);
+                digits += 1;
+                if let Some(width) = group.as_mut() {
+                    *width += 1;
+                }
+            }
+            b',' if digits > 0 && group.is_none_or(|width| width >= 3) => group = Some(0),
+            _ => break,
+        }
+        i += 1;
+    }
+    if group.is_some_and(|width| width < 3) {
         return None;
     }
-    for group in groups {
-        if group.len() < 3 || !group.bytes().all(|b| b.is_ascii_digit()) {
+    if bytes.get(i) == Some(&b'.') {
+        plain.push('.');
+        i += 1;
+        while let Some(&b) = bytes.get(i).filter(|b| b.is_ascii_digit()) {
+            plain.push(b as char);
+            digits += 1;
+            i += 1;
+        }
+    }
+    if digits == 0 {
+        return None;
+    }
+    if let Some(b'e' | b'E') = bytes.get(i) {
+        plain.push('e');
+        i += 1;
+        if let Some(&b) = bytes.get(i).filter(|b| matches!(b, b'+' | b'-')) {
+            plain.push(b as char);
+            i += 1;
+        }
+        let start = i;
+        while let Some(&b) = bytes.get(i).filter(|b| b.is_ascii_digit()) {
+            plain.push(b as char);
+            i += 1;
+        }
+        if i == start {
             return None;
         }
-        plain.push_str(group);
     }
-    plain.push_str(rest);
+    if i != bytes.len() {
+        return None;
+    }
     parse_finite_number(&plain)
 }
 
@@ -126,6 +210,62 @@ mod tests {
             "1.234,5",
             "1e3,000",
             "1,2a4",
+        ] {
+            assert_eq!(loc.parse_number_invariant(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn parse_number_invariant_reads_currency_and_parentheses() {
+        let loc = Locale::invariant();
+        for (text, n) in [
+            ("$1,000", 1000.0),
+            (" $1,234.50 ", 1234.5),
+            ("-$5", -5.0),
+            ("$-5", -5.0),
+            ("+$5", 5.0),
+            ("(1,000)", -1000.0),
+            ("($1,000)", -1000.0),
+            ("(2.5%)", -0.025),
+            ("-.5", -0.5),
+            ("5.", 5.0),
+            ("1.5E-3", 0.0015),
+        ] {
+            assert_eq!(loc.parse_number_invariant(text), Some(n), "{text}");
+        }
+        // Excel has no negative zero.
+        for text in ["-0", "(0)", "-$0.00"] {
+            let n = loc.parse_number_invariant(text).unwrap();
+            assert!(n == 0.0 && n.is_sign_positive(), "{text}");
+        }
+        for text in [
+            "$",
+            "-",
+            "()",
+            "$$5",
+            "--5",
+            "+-5",
+            "5-",
+            "(-5)",
+            "-(5)",
+            "$(5)",
+            "(5",
+            "5)",
+            "$5%",
+            "$ 5",
+            "- 5",
+            "( 5 )",
+            "5$",
+            "(0-2)",
+            "1 234",
+            "inf",
+            "-infinity",
+            "NaN",
+            "1e400",
+            "1e",
+            "1e+",
+            ".",
+            "0x10",
         ] {
             assert_eq!(loc.parse_number_invariant(text), None, "{text}");
         }

@@ -49,6 +49,9 @@ pub struct ValueFn;
 ///
 /// # Remarks
 /// - Parsing uses locale-aware invariant number parsing from the function context.
+/// - Text in a number format Excel recognizes in the en-US region converts:
+///   `,` group separators, a leading `$`, parentheses for a negative number and
+///   a trailing `%` (`"$1,000"` -> 1000, `"($5)"` -> -5, `"90%"` -> 0.9).
 /// - Non-numeric text returns `#VALUE!`.
 /// - Booleans and numbers are first coerced to text, then parsed.
 /// - Errors are propagated unchanged.
@@ -59,6 +62,12 @@ pub struct ValueFn;
 /// title: "Parse decimal text"
 /// formula: '=VALUE("12.5")'
 /// expected: 12.5
+/// ```
+///
+/// ```yaml,sandbox
+/// title: "Currency text"
+/// formula: '=VALUE("$1,000")'
+/// expected: 1000
 /// ```
 ///
 /// ```yaml,sandbox
@@ -460,6 +469,25 @@ mod tests {
                 .unwrap()
                 .into_literal();
             assert_eq!(out, LiteralValue::Number(1000.0), "{name}(\"1e3\")");
+        }
+    }
+
+    #[test]
+    fn value_currency_text() {
+        // Microsoft's VALUE example: =VALUE("$1,000") is 1000.
+        let wb = TestWorkbook::new().with_function(std::sync::Arc::new(ValueFn));
+        let ctx = wb.interpreter();
+        let f = ctx.context.get_function("", "VALUE").unwrap();
+        for (text, expected) in [("$1,000", 1000.0), ("($1,000)", -1000.0), ("-$2.5", -2.5)] {
+            let s = lit(LiteralValue::Text(text.into()));
+            let out = f
+                .dispatch(
+                    &[ArgumentHandle::new(&s, &ctx)],
+                    &ctx.function_context(None),
+                )
+                .unwrap()
+                .into_literal();
+            assert_eq!(out, LiteralValue::Number(expected), "VALUE({text:?})");
         }
     }
 
