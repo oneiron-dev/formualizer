@@ -548,6 +548,60 @@ mod tests {
     }
 
     #[test]
+    fn every_text_to_number_coercion_reads_en_us_numeric_text() {
+        // Microsoft's VALUE example, VALUE("$1,000") = 1000: the en-US
+        // currency, group-separator, parenthesized and percent forms are
+        // numbers wherever text becomes a number, so a function's number
+        // parameter (to_number_argument) and the arithmetic operators read
+        // them as VALUE does, in either date system.
+        let text = |s: &str| LiteralValue::Text(s.into());
+        let loc = crate::locale::Locale::invariant();
+        for (s, n) in [
+            ("$1,000", 1000.0),
+            ("($1,000)", -1000.0),
+            ("1,234.5", 1234.5),
+            ("-$5", -5.0),
+            ("$-5", -5.0),
+            (" (2.5%) ", -0.025),
+            ("45627,45657", 4_562_745_657.0),
+        ] {
+            assert_eq!(to_number_lenient(&text(s)).unwrap(), n, "lenient {s:?}");
+            assert_eq!(to_number_argument(&text(s)).unwrap(), n, "argument {s:?}");
+            assert_eq!(
+                to_number_lenient_with_locale(&text(s), &loc).unwrap(),
+                n,
+                "locale {s:?}"
+            );
+            for system in [DateSystem::Excel1900, DateSystem::Excel1904] {
+                let _call = enter_argument_date_context(system, Some(2024));
+                assert_eq!(to_number_argument(&text(s)).unwrap(), n, "{s:?} {system:?}");
+                assert_eq!(
+                    to_serial_lenient_in_year(&text(s), system, Some(2024)).unwrap(),
+                    n,
+                    "serial {s:?} {system:?}"
+                );
+                assert_eq!(
+                    to_arithmetic_number_with_locale(&text(s), &loc, system, Some(2024)).unwrap(),
+                    n,
+                    "arithmetic {s:?} {system:?}"
+                );
+            }
+        }
+        // "-$0" is 0, not -0.
+        let zero = to_number_argument(&text("-$0")).unwrap();
+        assert!(zero == 0.0 && zero.is_sign_positive());
+        for s in ["$5%", "1,23", "(-5)", "$ 5", "5$", "--5", "inf", "$1e400"] {
+            assert!(to_number_lenient(&text(s)).is_err(), "lenient {s:?}");
+            assert!(to_number_argument(&text(s)).is_err(), "argument {s:?}");
+            assert!(
+                to_arithmetic_number_with_locale(&text(s), &loc, DateSystem::Excel1900, None)
+                    .is_err(),
+                "arithmetic {s:?}"
+            );
+        }
+    }
+
+    #[test]
     fn number_strict_rejects_text() {
         assert!(to_number_strict(&LiteralValue::Text("1".into())).is_err());
     }
