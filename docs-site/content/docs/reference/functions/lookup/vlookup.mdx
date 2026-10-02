@@ -16,7 +16,7 @@ description: "VLOOKUP: Looks up a value in the first column of a table and retur
  - In exact mode, a blank candidate never matches. A blank lookup value matches a real numeric zero, but not blank, text, or boolean candidates.
  - Approximate matching expects the first column sorted ascending but, like Excel, does not check it: it bisects the column as written (a whole column is 1,048,576 rows), so unsorted data gives whichever row the search reaches, or `#N/A`.
  - Numeric `range_lookup` values use logical coercion: zero is exact and nonzero is approximate.
- - If the lookup value is not found, returns `#N/A`.
+ - If the lookup value is not found, returns `#N/A`; an error lookup value is returned as is.
  - If `col_index_num` is invalid, returns `#REF!` (or `#VALUE!` if non-numeric).
  - A matched empty target cell is materialized as numeric `0`.
 

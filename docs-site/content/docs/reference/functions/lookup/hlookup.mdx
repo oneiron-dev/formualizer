@@ -16,7 +16,7 @@ description: "HLOOKUP: Looks up a value in the first row of a table and returns 
  - In exact mode, a blank candidate never matches. A blank lookup value matches a real numeric zero, but not blank, text, or boolean candidates.
  - Approximate matching expects the first row sorted ascending but, like Excel, does not check it: it bisects the row as written, so unsorted data gives whichever column the search reaches, or `#N/A`.
  - Numeric `range_lookup` values use logical coercion: zero is exact and nonzero is approximate.
- - If the lookup value is not found, returns `#N/A`.
+ - If the lookup value is not found, returns `#N/A`; an error lookup value is returned as is.
  - If `row_index_num` is invalid, returns `#REF!` (or `#VALUE!` if non-numeric).
  - A matched empty target cell is materialized as numeric `0`.
 

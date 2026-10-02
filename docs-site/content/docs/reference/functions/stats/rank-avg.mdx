@@ -14,6 +14,8 @@ Use `RANK.AVG` when tied values should share the average of their occupied rank 
  - Any non-zero `order` ranks values in ascending order.
  - If `number` appears multiple times, the function returns the mean of those rank positions.
  - Returns `#N/A` if `number` is not found in `ref`.
+ - Returns `#VALUE!` if `number` or `order` is text that does not read as a number; an error in
+   either is returned as is.
 
 ## Examples
 
