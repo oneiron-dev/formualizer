@@ -858,6 +858,95 @@ fn financial_number_arguments_convert_date_and_time_text() {
 }
 
 #[test]
+fn financial_number_arguments_reject_nan_and_infinity_text() {
+    // "NaN", "inf", "infinity" (any case or sign) and text past the double
+    // range are not numeric text in Excel, so a financial number argument
+    // holding them is #VALUE!, typed in the call or read from a cell. The
+    // text coercion financial arguments share with VALUE() used to read them
+    // as a NaN or an infinity: =DB(1000,100,"inf",1) overflowed DB's period
+    // count and panicked.
+    for system in [DateSystem::Excel1900, DateSystem::Excel1904] {
+        for text in ["NaN", "nan", "inf", "-Inf", "INFINITY", "1e400", "-1E400"] {
+            for formula in [
+                format!("=DB(1000,100,\"{text}\",1)"),
+                format!("=DB(1000,100,10,\"{text}\")"),
+                format!("=DDB(1000,100,\"{text}\",1)"),
+                format!("=SLN(\"{text}\",0,1)"),
+                format!("=SYD(1000,100,\"{text}\",1)"),
+                format!("=PMT(\"{text}\",1,1)"),
+                format!("=PV(0,\"{text}\",-1)"),
+                format!("=FV(0,\"{text}\",-1)"),
+                format!("=NPER(0,-1,\"{text}\")"),
+                format!("=PRICE(DATE(2020,1,1),DATE(2030,1,1),0.05,\"{text}\",100,1)"),
+                format!("=ACCRINTM(DATE(2020,1,1),DATE(2021,1,1),\"{text}\",1000)"),
+                "=DB(1000,100,A1,1)".to_string(),
+                "=PMT(0,1,A1)".to_string(),
+                "=PRICE(DATE(2020,1,1),DATE(2030,1,1),A1,0.05,100,1)".to_string(),
+            ] {
+                match eval_with_text_a1(system, text, &formula) {
+                    LiteralValue::Error(error) => assert_eq!(
+                        error.kind,
+                        ExcelErrorKind::Value,
+                        "{formula} with A1 {text:?} ({system:?})"
+                    ),
+                    other => panic!(
+                        "{formula} with A1 {text:?} ({system:?}): expected #VALUE!, got {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+    // A finite life too long for a period count saturates rather than
+    // overflowing: the rate rounds to 0, so the first year depreciates 0.
+    assert_eq!(
+        eval_with_text_a1(DateSystem::Excel1900, "", "=DB(1000,100,1E+300,1)"),
+        LiteralValue::Number(0.0)
+    );
+    // Ordinary numeric text still converts.
+    assert_eq!(
+        eval_with_text_a1(DateSystem::Excel1900, "10", "=SLN(1000,0,A1)"),
+        LiteralValue::Number(100.0)
+    );
+}
+
+#[test]
+fn nan_and_infinity_text_is_no_number_for_operators_and_number_arguments() {
+    // The same rule for the arithmetic operators, VALUE() and the number
+    // parameters of other functions: such text is #VALUE!, from a cell too.
+    for text in ["NaN", "-nan", "inf", "+Infinity", "1e400"] {
+        for formula in [
+            format!("=\"{text}\"+0"),
+            format!("=-\"{text}\""),
+            format!("=VALUE(\"{text}\")"),
+            format!("=INT(\"{text}\")"),
+            format!("=ABS(\"{text}\")"),
+            "=A1*1".to_string(),
+            "=INT(A1)".to_string(),
+        ] {
+            match eval_with_text_a1(DateSystem::Excel1900, text, &formula) {
+                LiteralValue::Error(error) => assert_eq!(
+                    error.kind,
+                    ExcelErrorKind::Value,
+                    "{formula} with A1 {text:?}"
+                ),
+                other => panic!("{formula} with A1 {text:?}: expected #VALUE!, got {other:?}"),
+            }
+        }
+        // A criterion holding such text is a text criterion: it counts the
+        // cell holding that text, not a number.
+        assert_eq!(
+            eval_with_text_a1(
+                DateSystem::Excel1900,
+                text,
+                &format!("=COUNTIF(A1:A2,\"{text}\")")
+            ),
+            LiteralValue::Number(1.0),
+            "COUNTIF {text:?}"
+        );
+    }
+}
+
+#[test]
 fn lcm_of_2_to_the_53_or_more_is_num() {
     // Microsoft: "If lcm(a,b) >= 2^53, LCM returns the #NUM! error value."
     for formula in [

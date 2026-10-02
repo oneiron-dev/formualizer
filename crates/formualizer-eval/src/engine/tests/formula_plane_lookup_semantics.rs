@@ -619,16 +619,20 @@ fn error_lookup_value_is_the_result_cold_warm_and_approximate() {
 }
 
 #[test]
-fn exact_lookups_give_the_scan_answer_cold_and_warm() {
+fn exact_lookups_find_the_identical_key_cold_and_warm() {
     // Which lookups run before the exact-match index is built for a range
-    // depends on the evaluation schedule, so the index must answer as the
-    // scan does: text that reads as NaN or infinity matched cold and gave
-    // #N/A warm. A computed key that differs from a stored number in its
-    // last bits (1.1*3 against 3.3) is found by neither, as lookups compare
-    // numbers exactly.
+    // depends on the evaluation schedule, so the scan and the index must give
+    // the same answer, and it must be Excel's: an exact match finds only the
+    // identical number (0.2500000000005 and 0.25 are distinct within 15
+    // significant digits), and text that Rust reads as NaN or infinity is
+    // text.
     let mut engine = engine_with_config(EvalConfig::default());
-    for row in 1..=TABLE_ROWS {
-        number(&mut engine, "Sheet1", row, 4, row as f64 / 10.0);
+    number(&mut engine, "Sheet1", 1, 4, 0.2500000000005);
+    number(&mut engine, "Sheet1", 1, 5, 11.0);
+    number(&mut engine, "Sheet1", 2, 4, 0.25);
+    number(&mut engine, "Sheet1", 2, 5, 22.0);
+    for row in 3..=TABLE_ROWS {
+        number(&mut engine, "Sheet1", row, 4, row as f64);
         number(&mut engine, "Sheet1", row, 5, row as f64 * 10.0);
     }
     let last = TABLE_ROWS + 2;
@@ -636,36 +640,57 @@ fn exact_lookups_give_the_scan_answer_cold_and_warm() {
     number(&mut engine, "Sheet1", TABLE_ROWS + 1, 5, 7.0);
     text(&mut engine, "Sheet1", last, 4, "inf");
     number(&mut engine, "Sheet1", last, 5, 8.0);
+    // The same keys across G30:BX31 for HLOOKUP.
+    number(&mut engine, "Sheet1", 30, 7, 0.2500000000005);
+    number(&mut engine, "Sheet1", 31, 7, 11.0);
+    number(&mut engine, "Sheet1", 30, 8, 0.25);
+    number(&mut engine, "Sheet1", 31, 8, 22.0);
+    for col in 9..=76 {
+        number(&mut engine, "Sheet1", 30, col, col as f64);
+        number(&mut engine, "Sheet1", 31, col, col as f64 * 10.0);
+    }
+    let table = format!("$D$1:$E${last}");
+    let keys = format!("$D$1:$D${last}");
     let formulas = [
         (
             2,
-            format!("=VLOOKUP(1.1*3, $D$1:$E${last}, 2, FALSE)"),
-            LookupExpected::Na,
+            format!("=VLOOKUP(0.25, {table}, 2, FALSE)"),
+            LookupExpected::Number(22.0),
         ),
         (
             3,
-            format!("=MATCH(0.1+0.2, $D$1:$D${last}, 0)"),
-            LookupExpected::Na,
+            format!("=MATCH(0.25, {keys}, 0)"),
+            LookupExpected::Number(2.0),
         ),
         (
             6,
-            format!("=VLOOKUP(\"NAN\", $D$1:$E${last}, 2, FALSE)"),
-            LookupExpected::Number(7.0),
+            format!("=XLOOKUP(0.25, {keys}, $E$1:$E${last})"),
+            LookupExpected::Number(22.0),
         ),
         (
             7,
-            format!("=MATCH(\"Inf\", $D$1:$D${last}, 0)"),
-            LookupExpected::Number(last as f64),
+            "=HLOOKUP(0.25, $G$30:$BX$31, 2, FALSE)".to_string(),
+            LookupExpected::Number(22.0),
         ),
         (
             8,
-            format!("=XLOOKUP(0.7*3, $D$1:$D${last}, $E$1:$E${last})"),
-            LookupExpected::Na,
+            format!("=VLOOKUP(0.5*0.5, {table}, 2, FALSE)"),
+            LookupExpected::Number(22.0),
         ),
         (
             9,
-            format!("=VLOOKUP(3.3, $D$1:$E${last}, 2, FALSE)"),
-            LookupExpected::Number(330.0),
+            format!("=MATCH(0.2500000000001, {keys}, 0)"),
+            LookupExpected::Na,
+        ),
+        (
+            10,
+            format!("=VLOOKUP(\"NAN\", {table}, 2, FALSE)"),
+            LookupExpected::Number(7.0),
+        ),
+        (
+            11,
+            format!("=MATCH(\"Inf\", {keys}, 0)"),
+            LookupExpected::Number(last as f64),
         ),
     ];
     for row in 1..=8 {
@@ -693,6 +718,94 @@ fn exact_lookups_give_the_scan_answer_cold_and_warm() {
     let warm = engine.last_lookup_index_cache_report();
     assert!(warm.hits >= 8 * formulas.len(), "{warm:?}");
     check(&engine);
+}
+
+#[test]
+fn exact_boolean_lookup_value_skips_numbers_in_array_tables() {
+    // TRUE does not find the number 1 in an exact match, in an array table
+    // as in a range.
+    let mut engine = engine_with_config(EvalConfig::default());
+    number(&mut engine, "Sheet1", 1, 4, 1.0);
+    number(&mut engine, "Sheet1", 1, 5, 11.0);
+    value(&mut engine, "Sheet1", 2, 4, LiteralValue::Boolean(true));
+    number(&mut engine, "Sheet1", 2, 5, 22.0);
+    let formulas = [
+        "=VLOOKUP(TRUE,{1,11;TRUE,22},2,FALSE)",
+        "=HLOOKUP(TRUE,{1,TRUE;11,22},2,FALSE)",
+        "=VLOOKUP(TRUE,$D$1:$E$2,2,FALSE)",
+        "=XLOOKUP(TRUE,{1;TRUE},{11;22})",
+        "=INDEX({11,22},MATCH(TRUE,{1,TRUE},0))",
+    ];
+    for (offset, text) in formulas.iter().enumerate() {
+        formula(&mut engine, "Sheet1", offset as u32 + 1, 2, text);
+    }
+    formula(
+        &mut engine,
+        "Sheet1",
+        10,
+        2,
+        "=VLOOKUP(FALSE,{0,11;FALSE,22},2,FALSE)",
+    );
+    formula(&mut engine, "Sheet1", 11, 2, "=MATCH(TRUE,{1,0},0)");
+    engine.evaluate_all().unwrap();
+    for (offset, text) in formulas.iter().enumerate() {
+        assert_lookup_expected(
+            engine
+                .get_cell_value("Sheet1", offset as u32 + 1, 2)
+                .unwrap_or(LiteralValue::Empty),
+            LookupExpected::Number(22.0),
+            text,
+        );
+    }
+    assert_lookup_expected(
+        engine
+            .get_cell_value("Sheet1", 10, 2)
+            .unwrap_or(LiteralValue::Empty),
+        LookupExpected::Number(22.0),
+        "VLOOKUP(FALSE, ...)",
+    );
+    assert_lookup_expected(
+        engine
+            .get_cell_value("Sheet1", 11, 2)
+            .unwrap_or(LiteralValue::Empty),
+        LookupExpected::Na,
+        "MATCH(TRUE,{1,0},0)",
+    );
+}
+
+#[test]
+fn match_type_text_reads_as_its_number() {
+    // A match_type given as text converts like any number argument (spaces
+    // around it are ignored); text that is no number, "NaN" and "inf"
+    // included, is #VALUE!.
+    let mut engine = engine_with_config(EvalConfig::default());
+    let cases = [
+        ("=MATCH(2,{3,1,2},\" 0 \")", Some(3.0)),
+        ("=MATCH(2,{3,2,1},\" -1 \")", Some(2.0)),
+        ("=MATCH(2,{3,2,1},\"-100%\")", Some(2.0)),
+        ("=MATCH(2,{1,2,3},\"1\")", Some(2.0)),
+        ("=MATCH(2,{1,2,3},\"NaN\")", None),
+        ("=MATCH(2,{1,2,3},\"-inf\")", None),
+        ("=MATCH(2,{1,2,3},\"x\")", None),
+    ];
+    for (offset, (text, _)) in cases.iter().enumerate() {
+        formula(&mut engine, "Sheet1", offset as u32 + 1, 2, text);
+    }
+    engine.evaluate_all().unwrap();
+    for (offset, (text, expected)) in cases.iter().enumerate() {
+        let actual = engine
+            .get_cell_value("Sheet1", offset as u32 + 1, 2)
+            .unwrap_or(LiteralValue::Empty);
+        match expected {
+            Some(n) => assert_lookup_expected(actual, LookupExpected::Number(*n), text),
+            None => match actual {
+                LiteralValue::Error(error) => {
+                    assert_eq!(error.kind, ExcelErrorKind::Value, "{text}")
+                }
+                other => panic!("{text}: expected #VALUE!, got {other:?}"),
+            },
+        }
+    }
 }
 
 #[test]

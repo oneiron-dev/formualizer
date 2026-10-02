@@ -178,8 +178,10 @@ impl Function for MatchFn {
                 match mt_val {
                     LiteralValue::Number(n) => match_type = n,
                     LiteralValue::Int(i) => match_type = i as f64,
-                    LiteralValue::Text(s) => {
-                        if let Ok(n) = s.parse::<f64>() {
+                    // Text that reads as a number, as the argument check
+                    // already read it (never "NaN" or "inf").
+                    text @ LiteralValue::Text(_) => {
+                        if let Ok(n) = crate::coercion::to_number_argument(&text) {
                             match_type = n;
                         }
                     }

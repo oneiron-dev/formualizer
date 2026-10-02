@@ -721,6 +721,42 @@ mod tests {
     }
 
     #[test]
+    fn exact_index_tells_close_numbers_apart() {
+        // 0.2500000000005 and 0.25 are distinct within Excel's 15 significant
+        // digits: a warm index finds the 0.25 as the scan does, not the
+        // earlier near value.
+        let mut column = vec![
+            LiteralValue::Number(0.2500000000005),
+            LiteralValue::Number(0.25),
+        ];
+        column.extend((3..=100).map(|n| LiteralValue::Number(n as f64)));
+        let view = RangeView::from_owned_rows(
+            column.into_iter().map(|value| vec![value]).collect(),
+            DateSystem::Excel1900,
+        );
+        let BuildOutcome::Built(index) =
+            LookupIndex::build(&view, LookupAxis::ColumnInView(0), DateSystem::Excel1900).unwrap()
+        else {
+            panic!("expected a lookup index");
+        };
+        assert_eq!(index.find_first_exact(&LiteralValue::Number(0.25)), Some(1));
+        assert_eq!(index.find_last_exact(&LiteralValue::Number(0.25)), Some(1));
+        assert_eq!(
+            index.find_first_exact(&LiteralValue::Number(0.2500000000005)),
+            Some(0)
+        );
+        assert_eq!(
+            index.find_first_exact(&LiteralValue::Number(0.2500000000001)),
+            None
+        );
+        assert_eq!(index.find_first_exact(&LiteralValue::Number(3.0)), Some(2));
+        assert_eq!(
+            index.find_first_exact(&LiteralValue::Number(3.0000000000001)),
+            None
+        );
+    }
+
+    #[test]
     fn concurrent_admission_and_duplicate_races_obey_cap() {
         for duplicate in [false, true] {
             let mut cache = LookupIndexCache::new(if duplicate { 1024 } else { 4096 });

@@ -224,7 +224,9 @@ impl Function for NumberValueFn {
             )));
         }
 
-        let Ok(mut n) = cleaned.parse::<f64>() else {
+        // Only finite numbers: "NaN", "inf", "infinity" and text beyond the
+        // double range are not numbers in Excel.
+        let Some(mut n) = crate::locale::parse_finite_number(&cleaned) else {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_value(),
             )));
@@ -418,6 +420,47 @@ mod tests {
             .unwrap()
             .into_literal();
         assert_eq!(out, LiteralValue::Number(0.9));
+    }
+
+    #[test]
+    fn value_and_numbervalue_reject_non_finite_spellings() {
+        // "NaN", "inf" and "infinity" are Rust float spellings, not Excel
+        // numeric text: VALUE and NUMBERVALUE give #VALUE! rather than a NaN
+        // or an infinity that no Excel cell can hold.
+        let wb = TestWorkbook::new()
+            .with_function(std::sync::Arc::new(ValueFn))
+            .with_function(std::sync::Arc::new(NumberValueFn));
+        let ctx = wb.interpreter();
+        for name in ["VALUE", "NUMBERVALUE"] {
+            let f = ctx.context.get_function("", name).unwrap();
+            for text in [
+                "NaN", "nan", "-NaN", "inf", "-Inf", "Infinity", "NaN%", "1e400",
+            ] {
+                let s = lit(LiteralValue::Text(text.into()));
+                let out = f
+                    .dispatch(
+                        &[ArgumentHandle::new(&s, &ctx)],
+                        &ctx.function_context(None),
+                    )
+                    .unwrap()
+                    .into_literal();
+                match out {
+                    LiteralValue::Error(e) => {
+                        assert_eq!(e.kind, ExcelErrorKind::Value, "{name}({text:?})")
+                    }
+                    other => panic!("{name}({text:?}): expected #VALUE!, got {other:?}"),
+                }
+            }
+            let s = lit(LiteralValue::Text("1e3".into()));
+            let out = f
+                .dispatch(
+                    &[ArgumentHandle::new(&s, &ctx)],
+                    &ctx.function_context(None),
+                )
+                .unwrap()
+                .into_literal();
+            assert_eq!(out, LiteralValue::Number(1000.0), "{name}(\"1e3\")");
+        }
     }
 
     #[test]

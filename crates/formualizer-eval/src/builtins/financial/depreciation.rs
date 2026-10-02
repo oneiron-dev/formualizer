@@ -298,8 +298,11 @@ impl Function for DbFn {
 
         let life_int = life.trunc() as i32;
         let period_int = period.trunc() as i32;
+        // The partial year after the last whole one (a huge life saturates
+        // rather than overflowing).
+        let last_period = life_int.saturating_add(1);
 
-        if period_int < 1 || period_int > life_int + 1 {
+        if period_int < 1 || period_int > last_period {
             return Ok(CalcValue::Scalar(
                 LiteralValue::Error(ExcelError::new_num()),
             ));
@@ -320,7 +323,7 @@ impl Function for DbFn {
             let depreciation = if p == 1 {
                 // First period: prorated
                 value * rate * month / 12.0
-            } else if p == life_int + 1 {
+            } else if p == last_period {
                 // Last period (if partial year): remaining value minus salvage
                 (value - total_depreciation - salvage)
                     .max(0.0)

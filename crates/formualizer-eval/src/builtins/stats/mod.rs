@@ -7,10 +7,11 @@
 //! Notes:
 //! - We materialize numeric values into a Vec<f64>. Functions that need only one or two order
 //!   statistics (LARGE, SMALL, MEDIAN, PERCENTILE.INC/.EXC, QUARTILE.INC/.EXC) use quickselect
-//!   (`select_nth_unstable_by`) instead of a full sort. Functions that need the complete sorted
-//!   order keep the sort: RANK.EQ/RANK.AVG (positional scan), MODE.SNGL/MODE.MULT (run-length
-//!   over sorted order), TRIMMEAN (f64 summation order over the sorted middle slice must stay
-//!   bit-identical), PERCENTRANK.INC/.EXC (interpolating scan), FREQUENCY (sorted bins).
+//!   (`select_nth_unstable_by`) instead of a full sort. RANK.EQ/RANK.AVG need no order at all:
+//!   one pass counts the values ahead of the number and its duplicates. Functions that need the
+//!   complete sorted order keep the sort: MODE.SNGL/MODE.MULT (run-length over sorted order),
+//!   TRIMMEAN (f64 summation order over the sorted middle slice must stay bit-identical),
+//!   PERCENTRANK.INC/.EXC (interpolating scan), FREQUENCY (sorted bins).
 //! - Text/boolean coercion nuance: For Excel statistical functions, values coming from range
 //!   references should ignore text and logical values (they are skipped), while direct scalar
 //!   arguments still coerce (e.g. =STDEV(1,TRUE) treats TRUE as 1). This file now implements that
@@ -290,30 +291,36 @@ impl Function for RankEqFn {
             0.0
         };
         let nums = collect_numeric_stats(&args[1..2])?; // only one ref range per Excel spec
-        if nums.is_empty() {
+        let (ahead, equal) = rank_position(&nums, target, order != 0.0);
+        if equal == 0 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_na(),
             )));
         }
-        let mut sorted = nums; // copy
-        if order.abs() < 1e-12 {
-            // descending
-            sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
-        } else {
-            // ascending
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        }
-        for (i, &v) in sorted.iter().enumerate() {
-            if (v - target).abs() < 1e-12 {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-                    (i + 1) as f64,
-                )));
-            }
-        }
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-            ExcelError::new_na(),
+        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
+            (ahead + 1) as f64,
         )))
     }
+}
+
+/// Where `target` stands among `nums` for RANK.EQ and RANK.AVG: how many
+/// values rank ahead of it (larger ones in a descending rank, smaller ones in
+/// an ascending one) and how many equal it.
+///
+/// Excel compares the numbers exactly: only an equal number is a duplicate
+/// that shares the rank, and a number that differs from every value in `ref`,
+/// however little, is not in it (`#N/A`). Any nonzero `order` is ascending.
+fn rank_position(nums: &[f64], target: f64, ascending: bool) -> (usize, usize) {
+    let mut ahead = 0;
+    let mut equal = 0;
+    for &v in nums {
+        if v == target {
+            equal += 1;
+        } else if (ascending && v < target) || (!ascending && v > target) {
+            ahead += 1;
+        }
+    }
+    (ahead, equal)
 }
 
 /// Returns the rank position of a number, averaging the rank positions for ties.
@@ -415,29 +422,14 @@ impl Function for RankAvgFn {
             0.0
         };
         let nums = collect_numeric_stats(&args[1..2])?;
-        if nums.is_empty() {
+        let (ahead, equal) = rank_position(&nums, target, order != 0.0);
+        if equal == 0 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_na(),
             )));
         }
-        let mut sorted = nums;
-        if order.abs() < 1e-12 {
-            sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
-        } else {
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        }
-        let mut positions = Vec::new();
-        for (i, &v) in sorted.iter().enumerate() {
-            if (v - target).abs() < 1e-12 {
-                positions.push(i + 1);
-            }
-        }
-        if positions.is_empty() {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_na(),
-            )));
-        }
-        let avg = positions.iter().copied().sum::<usize>() as f64 / positions.len() as f64;
+        // The duplicates hold positions ahead+1 ..= ahead+equal; their mean.
+        let avg = ahead as f64 + (equal as f64 + 1.0) / 2.0;
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(avg)))
     }
 }
@@ -11097,6 +11089,124 @@ mod tests_basic_stats {
             assert_eq!(kind(format!("={name}(C1,A1:A3)")), Some(ExcelErrorKind::Na));
             assert_eq!(kind(format!("={name}(25,A1:A3)")), Some(ExcelErrorKind::Na));
         }
+    }
+
+    #[test]
+    fn rank_rejects_nan_and_infinity_text_and_never_sees_a_nan() {
+        use formualizer_common::ExcelErrorKind;
+        let wb = TestWorkbook::new()
+            .with_function(std::sync::Arc::new(RankEqFn))
+            .with_function(std::sync::Arc::new(RankAvgFn))
+            .with_function(std::sync::Arc::new(crate::builtins::lookup::ChooseFn))
+            .with_function(std::sync::Arc::new(crate::builtins::text::ValueFn))
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Number(1.0))
+            .with_cell_a1("Sheet1", "A2", LiteralValue::Number(2.0))
+            .with_cell_a1("Sheet1", "A3", LiteralValue::Number(3.0))
+            .with_cell_a1("Sheet1", "B1", LiteralValue::Text("NaN".into()))
+            .with_cell_a1("Sheet1", "B2", LiteralValue::Text("Infinity".into()))
+            // A NaN cannot come from a formula, but ranking must not panic on one.
+            .with_cell_a1("Sheet1", "C1", LiteralValue::Number(1.0))
+            .with_cell_a1("Sheet1", "C2", LiteralValue::Number(f64::NAN))
+            .with_cell_a1("Sheet1", "C3", LiteralValue::Number(3.0));
+        let ctx = interp(&wb);
+        let eval = |f: &str| {
+            ctx.evaluate_ast(&formualizer_parse::parser::parse(f).unwrap())
+                .unwrap()
+                .into_literal()
+        };
+        let kind = |f: String| match eval(&f) {
+            LiteralValue::Error(e) => Some(e.kind),
+            _ => None,
+        };
+        for name in ["RANK", "RANK.EQ", "RANK.AVG"] {
+            // Rust's float spellings are not Excel numbers: #VALUE! in number
+            // and in order, never #N/A or a rank.
+            for text in ["NaN", "nan", "Inf", "-inf", "infinity", "1E400"] {
+                assert_eq!(
+                    kind(format!("={name}(\"{text}\",A1:A3)")),
+                    Some(ExcelErrorKind::Value),
+                    "{name} number {text}"
+                );
+                assert_eq!(
+                    kind(format!("={name}(1,A1:A3,\"{text}\")")),
+                    Some(ExcelErrorKind::Value),
+                    "{name} order {text}"
+                );
+            }
+            assert_eq!(
+                kind(format!("={name}(B1,A1:A3)")),
+                Some(ExcelErrorKind::Value)
+            );
+            assert_eq!(
+                kind(format!("={name}(1,A1:A3,B2)")),
+                Some(ExcelErrorKind::Value)
+            );
+            // VALUE("NaN") is #VALUE!, and RANK returns that error from either
+            // argument (a NaN in ref used to panic the sort).
+            assert_eq!(
+                kind(format!("={name}(1,CHOOSE({{1,2}},VALUE(\"NaN\"),1))")),
+                Some(ExcelErrorKind::Value)
+            );
+            assert_eq!(
+                kind(format!("={name}(VALUE(\"NaN\"),A1:A3)")),
+                Some(ExcelErrorKind::Value)
+            );
+            assert_eq!(
+                eval(&format!("={name}(3,C1:C3)")),
+                LiteralValue::Number(1.0)
+            );
+            assert_eq!(
+                eval(&format!("={name}(3,C1:C3,1)")),
+                LiteralValue::Number(2.0)
+            );
+        }
+    }
+
+    #[test]
+    fn rank_order_and_duplicates_compare_numbers_exactly() {
+        use formualizer_common::ExcelErrorKind;
+        let wb = TestWorkbook::new()
+            .with_function(std::sync::Arc::new(RankEqFn))
+            .with_function(std::sync::Arc::new(RankAvgFn))
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Number(1.0))
+            .with_cell_a1("Sheet1", "A2", LiteralValue::Number(2.0))
+            .with_cell_a1("Sheet1", "A3", LiteralValue::Number(3.0))
+            .with_cell_a1("Sheet1", "B1", LiteralValue::Number(1.0))
+            .with_cell_a1("Sheet1", "B2", LiteralValue::Number(1.0000000000005))
+            .with_cell_a1("Sheet1", "C1", LiteralValue::Number(1e-13))
+            .with_cell_a1("Sheet1", "C2", LiteralValue::Number(-1e-13))
+            .with_cell_a1("Sheet1", "D1", LiteralValue::Number(2.0))
+            .with_cell_a1("Sheet1", "D2", LiteralValue::Number(2.0))
+            .with_cell_a1("Sheet1", "D3", LiteralValue::Number(1.0))
+            .with_cell_a1("Sheet1", "D4", LiteralValue::Number(5.0));
+        let ctx = interp(&wb);
+        let eval = |f: &str| {
+            ctx.evaluate_ast(&formualizer_parse::parser::parse(f).unwrap())
+                .unwrap()
+                .into_literal()
+        };
+        let n = LiteralValue::Number;
+        for name in ["RANK", "RANK.EQ", "RANK.AVG"] {
+            // Any nonzero order is ascending, however small; zero is descending.
+            assert_eq!(eval(&format!("={name}(3,A1:A3,C1)")), n(3.0), "{name}");
+            assert_eq!(eval(&format!("={name}(3,A1:A3,C2)")), n(3.0), "{name}");
+            assert_eq!(eval(&format!("={name}(3,A1:A3,0)")), n(1.0), "{name}");
+            // A number that differs from every value in ref is not in it, and
+            // two distinct numbers are not duplicates.
+            match eval(&format!("={name}(B2,B1)")) {
+                LiteralValue::Error(e) => assert_eq!(e.kind, ExcelErrorKind::Na, "{name}"),
+                other => panic!("{name}: expected #N/A, got {other:?}"),
+            }
+            assert_eq!(eval(&format!("={name}(1,B1:B2)")), n(2.0), "{name}");
+            assert_eq!(eval(&format!("={name}(B2,B1:B2)")), n(1.0), "{name}");
+            assert_eq!(eval(&format!("={name}(1,B1:B2,1)")), n(1.0), "{name}");
+        }
+        // Equal numbers still share a rank (RANK.AVG: the mean of their places).
+        assert_eq!(eval("=RANK.EQ(2,D1:D4)"), n(2.0));
+        assert_eq!(eval("=RANK.AVG(2,D1:D4)"), n(2.5));
+        assert_eq!(eval("=RANK.EQ(2,D1:D4,1)"), n(2.0));
+        assert_eq!(eval("=RANK.AVG(2,D1:D4,1)"), n(2.5));
+        assert_eq!(eval("=RANK.AVG(5,D1:D4)"), n(1.0));
     }
 
     #[test]

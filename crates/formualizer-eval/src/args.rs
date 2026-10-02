@@ -96,17 +96,10 @@ pub struct ValidationOptions {
 // Legacy adapter removed in clean break.
 
 /// A criterion operand that Excel reads as a number (`"5"`, `" 1e3 "`,
-/// `"90%"`). Rust spellings such as `inf` or `NaN` stay text.
+/// `"90%"`). Rust spellings such as `inf` or `NaN` stay text: numeric text is
+/// only ever a finite number ([`crate::locale::parse_finite_number`]).
 fn criteria_number(text: &str) -> Option<f64> {
-    if text
-        .chars()
-        .any(|c| c.is_alphabetic() && !matches!(c, 'e' | 'E'))
-    {
-        return None;
-    }
-    crate::locale::Locale::invariant()
-        .parse_number_invariant(text)
-        .filter(|n| n.is_finite())
+    crate::locale::Locale::invariant().parse_number_invariant(text)
 }
 
 /// An Excel error value written as criteria text (`#N/A`, `#DIV/0!`).

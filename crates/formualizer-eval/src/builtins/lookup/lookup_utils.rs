@@ -19,7 +19,8 @@ pub fn value_to_f64_lenient(v: &LiteralValue, date_system: DateSystem) -> Option
     match v {
         LiteralValue::Number(n) => Some(*n),
         LiteralValue::Int(i) => Some(*i as f64),
-        LiteralValue::Text(s) => s.parse::<f64>().ok(),
+        // Only finite numbers: "NaN", "inf" and "infinity" are text in Excel.
+        LiteralValue::Text(s) => crate::locale::parse_finite_number(s),
         LiteralValue::Boolean(b) => Some(if *b { 1.0 } else { 0.0 }),
         LiteralValue::Date(_) | LiteralValue::DateTime(_) | LiteralValue::Time(_) => {
             v.as_serial_number_for(date_system)
@@ -152,9 +153,13 @@ impl<'a> PreparedLookupMatcher<'a> {
             // Excel exact lookups never match a text needle against a
             // non-text candidate: "20" does not find the number 20.
             (Some(_), _) => false,
-            _ => cmp_for_lookup(self.needle, candidate, self.date_system)
-                .map(|o| o == 0)
-                .unwrap_or(false),
+            // A boolean finds only the same boolean: TRUE does not find the
+            // number 1, nor FALSE a 0 (as the scan's boolean lane and the
+            // index's boolean keys already do).
+            (None, candidate) => match (self.needle, candidate) {
+                (LiteralValue::Boolean(b), LiteralValue::Boolean(c)) => b == c,
+                _ => false,
+            },
         }
     }
 }
@@ -677,6 +682,8 @@ pub fn find_exact_index_in_view(
     }
 }
 
+/// The first numeric (or temporal) cell holding exactly `n`: an exact match
+/// has no tolerance (see [`lookup_numbers_equal`]).
 fn find_exact_number_in_view(
     view: &RangeView<'_>,
     n: f64,
@@ -1106,6 +1113,114 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn exact_numbers_match_only_the_identical_number_in_every_path() {
+        // 0.2500000000005 and 0.25 are distinct numbers within Excel's 15
+        // significant digits: exact mode finds the 0.25, not the earlier
+        // near value, in materialized vectors and in both view orientations.
+        let values = vec![
+            LiteralValue::Number(0.2500000000005),
+            LiteralValue::Number(0.25),
+            LiteralValue::Number(1.0000000000001),
+            LiteralValue::Number(0.1 + 0.2),
+            LiteralValue::Int(7),
+        ];
+        let cases = [
+            (LiteralValue::Number(0.25), Some(1)),
+            (LiteralValue::Number(0.2500000000005), Some(0)),
+            (LiteralValue::Number(0.2500000000001), None),
+            (LiteralValue::Number(1.0), None),
+            (LiteralValue::Number(1.0000000000001), Some(2)),
+            (LiteralValue::Number(0.3), None),
+            (LiteralValue::Number(0.1 + 0.2), Some(3)),
+            (LiteralValue::Number(7.0), Some(4)),
+            (LiteralValue::Number(7.0000000000001), None),
+            (LiteralValue::Number(f64::NAN), None),
+        ];
+        for (needle, expected) in &cases {
+            assert_eq!(
+                find_exact_index(&values, needle, false, DateSystem::Excel1900),
+                *expected,
+                "materialized {needle:?}"
+            );
+        }
+        for vertical in [true, false] {
+            let rows = if vertical {
+                values.iter().cloned().map(|value| vec![value]).collect()
+            } else {
+                vec![values.clone()]
+            };
+            let view = RangeView::from_owned_rows(rows, DateSystem::Excel1900);
+            for (needle, expected) in &cases {
+                assert_eq!(
+                    find_exact_index_in_view(&view, needle, false, DateSystem::Excel1900).unwrap(),
+                    *expected,
+                    "view (vertical {vertical}) {needle:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn materialized_exact_boolean_needles_find_only_booleans() {
+        // TRUE does not find the number 1 (nor FALSE a 0) in an exact match:
+        // =VLOOKUP(TRUE,{1,11;TRUE,22},2,FALSE) is 22, as the view scan's
+        // boolean lane and the index's boolean keys already answer.
+        let values = vec![
+            LiteralValue::Number(1.0),
+            LiteralValue::Number(0.0),
+            LiteralValue::Text("TRUE".into()),
+            LiteralValue::Boolean(true),
+            LiteralValue::Boolean(false),
+        ];
+        let ds = DateSystem::Excel1900;
+        assert_eq!(
+            find_exact_index(&values, &LiteralValue::Boolean(true), false, ds),
+            Some(3)
+        );
+        assert_eq!(
+            find_exact_index(&values, &LiteralValue::Boolean(false), false, ds),
+            Some(4)
+        );
+        assert_eq!(
+            find_exact_index(&values[..3], &LiteralValue::Boolean(true), false, ds),
+            None
+        );
+        assert_eq!(
+            find_exact_index(&values[..3], &LiteralValue::Boolean(false), false, ds),
+            None
+        );
+        // ...and a number does not find a boolean.
+        assert_eq!(
+            find_exact_index(&values[2..], &LiteralValue::Number(1.0), false, ds),
+            None
+        );
+        let view = RangeView::from_owned_rows(
+            values.iter().cloned().map(|value| vec![value]).collect(),
+            ds,
+        );
+        assert_eq!(
+            find_exact_index_in_view(&view, &LiteralValue::Boolean(true), false, ds).unwrap(),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn lenient_lookup_numbers_do_not_read_nan_or_infinity_text() {
+        let ds = DateSystem::Excel1900;
+        for text in ["NaN", "nan", "inf", "-Infinity", "1e400"] {
+            assert_eq!(
+                value_to_f64_lenient(&LiteralValue::Text(text.into()), ds),
+                None,
+                "{text}"
+            );
+        }
+        assert_eq!(
+            value_to_f64_lenient(&LiteralValue::Text("2.5".into()), ds),
+            Some(2.5)
+        );
     }
 
     #[test]
