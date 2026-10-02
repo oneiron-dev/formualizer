@@ -345,14 +345,45 @@ fn sum_over_rect_keeps_whole_rect_edges() {
     assert!(is_circ(&engine, 9, 3), "C9 must remain Circ");
 }
 
+/// INDEX reads only the cell it selects from a whole column, as from a
+/// bounded range: validating its reference does not read the column.
 #[test]
-fn index_unbounded_column_selection_measured() {
+fn index_unbounded_column_selection_reads_only_the_selected_cell() {
     let mut engine = build_guarded_chain("=INDEX(Q:Q,24)");
     engine.evaluate_all().expect("evaluate");
     assert!(
-        is_circ(&engine, 9, 3),
-        "unbounded INDEX retains whole-column live edges while resolving bounds"
+        matches!(
+            engine.get_cell_value("Sheet1", 9, 3),
+            Some(LiteralValue::Number(0.0) | LiteralValue::Int(0))
+        ),
+        "C9 expected numeric zero, got {:?}",
+        engine.get_cell_value("Sheet1", 9, 3)
     );
+    assert_eq!(
+        (1..=100)
+            .flat_map(|row| (1..=17).map(move |col| (row, col)))
+            .filter(|&(row, col)| is_circ(&engine, row, col))
+            .count(),
+        0
+    );
+
+    // A computed row (here the guard row's own number), and an index that is
+    // an error, read no other cell of the column either.
+    for formula in ["=INDEX(Q:Q,B24)", "=INDEX(Q:Q,MATCH(-1,B1:B100,0))"] {
+        let mut engine = build_guarded_chain(formula);
+        engine.evaluate_all().expect("evaluate");
+        assert!(!is_circ(&engine, 9, 3), "{formula}");
+        assert_eq!(
+            engine.last_cycle_telemetry().live_cycles_witnessed,
+            0,
+            "{formula}"
+        );
+    }
+
+    // Selecting a cell that reads the formula is still circular.
+    let mut engine = build_guarded_chain("=INDEX(Q:Q,40)");
+    engine.evaluate_all().expect("evaluate");
+    assert!(is_circ(&engine, 9, 3), "Q40 reads C9 through E29");
 }
 
 /// Direct bound assertions on `precise_single_cell_selection`. The dispatch

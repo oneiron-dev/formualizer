@@ -279,16 +279,33 @@ pub trait Function: Send + Sync + 'static {
         args: &'c [crate::traits::ArgumentHandle<'a, 'b>],
         ctx: &dyn crate::traits::FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        // Central argument validation (includes min-arity check)
+        // Central argument validation (includes min-arity check). Arguments
+        // the function reads only as a reference (ROWS's, CELL("row",...)'s)
+        // are not read to validate them, as they are not dependencies.
         {
-            use crate::args::{ValidationOptions, validate_and_prepare};
+            use crate::args::{ValidationOptions, validate_and_prepare_reading};
             let schema = self.arg_schema();
-            if let Err(e) = validate_and_prepare(
+            let name = self.name();
+            let cell_info = if name.eq_ignore_ascii_case("CELL") {
+                args.first().and_then(|info| match info.value() {
+                    Ok(value) => match value.into_literal() {
+                        LiteralValue::Text(text) => Some(text),
+                        _ => None,
+                    },
+                    Err(_) => None,
+                })
+            } else {
+                None
+            };
+            if let Err(e) = validate_and_prepare_reading(
                 args,
                 schema,
                 ValidationOptions {
                     warn_only: false,
                     min_args: self.min_args(),
+                },
+                |index| {
+                    !crate::engine::refs::reference_only_argument(name, index, cell_info.as_deref())
                 },
             ) {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));

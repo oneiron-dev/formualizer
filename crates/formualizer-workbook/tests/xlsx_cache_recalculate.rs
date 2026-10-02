@@ -2560,6 +2560,56 @@ fn an_explicit_retain_last_value_policy_reads_the_package_caches_too() {
     }
 }
 #[test]
+fn an_index_into_its_own_column_that_selects_another_row_is_calculated() {
+    // INDEX(B:B,MATCH(...)) in column B reads only the row MATCH picks, an
+    // earlier one here: no circular reference, so the stale caches (99) are
+    // recalculated, not kept as last calculated values.
+    let formula = |row: u32| {
+        format!(
+            "IF(COUNTIF(A$2:A{row},A{row})=1,MAX(B$1:B{})+1,INDEX(B:B,MATCH(A{row},A:A,0)))",
+            row - 1
+        )
+    };
+    let p = parts(&format!(
+        "<row r=\"2\"><c r=\"A2\" t=\"inlineStr\"><is><t>p</t></is></c><c r=\"B2\"><f>{}</f><v>99</v></c></row>\
+         <row r=\"3\"><c r=\"A3\" t=\"inlineStr\"><is><t>q</t></is></c><c r=\"B3\"><f t=\"array\" ref=\"B3\">{}</f><v>99</v></c></row>\
+         <row r=\"4\"><c r=\"A4\" t=\"inlineStr\"><is><t>p</t></is></c><c r=\"B4\"><f t=\"array\" ref=\"B4\">{}</f><v>99</v></c></row>",
+        formula(2),
+        formula(3),
+        formula(4)
+    ));
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for (cell, expected) in [("B2", "<v>1</v>"), ("B3", "<v>2</v>"), ("B4", "<v>1</v>")] {
+        let at = sheet.find(&format!("r=\"{cell}\"")).unwrap();
+        let end = at + sheet[at..].find("</c>").unwrap();
+        assert!(
+            sheet[at..end].contains(expected),
+            "{cell}={expected}: {sheet}"
+        );
+    }
+}
+#[test]
+fn a_dynamic_formula_counting_rows_down_to_its_own_cell_is_calculated() {
+    // ROWS(C$2:C2) reads no cell of C2, so OFFSET($A$1,ROWS(C$2:C2),0) in
+    // column C is not circular: the stale caches (99) are recalculated.
+    let p = parts(
+        "<row r=\"1\"><c r=\"A1\"><v>1</v></c></row>\
+         <row r=\"2\"><c r=\"A2\"><v>5</v></c><c r=\"C2\"><f>OFFSET($A$1,ROWS(C$2:C2),0)</f><v>99</v></c></row>\
+         <row r=\"3\"><c r=\"A3\"><v>6</v></c><c r=\"C3\"><f t=\"array\" ref=\"C3\">OFFSET($A$1,ROWS(C$2:C3),0)</f><v>99</v></c></row>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for (cell, expected) in [("C2", "<v>5</v>"), ("C3", "<v>6</v>")] {
+        let at = sheet.find(&format!("r=\"{cell}\"")).unwrap();
+        let end = at + sheet[at..].find("</c>").unwrap();
+        assert!(
+            sheet[at..end].contains(expected),
+            "{cell}={expected}: {sheet}"
+        );
+    }
+}
+#[test]
 fn whole_columns_span_the_grid() {
     // A:A and D:D line up row by row, and INDEX reaches rows past the data.
     let p = parts(

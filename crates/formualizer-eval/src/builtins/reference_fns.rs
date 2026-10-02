@@ -405,14 +405,20 @@ impl IndexFn {
         args: &[ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        use crate::args::{ValidationOptions, validate_and_prepare};
-        if let Err(error) = validate_and_prepare(
+        use crate::args::{ValidationOptions, validate_and_prepare_reading};
+        // INDEX reads only the cells it selects. Validating its reference as
+        // a range would read every cell of it, so INDEX(B:B,MATCH(...)) in
+        // column B would read its own cell, a circular reference Excel does
+        // not see. That validation never fails (any value is accepted), so
+        // only the argument count and the indexes are validated.
+        if let Err(error) = validate_and_prepare_reading(
             args,
             self.arg_schema(),
             ValidationOptions {
                 warn_only: false,
                 min_args: self.min_args(),
             },
+            |index| index != 0,
         ) {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
         }

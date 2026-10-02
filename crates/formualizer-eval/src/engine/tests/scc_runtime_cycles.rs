@@ -1219,6 +1219,44 @@ fn retain_last_value_keeps_the_last_successful_result_when_a_guard_flips() {
     assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 1);
 }
 
+/// INDEX reads only the cell it selects: `INDEX(B:B,MATCH(A4,A:A,0))` in
+/// column B, picking an earlier row, is not a circular reference, so with
+/// iteration off it calculates and does not keep a supplied last calculated
+/// value. A formula that selects its own cell is circular and keeps it.
+#[test]
+fn retain_last_value_index_selecting_another_cell_of_its_column_calculates() {
+    let mut engine = retain_engine();
+    set_value(&mut engine, "Sheet1", 1, 2, LiteralValue::Text("ID".into()));
+    // Each product gets the next ID on first sight and its first ID after.
+    for (row, product) in [(2u32, "p"), (3, "q"), (4, "p"), (5, "r"), (6, "q")] {
+        set_value(
+            &mut engine,
+            "Sheet1",
+            row,
+            1,
+            LiteralValue::Text(product.into()),
+        );
+        set_formula(
+            &mut engine,
+            "Sheet1",
+            row,
+            2,
+            &format!(
+                "=IF(COUNTIF(A$2:A{row},A{row})=1,MAX(B$1:B{})+1,INDEX(B:B,MATCH(A{row},A:A,0)))",
+                row - 1
+            ),
+        );
+        engine.set_last_calculated_value("Sheet1", row, 2, LiteralValue::Number(99.0));
+    }
+    set_formula(&mut engine, "Sheet1", 7, 2, "=INDEX(B:B,ROW())+1"); // B7, itself
+    engine.set_last_calculated_value("Sheet1", 7, 2, LiteralValue::Number(42.0));
+    engine.evaluate_all().unwrap();
+    let ids: Vec<f64> = (2..=6).map(|row| num(&engine, "Sheet1", row, 2)).collect();
+    assert_eq!(ids, vec![1.0, 2.0, 1.0, 3.0, 2.0]);
+    assert_eq!(num(&engine, "Sheet1", 7, 2), 42.0);
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 1);
+}
+
 /// With iteration off Excel accepts a formula that refers to its own cell
 /// (it warns and leaves it uncalculated): the edit is not rejected and the
 /// new formula, which has no earlier result, holds 0.
@@ -1501,6 +1539,45 @@ fn dynamic_self_reference_is_a_circular_reference() {
     set_formula(&mut engine, "Sheet1", 1, 1, "=IF(TRUE,5,INDIRECT(\"A1\"))");
     engine.evaluate_all().unwrap();
     assert_eq!(num(&engine, "Sheet1", 1, 1), 5.0);
+}
+
+/// An argument a function reads only as a reference (ROWS's, COLUMNS's,
+/// CELL("row",...)'s) is not a read of its cells, also in a formula with a
+/// dynamic reference: `=INDIRECT("B1")+ROWS(B$1:B5)` in B5 is not circular,
+/// so it calculates instead of keeping its last calculated value. A read of
+/// the cell's contents is circular.
+#[test]
+fn reference_only_arguments_of_a_dynamic_formula_are_not_circular() {
+    for (formula, expected) in [
+        ("=INDIRECT(\"B1\")+ROWS(B$1:B5)", 12.0),
+        ("=OFFSET($B$1,0,0)+COLUMNS(A5:B5)", 9.0),
+        ("=INDIRECT(\"B1\")+CELL(\"row\",B5)", 12.0),
+    ] {
+        let mut engine = runtime_engine();
+        set_value(&mut engine, "Sheet1", 1, 2, LiteralValue::Number(7.0));
+        set_formula(&mut engine, "Sheet1", 5, 2, formula);
+        engine.evaluate_all().unwrap();
+        assert_eq!(num(&engine, "Sheet1", 5, 2), expected, "{formula}");
+
+        let mut engine = retain_engine();
+        set_value(&mut engine, "Sheet1", 1, 2, LiteralValue::Number(7.0));
+        set_formula(&mut engine, "Sheet1", 5, 2, formula);
+        engine.set_last_calculated_value("Sheet1", 5, 2, LiteralValue::Number(-1.0));
+        engine.evaluate_all().unwrap();
+        assert_eq!(num(&engine, "Sheet1", 5, 2), expected, "{formula}");
+        assert_eq!(
+            engine.last_cycle_telemetry().live_cycles_witnessed,
+            0,
+            "{formula}"
+        );
+    }
+
+    let mut engine = retain_engine();
+    set_value(&mut engine, "Sheet1", 1, 2, LiteralValue::Number(7.0));
+    set_formula(&mut engine, "Sheet1", 5, 2, "=INDIRECT(\"B1\")+SUM(B$1:B5)");
+    engine.set_last_calculated_value("Sheet1", 5, 2, LiteralValue::Number(-1.0));
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 5, 2), -1.0);
 }
 
 /// A circular reference whose `INDIRECT` text is itself calculated is only

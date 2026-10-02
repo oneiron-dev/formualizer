@@ -245,6 +245,20 @@ pub fn validate_and_prepare<'a, 'b>(
     schema: &[ArgSchema],
     options: ValidationOptions,
 ) -> Result<PreparedArgs<'a>, ExcelError> {
+    validate_and_prepare_reading(args, schema, options, |_| true)
+}
+
+/// [`validate_and_prepare`] that validates only the arguments `reads`
+/// accepts (by index). An argument the function reads only as a reference
+/// (ROWS's, INDEX's) is not read to validate it: reading every cell of
+/// `A$1:A5` for `=ROWS(A$1:A5)` in A5 would be a read of the formula's own
+/// cell that the formula never makes. The argument count is still checked.
+pub fn validate_and_prepare_reading<'a, 'b>(
+    args: &'a [ArgumentHandle<'a, 'b>],
+    schema: &[ArgSchema],
+    options: ValidationOptions,
+    reads: impl Fn(usize) -> bool,
+) -> Result<PreparedArgs<'a>, ExcelError> {
     // Minimum arity — reject too-few arguments before per-arg validation so
     // that individual `eval` implementations cannot panic on indexing.
     if options.min_args > 0 && args.len() < options.min_args {
@@ -281,6 +295,9 @@ pub fn validate_and_prepare<'a, 'b>(
                 );
             }
         };
+        if !reads(idx) {
+            continue;
+        }
 
         // By-ref argument: require a reference (AST literal or function-returned)
         if spec.by_ref {
