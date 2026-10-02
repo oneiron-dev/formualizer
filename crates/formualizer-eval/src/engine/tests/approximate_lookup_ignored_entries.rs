@@ -833,3 +833,135 @@ fn exact_hit_ends_the_bisection_at_the_end_of_its_run() {
         );
     }
 }
+
+/// Evaluates `formula` on Sheet2 against a Sheet1 holding only A1 = 10 and
+/// B1 = 100, so every other cell of a whole row or column of Sheet1 lies past
+/// its used range.
+fn eval_against_sparse_sheet(formula: &str) -> Option<LiteralValue> {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    engine.graph.add_sheet("Sheet2").unwrap();
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Int(10))
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 1, 2, LiteralValue::Int(100))
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet2", 1, 1, parse(formula).unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    engine.get_cell_value("Sheet2", 1, 1)
+}
+
+/// VLOOKUP and HLOOKUP return #REF! only for an index past table_array as
+/// written: whole rows 1:2 span 16,384 columns and whole columns A:B
+/// 1,048,576 rows, so an index past the used cells reads a blank cell (0).
+#[test]
+fn return_index_is_bounded_by_the_table_as_written() {
+    for (formula, expected) in [
+        ("=VLOOKUP(10,Sheet1!1:2,100,TRUE)", 0.0),
+        ("=HLOOKUP(10,Sheet1!A:B,100,TRUE)", 0.0),
+        ("=VLOOKUP(10,Sheet1!1:2,100,FALSE)", 0.0),
+        ("=HLOOKUP(10,Sheet1!A:B,100,FALSE)", 0.0),
+        ("=VLOOKUP(10,Sheet1!1:2,16384,TRUE)", 0.0),
+        ("=HLOOKUP(10,Sheet1!A:B,1048576,TRUE)", 0.0),
+        // Control: a used return cell.
+        ("=VLOOKUP(10,Sheet1!1:2,2,TRUE)", 100.0),
+    ] {
+        assert_number(eval_against_sparse_sheet(formula), expected, formula);
+    }
+    for formula in [
+        "=VLOOKUP(10,Sheet1!A:B,3,TRUE)",
+        "=HLOOKUP(10,Sheet1!1:2,3,TRUE)",
+        "=VLOOKUP(10,Sheet1!A1:B5,3,FALSE)",
+    ] {
+        assert_error(
+            eval_against_sparse_sheet(formula),
+            ExcelErrorKind::Ref,
+            formula,
+        );
+    }
+}
+
+/// MATCH's lookup array must be one row or one column (MS-OI29500 2.1.990,
+/// "MATCH"): a two-dimensional array or reference gives #N/A in every match
+/// type and is never flattened into a vector.
+#[test]
+fn match_rejects_a_two_dimensional_lookup_array() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    // X1:Y2 = 1, 2; 3, 4.
+    for (row, col, value) in [(1, 24, 1), (1, 25, 2), (2, 24, 3), (2, 25, 4)] {
+        engine
+            .set_cell_value("Sheet1", row, col, LiteralValue::Int(value))
+            .unwrap();
+    }
+    for formula in [
+        "=MATCH(3,{1,2;3,4},1)",
+        "=MATCH(3,{1,2;3,4},0)",
+        "=MATCH(3,{4,3;2,1},-1)",
+        "=MATCH(3,X1:Y2,1)",
+        "=MATCH(3,X1:Y2,0)",
+        "=MATCH(3,X1:Y2,-1)",
+        "=MATCH(3,X:Y,1)",
+    ] {
+        assert_na(eval_at(&mut engine, formula), formula);
+    }
+    // Controls: one row and one column.
+    for (formula, expected) in [
+        ("=MATCH(3,{1,2,3,4},1)", 3.0),
+        ("=MATCH(3,{1;2;3;4},1)", 3.0),
+        ("=MATCH(3,X1:X2,1)", 2.0),
+        ("=MATCH(2,X1:Y1,1)", 2.0),
+    ] {
+        assert_number(eval_at(&mut engine, formula), expected, formula);
+    }
+}
+
+/// A lookup tells apart numbers that differ within 15 significant digits,
+/// however close to zero they are: 5E-13 is above 0, so an ascending
+/// approximate lookup for 0 has nothing at or below it, exact-or-next-smaller
+/// misses, and an exact lookup finds no 0. A difference past the 15th
+/// significant digit is floating-point noise and still matches.
+#[test]
+fn numbers_differing_within_15_digits_are_not_equal() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    // X1:X2 = 5E-13, 1 with Y1:Y2 = 10, 20.
+    for (row, key, payload) in [(1, 0.0000000000005, 10), (2, 1.0, 20)] {
+        engine
+            .set_cell_value("Sheet1", row, 24, LiteralValue::Number(key))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", row, 25, LiteralValue::Int(payload))
+            .unwrap();
+    }
+    for formula in [
+        "=MATCH(0,{0.0000000000005,1},1)",
+        "=LOOKUP(0,{0.0000000000005,1},{10,20})",
+        "=VLOOKUP(0,{0.0000000000005,10;1,20},2,TRUE)",
+        "=MATCH(0,X1:X2,1)",
+        "=VLOOKUP(0,X1:Y2,2,TRUE)",
+        "=MATCH(0,{0.0000000000005,1},0)",
+        "=MATCH(0,X1:X2,0)",
+        "=VLOOKUP(0,X1:Y2,2,FALSE)",
+        "=XMATCH(0,X1:X2)",
+    ] {
+        assert_na(eval_at(&mut engine, formula), formula);
+    }
+    assert_eq!(
+        eval_at(
+            &mut engine,
+            "=XLOOKUP(0,{0.0000000000005,1},{10,20},\"NF\",-1)"
+        ),
+        Some(LiteralValue::Text("NF".into()))
+    );
+    for (formula, expected) in [
+        ("=XLOOKUP(0,{0.0000000000005,1},{10,20},\"NF\",1)", 10.0),
+        ("=MATCH(0.0000000000005,X1:X2,0)", 1.0),
+        ("=MATCH(0.0000000000005,X1:X2,1)", 1.0),
+        // 0.1+0.2 is 0.30000000000000004: noise past the 15th digit.
+        ("=MATCH(0.1+0.2,{0.1,0.3},0)", 2.0),
+        ("=MATCH(0.3,{0.1,0.1+0.2},1)", 2.0),
+    ] {
+        assert_number(eval_at(&mut engine, formula), expected, formula);
+    }
+}

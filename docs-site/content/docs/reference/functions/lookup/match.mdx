@@ -16,6 +16,7 @@ description: "MATCH: Returns the relative position of a lookup value in a one-di
  - `match_type=1` looks for the largest value less than or equal to the lookup value.
  - `match_type=-1` looks for the smallest value greater than or equal to the lookup value.
  - Approximate modes expect sorted data but do not check it: like Excel they bisect the lookup array, so unsorted data gives whichever entry the search reaches, or `#N/A`.
+ - `lookup_array` must be one row or one column; a two-dimensional array or reference returns `#N/A`.
  - If no match is found, returns `#N/A`.
 
 ## Examples

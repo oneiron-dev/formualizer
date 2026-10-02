@@ -20,7 +20,7 @@
 
 use super::super::utils::collapse_if_scalar;
 use super::lookup_utils::{
-    PreparedLookupMatcher, cmp_for_approximate, cmp_for_lookup, searches_numbers,
+    PreparedLookupMatcher, cmp_for_approximate, cmp_for_lookup, reference_extent, searches_numbers,
     value_to_f64_lenient,
 };
 use super::sort_collation::cmp_text_for_sort;
@@ -107,8 +107,15 @@ fn find_semantic_empty(
 /// empty entry, as in the exact mode, and otherwise searches as the number 0.
 /// Candidates are ordered by their own values (numbers exactly, with no
 /// lookup tolerance), so the nearer of two close numbers wins.
+///
+/// The lookup array holds `written_len` entries, of which `cell` reads the
+/// first `len`; the rest (the unused tail of a whole column or row) are blank
+/// and candidates like any other blank. They are all the same, so only the
+/// first of them met in search order is visited: the entry just past the used
+/// range searching forward, the array's last entry searching in reverse.
 fn linear_approximate_match(
     len: usize,
+    written_len: usize,
     cell: impl Fn(usize) -> LiteralValue,
     needle: &LiteralValue,
     match_mode: i64,
@@ -116,10 +123,11 @@ fn linear_approximate_match(
     date_system: crate::engine::DateSystem,
 ) -> Option<usize> {
     let side = match_mode.signum() as i32;
+    let blank_tail = (written_len > len).then(|| if reverse { written_len - 1 } else { len });
     let order: Box<dyn Iterator<Item = usize>> = if reverse {
-        Box::new((0..len).rev())
+        Box::new(blank_tail.into_iter().chain((0..len).rev()))
     } else {
-        Box::new(0..len)
+        Box::new((0..len).chain(blank_tail))
     };
     let blank_ranks_above = side == 1 && searches_numbers(needle);
     let mut first_blank: Option<usize> = None;
@@ -140,7 +148,11 @@ fn linear_approximate_match(
         _ => cmp_for_approximate(cand, best, date_system) == Some(-side),
     };
     for i in order {
-        let cand = cell(i);
+        let cand = if i < len {
+            cell(i)
+        } else {
+            LiteralValue::Empty
+        };
         if matches!(needle, LiteralValue::Empty) && matches!(cand, LiteralValue::Empty) {
             return Some(i);
         }
@@ -160,6 +172,42 @@ fn linear_approximate_match(
     best.map(|(i, _)| i).or(first_blank)
 }
 
+/// A lookup array as written, when it is a one-row or one-column reference
+/// whose extent is known: whether it is a column, and how many entries it
+/// holds. A whole column holds 1,048,576 entries though its range view stops
+/// at the last used row, and a whole row is a row even when its view is a
+/// single cell.
+fn written_vector(arg: &ArgumentHandle<'_, '_>) -> Option<(bool, usize)> {
+    let reference = arg.as_reference_or_eval().ok()?;
+    match reference_extent(&reference)? {
+        (rows, 1) => Some((true, rows)),
+        (1, cols) => Some((false, cols)),
+        _ => None,
+    }
+}
+
+/// The orientation and length an approximate `XLOOKUP`/`XMATCH` searches:
+/// the lookup array as written when its range view (`view_dims`, read as
+/// `vertical` with `len` entries) is part of it, so the blank cells past the
+/// used range are candidates too. A view of at most one cell says nothing
+/// about orientation, so the written reference decides it.
+fn approximate_search_extent(
+    arg: &ArgumentHandle<'_, '_>,
+    view_dims: (usize, usize),
+    vertical: bool,
+    len: usize,
+) -> (bool, usize) {
+    let view_is_a_cell = view_dims.0 <= 1 && view_dims.1 <= 1;
+    match written_vector(arg) {
+        Some((written_vertical, written_len))
+            if (written_vertical == vertical || view_is_a_cell) && written_len >= len =>
+        {
+            (written_vertical, written_len)
+        }
+        _ => (vertical, len),
+    }
+}
+
 /* ───────────────────────── XLOOKUP() ───────────────────────── */
 
 #[derive(Debug)]
@@ -175,7 +223,7 @@ pub struct XLookupFn;
 /// - `if_not_found` is optional; if omitted and no match exists, returns `#N/A`.
 /// - `match_mode`: `0` exact, `-1` exact-or-next-smaller, `1` exact-or-next-larger, `2` wildcard.
 /// - `search_mode`: `1` forward, `-1` reverse. Other modes are accepted with current fallback behavior.
-/// - Approximate modes (`-1`/`1`) scan every entry in search order, so the lookup array need not be sorted; only entries of the lookup value's type (number, text or logical) are candidates, except that a blank ranks above every number for exact-or-next-larger.
+/// - Approximate modes (`-1`/`1`) scan every entry in search order, so the lookup array need not be sorted; only entries of the lookup value's type (number, text or logical) are candidates, except that a blank ranks above every number for exact-or-next-larger, the blank cells of a whole column or row past its used range included.
 /// - `lookup_array` must be 1D. Invalid shape returns `#VALUE!`.
 /// - If `return_array` is multi-column or multi-row, the matched row/column is returned as a spill.
 ///
@@ -447,7 +495,7 @@ impl XLookupFn {
         // If the lookup range is completely empty (used-region trimmed to 0),
         // fall back to the return range's used-region length and treat missing lookup
         // cells as Empty.
-        let vertical = if lookup_cols == 1 {
+        let mut vertical = if lookup_cols == 1 {
             true
         } else if lookup_rows == 1 {
             false
@@ -563,9 +611,24 @@ impl XLookupFn {
                 }
             }
         } else if match_mode == -1 || match_mode == 1 {
-            // A linear scan: unsorted data is searched, not rejected.
+            // A linear scan: unsorted data is searched, not rejected. A
+            // linear search mode searches the lookup array as written,
+            // blank cells past its used range included.
+            let written_len = if matches!(search_mode, 1 | -1) {
+                let (written_vertical, written_len) = approximate_search_extent(
+                    &args[1],
+                    (lookup_rows, lookup_cols),
+                    vertical,
+                    lookup_len,
+                );
+                vertical = written_vertical;
+                written_len
+            } else {
+                lookup_len
+            };
             found = linear_approximate_match(
                 lookup_len,
+                written_len,
                 |i| {
                     if vertical {
                         lookup_view.get_cell(i, 0)
@@ -842,27 +905,34 @@ impl Function for XMatchFn {
         let (lookup_rows, lookup_cols) = lookup_view.dims();
 
         // XMATCH requires a 1-D lookup array (single row or single column).
-        let vertical = if lookup_cols == 1 {
+        // A reference with no used cells is still searched by the
+        // approximate modes, whose candidates include its blanks.
+        let mut vertical = if lookup_cols == 1 {
             true
         } else if lookup_rows == 1 {
             false
         } else if lookup_rows == 0 || lookup_cols == 0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new(ExcelErrorKind::Na),
-            )));
+            match written_vector(&args[1]) {
+                Some((written_vertical, _)) => written_vertical,
+                None => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                        ExcelError::new(ExcelErrorKind::Na),
+                    )));
+                }
+            }
         } else {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new(ExcelErrorKind::Value),
             )));
         };
 
-        let lookup_len = if vertical { lookup_rows } else { lookup_cols };
-
-        if lookup_len == 0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new(ExcelErrorKind::Na),
-            )));
-        }
+        let lookup_len = if lookup_rows == 0 || lookup_cols == 0 {
+            0
+        } else if vertical {
+            lookup_rows
+        } else {
+            lookup_cols
+        };
 
         let match_mode = if args.len() >= 3 {
             // Defensive: value() currently materializes omission as Number(0), so this is redundant.
@@ -972,8 +1042,23 @@ impl Function for XMatchFn {
                 }
             }
 
+            // A linear search mode searches the lookup array as written,
+            // blank cells past its used range included.
+            let written_len = if matches!(search_mode, 1 | -1) {
+                let (written_vertical, written_len) = approximate_search_extent(
+                    &args[1],
+                    (lookup_rows, lookup_cols),
+                    vertical,
+                    lookup_len,
+                );
+                vertical = written_vertical;
+                written_len
+            } else {
+                lookup_len
+            };
             found = linear_approximate_match(
                 lookup_len,
+                written_len,
                 |i| {
                     if vertical {
                         lookup_view.get_cell(i, 0)

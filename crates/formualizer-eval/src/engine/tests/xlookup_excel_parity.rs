@@ -276,3 +276,54 @@ fn approximate_modes_rank_close_candidates_and_match_a_blank_needle() {
         );
     }
 }
+
+/// Exact-or-next-larger's blank candidates include every blank of the lookup
+/// array, those past its used range too: with Sheet1 holding only A1 = 10
+/// and B1 = 100, a lookup for 20 in Sheet1!A:A finds A2, the first blank, and
+/// returns its blank B2; a reverse search meets A1048576 first.
+#[test]
+fn next_larger_reaches_the_blanks_past_the_used_range() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    engine.graph.add_sheet("Sheet2").unwrap();
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Int(10))
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 1, 2, LiteralValue::Int(100))
+        .unwrap();
+    let mut eval = |formula: &str| {
+        engine
+            .set_cell_formula("Sheet2", 1, 1, parse(formula).unwrap())
+            .unwrap();
+        engine.evaluate_all().unwrap();
+        engine.get_cell_value("Sheet2", 1, 1)
+    };
+    for (formula, expected) in [
+        ("=XMATCH(20,Sheet1!A:A,1)", 2.0),
+        ("=XMATCH(20,Sheet1!A:A,1,-1)", 1_048_576.0),
+        ("=XMATCH(200,Sheet1!1:1,1)", 3.0),
+        // A row or column with no used cell is all blanks.
+        ("=XMATCH(20,Sheet1!3:3,1)", 1.0),
+        ("=XMATCH(20,Sheet1!C:C,1)", 1.0),
+        ("=XLOOKUP(20,Sheet1!C:C,Sheet1!B:B,\"NF\",1)", 100.0),
+        ("=XLOOKUP(20,Sheet1!A:A,Sheet1!B:B,\"NF\",1)", 0.0),
+        // Controls: a qualifying number outranks the blanks.
+        ("=XMATCH(5,Sheet1!A:A,1)", 1.0),
+        ("=XLOOKUP(5,Sheet1!A:A,Sheet1!B:B,\"NF\",1)", 100.0),
+        ("=XLOOKUP(20,Sheet1!A:A,Sheet1!B:B,\"NF\",-1)", 100.0),
+    ] {
+        let value = eval(formula);
+        let actual = match value {
+            Some(LiteralValue::Number(n)) => n,
+            Some(LiteralValue::Int(i)) => i as f64,
+            Some(LiteralValue::Empty) | None => 0.0,
+            other => panic!("{formula}: expected {expected}, got {other:?}"),
+        };
+        assert_eq!(actual, expected, "{formula}");
+    }
+    // No blank is below a number: exact-or-next-smaller still misses.
+    assert_eq!(
+        eval("=XLOOKUP(5,Sheet1!A:A,Sheet1!B:B,\"NF\",-1)"),
+        Some(LiteralValue::Text("NF".into()))
+    );
+}

@@ -10,7 +10,7 @@ description: "VLOOKUP: Looks up a value in the first column of a table and retur
 `VLOOKUP` searches vertically and returns the matching row's value from `col_index_num`.
 
 ## Remarks
- - `col_index_num` is 1-based and must be within the table width.
+ - `col_index_num` is 1-based and must be within the table width as written (whole rows span 16,384 columns).
  - `range_lookup` defaults to `TRUE`, matching Excel and LibreOffice.
  - When `range_lookup=TRUE`, approximate match logic is used against the first column.
  - In exact mode, a blank candidate never matches. A blank lookup value matches a real numeric zero, but not blank, text, or boolean candidates.

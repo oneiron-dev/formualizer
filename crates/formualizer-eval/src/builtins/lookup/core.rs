@@ -55,6 +55,7 @@ pub struct MatchFn;
 /// - `match_type=1` looks for the largest value less than or equal to the lookup value.
 /// - `match_type=-1` looks for the smallest value greater than or equal to the lookup value.
 /// - Approximate modes expect sorted data but do not check it: like Excel they bisect the lookup array, so unsorted data gives whichever entry the search reaches, or `#N/A`.
+/// - `lookup_array` must be one row or one column; a two-dimensional array or reference returns `#N/A`.
 /// - If no match is found, returns `#N/A`.
 ///
 /// # Examples
@@ -198,6 +199,14 @@ impl Function for MatchFn {
             let current_sheet = ctx.current_sheet();
             match ctx.resolve_range_view(&r, current_sheet) {
                 Ok(rv) => {
+                    // The lookup array must be one row or one column, as
+                    // written: A1:B2 or A:B is not searched at all.
+                    let (rows, cols) = reference_extent(&r).unwrap_or_else(|| rv.dims());
+                    if rows > 1 && cols > 1 {
+                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                            ExcelError::new(ExcelErrorKind::Na),
+                        )));
+                    }
                     if mt == 0 {
                         let wildcard_mode = matches!(lookup_value, LiteralValue::Text(ref s) if s.contains('*') || s.contains('?') || s.contains('~'));
                         if !wildcard_mode {
@@ -287,7 +296,6 @@ impl Function for MatchFn {
             }
             let values: Vec<LiteralValue> = match v {
                 LiteralValue::Array(rows) => {
-                    // Flatten the array (MATCH works on 1D, so take first row or column)
                     if rows.len() == 1 {
                         // Single row - use as-is
                         rows.into_iter().next().unwrap_or_default()
@@ -297,8 +305,11 @@ impl Function for MatchFn {
                             .filter_map(|r| r.into_iter().next())
                             .collect()
                     } else {
-                        // 2D array - flatten row by row
-                        rows.into_iter().flatten().collect()
+                        // The lookup array must be one row or one column: a
+                        // two-dimensional array is not searched at all.
+                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                            ExcelError::new(ExcelErrorKind::Na),
+                        )));
                     }
                 }
                 other => vec![other],
@@ -362,7 +373,7 @@ pub struct VLookupFn;
 /// `VLOOKUP` searches vertically and returns the matching row's value from `col_index_num`.
 ///
 /// # Remarks
-/// - `col_index_num` is 1-based and must be within the table width.
+/// - `col_index_num` is 1-based and must be within the table width as written (whole rows span 16,384 columns).
 /// - `range_lookup` defaults to `TRUE`, matching Excel and LibreOffice.
 /// - When `range_lookup=TRUE`, approximate match logic is used against the first column.
 /// - In exact mode, a blank candidate never matches. A blank lookup value matches a real numeric zero, but not blank, text, or boolean candidates.
@@ -516,7 +527,11 @@ impl Function for VLookupFn {
                 let current_sheet = ctx.current_sheet();
                 let rv = ctx.resolve_range_view(&table_ref, current_sheet)?;
                 let (rows, cols) = rv.dims();
-                if col_index as usize > cols {
+                // The table is as wide as written: the view of whole rows
+                // (1:2) stops at the last used column, and a column past it
+                // is blank, not outside the table.
+                let width = reference_extent(&table_ref).map_or(cols, |(_, cols)| cols);
+                if col_index as usize > width {
                     return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                         ExcelError::new(ExcelErrorKind::Ref),
                     )));
@@ -627,7 +642,7 @@ pub struct HLookupFn;
 /// `HLOOKUP` searches horizontally and returns the matching column's value from `row_index_num`.
 ///
 /// # Remarks
-/// - `row_index_num` is 1-based and must be within the table height.
+/// - `row_index_num` is 1-based and must be within the table height as written (whole columns span 1,048,576 rows).
 /// - `range_lookup` defaults to `TRUE`, matching Excel and LibreOffice.
 /// - When `range_lookup=TRUE`, approximate match logic is used against the first row.
 /// - In exact mode, a blank candidate never matches. A blank lookup value matches a real numeric zero, but not blank, text, or boolean candidates.
@@ -781,7 +796,11 @@ impl Function for HLookupFn {
                 let current_sheet = ctx.current_sheet();
                 let rv = ctx.resolve_range_view(&table_ref, current_sheet)?;
                 let (rows, cols) = rv.dims();
-                if row_index as usize > rows {
+                // The table is as tall as written: the view of whole columns
+                // (A:B) stops at the last used row, and a row past it is
+                // blank, not outside the table.
+                let height = reference_extent(&table_ref).map_or(rows, |(rows, _)| rows);
+                if row_index as usize > height {
                     return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                         ExcelError::new(ExcelErrorKind::Ref),
                     )));

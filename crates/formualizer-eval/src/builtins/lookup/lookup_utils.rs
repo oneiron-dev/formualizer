@@ -29,6 +29,19 @@ pub fn value_to_f64_lenient(v: &LiteralValue, date_system: DateSystem) -> Option
     }
 }
 
+/// Whether two numbers are the same lookup key.
+///
+/// Excel keeps 15 significant digits, so two numbers that differ within them
+/// are different keys however close to zero they are: 5E-13 is not 0, and a
+/// lookup for 0 neither finds it as an exact match nor counts it as the
+/// largest value at or below 0. A difference past the 15th significant digit
+/// is floating-point noise (`0.1+0.2` against `0.3`) and does not separate
+/// two numbers, as with the `=` operator; a difference of 1E-12 or more
+/// always does.
+pub(crate) fn lookup_numbers_equal(x: f64, y: f64) -> bool {
+    x == y || ((x - y).abs() < 1e-12 && crate::coercion::same_to_15_digits(x, y))
+}
+
 /// Case-insensitive text equality (no wildcards).
 pub fn text_equal_ci(a: &str, b: &str) -> bool {
     a.to_lowercase() == b.to_lowercase()
@@ -41,7 +54,7 @@ pub fn cmp_for_lookup(a: &LiteralValue, b: &LiteralValue, date_system: DateSyste
         value_to_f64_lenient(a, date_system),
         value_to_f64_lenient(b, date_system),
     ) {
-        if (x - y).abs() < 1e-12 {
+        if lookup_numbers_equal(x, y) {
             return Some(0);
         }
         return Some(if x < y { -1 } else { 1 });
@@ -667,7 +680,7 @@ fn find_exact_number_in_view(
             if !cols.is_empty() {
                 let arr = &cols[0];
                 for i in 0..arr.len() {
-                    if !arr.is_null(i) && (arr.value(i) - n).abs() < 1e-12 {
+                    if !arr.is_null(i) && lookup_numbers_equal(arr.value(i), n) {
                         return Ok(Some(row_start + i));
                     }
                 }
@@ -678,7 +691,7 @@ fn find_exact_number_in_view(
         for res in view.numbers_slices() {
             let (_row_start, _row_len, cols) = res?;
             for (c, arr) in cols.iter().enumerate() {
-                if !arr.is_null(0) && (arr.value(0) - n).abs() < 1e-12 {
+                if !arr.is_null(0) && lookup_numbers_equal(arr.value(0), n) {
                     return Ok(Some(c));
                 }
             }
