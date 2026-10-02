@@ -20424,8 +20424,11 @@ where
             .expect("cell ref for vertex");
         let interpreter = self.formula_interpreter(self, sheet_name, cell_ref);
 
-        let result =
-            interpreter.evaluate_arena_ast(ast_id, self.graph.data_store(), self.graph.sheet_reg());
+        let result = interpreter.evaluate_arena_formula(
+            ast_id,
+            self.graph.data_store(),
+            self.graph.sheet_reg(),
+        );
 
         // If array result, perform spill from the anchor cell
         match result {
@@ -26535,7 +26538,7 @@ where
         let interpreter = self.formula_interpreter(self, sheet_name, cell_ref);
 
         interpreter
-            .evaluate_arena_ast(ast_id, self.graph.data_store(), self.graph.sheet_reg())
+            .evaluate_arena_formula(ast_id, self.graph.data_store(), self.graph.sheet_reg())
             .map(|cv| {
                 let format = cv.format_id();
                 self.derived_format_results
@@ -29196,7 +29199,7 @@ where
                     .expect("cell ref for vertex");
                 let interpreter = self.formula_interpreter(ctx, sheet_name, cell_ref);
                 interpreter
-                    .evaluate_arena_ast(ast_id, self.graph.data_store(), self.graph.sheet_reg())
+                    .evaluate_arena_formula(ast_id, self.graph.data_store(), self.graph.sheet_reg())
                     .map(|cv| {
                         let format = cv.format_id();
                         self.derived_format_results

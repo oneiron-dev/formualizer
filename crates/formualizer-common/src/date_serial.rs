@@ -341,9 +341,16 @@ fn parse_month_name(text: &str) -> Option<u32> {
 ///
 /// Parsing has no locale parameter, uses English AM/PM markers, and never
 /// consults the host locale. ASCII whitespace around separators is ignored.
-/// Fractional seconds (e.g. `12:30:45.5`) are truncated to whole seconds.
+/// Fractional seconds (e.g. `12:30:45.5`) are truncated to whole seconds; the
+/// serial of the text ([`parse_excel_datetime_text_to_serial_for`]) keeps them.
 /// `24:00` and `24:00:00` are accepted as midnight (Excel compatibility).
 pub fn parse_excel_time_text(input: &str) -> Option<NaiveTime> {
+    parse_time_with_fractional_seconds(input).map(|(time, _)| time)
+}
+
+/// [`parse_excel_time_text`] plus the fractional seconds it truncates
+/// (`0.5` for `12:30:45.5`).
+fn parse_time_with_fractional_seconds(input: &str) -> Option<(NaiveTime, f64)> {
     let text = trim_date_time_spaces(input)?;
     let mut normalized = String::with_capacity(text.len());
     let mut pending_space = false;
@@ -361,27 +368,28 @@ pub fn parse_excel_time_text(input: &str) -> Option<NaiveTime> {
 
     // Handle 24:00 and 24:00:00 as midnight (Excel treats this as end-of-day = 0:00)
     if normalized == "24:00" || normalized == "24:00:00" {
-        return Some(NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+        return Some((NaiveTime::from_hms_opt(0, 0, 0).unwrap(), 0.0));
     }
 
-    // Strip fractional seconds: "12:30:45.5" → "12:30:45"
-    // Find the seconds decimal point (after the second colon) and truncate
-    let normalized = strip_fractional_seconds(&normalized);
+    // Split off fractional seconds: "12:30:45.5" → "12:30:45" and 0.5
+    // Find the seconds decimal point (after the second colon)
+    let (normalized, fraction) = split_fractional_seconds(&normalized);
 
     const FORMATS: &[&str] = &["%H:%M:%S", "%H:%M", "%I:%M:%S %p", "%I:%M %p"];
     FORMATS
         .iter()
         .find_map(|format| NaiveTime::parse_from_str(&normalized, format).ok())
+        .map(|time| (time, fraction))
 }
 
-/// Strip fractional seconds from a time string: "12:30:45.123" → "12:30:45"
+/// Split fractional seconds from a time string: "12:30:45.125" → ("12:30:45", 0.125)
 ///
 /// Only a dot that terminates a full `HH:MM:SS` field is treated as fractional
 /// seconds. The dot must be preceded by two colons (the hour and minute
 /// separators), so `"12:00.5"` — a single colon, i.e. a malformed time — is
 /// left untouched and subsequently rejected by the parser as `#VALUE!` rather
 /// than silently accepted as `12:00`.
-fn strip_fractional_seconds(text: &str) -> String {
+fn split_fractional_seconds(text: &str) -> (String, f64) {
     // Find pattern: digits followed by '.' followed by digits, where this
     // appears after the second ':' (seconds position) or before a space/AM/PM
     if let Some(dot_pos) = text.find('.') {
@@ -399,11 +407,14 @@ fn strip_fractional_seconds(text: &str) -> String {
                 // Reconstruct without the fractional part
                 let mut result = before_dot.to_string();
                 result.push_str(&after_dot[frac_end..]);
-                return result;
+                let fraction = format!("0.{}", &after_dot[..frac_end])
+                    .parse::<f64>()
+                    .unwrap_or(0.0);
+                return (result, fraction);
             }
         }
     }
-    text.to_string()
+    (text.to_string(), 0.0)
 }
 
 /// Parse an en-US date and time separated by whitespace or an ISO `T`.
@@ -422,6 +433,15 @@ pub fn parse_excel_datetime_text_in_year(
     input: &str,
     current_year: Option<i32>,
 ) -> Option<NaiveDateTime> {
+    parse_datetime_with_fractional_seconds(input, current_year).map(|(datetime, _)| datetime)
+}
+
+/// [`parse_excel_datetime_text_in_year`] plus the fractional seconds of its
+/// time part.
+fn parse_datetime_with_fractional_seconds(
+    input: &str,
+    current_year: Option<i32>,
+) -> Option<(NaiveDateTime, f64)> {
     let text = trim_date_time_spaces(input)?;
     text.char_indices()
         .filter(|(_, ch)| *ch == 'T' || ch.is_ascii_whitespace())
@@ -432,8 +452,8 @@ pub fn parse_excel_datetime_text_in_year(
             } else {
                 parse_excel_date_text_in_year(&text[..index], current_year)?
             };
-            let time = parse_excel_time_text(&text[time_start..])?;
-            Some(date.and_time(time))
+            let (time, fraction) = parse_time_with_fractional_seconds(&text[time_start..])?;
+            Some((date.and_time(time), fraction))
         })
 }
 
@@ -450,6 +470,14 @@ pub fn is_excel_date_text_in_range(system: DateSystem, date: &NaiveDate) -> bool
     (first..=EXCEL_MAX_DATE).contains(date)
 }
 
+/// The fraction of a day at `time` plus `fractional_seconds`.
+fn time_to_fraction_with_seconds(time: &NaiveTime, fractional_seconds: f64) -> f64 {
+    if fractional_seconds == 0.0 {
+        return time_to_fraction(time);
+    }
+    (time.num_seconds_from_midnight() as f64 + fractional_seconds) / SECONDS_PER_DAY
+}
+
 /// Parse spreadsheet date, time, or datetime text and return its serial.
 ///
 /// This is the canonical entry point for text operands that need a temporal
@@ -458,6 +486,8 @@ pub fn is_excel_date_text_in_range(system: DateSystem, date: &NaiveDate) -> bool
 /// system; time-only results are fractional days in either system. Text
 /// naming a day outside the system's date range
 /// ([`is_excel_date_text_in_range`]) is no date and returns `None`.
+/// Fractional seconds count (`12:00:00.5` is noon plus half a second), since
+/// Excel keeps times as fractions of a day.
 pub fn parse_excel_datetime_text_to_serial_for(system: DateSystem, input: &str) -> Option<f64> {
     parse_excel_datetime_text_to_serial_in_year_for(system, input, None)
 }
@@ -469,15 +499,20 @@ pub fn parse_excel_datetime_text_to_serial_in_year_for(
     input: &str,
     current_year: Option<i32>,
 ) -> Option<f64> {
-    if let Some(datetime) = parse_excel_datetime_text_in_year(input, current_year) {
-        return is_excel_date_text_in_range(system, &datetime.date())
-            .then(|| datetime_to_serial_for(system, &datetime));
+    if let Some((datetime, fraction)) = parse_datetime_with_fractional_seconds(input, current_year)
+    {
+        let date = datetime.date();
+        return is_excel_date_text_in_range(system, &date).then(|| {
+            date_to_serial_for(system, &date)
+                + time_to_fraction_with_seconds(&datetime.time(), fraction)
+        });
     }
     if let Some(date) = parse_excel_date_text_in_year(input, current_year) {
         return is_excel_date_text_in_range(system, &date)
             .then(|| date_to_serial_for(system, &date));
     }
-    parse_excel_time_text(input).map(|time| time_to_fraction(&time))
+    parse_time_with_fractional_seconds(input)
+        .map(|(time, fraction)| time_to_fraction_with_seconds(&time, fraction))
 }
 
 /// Return the final whole-day serial supported by Excel's calendar.
@@ -1170,6 +1205,27 @@ mod tests {
             parse_excel_datetime_text_to_serial_for(DateSystem::Excel1900, "1/2/2023 6:00\n"),
             None
         );
+    }
+
+    #[test]
+    fn text_serials_keep_fractional_seconds() {
+        // Excel keeps times as fractions of a day: half a second is 0.5/86400.
+        let serial = |text| parse_excel_datetime_text_to_serial_for(DateSystem::Excel1900, text);
+        assert_eq!(serial("12:00:00.5"), Some((43_200.0 + 0.5) / 86_400.0));
+        assert_eq!(serial("0:00:01.25"), Some(1.25 / 86_400.0));
+        assert_eq!(serial("12:00:00.5 PM"), Some((43_200.0 + 0.5) / 86_400.0));
+        assert_eq!(
+            serial("3/1/2021 12:00:00.5"),
+            Some(44_256.0 + (43_200.0 + 0.5) / 86_400.0)
+        );
+        assert!(serial("12:00:00.5").unwrap() > 0.5);
+        // Whole seconds are unchanged.
+        assert_eq!(serial("12:00:00.0"), Some(0.5));
+        assert_eq!(serial("12:00"), Some(0.5));
+        assert_eq!(serial("3/1/2021 12:00"), Some(44_256.5));
+        // Only the spaces around the text are ignored.
+        assert_eq!(serial(" 12:00:00.5 "), Some((43_200.0 + 0.5) / 86_400.0));
+        assert_eq!(serial("12:00:00.5\n"), None);
     }
 
     #[test]

@@ -390,7 +390,8 @@ pub(crate) fn numeric_criteria_mask(
 /// read in the function call's date context
 /// ([`crate::coercion::argument_date_text_serial`]), and its serial equals
 /// the criterion's number as numbers do, to 15 significant digits
-/// ([`numbers_equal`]). A logical is never a number for criteria.
+/// ([`numbers_equal`]): midnight ("0:00") is 0, not 1E-13. A logical is never
+/// a number for criteria.
 fn date_text_equals(criterion: &LiteralValue, v: &LiteralValue) -> bool {
     let LiteralValue::Text(text) = v else {
         return false;

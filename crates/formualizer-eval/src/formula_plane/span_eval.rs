@@ -304,8 +304,8 @@ impl<'a> SpanEvaluator<'a> {
 
             // Constant-result spans have only all-absolute precedents, so
             // placement offsets cannot affect their value. Materialize the
-            // template once and evaluate through `evaluate_ast`, which keeps
-            // the AST planner enabled for chunked reductions such as SUMIFS.
+            // template once and evaluate through `evaluate_formula_ast`, which
+            // keeps the AST planner enabled for chunked reductions such as SUMIFS.
             report.transient_ast_relocation_count =
                 report.transient_ast_relocation_count.saturating_add(1);
             let ast_tree = self
@@ -317,7 +317,7 @@ impl<'a> SpanEvaluator<'a> {
                 first_writable_placement.row,
                 first_writable_placement.col,
             ));
-            let (value, format_id) = match interpreter.evaluate_ast(&ast_tree) {
+            let (value, format_id) = match interpreter.evaluate_formula_ast(&ast_tree) {
                 Ok(calc) => {
                     let format_id = calc.format_id();
                     (
@@ -448,7 +448,7 @@ impl<'a> SpanEvaluator<'a> {
                 literal_slots_by_node: &binding_set.template_slot_map.literal_slots_by_arena_node,
                 literal_values: binding.as_ref(),
             });
-            match interpreter.evaluate_arena_ast_with_offset(
+            match interpreter.evaluate_arena_formula_with_offset(
                 ast_id,
                 row_delta,
                 col_delta,
@@ -471,7 +471,7 @@ impl<'a> SpanEvaluator<'a> {
                 },
             }
         } else {
-            match interpreter.evaluate_arena_ast_with_offset(
+            match interpreter.evaluate_arena_formula_with_offset(
                 ast_id,
                 row_delta,
                 col_delta,
@@ -756,7 +756,7 @@ impl<'a> SpanEvaluator<'a> {
                 literal_slots_by_node: &binding_set.template_slot_map.literal_slots_by_arena_node,
                 literal_values: binding.as_ref(),
             });
-        let value = match interpreter.evaluate_arena_ast_with_offset(
+        let value = match interpreter.evaluate_arena_formula_with_offset(
             ast_id,
             row_delta,
             col_delta,

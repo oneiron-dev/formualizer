@@ -256,3 +256,55 @@ fn criteria_read_date_text_in_the_workbook_date_system() {
         }
     }
 }
+
+#[test]
+fn date_and_time_text_criteria_compare_serials_to_15_digits() {
+    // Midnight ("0:00") is serial 0, noon 0.5, and "12:00:00.5" is half a
+    // second after noon; "12/31/1899" is before Excel's date text range, so
+    // it stays text. A serial equals a number that agrees to 15 significant
+    // digits, as numbers do: "8:30" (0.35416666666666669) is
+    // 0.354166666666667, the number "8:30"'s serial reads as in text.
+    for config in [EvalConfig::default(), super::common::arrow_eval_config()] {
+        let mut engine = Engine::new(TestWorkbook::new(), config);
+        let cells = [
+            LiteralValue::Text("0:00".into()),
+            LiteralValue::Text("12:00".into()),
+            LiteralValue::Number(0.5),
+            LiteralValue::Text("12:00:00.5".into()),
+            LiteralValue::Number(0.0),
+            LiteralValue::Text("12/31/1899".into()),
+            LiteralValue::Text("8:30".into()),
+        ];
+        for (i, cell) in cells.into_iter().enumerate() {
+            engine
+                .set_cell_value("Sheet1", i as u32 + 1, 1, cell)
+                .unwrap();
+        }
+        let cases = [
+            ("=COUNTIF(A1,1E-13)", 0.0),
+            ("=COUNTIF(A1,\"<>1E-13\")", 1.0),
+            ("=COUNTIF(A1,0)", 1.0),
+            ("=COUNTIF(A2,0.5000000000005)", 0.0),
+            ("=COUNTIF(A2,0.5)", 1.0),
+            ("=COUNTIF(A3,\"12:00:00.5\")", 0.0),
+            ("=COUNTIF(A3,\"<12:00:00.5\")", 1.0),
+            ("=COUNTIF(A3,\"12:00:00\")", 1.0),
+            ("=COUNTIF(A4,0.5)", 0.0),
+            ("=COUNTIF(A4,\"12:00:00.5\")", 1.0),
+            ("=COUNTIF(A5,\"12/31/1899\")", 0.0),
+            ("=COUNTIF(A6,0)", 0.0),
+            ("=COUNTIF(A6,\"12/31/1899\")", 1.0),
+            ("=COUNTIF(A1:A6,0)", 2.0),
+            ("=COUNTIF(A7,0.354166666666667)", 1.0),
+            ("=COUNTIF(A7,\"<>0.354166666666667\")", 0.0),
+            ("=COUNTIF(A7,0.35416666666667)", 0.0),
+        ];
+        for (formula, expected) in cases {
+            assert_eq!(
+                criteria_value(&mut engine, formula),
+                LiteralValue::Number(expected),
+                "{formula}"
+            );
+        }
+    }
+}

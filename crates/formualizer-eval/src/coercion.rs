@@ -499,9 +499,51 @@ pub fn to_datetime_serial(value: &LiteralValue) -> Result<f64, ExcelError> {
     }
 }
 
+/// Excel's compensation of a final addition or subtraction (Microsoft,
+/// "Floating-point arithmetic may give inaccurate results in Excel", "Example
+/// when a value reaches zero"): when `sum`, the result of adding or
+/// subtracting `a` and `b`, lands at or very close to zero, within the binary
+/// conversion error of its operands, it is exactly 0. `=1.333+1.225-1.333-1.225`
+/// and `=0.5-0.4-0.1` are 0 (residues of one or two units in the last place of
+/// the operands), while a residue of eight units (`=A1-A2` with A1 =
+/// 14.860000000000014 and A2 = 14.86) and genuinely small results stay. Excel
+/// applies this to a formula's last operation only: `=1*(0.5-0.4-0.1)` keeps
+/// -2.78E-17.
+pub fn snap_cancellation(sum: f64, a: f64, b: f64) -> f64 {
+    const NOISE: f64 = 1.0 / (1u64 << 51) as f64;
+    if sum != 0.0 && sum.is_finite() && sum.abs() <= a.abs().max(b.abs()) * NOISE {
+        0.0
+    } else {
+        sum
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_snaps_only_within_binary_noise() {
+        // Microsoft's example and other one- or two-unit residues are 0.
+        let (a, b) = (1.333 + 1.225 - 1.333, 1.225);
+        assert_ne!(a - b, 0.0);
+        assert_eq!(snap_cancellation(a - b, a, b), 0.0);
+        let (a, b) = (0.5 - 0.4, 0.1);
+        assert_eq!(snap_cancellation(a - b, a, b), 0.0);
+        let (a, b) = (-40411178.260000005, 40411178.26);
+        assert_eq!(snap_cancellation(a + b, a, b), 0.0);
+        // An eight-unit residue and genuinely small results stay.
+        let (a, b) = (14.860000000000014, 14.86);
+        assert_eq!(snap_cancellation(a - b, a, b), a - b);
+        assert_eq!(snap_cancellation(1e-20 + 1e-20, 1e-20, 1e-20), 2e-20);
+        assert_eq!(snap_cancellation(2e-20 - 1e-20, 2e-20, 1e-20), 1e-20);
+        assert_eq!(snap_cancellation(1.0 - 0.999, 1.0, 0.999), 1.0 - 0.999);
+        assert_eq!(snap_cancellation(5.0, 2.0, 3.0), 5.0);
+        assert_eq!(
+            snap_cancellation(f64::INFINITY, f64::INFINITY, 1.0),
+            f64::INFINITY
+        );
+    }
 
     #[test]
     fn number_lenient_parses_text_and_booleans() {
@@ -1035,6 +1077,9 @@ mod tests {
             sanitize_numeric(-f64::MIN_POSITIVE).unwrap(),
             -f64::MIN_POSITIVE
         );
+        // POWER and ^ underflow through the same guard.
+        assert_eq!(excel_power(10.0, -309.0).unwrap(), 0.0);
+        assert_eq!(excel_power(10.0, -307.0).unwrap(), 10f64.powf(-307.0));
     }
 
     #[test]

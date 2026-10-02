@@ -559,6 +559,59 @@ mod criteria_tests {
     }
 
     #[test]
+    fn date_and_time_text_criteria_equal_their_serials_to_15_digits() {
+        // Midnight is 0, not 1E-13; noon is 0.5, not 0.5000000000005. Like
+        // numbers, a serial equals a criterion that agrees to 15 significant
+        // digits: "8:30" (0.35416666666666669) equals 0.354166666666667.
+        let tiny = parse_criteria(&LiteralValue::Number(1e-13)).unwrap();
+        assert!(!criteria_match(&tiny, &text("0:00")));
+        let not_tiny = parse_criteria(&text("<>1E-13")).unwrap();
+        assert!(criteria_match(&not_tiny, &text("0:00")));
+        let zero = parse_criteria(&LiteralValue::Number(0.0)).unwrap();
+        assert!(criteria_match(&zero, &text("0:00")));
+        let near_noon = parse_criteria(&LiteralValue::Number(0.5000000000005)).unwrap();
+        assert!(!criteria_match(&near_noon, &text("12:00")));
+        let noon = parse_criteria(&LiteralValue::Number(0.5)).unwrap();
+        assert!(criteria_match(&noon, &text("12:00")));
+        let half_past_eight = parse_criteria(&LiteralValue::Number(0.354166666666667)).unwrap();
+        assert!(criteria_match(&half_past_eight, &text("8:30")));
+        let not_half_past_eight = parse_criteria(&text("<>0.354166666666667")).unwrap();
+        assert!(!criteria_match(&not_half_past_eight, &text("8:30")));
+    }
+
+    #[test]
+    fn time_criteria_keep_fractional_seconds() {
+        // "12:00:00.5" is half a second after noon, in the criterion and in a
+        // cell, so it neither equals nor falls below noon itself.
+        let half_past = (43_200.0 + 0.5) / 86_400.0;
+        let pred = parse_criteria(&text("12:00:00.5")).unwrap();
+        assert!(matches!(
+            pred,
+            CriteriaPredicate::Eq(LiteralValue::Number(n)) if n == half_past
+        ));
+        assert!(!criteria_match(&pred, &LiteralValue::Number(0.5)));
+        assert!(criteria_match(&pred, &text("12:00:00.5")));
+        let below = parse_criteria(&text("<12:00:00.5")).unwrap();
+        assert!(criteria_match(&below, &LiteralValue::Number(0.5)));
+        let noon = parse_criteria(&LiteralValue::Number(0.5)).unwrap();
+        assert!(!criteria_match(&noon, &text("12:00:00.5")));
+    }
+
+    #[test]
+    fn date_text_before_1900_stays_a_text_criterion() {
+        // DATEVALUE reads date text from January 1, 1900; "12/31/1899" is
+        // text, so it neither matches serial 0 nor is matched by 0.
+        let pred = parse_criteria(&text("12/31/1899")).unwrap();
+        assert!(matches!(pred, CriteriaPredicate::Eq(LiteralValue::Text(_))));
+        assert!(!criteria_match(&pred, &LiteralValue::Number(0.0)));
+        assert!(criteria_match(&pred, &text("12/31/1899")));
+        let zero = parse_criteria(&LiteralValue::Number(0.0)).unwrap();
+        assert!(!criteria_match(&zero, &text("12/31/1899")));
+        let one = parse_criteria(&LiteralValue::Number(1.0)).unwrap();
+        assert!(criteria_match(&one, &text("1/1/1900")));
+    }
+
+    #[test]
     fn criteria_dates_follow_the_date_system_and_clock_year() {
         // Criteria read date text in the function call's date context: here
         // a 1904 workbook whose clock is in 2021.

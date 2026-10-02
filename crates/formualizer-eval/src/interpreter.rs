@@ -1041,6 +1041,27 @@ impl<'a> Interpreter<'a> {
         self.evaluate_ast_uncached(node)
     }
 
+    /// Evaluates a cell formula from its root. A root `+`/`-` is the formula's
+    /// last operation, whose result Excel compensates to exactly 0 when it
+    /// lands within binary conversion error of zero (`=0.5-0.4-0.1` is 0,
+    /// `=1*(0.5-0.4-0.1)` keeps -2.78E-17). The parsed AST does not record
+    /// outer parentheses, so `=(0.1+0.2-0.3)`, which Excel leaves alone, is
+    /// compensated too.
+    pub(crate) fn evaluate_formula_ast(
+        &self,
+        node: &ASTNode,
+    ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        if self.legacy.is_some() {
+            return self.with_legacy_context(None).evaluate_formula_ast(node);
+        }
+        match &node.node_type {
+            ASTNodeType::BinaryOp { op, left, right } if matches!(op.as_str(), "+" | "-") => {
+                self.eval_binary(op, left, right, true)
+            }
+            _ => self.evaluate_ast(node),
+        }
+    }
+
     pub(crate) fn evaluate_ast_with_offset(
         &self,
         node: &ASTNode,
@@ -1084,7 +1105,9 @@ impl<'a> Interpreter<'a> {
             .map(|reference| reference.into_owned())
     }
 
-    pub(crate) fn evaluate_arena_ast_with_offset(
+    /// [`Self::evaluate_arena_formula`] of a formula template placed
+    /// `row_delta` rows and `col_delta` columns from its anchor.
+    pub(crate) fn evaluate_arena_formula_with_offset(
         &self,
         node_id: AstNodeId,
         row_delta: i64,
@@ -1103,7 +1126,7 @@ impl<'a> Interpreter<'a> {
             parameter_bindings: self.parameter_bindings,
             legacy: self.legacy,
         };
-        offset.evaluate_arena_ast(node_id, data_store, sheet_registry)
+        offset.evaluate_arena_formula(node_id, data_store, sheet_registry)
     }
 
     fn annotate_cell_value(
@@ -1198,6 +1221,29 @@ impl<'a> Interpreter<'a> {
         node_id: AstNodeId,
         data_store: &DataStore,
         sheet_registry: &SheetRegistry,
+    ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        self.evaluate_arena_node(node_id, data_store, sheet_registry, false)
+    }
+
+    /// Arena counterpart of [`Self::evaluate_formula_ast`]: evaluates a cell
+    /// formula from its root, whose `+`/`-` is the formula's last operation.
+    pub(crate) fn evaluate_arena_formula(
+        &self,
+        node_id: AstNodeId,
+        data_store: &DataStore,
+        sheet_registry: &SheetRegistry,
+    ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        self.evaluate_arena_node(node_id, data_store, sheet_registry, true)
+    }
+
+    /// Evaluates an arena node. `final_step` marks a cell formula's root, where
+    /// a `+`/`-` is the last operation (see [`coercion::snap_cancellation`]).
+    fn evaluate_arena_node(
+        &self,
+        node_id: AstNodeId,
+        data_store: &DataStore,
+        sheet_registry: &SheetRegistry,
+        final_step: bool,
     ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
         let node = data_store.get_node(node_id).ok_or_else(|| {
             ExcelError::new(ExcelErrorKind::Value).with_message("Missing AST node")
@@ -1347,18 +1393,9 @@ impl<'a> Interpreter<'a> {
                 }
 
                 match op {
-                    "+" => self.numeric_binary(left, right, |a, b| a + b).map(|value| {
-                        self.annotate_numeric_result(
-                            value,
-                            self.binary_format('+', left_format, right_format),
-                        )
-                    }),
-                    "-" => self.numeric_binary(left, right, |a, b| a - b).map(|value| {
-                        self.annotate_numeric_result(
-                            value,
-                            self.binary_format('-', left_format, right_format),
-                        )
-                    }),
+                    "+" | "-" => {
+                        self.additive(op, left, left_format, right, right_format, final_step)
+                    }
                     "*" => self
                         .numeric_binary(left, right, |a, b| a * b)
                         .map(crate::traits::CalcValue::Scalar),
@@ -1508,7 +1545,7 @@ impl<'a> Interpreter<'a> {
             ASTNodeType::UnaryOp { op, expr } => self
                 .eval_unary(op, expr)
                 .map(crate::traits::CalcValue::Scalar),
-            ASTNodeType::BinaryOp { op, left, right } => self.eval_binary(op, left, right),
+            ASTNodeType::BinaryOp { op, left, right } => self.eval_binary(op, left, right, false),
             ASTNodeType::Function { name, args } => self.eval_function_to_calc(name, args),
             ASTNodeType::Call { callee, args } => self.eval_call_to_calc(callee, args),
             ASTNodeType::Array(rows) => self.eval_array_literal_to_calc(rows),
@@ -1530,7 +1567,7 @@ impl<'a> Interpreter<'a> {
                 self.eval_unary(op, expr)
                     .map(crate::traits::CalcValue::Scalar)
             }
-            ASTNodeType::BinaryOp { op, left, right } => self.eval_binary(op, left, right),
+            ASTNodeType::BinaryOp { op, left, right } => self.eval_binary(op, left, right, false),
             ASTNodeType::Function { name, args } => {
                 let strategy = plan_node.strategy;
                 if let Some(fun) = self.context.get_function("", name) {
@@ -1933,11 +1970,13 @@ impl<'a> Interpreter<'a> {
     }
 
     /* ===================  binary ops  =================== */
+    /// `final_step` marks a cell formula's root (see [`Self::additive`]).
     fn eval_binary(
         &self,
         op: &str,
         left_node: &ASTNode,
         right_node: &ASTNode,
+        final_step: bool,
     ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
         if op == " " {
             let intersection = self.evaluate_ast_as_reference(left_node).and_then(|lref| {
@@ -1975,18 +2014,7 @@ impl<'a> Interpreter<'a> {
                 .map(crate::traits::CalcValue::Scalar);
         }
         match op {
-            "+" => self.numeric_binary(left, right, |a, b| a + b).map(|value| {
-                self.annotate_numeric_result(
-                    value,
-                    self.binary_format('+', left_format, right_format),
-                )
-            }),
-            "-" => self.numeric_binary(left, right, |a, b| a - b).map(|value| {
-                self.annotate_numeric_result(
-                    value,
-                    self.binary_format('-', left_format, right_format),
-                )
-            }),
+            "+" | "-" => self.additive(op, left, left_format, right, right_format, final_step),
             "*" => self
                 .numeric_binary(left, right, |a, b| a * b)
                 .map(crate::traits::CalcValue::Scalar),
@@ -2113,6 +2141,44 @@ impl<'a> Interpreter<'a> {
     fn eval_array_literal(&self, rows: &[Vec<ASTNode>]) -> Result<LiteralValue, ExcelError> {
         self.eval_array_literal_to_calc(rows)
             .map(|cv| cv.into_literal())
+    }
+
+    /// `+`/`-` on evaluated operands. `final_step` marks a cell formula's last
+    /// operation, whose result Excel compensates to exactly 0 when it lands
+    /// within binary conversion error of zero (Microsoft, "Example when a
+    /// value reaches zero": `=1.333+1.225-1.333-1.225` is 0); intermediate
+    /// results keep their residue (`=1*(0.5-0.4-0.1)` is -2.78E-17).
+    fn additive(
+        &self,
+        op: &str,
+        left: LiteralValue,
+        left_format: Option<crate::format::FormatId>,
+        right: LiteralValue,
+        right_format: Option<crate::format::FormatId>,
+        final_step: bool,
+    ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        let snap = |sum: f64, a: f64, b: f64| {
+            if final_step {
+                coercion::snap_cancellation(sum, a, b)
+            } else {
+                sum
+            }
+        };
+        let (value, format_op) = if op == "+" {
+            (
+                self.numeric_binary(left, right, |a, b| snap(a + b, a, b))?,
+                '+',
+            )
+        } else {
+            (
+                self.numeric_binary(left, right, |a, b| snap(a - b, a, b))?,
+                '-',
+            )
+        };
+        Ok(self.annotate_numeric_result(
+            value,
+            self.binary_format(format_op, left_format, right_format),
+        ))
     }
 
     fn numeric_binary<F>(
