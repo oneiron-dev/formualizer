@@ -57,6 +57,9 @@ pub struct MatchFn;
 /// - Approximate modes expect sorted data but do not check it: like Excel they bisect the lookup array, so unsorted data gives whichever entry the search reaches, or `#N/A`.
 /// - `lookup_array` must be one row or one column; a two-dimensional array or reference returns `#N/A`.
 /// - If no match is found, returns `#N/A`.
+/// - `lookup_array` is searched when it is a reference or an array (`{1}` included). A single
+///   value there is not searched: a number, a logical or numeric text gives `#N/A`, other text
+///   `#VALUE!` (`MATCH(1,1,0)` is `#N/A`, `MATCH("a","a",0)` is `#VALUE!`).
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -290,31 +293,45 @@ impl Function for MatchFn {
                 Err(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
             }
         } else {
-            // Handle array literals and other non-reference values
-            let v = args[1].value()?.into_literal();
-            // An error in place of the lookup array is the result.
-            if let LiteralValue::Error(e) = v {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
-            }
-            let values: Vec<LiteralValue> = match v {
-                LiteralValue::Array(rows) => {
-                    if rows.len() == 1 {
-                        // Single row - use as-is
-                        rows.into_iter().next().unwrap_or_default()
-                    } else if rows.iter().all(|r| r.len() == 1) {
-                        // Column vector - extract first element of each row
-                        rows.into_iter()
-                            .filter_map(|r| r.into_iter().next())
-                            .collect()
-                    } else {
-                        // The lookup array must be one row or one column: a
-                        // two-dimensional array is not searched at all.
+            // An array value (a constant or a computed array, of any size,
+            // 1x1 included) is searched; a single value is not.
+            let rows: Vec<Vec<LiteralValue>> = match args[1].value()? {
+                crate::traits::CalcValue::Range(view) => {
+                    let (height, width) = view.dims();
+                    (0..height)
+                        .map(|r| (0..width).map(|c| view.get_cell(r, c)).collect())
+                        .collect()
+                }
+                other => match other.into_literal() {
+                    LiteralValue::Array(rows) => rows,
+                    // An error in place of the lookup array is the result.
+                    LiteralValue::Error(e) => {
+                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+                    }
+                    // A one-element array, held as a single value.
+                    value if args[1].has_array_source() => vec![vec![value]],
+                    value => {
                         return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                            ExcelError::new(ExcelErrorKind::Na),
+                            unsearched_lookup_array(&value, &args[1], ctx),
                         )));
                     }
-                }
-                other => vec![other],
+                },
+            };
+            // Flatten the array (MATCH works on 1D, so take first row or column)
+            let values: Vec<LiteralValue> = if rows.len() == 1 {
+                // Single row - use as-is
+                rows.into_iter().next().unwrap_or_default()
+            } else if rows.iter().all(|r| r.len() == 1) {
+                // Column vector - extract first element of each row
+                rows.into_iter()
+                    .filter_map(|r| r.into_iter().next())
+                    .collect()
+            } else {
+                // The lookup array must be one row or one column: a
+                // two-dimensional array is not searched at all.
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                    ExcelError::new(ExcelErrorKind::Na),
+                )));
             };
             let idx = if mt == 0 {
                 let wildcard_mode = matches!(lookup_value, LiteralValue::Text(ref s) if s.contains('*') || s.contains('?') || s.contains('~'));
@@ -331,6 +348,33 @@ impl Function for MatchFn {
                 ))),
             }
         }
+    }
+}
+
+/// The result of MATCH when its lookup_array is a single value rather than a
+/// reference or an array: Excel does not search it. It reads the value as a
+/// number and returns `#N/A`, or `#VALUE!` when it is text that does not read
+/// as a number. In a formula saved without the array flag an expression over
+/// ranges there is implicitly intersected to such a value, so
+/// `MATCH(B4&C3,I3:I22&J3:J22,0)` is `#VALUE!` and `MATCH(1,(A1:A9=1)*1,0)`
+/// is `#N/A` without array entry.
+fn unsearched_lookup_array(
+    value: &LiteralValue,
+    arg: &ArgumentHandle<'_, '_>,
+    ctx: &dyn FunctionContext<'_>,
+) -> ExcelError {
+    let is_number = !matches!(value, LiteralValue::Text(_))
+        || crate::coercion::to_arithmetic_number_with_locale(
+            value,
+            &ctx.locale(),
+            ctx.date_system(),
+            Some(arg.current_year()),
+        )
+        .is_ok();
+    if is_number {
+        ExcelError::new(ExcelErrorKind::Na)
+    } else {
+        ExcelError::new(ExcelErrorKind::Value)
     }
 }
 

@@ -509,6 +509,43 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         }
     }
 
+    /// Whether this argument's expression contains an array: an array constant
+    /// or a call to a function that returns an array (SEQUENCE, SORT,
+    /// TRANSPOSE, MMULT, ...). The engine holds a one-element array as a single
+    /// value where Excel keeps a 1x1 array, so `{1}+0`, `SEQUENCE(1)` and
+    /// `LET(x,SEQUENCE(1),x)` are arrays to Excel although their value here is
+    /// not. Functions that pass a value through (IF, CHOOSE, IFERROR, IFS,
+    /// SWITCH, LET, LAMBDA) are arrays only through their arguments.
+    pub(crate) fn has_array_source(&self) -> bool {
+        fn contains_array(interp: &Interpreter<'_>, node: &ASTNode) -> bool {
+            use crate::function::FnCaps;
+            match &node.node_type {
+                ASTNodeType::Array(_) | ASTNodeType::Literal(LiteralValue::Array(_)) => true,
+                ASTNodeType::Function { name, args } => {
+                    interp
+                        .context
+                        .function_capabilities("", name)
+                        .is_some_and(|caps| {
+                            caps.contains(FnCaps::MAY_SPILL)
+                                && !caps
+                                    .intersects(FnCaps::SHORT_CIRCUIT | FnCaps::LOCAL_ENVIRONMENT)
+                        })
+                        || args.iter().any(|arg| contains_array(interp, arg))
+                }
+                ASTNodeType::Call { callee, args } => {
+                    contains_array(interp, callee)
+                        || args.iter().any(|arg| contains_array(interp, arg))
+                }
+                ASTNodeType::UnaryOp { expr, .. } => contains_array(interp, expr),
+                ASTNodeType::BinaryOp { left, right, .. } => {
+                    contains_array(interp, left) || contains_array(interp, right)
+                }
+                _ => false,
+            }
+        }
+        contains_array(self.interp, self.ast())
+    }
+
     pub fn value(&self) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         self.cached_value
             .get_or_init(|| self.compute_value())

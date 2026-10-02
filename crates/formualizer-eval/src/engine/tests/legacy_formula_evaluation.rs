@@ -122,6 +122,97 @@ fn if_and_iferror_inside_an_array_argument_test_one_value() {
 }
 
 #[test]
+fn match_does_not_search_the_single_value_an_intersection_leaves() {
+    // Row 2 intersects A2=0 and B2=20: MATCH's lookup_array is one value,
+    // which MATCH does not search. Text that is not a number is #VALUE!
+    // (the classic INDEX/MATCH on joined columns without array entry).
+    assert_eq!(
+        error_kind(legacy(2, "=MATCH(\"0x\",A1:A3&\"x\",0)")),
+        ExcelErrorKind::Value
+    );
+    assert_eq!(
+        error_kind(legacy(2, "=INDEX(B1:B3,MATCH(\"0x\",A1:A3&\"x\",0))")),
+        ExcelErrorKind::Value
+    );
+    // A number, a logical or numeric text ("020") is #N/A, even when equal.
+    assert_eq!(
+        error_kind(legacy(2, "=MATCH(1,(A1:A3=0)*(B1:B3=20),0)")),
+        ExcelErrorKind::Na
+    );
+    assert_eq!(
+        error_kind(legacy(2, "=MATCH(TRUE,A1:A3=0,0)")),
+        ExcelErrorKind::Na
+    );
+    assert_eq!(
+        error_kind(legacy(2, "=MATCH(\"020\",A1:A3&B1:B3,0)")),
+        ExcelErrorKind::Na
+    );
+    // Array entry and an array argument search the whole expression.
+    assert_eq!(
+        evaluate(false, &[(2, 4, "=MATCH(\"0x\",A1:A3&\"x\",0)")])[0],
+        number(2.0)
+    );
+    assert_eq!(
+        legacy(2, "=MATCH(\"0x\",INDEX(A1:A3&\"x\",0),0)"),
+        number(2.0)
+    );
+}
+
+#[test]
+fn match_searches_references_and_arrays_but_not_single_values() {
+    for legacy_file in [true, false] {
+        let results = evaluate(
+            legacy_file,
+            &[
+                (5, 4, "=MATCH(1,1,0)"),
+                (5, 5, "=MATCH(TRUE,TRUE,0)"),
+                (5, 6, "=MATCH(\"1\",\"1\",0)"),
+                (5, 7, "=MATCH(\"a\",\"a\",0)"),
+                (5, 8, "=MATCH(0,A2&\"\",0)"),
+                (5, 9, "=MATCH(\"0x\",A2&\"x\",0)"),
+                (5, 10, "=MATCH(1,1/0,0)"),
+                // A one-cell reference and a one-element array, also one an
+                // array function returns or an expression computes from one,
+                // are searched.
+                (5, 11, "=MATCH(0,A2,0)"),
+                (5, 12, "=MATCH(\"a\",{\"a\"},0)"),
+                (5, 13, "=MATCH(20,B2:B2,0)"),
+                (5, 14, "=MATCH(1,SEQUENCE(1),0)"),
+                (5, 15, "=MATCH(1,TRANSPOSE(A1),0)"),
+                (5, 16, "=MATCH(10,INDEX(B1:B3,1),0)"),
+                (5, 17, "=MATCH(1,{1}+0,0)"),
+                (5, 18, "=MATCH(1,ABS({-1}),0)"),
+                (5, 19, "=MATCH(\"a\",LOWER({\"A\"}),0)"),
+                (5, 20, "=MATCH(1,LET(x,SEQUENCE(1),x),0)"),
+                (5, 21, "=MATCH(1,IF(TRUE,SEQUENCE(1),0),0)"),
+            ],
+        );
+        let kinds: Vec<_> = results[..7]
+            .iter()
+            .map(|value| error_kind(value.clone()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ExcelErrorKind::Na,
+                ExcelErrorKind::Na,
+                ExcelErrorKind::Na,
+                ExcelErrorKind::Value,
+                ExcelErrorKind::Na,
+                ExcelErrorKind::Value,
+                ExcelErrorKind::Div,
+            ],
+            "legacy={legacy_file}"
+        );
+        assert!(
+            results[7..].iter().all(|value| *value == number(1.0)),
+            "legacy={legacy_file}: {:?}",
+            &results[7..]
+        );
+    }
+}
+
+#[test]
 fn row_and_column_return_their_first_index_as_values() {
     assert_eq!(legacy(5, "=SUM(ROW(A1:A3))"), number(1.0));
     assert_eq!(legacy(5, "=SUM(COLUMN(A1:C1))"), number(1.0));

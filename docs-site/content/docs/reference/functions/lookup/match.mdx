@@ -18,6 +18,9 @@ description: "MATCH: Returns the relative position of a lookup value in a one-di
  - Approximate modes expect sorted data but do not check it: like Excel they bisect the lookup array, so unsorted data gives whichever entry the search reaches, or `#N/A`.
  - `lookup_array` must be one row or one column; a two-dimensional array or reference returns `#N/A`.
  - If no match is found, returns `#N/A`.
+ - `lookup_array` is searched when it is a reference or an array (`{1}` included). A single
+   value there is not searched: a number, a logical or numeric text gives `#N/A`, other text
+   `#VALUE!` (`MATCH(1,1,0)` is `#N/A`, `MATCH("a","a",0)` is `#VALUE!`).
 
 ## Examples
 
