@@ -35,10 +35,7 @@ fn to_text(arg: &ArgumentHandle<'_, '_>) -> Result<String, ExcelError> {
         LiteralValue::Empty => String::new(),
         LiteralValue::Boolean(b) => if b { "TRUE" } else { "FALSE" }.into(),
         LiteralValue::Int(i) => i.to_string(),
-        LiteralValue::Number(n) => {
-            let s = n.to_string();
-            s.strip_suffix(".0").map(str::to_string).unwrap_or(s)
-        }
+        LiteralValue::Number(n) => crate::coercion::number_to_text(n),
         LiteralValue::Error(e) => return Err(e),
         other => other.to_string(),
     })
