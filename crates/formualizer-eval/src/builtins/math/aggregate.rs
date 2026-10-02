@@ -23,9 +23,10 @@ pub struct SumFn;
 /// - If any argument evaluates to an error, `SUM` propagates the first error it encounters.
 /// - Unparseable text literals (e.g., `"foo"`) will result in a `#VALUE!` error.
 /// - Numbers are added in order, a range row by row. Like a formula's final
-///   `+`/`-`, the addition of the last number of a cell or range argument
-///   compensates a cancellation to exactly 0 (`SUM(A1:A3)` is 0 for 123.45,
-///   56.78 and -180.23); values given directly, such as
+///   `+`/`-`, the last addition of a number read from a cell compensates a
+///   cancellation to exactly 0: `SUM(A1:A3)` and `SUM(A1:A3,0)` are 0 for
+///   123.45, 56.78 and -180.23, but with a 0 in A4 `SUM(A1:A4)` keeps the
+///   2.84E-14 residual. Values given directly, such as
 ///   `SUM(123.45,56.78,-180.23)`, are added without compensation.
 ///
 /// # Examples
@@ -93,7 +94,24 @@ impl Function for SumFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        // Excel adds SUM's numbers one by one, arguments left to right and a
+        // range row by row, and keeps the total as added. Like a formula's
+        // final `+` (Microsoft, "Example when a value reaches zero"), its
+        // last addition of a number read from a cell is compensated: when
+        // that addition cancels (coercion::snap_cancellation, the total
+        // before it and the number), the values given directly after it
+        // (literals, expressions, arrays) are added to 0 instead of the
+        // residual. A later number read from a cell that does not cancel,
+        // even a 0, leaves the total as added, residual included. With
+        // 1.333, 1.225, -1.333, -1.225 and 0 in A1:A5, SUM(A1,A2,A3,A4),
+        // SUM(A1,A2,A3,A4,0) and SUM(A1,A2,A3,A5,A4) are 0, but
+        // SUM(A1,A2,A3,A4,A5) and SUM(A1:A5) keep -2.22E-16, as does
+        // SUM(1.333,1.225,-1.333,-1.225): a value given directly is never
+        // compensated itself.
         let mut total = 0.0;
+        // `Some(sum)` while the last addition of a cell's number cancelled:
+        // the values given directly since, added to 0, are the result.
+        let mut after_cancellation: Option<f64> = None;
         for arg in args {
             match resolve_aggregate_argument(arg, ctx)? {
                 AggregateArgument::Range(view) => {
@@ -115,16 +133,9 @@ impl Function for SumFn {
                         }
                     }
 
-                    // Excel adds a range's numbers one by one, row by row, and
-                    // compensates its addition of a reference's last number
-                    // like a formula's final `+` (Microsoft, "Example when a
-                    // value reaches zero"): for 2.558, -1.333 and -1.225 in
-                    // A1:A3, SUM(A1:A3), SUM(A1,A2,A3) and SUM(A1,A2,A3,0) are
-                    // 0. A cancellation before a reference's last number is
-                    // kept (a range ending in a 0 cell keeps its 5.68E-14), and
-                    // so is one by a value given directly: SUM(A1,--A2,--A3)
-                    // and SUM(2.558-1.333,-1.225) keep -2.22E-16. An array is
-                    // such a value.
+                    // A reference's numbers are read from cells; an array's
+                    // (such as A1:A3*1) are values given directly.
+                    let reference = arg.resolved_as_reference();
                     let mut last = None;
                     for res in view.numbers_slices() {
                         let (_, row_len, num_cols) = res?;
@@ -139,14 +150,17 @@ impl Function for SumFn {
                                     let value = col.value(row);
                                     last = Some((total, value));
                                     total += value;
+                                    if !reference && let Some(sum) = after_cancellation.as_mut() {
+                                        *sum += value;
+                                    }
                                 }
                             }
                         }
                     }
-                    if let Some((before, value)) = last
-                        && arg.resolved_as_reference()
-                    {
-                        total = crate::coercion::snap_cancellation(total, before, value);
+                    if reference && let Some((before, value)) = last {
+                        after_cancellation =
+                            (crate::coercion::snap_cancellation(total, before, value) == 0.0)
+                                .then_some(0.0);
                     }
                 }
                 AggregateArgument::ReferenceError(e) => {
@@ -156,12 +170,18 @@ impl Function for SumFn {
                     LiteralValue::Error(e) => {
                         return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
                     }
-                    v => total += coerce_num(&v)?,
+                    v => {
+                        let value = coerce_num(&v)?;
+                        total += value;
+                        if let Some(sum) = after_cancellation.as_mut() {
+                            *sum += value;
+                        }
+                    }
                 },
             }
         }
         Ok(crate::traits::CalcValue::Scalar(
-            super::super::utils::aggregate_result(total),
+            super::super::utils::aggregate_result(after_cancellation.unwrap_or(total)),
         ))
     }
 }

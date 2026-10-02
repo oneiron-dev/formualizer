@@ -1,9 +1,9 @@
 //! Excel's arithmetic near zero (Microsoft, "Floating-point arithmetic may
 //! give inaccurate results in Excel"): a formula's last addition or
 //! subtraction that lands within binary conversion error of zero is exactly 0
-//! ("Example when a value reaches zero"), as is SUM's addition of the last
-//! number of a cell or range argument, and results too small for a normal
-//! double underflow to 0, as Excel has no denormalized numbers.
+//! ("Example when a value reaches zero"), as is SUM's last addition of a
+//! number read from a cell, and results too small for a normal double
+//! underflow to 0, as Excel has no denormalized numbers.
 
 use std::sync::Arc;
 
@@ -169,7 +169,7 @@ fn results_below_the_smallest_normal_number_underflow_to_zero() {
 }
 
 #[test]
-fn sum_compensates_the_last_number_of_each_reference() {
+fn sum_compensates_its_last_addition_from_a_cell() {
     for config in configs() {
         let engine = engine_with(
             config,
@@ -249,6 +249,60 @@ fn sum_keeps_residues_of_values_and_of_earlier_additions() {
         assert_eq!(number(&engine, 7, 6), large);
         assert_eq!(number(&engine, 8, 6), large + 5.0);
         assert_eq!(number(&engine, 9, 6), 123.45 + 56.78 - 180.23);
+    }
+}
+
+#[test]
+fn sum_keeps_a_residual_a_later_cell_leaves_uncancelled() {
+    // Microsoft Q&A 4775315 (Excel for Windows): with 1.333, 1.225, -1.333,
+    // -1.225 and 0 in A1:A5, SUM(A1,A2,A3,A4) and SUM(A1,A2,A3,A4,0) are 0,
+    // SUM(A1,A2,A3,A4,A5) and SUM(A1:A5) about -2.22E-16, SUM(A1,A2,A3,A5,A4)
+    // 0 and SUM(1.333,1.225,-1.333,-1.225) about -2.22E-16. In the question,
+    // 1.75, 0.72, -2.47 and 0 sum to -4.44E-16, to 0 with the 0 cell emptied
+    // and to 0 again with 1 and -1 below the 0.
+    for config in configs() {
+        let engine = engine_with(
+            config,
+            &[
+                (1, 1, "1.333"),
+                (2, 1, "1.225"),
+                (3, 1, "-1.333"),
+                (4, 1, "-1.225"),
+                (5, 1, "0"),
+                (1, 2, "1.75"),
+                (2, 2, "0.72"),
+                (3, 2, "-2.47"),
+                (4, 2, "0"),
+                (5, 2, "1"),
+                (6, 2, "-1"),
+                (1, 3, "1.75"),
+                (2, 3, "0.72"),
+                (3, 3, "-2.47"),
+                (1, 6, "=SUM(A1,A2,A3,A4)"),
+                (2, 6, "=SUM(A1,A2,A3,A4,0)"),
+                (3, 6, "=SUM(A1,A2,A3,A5,A4)"),
+                (4, 6, "=SUM(A1:A4)"),
+                (5, 6, "=SUM(C1:C4)"),
+                (6, 6, "=SUM(B1:B6)"),
+                (7, 6, "=SUM(A1,A2,A3,A4,A5)"),
+                (8, 6, "=SUM(A1:A5)"),
+                (9, 6, "=SUM(1.333,1.225,-1.333,-1.225)"),
+                (10, 6, "=SUM(B1:B4)"),
+            ],
+        );
+        for row in 1..=6 {
+            let n = number(&engine, row, 6);
+            assert_eq!(n, 0.0, "row {row}");
+            assert!(n.is_sign_positive(), "row {row}");
+        }
+        let residue = 1.333 + 1.225 - 1.333 - 1.225;
+        assert_eq!(residue, -2.220446049250313e-16);
+        for row in 7..=9 {
+            assert_eq!(number(&engine, row, 6), residue, "row {row}");
+        }
+        let residue = 1.75 + 0.72 - 2.47;
+        assert_eq!(residue, -4.440892098500626e-16);
+        assert_eq!(number(&engine, 10, 6), residue);
     }
 }
 
