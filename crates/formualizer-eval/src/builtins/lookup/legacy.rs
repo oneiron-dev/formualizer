@@ -25,8 +25,8 @@ use formualizer_macros::func_caps;
 /// Approximate match (largest value <= needle) over a lookup vector of `len`
 /// cells, `slice` being the ones read from it. LOOKUP runs the same bisection
 /// as MATCH and VLOOKUP ([`excel_approximate_search`]): inclusive bounds, a
-/// floor midpoint, an exact hit kept over the entries probed after it, and
-/// unsorted data searched rather than rejected. Errors, blanks and entries of
+/// floor midpoint, an exact hit ending the search at the end of its run of
+/// equal entries, and unsorted data searched rather than rejected. Errors, blanks and entries of
 /// another type are skipped, so `LOOKUP(2,1/(cond),result)` finds the last
 /// position where `cond` holds.
 fn approx_match_ascending(
@@ -196,16 +196,20 @@ impl Function for LookupFn {
             None
         };
 
-        // Determine search orientation and build the search slice.
+        // Determine search orientation and build the search slice. The array
+        // form is wider or taller as written: A:C is taller than it is wide
+        // however few of its rows are used.
+        let (shape_rows, shape_cols) = written.unwrap_or((l_rows, l_cols));
+        let single_cell = l_rows == 1 && l_cols == 1 && shape_rows == 1 && shape_cols == 1;
         let (search_vec, is_row_search) = if has_result_vector {
             // Vector form: lookup_data must be 1-D
             flatten_1d(&lookup_data, l_rows, l_cols)
-        } else if l_rows == 1 && l_cols == 1 {
+        } else if single_cell {
             // Single cell – trivially a column search
             (vec![lookup_data[0][0].clone()], false)
-        } else if l_cols > l_rows {
+        } else if shape_cols > shape_rows {
             // Array form: wider than tall → search first row
-            (lookup_data[0].clone(), true)
+            (lookup_data.first().cloned().unwrap_or_default(), true)
         } else {
             // Array form: tall or square → search first column
             (
@@ -248,13 +252,14 @@ impl Function for LookupFn {
                 .cloned()
                 .unwrap_or(LiteralValue::Empty);
             Ok(CalcValue::Scalar(materialise_empty(val)))
-        } else if l_rows == 1 && l_cols == 1 {
+        } else if single_cell {
             Ok(CalcValue::Scalar(materialise_empty(
                 lookup_data[0][0].clone(),
             )))
         } else if is_row_search {
-            // Return from last row at matched column
-            let last_row = l_rows - 1;
+            // Return from the array's last row, as written, at the matched
+            // column; a cell past the ones read is blank.
+            let last_row = shape_rows.saturating_sub(1);
             let val = lookup_data
                 .get(last_row)
                 .and_then(|r| r.get(match_idx))
@@ -262,8 +267,9 @@ impl Function for LookupFn {
                 .unwrap_or(LiteralValue::Empty);
             Ok(CalcValue::Scalar(materialise_empty(val)))
         } else {
-            // Return from last column at matched row
-            let last_col = l_cols - 1;
+            // Return from the array's last column, as written, at the matched
+            // row; a cell past the ones read is blank.
+            let last_col = shape_cols.saturating_sub(1);
             let val = lookup_data
                 .get(match_idx)
                 .and_then(|r| r.get(last_col))
@@ -511,8 +517,8 @@ mod tests {
             approx_match_ascending(&dups, &LiteralValue::Int(7), 6, d),
             Some(4)
         );
-        // The first probe is an exact hit; the smaller entries probed after
-        // it do not replace it.
+        // The first probe is an exact hit, which ends the search; the
+        // smaller entries after it are never probed.
         let titles: Vec<LiteralValue> = [
             "Winter Guard #1",
             "Iron man Annual 2021",
@@ -583,6 +589,53 @@ mod tests {
         assert!(
             matches!(na, Some(LiteralValue::Error(ref e)) if e.kind == ExcelErrorKind::Na),
             "{na:?}"
+        );
+    }
+
+    #[test]
+    fn lookup_array_form_orientation_follows_the_array_as_written() {
+        use crate::engine::{Engine, EvalConfig};
+        use formualizer_parse::parser::parse;
+        // A:C has two used rows but is taller than it is wide as written, so
+        // LOOKUP searches column A and returns from column C; 1:2 is wider
+        // than tall, so it searches row 1 and returns from row 2.
+        let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+        for (row, col, v) in [
+            (1, 1, LiteralValue::Int(1)),
+            (1, 2, LiteralValue::Int(5)),
+            (1, 3, LiteralValue::Text("a".into())),
+            (2, 1, LiteralValue::Int(2)),
+            (2, 2, LiteralValue::Int(6)),
+            (2, 3, LiteralValue::Text("b".into())),
+        ] {
+            engine.set_cell_value("Sheet1", row, col, v).unwrap();
+        }
+        // The formulas live on another sheet, so Sheet1's used rows stay 1:2.
+        engine.add_sheet("Sheet2").unwrap();
+        let mut eval = |formula: &str| {
+            engine
+                .set_cell_formula("Sheet2", 1, 1, parse(formula).unwrap())
+                .unwrap();
+            engine.evaluate_all().unwrap();
+            engine.get_cell_value("Sheet2", 1, 1)
+        };
+        assert_eq!(
+            eval("=LOOKUP(2,Sheet1!A:C)"),
+            Some(LiteralValue::Text("b".into()))
+        );
+        assert_eq!(
+            eval("=LOOKUP(5.5,Sheet1!1:2)"),
+            Some(LiteralValue::Number(6.0))
+        );
+        // Bounded arrays keep their shape: A1:C2 is wider than tall, A1:B2
+        // is square and searched by column.
+        assert_eq!(
+            eval("=LOOKUP(5.5,Sheet1!A1:C2)"),
+            Some(LiteralValue::Number(6.0))
+        );
+        assert_eq!(
+            eval("=LOOKUP(2,Sheet1!A1:B2)"),
+            Some(LiteralValue::Number(6.0))
         );
     }
 

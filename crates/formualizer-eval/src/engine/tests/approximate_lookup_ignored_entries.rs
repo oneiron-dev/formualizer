@@ -721,7 +721,7 @@ fn unsorted_data_is_bisected_not_rejected() {
     ] {
         assert_number(eval_at(&mut engine, formula), expected, formula);
     }
-    // An exact probe is kept over the inexact ones after it.
+    // An exact probe ends the search.
     let titles = "{\"Winter Guard\";\"Iron man\";\"Infinity War\";\"Deadpool AGAIN\";\"Deadpool\";\"Black Cat\"}";
     assert_number(
         eval_at(&mut engine, &format!("=MATCH(\"Infinity War\",{titles},1)")),
@@ -780,5 +780,56 @@ fn whole_column_is_bisected_over_its_full_height() {
         ("=MATCH(6.5,D:D,-1)", 4.0),
     ] {
         assert_number(eval_at(&mut engine, formula), expected, formula);
+    }
+}
+
+/// An exact hit ends Excel's bisection: Excel walks from it through the run
+/// of equal entries next to it and returns the run's last entry (the first,
+/// for a descending search), not a later equal entry beyond a smaller one.
+/// Excel (Microsoft Q&A "Binary search explain in Lookup with duplicates"):
+/// `=MATCH(1,{1,1,1,1,1,0,1},1)` => 5, `=MATCH(1,{1,1,1,1,1,0,1,-1,1,1,1,1,1,0,1})`
+/// => 13, `=MATCH(1,{1,1,1,1,1,0,1,2,1,1,1,1,1,0,1})` => 5,
+/// `=LOOKUP(1,{1;1;1;1;1},{"a";"b";"c";"d";"e"})` => "e" and
+/// `=LOOKUP(3,{5;3;1;2;4},{"a";"b";"c";"d";"e"})` => "d".
+#[test]
+fn exact_hit_ends_the_bisection_at_the_end_of_its_run() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    // A = 1, 1, 1, 1, 1, 0, 1 with B = 10..70.
+    for (row, value) in [1, 1, 1, 1, 1, 0, 1].into_iter().enumerate() {
+        let row = row as u32 + 1;
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Int(value))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", row, 2, LiteralValue::Int(row as i64 * 10))
+            .unwrap();
+    }
+    for (formula, expected) in [
+        ("=MATCH(1,{1,1,1,1,1,0,1},1)", 5.0),
+        ("=MATCH(1,{1,1,1,1,1,0,1,-1,1,1,1,1,1,0,1})", 13.0),
+        ("=MATCH(1,{1,1,1,1,1,0,1,2,1,1,1,1,1,0,1})", 5.0),
+        ("=MATCH(1,A1:A7,1)", 5.0),
+        ("=VLOOKUP(1,A1:B7,2,TRUE)", 50.0),
+        ("=LOOKUP(1,A1:A7,B1:B7)", 50.0),
+        // The mirror for a descending search: the first entry of the run.
+        ("=MATCH(4,{9,4,9,4,4,4,4},-1)", 4.0),
+    ] {
+        assert_number(eval_at(&mut engine, formula), expected, formula);
+    }
+    for (formula, expected) in [
+        (
+            "=LOOKUP(1,{1;1;1;1;1},{\"a\";\"b\";\"c\";\"d\";\"e\"})",
+            "e",
+        ),
+        (
+            "=LOOKUP(3,{5;3;1;2;4},{\"a\";\"b\";\"c\";\"d\";\"e\"})",
+            "d",
+        ),
+    ] {
+        assert_eq!(
+            eval_at(&mut engine, formula),
+            Some(LiteralValue::Text(expected.into())),
+            "{formula}"
+        );
     }
 }

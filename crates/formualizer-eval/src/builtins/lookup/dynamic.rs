@@ -21,6 +21,7 @@
 use super::super::utils::collapse_if_scalar;
 use super::lookup_utils::{
     PreparedLookupMatcher, cmp_for_approximate, cmp_for_lookup, searches_numbers,
+    value_to_f64_lenient,
 };
 use super::sort_collation::cmp_text_for_sort;
 use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
@@ -102,7 +103,10 @@ fn find_semantic_empty(
 /// search order among equals. Entries of another type than the lookup value
 /// are not candidates, except that an empty entry ranks above every number:
 /// when no number is at or above a numeric lookup value, exact-or-next-larger
-/// returns the first blank met.
+/// returns the first blank met. A blank lookup value is an exact match for an
+/// empty entry, as in the exact mode, and otherwise searches as the number 0.
+/// Candidates are ordered by their own values (numbers exactly, with no
+/// lookup tolerance), so the nearer of two close numbers wins.
 fn linear_approximate_match(
     len: usize,
     cell: impl Fn(usize) -> LiteralValue,
@@ -120,8 +124,26 @@ fn linear_approximate_match(
     let blank_ranks_above = side == 1 && searches_numbers(needle);
     let mut first_blank: Option<usize> = None;
     let mut best: Option<(usize, LiteralValue)> = None;
+    // Whether `cand` is nearer the lookup value than `best`, both being on
+    // the requested side of it.
+    let nearer = |cand: &LiteralValue, best: &LiteralValue| match (
+        value_to_f64_lenient(cand, date_system),
+        value_to_f64_lenient(best, date_system),
+    ) {
+        (Some(x), Some(y)) if searches_numbers(needle) => {
+            if side == 1 {
+                x < y
+            } else {
+                x > y
+            }
+        }
+        _ => cmp_for_approximate(cand, best, date_system) == Some(-side),
+    };
     for i in order {
         let cand = cell(i);
+        if matches!(needle, LiteralValue::Empty) && matches!(cand, LiteralValue::Empty) {
+            return Some(i);
+        }
         let Some(c) = cmp_for_approximate(&cand, needle, date_system) else {
             if blank_ranks_above && first_blank.is_none() && matches!(cand, LiteralValue::Empty) {
                 first_blank = Some(i);
@@ -131,11 +153,7 @@ fn linear_approximate_match(
         if c == 0 {
             return Some(i);
         }
-        if c == side
-            && best
-                .as_ref()
-                .is_none_or(|(_, b)| cmp_for_approximate(&cand, b, date_system) == Some(-side))
-        {
+        if c == side && best.as_ref().is_none_or(|(_, b)| nearer(&cand, b)) {
             best = Some((i, cand));
         }
     }

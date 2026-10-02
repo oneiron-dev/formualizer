@@ -72,6 +72,29 @@ fn ranges_feed_lookups_and_aggregates() {
     );
 }
 
+/// LOOKUP's array form takes its shape from the range as written, though a
+/// linked range too large to read whole stops at the last saved cell:
+/// A1:ZZ20000 is taller than wide (search column A, return from ZZ) and
+/// A1:XFD300 is wider than tall (search row 1, return from row 300). The cells
+/// returned lie past the saved ones, so they are blank.
+#[test]
+fn lookup_array_form_reads_a_cropped_range_as_written() {
+    let mut engine = engine_with_book();
+    assert_eq!(
+        eval(&mut engine, "=LOOKUP(\"pear\",[1]Rates!A1:ZZ20000)"),
+        Some(LiteralValue::Number(0.0))
+    );
+    assert_eq!(
+        eval(&mut engine, "=LOOKUP(5,[1]Rates!A1:XFD300)"),
+        Some(LiteralValue::Number(0.0))
+    );
+    // Within the saved cells the array form is unchanged.
+    assert_eq!(
+        eval(&mut engine, "=LOOKUP(\"pear\",[1]Rates!A1:B4)"),
+        Some(LiteralValue::Number(5.0))
+    );
+}
+
 #[test]
 fn sheet_missing_from_link_is_ref_error() {
     let mut engine = engine_with_book();

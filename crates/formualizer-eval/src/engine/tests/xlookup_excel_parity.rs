@@ -242,3 +242,37 @@ fn next_larger_ranks_a_blank_above_every_number() {
         Some(LiteralValue::Text("none".into()))
     );
 }
+
+/// The approximate modes rank candidates by their own values: of two numbers
+/// on the requested side, the nearer one wins even when they differ by less
+/// than the tolerance used to find an exact match. A blank lookup value is an
+/// exact match for an empty entry, as in the exact mode.
+#[test]
+fn approximate_modes_rank_close_candidates_and_match_a_blank_needle() {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    for (row, value) in [(1, Some(-1)), (2, None), (3, Some(1))] {
+        if let Some(value) = value {
+            engine
+                .set_cell_value("Sheet1", row, 1, LiteralValue::Int(value))
+                .unwrap();
+        }
+        engine
+            .set_cell_value("Sheet1", row, 2, LiteralValue::Int(row as i64 * 10))
+            .unwrap();
+    }
+    for (formula, expected) in [
+        ("=XMATCH(1,{0.5,0.5000000000005},-1)", 2.0),
+        ("=XLOOKUP(1,{0.5,0.5000000000005},{1,2},,-1)", 2.0),
+        ("=XMATCH(0,{0.5000000000005,0.5},1)", 2.0),
+        // E1 is empty: the empty A2 is its exact match in either mode.
+        ("=XLOOKUP(E1,A1:A3,B1:B3,\"NF\",-1)", 20.0),
+        ("=XLOOKUP(E1,A1:A3,B1:B3,\"NF\",1)", 20.0),
+        ("=XMATCH(E1,A1:A3,1)", 2.0),
+    ] {
+        assert_eq!(
+            number(eval_formula(&mut engine, formula)),
+            expected,
+            "{formula}"
+        );
+    }
+}

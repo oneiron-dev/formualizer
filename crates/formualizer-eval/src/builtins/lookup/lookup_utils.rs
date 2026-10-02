@@ -284,11 +284,13 @@ impl<'a> SearchedVector<'a> {
 /// answer is wherever the probes lead, possibly `#N/A`. A probe that lands on
 /// an entry the search skips (see [`cmp_for_approximate`]) moves forward to
 /// the next searched entry; when there is none up to the upper bound, the
-/// search continues in the lower half. An exact hit is kept in preference to
-/// any inexact one, and the search goes on towards the end of a run of equal
-/// entries that Excel returns: the last for an ascending search, the first
-/// for a descending one. Otherwise the answer is the last probed entry below
-/// (ascending) or above (descending) the lookup value.
+/// search continues in the lower half. An exact hit ends the bisection:
+/// Excel walks on from it through the run of equal entries next to it and
+/// returns the run's last entry for an ascending search, its first for a
+/// descending one, so `MATCH(1,{1,1,1,1,1,0,1},1)` is 5 (the first probe hits
+/// position 4, the run ends at the 0) and not the 1 beyond it. Otherwise the
+/// answer is the last probed entry below (ascending) or above (descending)
+/// the lookup value.
 pub fn excel_approximate_search(
     searched: &SearchedVector<'_>,
     len: usize,
@@ -300,7 +302,10 @@ pub fn excel_approximate_search(
         return None;
     }
     let (mut lo, mut hi) = (0usize, len - 1);
-    let (mut exact, mut nearest) = (None, None);
+    let mut nearest = None;
+    let equal = |index: usize| {
+        cmp_for_approximate(searched.get(index), needle, searched.date_system) == Some(0)
+    };
     while lo <= hi {
         let mid = lo + (hi - lo) / 2;
         let probe = searched
@@ -317,17 +322,23 @@ pub fn excel_approximate_search(
         };
         let c = cmp_for_approximate(searched.get(index), needle, searched.date_system)
             .expect("SearchedVector contains only entries comparable with the lookup value");
-        let towards_end = if c == 0 {
-            exact = Some(position);
-            !descending
-        } else {
-            let qualifies = (c < 0) != descending;
-            if qualifies {
-                nearest = Some(position);
+        if c == 0 {
+            // Walk the run of equal entries (skipped entries are passed over)
+            // to its last entry, or its first for a descending search.
+            let mut end = index;
+            if descending {
+                while end > 0 && equal(end - 1) {
+                    end -= 1;
+                }
+            } else {
+                while end + 1 < searched.len() && equal(end + 1) {
+                    end += 1;
+                }
             }
-            qualifies
-        };
-        if towards_end {
+            return Some(searched.original_position(end));
+        }
+        if (c < 0) != descending {
+            nearest = Some(position);
             lo = position + 1;
         } else if mid == 0 {
             break;
@@ -335,7 +346,7 @@ pub fn excel_approximate_search(
             hi = mid - 1;
         }
     }
-    exact.or(nearest)
+    nearest
 }
 
 /// The rows and columns a reference spans as written. A whole column or row

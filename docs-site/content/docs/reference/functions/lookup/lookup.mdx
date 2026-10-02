@@ -15,9 +15,8 @@ description: "LOOKUP: Searches for a value and returns a corresponding value fro
  - **Array form** `LOOKUP(value, array)`: if width &gt; height searches first row
    and returns from last row; otherwise searches first column and returns from
    last column.
- - Data must be sorted ascending; unsorted data may return incorrect results
-   (Excel does not guarantee #N/A for unsorted LOOKUP, but results are
-   undefined).
+ - Data should be sorted ascending. Like Excel, LOOKUP bisects without checking
+   the order, so unsorted data gives whichever entry the search reaches.
  - Returns `#N/A` when the lookup value is smaller than every value in the
    search range.
 
@@ -59,7 +58,7 @@ description: "LOOKUP: Searches for a value and returns a corresponding value fro
 No. LOOKUP always performs approximate matching (largest &lt;= lookup value).
 
 ### What happens with unsorted data?
-Results are undefined. Unlike MATCH, LOOKUP does not guarantee #N/A for unsorted ranges.
+LOOKUP runs Excel's binary search without checking the order, as MATCH and VLOOKUP do, so the result follows the search path and may be a wrong entry or #N/A.
 
 ## Runtime metadata
 
