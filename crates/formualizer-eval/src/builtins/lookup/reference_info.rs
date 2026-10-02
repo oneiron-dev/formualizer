@@ -30,6 +30,9 @@ pub struct RowFn;
 /// - Invalid references return an error (`#REF!`/`#VALUE!` depending on context).
 /// - A computed value instead of a reference (`IF(A1:C1<>"",A1:C1)` in an array
 ///   formula) gives, element by element, the element's error or `#VALUE!`.
+/// - An array of references (`OFFSET(A1,{0;1},0)`, `INDIRECT({"A1";"C3"})`)
+///   gives one result per reference; an element that is no reference keeps its
+///   error (`#REF!` for an offset off the sheet).
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -76,15 +79,14 @@ impl Function for RowFn {
 
     func_caps!(PURE);
 
-    // The argument may be a computed array rather than a reference; see
-    // `non_reference_result`.
+    // The argument may be an array of references or a computed array rather
+    // than a reference; see `dispatch_position`.
     fn dispatch<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let result = self.dispatch_scalar(args, ctx)?;
-        Ok(non_reference_result(args, result, ctx))
+        dispatch_position(self, args, ctx)
     }
 
     fn semantic_contract(&self, arity: usize) -> Option<FunctionSemanticContract> {
@@ -135,6 +137,7 @@ impl Function for RowFn {
         // Get reference
         let reference = match args[0].as_reference_or_eval() {
             Ok(r) => r,
+            Err(e) if e.kind == ExcelErrorKind::Cancelled => return Err(e),
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
 
@@ -343,6 +346,9 @@ pub struct ColumnFn;
 /// - Invalid references return an error (`#REF!`/`#VALUE!` depending on context).
 /// - A computed value instead of a reference (`IF(A1:C1<>"",A1:C1)` in an array
 ///   formula) gives, element by element, the element's error or `#VALUE!`.
+/// - An array of references (`OFFSET(A1,{0;1},0)`, `INDIRECT({"A1";"C3"})`)
+///   gives one result per reference; an element that is no reference keeps its
+///   error (`#REF!` for an offset off the sheet).
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -389,15 +395,14 @@ impl Function for ColumnFn {
 
     func_caps!(PURE);
 
-    // The argument may be a computed array rather than a reference; see
-    // `non_reference_result`.
+    // The argument may be an array of references or a computed array rather
+    // than a reference; see `dispatch_position`.
     fn dispatch<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let result = self.dispatch_scalar(args, ctx)?;
-        Ok(non_reference_result(args, result, ctx))
+        dispatch_position(self, args, ctx)
     }
 
     fn semantic_contract(&self, arity: usize) -> Option<FunctionSemanticContract> {
@@ -448,6 +453,7 @@ impl Function for ColumnFn {
         // Get reference
         let reference = match args[0].as_reference_or_eval() {
             Ok(r) => r,
+            Err(e) if e.kind == ExcelErrorKind::Cancelled => return Err(e),
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
 
@@ -493,34 +499,65 @@ impl Function for ColumnFn {
     }
 }
 
+/// ROW/COLUMN dispatch. A reference gives its row or column numbers. Any
+/// other argument fails that path, and then ROW/COLUMN apply once to each
+/// reference of an array of references (`COLUMN(OFFSET(A1,0,{0,1,2}))` is
+/// `{1,2,3}`, an element that is no reference keeping its error, as
+/// `ROW(OFFSET(A1,{-1;0},0))` is `{#REF!;1}`) or to each element of a
+/// computed value (see `non_reference_result`).
+fn dispatch_position<'b>(
+    fun: &dyn Function,
+    args: &[ArgumentHandle<'_, 'b>],
+    ctx: &dyn FunctionContext<'b>,
+) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+    let result = fun.dispatch_scalar(args, ctx)?;
+    if !matches!(
+        result,
+        crate::traits::CalcValue::Scalar(LiteralValue::Error(_))
+    ) {
+        return Ok(result);
+    }
+    if let Some(lifted) =
+        crate::lift::lift_call(fun.name(), args, |call| dispatch_position(fun, call, ctx))?
+    {
+        return Ok(lifted);
+    }
+    non_reference_result(args, result, ctx)
+}
+
 /// ROW/COLUMN of a computed value instead of a reference, as in the array
 /// formula `COLUMN(IF(A1:C1<>"",A1:C1))`: Excel applies the function to each
 /// element of the value, so an error element keeps its error and any other
 /// element is #VALUE!. `result` is the reference path's result, an error
 /// whenever the argument is not a reference (a name that holds a value
-/// included).
+/// included). Cancellation aborts the formula.
 fn non_reference_result<'b>(
     args: &[ArgumentHandle<'_, 'b>],
     result: crate::traits::CalcValue<'b>,
     ctx: &dyn FunctionContext<'b>,
-) -> crate::traits::CalcValue<'b> {
-    let [arg] = args else {
-        return result;
-    };
-    if !matches!(
-        result,
-        crate::traits::CalcValue::Scalar(LiteralValue::Error(_))
-    ) {
-        return result;
+) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+    match &result {
+        crate::traits::CalcValue::Scalar(LiteralValue::Error(error))
+            if error.kind == ExcelErrorKind::Cancelled =>
+        {
+            return Err(error.clone());
+        }
+        crate::traits::CalcValue::Scalar(LiteralValue::Error(_)) => {}
+        _ => return Ok(result),
     }
-    let Ok(FunctionResolution::Value(value)) = arg.resolve_reference_or_value() else {
-        return result;
+    let [arg] = args else {
+        return Ok(result);
+    };
+    let value = match arg.resolve_reference_or_value() {
+        Ok(FunctionResolution::Value(value)) => value,
+        Err(error) if error.kind == ExcelErrorKind::Cancelled => return Err(error),
+        _ => return Ok(result),
     };
     let element = |value: LiteralValue| match value {
         LiteralValue::Error(error) => LiteralValue::Error(error),
         _ => LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)),
     };
-    match value.into_literal() {
+    Ok(match value.into_literal() {
         // Excel has no empty array; an empty result is #CALC!.
         LiteralValue::Array(rows) if rows.first().is_none_or(Vec::is_empty) => {
             crate::traits::CalcValue::Scalar(LiteralValue::Error(ExcelError::new(
@@ -534,7 +571,7 @@ fn non_reference_result<'b>(
             ctx.date_system(),
         ),
         other => crate::traits::CalcValue::Scalar(element(other)),
-    }
+    })
 }
 
 /// ROW/COLUMN result: a single index, or for a multi-row (multi-column)

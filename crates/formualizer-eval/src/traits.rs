@@ -886,31 +886,11 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         match &self.expr {
             ArgumentExpr::Ast(node) => match &node.node_type {
                 ASTNodeType::Reference { reference, .. } => {
-                    // A LET/LAMBDA local shadows any workbook name of the same
-                    // spelling. A local bound to a reference is that reference;
-                    // any other local resolves only on the value path, so it
-                    // must not be sent down the named-range route.
-                    if let ReferenceType::NamedRange(name) = reference
-                        && let Some(binding) = self.interp.resolve_local_name(name)
-                    {
-                        return match binding {
-                            crate::interpreter::LocalBinding::Reference(bound) => Some(Ok(bound)),
-                            _ => None,
-                        };
-                    }
                     // A closed linked workbook yields values, not a reference.
                     if matches!(reference, ReferenceType::External(_)) {
                         return None;
                     }
-                    if let ReferenceType::NamedRange(name) = reference
-                        && self
-                            .interp
-                            .context
-                            .is_value_name(name, self.interp.current_sheet())
-                    {
-                        return None;
-                    }
-                    Some(self.interp.reference_for_current_offset(reference))
+                    self.written_reference(reference)
                 }
                 ASTNodeType::BinaryOp { op, .. } if op == ":" => {
                     Some(self.interp.evaluate_ast_as_reference(node))
@@ -943,19 +923,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                 };
                 match node {
                     crate::engine::arena::AstNodeData::Reference { ref_type, .. } => {
-                        // Same local-shadowing rule as the AST branch above.
-                        if let crate::engine::arena::CompactRefType::NamedRange(name_id) = ref_type
-                            && let Some(binding) = self
-                                .interp
-                                .resolve_local_name(data_store.resolve_ast_string(*name_id))
-                        {
-                            return match binding {
-                                crate::interpreter::LocalBinding::Reference(bound) => {
-                                    Some(Ok(bound))
-                                }
-                                _ => None,
-                            };
-                        }
+                        // Same rules as the AST branch above.
                         if matches!(
                             ref_type,
                             crate::engine::arena::CompactRefType::External { .. }
@@ -964,15 +932,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                         }
                         let reference = data_store
                             .reconstruct_reference_type_for_eval(ref_type, sheet_registry);
-                        if let ReferenceType::NamedRange(name) = &reference
-                            && self
-                                .interp
-                                .context
-                                .is_value_name(name, self.interp.current_sheet())
-                        {
-                            return None;
-                        }
-                        Some(self.interp.reference_for_current_offset(&reference))
+                        self.written_reference(&reference)
                     }
                     crate::engine::arena::AstNodeData::BinaryOp { op_id, .. }
                         if data_store.resolve_ast_string(*op_id) == ":" =>
@@ -1084,20 +1044,33 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         }
     }
 
-    /// Whether this argument is a name that holds a value rather than a
-    /// reference: a LET or LAMBDA local bound to a value, or a defined name
-    /// whose formula yields one (`={1,2,3}`, `=Sheet1!$B$1:$B$3*2`).
-    fn names_a_value(&self) -> bool {
-        let Some(name) = self.name_reference() else {
-            return false;
-        };
-        match self.interp.local_binding(name) {
-            Some(binding) => !matches!(binding, crate::interpreter::LocalBinding::Reference(_)),
-            None => self
-                .interp
-                .context
-                .is_value_name(name, self.interp.current_sheet()),
+    /// `reference`, written as this argument, resolved for the formula cell.
+    /// A LET/LAMBDA local shadows any workbook name of the same spelling: a
+    /// local bound to a reference is that reference. A name that holds a value
+    /// is not a reference (`None`): a local bound to a value, or a defined name
+    /// whose formula does not evaluate to a reference (`={1,2,3}`,
+    /// `=Sheet1!$B$1:$B$3*2`, `=Konst` for such a name, `=IF(TRUE,42)`). Such a
+    /// name resolves only on the value path.
+    fn written_reference(
+        &self,
+        reference: &ReferenceType,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        if let ReferenceType::NamedRange(name) = reference {
+            if let Some(binding) = self.interp.local_binding(name) {
+                return match binding {
+                    crate::interpreter::LocalBinding::Reference(bound) => Some(Ok(bound.clone())),
+                    _ => None,
+                };
+            }
+            let sheet = self.interp.current_sheet();
+            if let Some(resolved) = self.interp.context.resolve_name_reference(name, sheet) {
+                return Some(resolved);
+            }
+            if self.interp.context.is_value_name(name, sheet) {
+                return None;
+            }
         }
+        Some(self.interp.reference_for_current_offset(reference))
     }
 
     /// The array of references a LET binding or a defined name holds.
@@ -1692,15 +1665,15 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
     /// A name that holds a value (a LET or LAMBDA local bound to a value, a
     /// defined name such as `={1,2,3}`) is not a reference: `#VALUE!`.
     pub fn as_reference_or_eval(&self) -> Result<ReferenceType, ExcelError> {
-        if self.names_a_value() {
-            return Err(ExcelError::new(ExcelErrorKind::Value)
-                .with_message("The name holds a value, not a reference"));
-        }
+        let written = |reference: &ReferenceType| {
+            self.written_reference(reference).unwrap_or_else(|| {
+                Err(ExcelError::new(ExcelErrorKind::Value)
+                    .with_message("The name holds a value, not a reference"))
+            })
+        };
         match &self.expr {
             ArgumentExpr::Ast(node) => match &node.node_type {
-                ASTNodeType::Reference { reference, .. } => {
-                    self.interp.reference_for_current_offset(reference)
-                }
+                ASTNodeType::Reference { reference, .. } => written(reference),
                 ASTNodeType::Function { .. } | ASTNodeType::BinaryOp { .. } => {
                     self.interp.evaluate_ast_as_reference(node)
                 }
@@ -1717,9 +1690,9 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                 })?;
 
                 match node {
-                    crate::engine::arena::AstNodeData::Reference { .. } => {
-                        self.reference_for_eval()
-                    }
+                    crate::engine::arena::AstNodeData::Reference { ref_type, .. } => written(
+                        &data_store.reconstruct_reference_type_for_eval(ref_type, sheet_registry),
+                    ),
                     crate::engine::arena::AstNodeData::Function { .. }
                     | crate::engine::arena::AstNodeData::BinaryOp { .. } => self
                         .interp
@@ -2143,9 +2116,10 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
         None
     }
 
-    /// Whether `name` is defined by a formula that yields a value rather than a
-    /// reference (`{0,1,2}`, `MATCH(...)`, `days+1`): arguments that accept a
-    /// reference or a value take its value.
+    /// Whether `name` holds a value rather than a reference: a constant, or a
+    /// formula that does not evaluate to a reference (`{0,1,2}`, `MATCH(...)`,
+    /// `days+1`, `IF(TRUE,42)`, a name for such a name). Arguments that accept
+    /// a reference or a value take its value.
     fn is_value_name(&self, _name: &str, _current_sheet: &str) -> bool {
         false
     }

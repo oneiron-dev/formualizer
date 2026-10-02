@@ -27087,8 +27087,13 @@ where
             return false;
         };
         match self.graph.resolve_name_entry(name, current_id) {
+            // A formula holds a value unless it evaluates to a reference: `=Konst`
+            // for a name holding a value, or `=IF(TRUE,42)`, holds a value too.
             Some(named) => match &named.definition {
-                NamedDefinition::Formula { ast, .. } => !self.yields_reference(ast),
+                NamedDefinition::Formula { ast, .. } => {
+                    !self.yields_reference(ast)
+                        || self.resolve_name_reference(name, current_sheet).is_none()
+                }
                 NamedDefinition::Literal(_) => true,
                 _ => false,
             },
@@ -27141,7 +27146,18 @@ where
         let sheet = self.graph.sheet_name(sheet_id);
         let cell_ref = self.graph.make_cell_ref(sheet, 0, 0);
         let interpreter = Interpreter::new_with_cell(self, sheet, cell_ref);
-        match Self::in_named_formula(|| Ok(interpreter.try_evaluate_ast_as_reference(ast))) {
+        let resolved = Self::in_named_formula(|| {
+            Ok(match interpreter.try_evaluate_ast_as_reference(ast) {
+                // A name for another name (`=Konst`, `=INDIRECT("Amounts")`) is
+                // the reference that name resolves to, and holds a value when
+                // that name does.
+                Some(Ok(ReferenceType::NamedRange(other))) => {
+                    self.resolve_name_reference(&other, sheet)
+                }
+                result => result,
+            })
+        });
+        match resolved {
             Ok(result) => result,
             Err(err) => Some(Err(err)),
         }

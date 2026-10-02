@@ -120,12 +120,13 @@ pub(crate) fn lift_spec(name: &str) -> Option<Lift> {
 
 /// The parameters of builtins taking a reference that are evaluated once per
 /// reference of an array of references (SUBTOTAL's refs, SUMIF's range and
-/// sum_range, RANK's ref, ...). Positions that `lift_spec` lists take single
-/// values instead and lift over arrays only.
+/// sum_range, RANK's ref, ROW's and COLUMN's reference, ...). Positions that
+/// `lift_spec` lists take single values instead and lift over arrays only.
 fn reference_lift_spec(name: &str) -> Option<Lift> {
     Some(match name {
         "SUBTOTAL" | "AGGREGATE" | "SUMIF" | "COUNTIF" | "AVERAGEIF" | "SUMIFS" | "COUNTIFS"
-        | "AVERAGEIFS" | "MAXIFS" | "MINIFS" | "COUNTBLANK" | "RANK.EQ" | "RANK.AVG" => Lift::All,
+        | "AVERAGEIFS" | "MAXIFS" | "MINIFS" | "COUNTBLANK" | "RANK.EQ" | "RANK.AVG" | "ROW"
+        | "COLUMN" => Lift::All,
         _ => return None,
     })
 }

@@ -833,3 +833,132 @@ fn row_and_column_of_an_empty_array_are_calc() {
         );
     }
 }
+
+#[test]
+fn row_and_column_of_an_array_of_references_give_one_result_per_reference() {
+    // OFFSET and INDIRECT lifted over an array return an array of references;
+    // ROW and COLUMN apply to each reference, and an element that is no
+    // reference (an offset above row 1) keeps its #REF!.
+    assert_eq!(spill("=COLUMN(OFFSET(A1,0,{0,1,2}))", 1, 3), "{1,2,3}");
+    assert_eq!(spill("=ROW(INDIRECT({\"A1\";\"C3\"}))", 2, 1), "{1;3}");
+    assert_eq!(spill("=ROW(OFFSET(A1,{-1;0;1},0))", 3, 1), "{#REF!;1;2}");
+    assert_eq!(spill("=COLUMN(OFFSET(C1,0,{-3,-1}))", 1, 2), "{#REF!,2}");
+    assert_number("=SUM(ROW(OFFSET(A1,{1;2;3},0)))", 9.0);
+    // The same array of references through IF, a LET name or a defined name.
+    assert_eq!(spill("=ROW(IF(TRUE,OFFSET(A1,{0;2},0)))", 2, 1), "{1;3}");
+    assert_eq!(spill("=LET(r,OFFSET(A1,{1;2},0),ROW(r))", 2, 1), "{2;3}");
+    let mut engine = engine();
+    engine
+        .define_name(
+            "Steps",
+            NamedDefinition::Formula {
+                ast: parse("=OFFSET(Sheet1!$A$1,0,{1,2})").unwrap(),
+                dependencies: Vec::new(),
+                range_deps: Vec::new(),
+            },
+            NameScope::Workbook,
+        )
+        .unwrap();
+    assert_eq!(spill_in(&mut engine, "=COLUMN(Steps)", 1, 2), "{2,3}");
+}
+
+/// `engine_with_value_names` plus names that alias a name or choose with IF.
+fn engine_with_aliased_names() -> Engine<TestWorkbook> {
+    let mut engine = engine_with_value_names();
+    for (name, formula) in [
+        ("AliasValue", "=Konst"),
+        ("TrueValue", "=IF(TRUE,{1,2,3})"),
+        ("ChoiceScalar", "=IF(TRUE,42)"),
+        ("AliasRange", "=Amounts"),
+        ("TrueRange", "=IF(TRUE,Sheet1!$B$2:$B$3)"),
+        ("IndirectRange", "=INDIRECT(\"Amounts\")"),
+    ] {
+        engine
+            .define_name(
+                name,
+                NamedDefinition::Formula {
+                    ast: parse(formula).unwrap(),
+                    dependencies: Vec::new(),
+                    range_deps: Vec::new(),
+                },
+                NameScope::Workbook,
+            )
+            .unwrap();
+    }
+    engine
+}
+
+#[test]
+fn a_name_holds_a_value_unless_its_formula_evaluates_to_a_reference() {
+    // Aliasing a name that holds a value, or producing the value through IF,
+    // does not give it worksheet coordinates.
+    let spill_named = |formula: &str, rows: u32, cols: u32| {
+        spill_in(&mut engine_with_aliased_names(), formula, rows, cols)
+    };
+    assert_eq!(
+        spill_named("=COLUMN(AliasValue)", 1, 3),
+        "{#VALUE!,#VALUE!,#VALUE!}"
+    );
+    assert_eq!(
+        spill_named("=COLUMN(TrueValue)", 1, 3),
+        "{#VALUE!,#VALUE!,#VALUE!}"
+    );
+    assert_eq!(spill_named("=COLUMN(ChoiceScalar)", 1, 1), "{#VALUE!}");
+    // A name whose formula evaluates to a reference is that reference.
+    assert_eq!(spill_named("=ROW(AliasRange)", 3, 1), "{1;2;3}");
+    assert_eq!(spill_named("=ROW(TrueRange)", 2, 1), "{2;3}");
+    assert_eq!(spill_named("=ROW(IndirectRange)", 3, 1), "{1;2;3}");
+    // Their values read as before.
+    let mut engine = engine_with_aliased_names();
+    for (formula, expected) in [
+        ("=SUM(AliasValue)", LiteralValue::Number(6.0)),
+        ("=SUM(TrueValue)", LiteralValue::Number(6.0)),
+        ("=ChoiceScalar+1", LiteralValue::Number(43.0)),
+        ("=SUM(AliasRange)", LiteralValue::Number(6.0)),
+        ("=SUM(TrueRange)", LiteralValue::Number(5.0)),
+        ("=ISREF(AliasValue)", LiteralValue::Boolean(false)),
+        ("=ISREF(ChoiceScalar)", LiteralValue::Boolean(false)),
+        ("=ISREF(AliasRange)", LiteralValue::Boolean(true)),
+    ] {
+        assert_eq!(eval(&mut engine, formula), expected, "{formula}");
+    }
+}
+
+#[test]
+fn row_and_column_propagate_cancellation() {
+    // Cancellation aborts the formula; it is not a worksheet error of ROW or
+    // COLUMN's argument.
+    #[derive(Debug)]
+    struct Abort;
+    impl crate::function::Function for Abort {
+        fn name(&self) -> &'static str {
+            "ABORT"
+        }
+        fn eval<'a, 'b, 'c>(
+            &self,
+            _args: &'c [crate::traits::ArgumentHandle<'a, 'b>],
+            _ctx: &dyn crate::traits::FunctionContext<'b>,
+        ) -> Result<crate::traits::CalcValue<'b>, formualizer_common::ExcelError> {
+            Err(formualizer_common::ExcelError::new(
+                ExcelErrorKind::Cancelled,
+            ))
+        }
+    }
+    crate::builtins::load_builtins();
+    let wb = TestWorkbook::new().with_function(std::sync::Arc::new(Abort));
+    let interpreter = wb.interpreter();
+    for formula in [
+        "=ABORT()",
+        "=COLUMN(ABORT())",
+        "=ROW(ABORT())",
+        "=ROW(OFFSET(A1,ABORT(),0))",
+        "=COLUMN(IF(TRUE,ABORT()))",
+    ] {
+        let result = interpreter.evaluate_ast(&parse(formula).unwrap());
+        assert!(
+            matches!(&result, Err(error) if error.kind == ExcelErrorKind::Cancelled),
+            "{formula}: {:?}",
+            result.map(|value| value.into_literal())
+        );
+    }
+}
