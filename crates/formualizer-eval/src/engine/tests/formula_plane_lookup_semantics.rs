@@ -619,6 +619,83 @@ fn error_lookup_value_is_the_result_cold_warm_and_approximate() {
 }
 
 #[test]
+fn exact_lookups_give_the_scan_answer_cold_and_warm() {
+    // Which lookups run before the exact-match index is built for a range
+    // depends on the evaluation schedule, so the index must answer as the
+    // scan does: text that reads as NaN or infinity matched cold and gave
+    // #N/A warm. A computed key that differs from a stored number in its
+    // last bits (1.1*3 against 3.3) is found by neither, as lookups compare
+    // numbers exactly.
+    let mut engine = engine_with_config(EvalConfig::default());
+    for row in 1..=TABLE_ROWS {
+        number(&mut engine, "Sheet1", row, 4, row as f64 / 10.0);
+        number(&mut engine, "Sheet1", row, 5, row as f64 * 10.0);
+    }
+    let last = TABLE_ROWS + 2;
+    text(&mut engine, "Sheet1", TABLE_ROWS + 1, 4, "Nan");
+    number(&mut engine, "Sheet1", TABLE_ROWS + 1, 5, 7.0);
+    text(&mut engine, "Sheet1", last, 4, "inf");
+    number(&mut engine, "Sheet1", last, 5, 8.0);
+    let formulas = [
+        (
+            2,
+            format!("=VLOOKUP(1.1*3, $D$1:$E${last}, 2, FALSE)"),
+            LookupExpected::Na,
+        ),
+        (
+            3,
+            format!("=MATCH(0.1+0.2, $D$1:$D${last}, 0)"),
+            LookupExpected::Na,
+        ),
+        (
+            6,
+            format!("=VLOOKUP(\"NAN\", $D$1:$E${last}, 2, FALSE)"),
+            LookupExpected::Number(7.0),
+        ),
+        (
+            7,
+            format!("=MATCH(\"Inf\", $D$1:$D${last}, 0)"),
+            LookupExpected::Number(last as f64),
+        ),
+        (
+            8,
+            format!("=XLOOKUP(0.7*3, $D$1:$D${last}, $E$1:$E${last})"),
+            LookupExpected::Na,
+        ),
+        (
+            9,
+            format!("=VLOOKUP(3.3, $D$1:$E${last}, 2, FALSE)"),
+            LookupExpected::Number(330.0),
+        ),
+    ];
+    for row in 1..=8 {
+        for (col, text, _) in &formulas {
+            formula(&mut engine, "Sheet1", row, *col, text);
+        }
+    }
+    let check = |engine: &Engine<TestWorkbook>| {
+        for row in 1..=8 {
+            for (col, text, expected) in &formulas {
+                assert_lookup_expected(
+                    engine
+                        .get_cell_value("Sheet1", row, *col)
+                        .unwrap_or(LiteralValue::Empty),
+                    *expected,
+                    &format!("R{row}C{col} {text}"),
+                );
+            }
+        }
+    };
+    engine.evaluate_all().unwrap();
+    check(&engine);
+    mark_all_formulas_dirty_without_edit(&mut engine);
+    engine.evaluate_all().unwrap();
+    let warm = engine.last_lookup_index_cache_report();
+    assert!(warm.hits >= 8 * formulas.len(), "{warm:?}");
+    check(&engine);
+}
+
+#[test]
 fn vlookup_against_table_with_errors_in_lookup_column() {
     single_formula_parity(
         |engine| {

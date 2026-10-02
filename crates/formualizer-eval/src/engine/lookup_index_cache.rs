@@ -111,10 +111,17 @@ pub struct DuplicateIndices {
     pub(crate) all: SmallVec<[usize; 1]>,
 }
 
+/// An exact-match index over one lookup axis. It answers exactly as the scan
+/// in `lookup_utils::find_exact_index_in_view` does, so a lookup gives the
+/// same result whether or not an index was built for its range (which depends
+/// on how many lookups over that range ran before it).
 pub struct LookupIndex {
     pub(crate) len: usize,
     date_system: DateSystem,
     pub(crate) bytes: usize,
+    /// Candidate positions by key: case-folded text, a boolean, or a number
+    /// (temporal values by their serial; numbers within 1e-12 of an integer
+    /// filed under the integer).
     pub(crate) entries: FxHashMap<LookupHashKey, DuplicateIndices>,
     pub(crate) cell_values: Box<[LiteralValue]>,
 }
@@ -198,27 +205,32 @@ impl LookupIndex {
     }
 
     pub(crate) fn find_first_exact(&self, needle: &LiteralValue) -> Option<usize> {
-        let hash_key = LookupHashKey::from_needle(needle, self.date_system)?;
-        if let Some(dups) = self.entries.get(&hash_key) {
-            for &idx in &dups.all {
-                if cmp_for_lookup(needle, &self.cell_values[idx], self.date_system) == Some(0) {
-                    return Some(idx);
-                }
-            }
-        }
-        None
+        self.find_exact(needle, false)
     }
 
     pub(crate) fn find_last_exact(&self, needle: &LiteralValue) -> Option<usize> {
+        self.find_exact(needle, true)
+    }
+
+    fn find_exact(&self, needle: &LiteralValue, last: bool) -> Option<usize> {
+        // A blank needle searches for zero.
         let hash_key = LookupHashKey::from_needle(needle, self.date_system)?;
-        if let Some(dups) = self.entries.get(&hash_key) {
-            for &idx in dups.all.iter().rev() {
-                if cmp_for_lookup(needle, &self.cell_values[idx], self.date_system) == Some(0) {
-                    return Some(idx);
-                }
-            }
+        let dups = self.entries.get(&hash_key)?;
+        // Text matches text case-insensitively and a boolean the same boolean:
+        // exactly the candidates stored under the needle's key, with no
+        // numeric re-check (which read "NaN" or "inf" text as a number that
+        // never equals itself). A numeric key also holds the near-integers
+        // filed under it, so each candidate is confirmed with the lookup's
+        // exact comparison.
+        let numeric = matches!(hash_key, LookupHashKey::Number(_));
+        let matches = |idx: usize| {
+            !numeric || cmp_for_lookup(needle, &self.cell_values[idx], self.date_system) == Some(0)
+        };
+        if last {
+            dups.all.iter().rev().copied().find(|&idx| matches(idx))
+        } else {
+            dups.all.iter().copied().find(|&idx| matches(idx))
         }
-        None
     }
 }
 
@@ -591,6 +603,121 @@ mod tests {
             temporal_only.find_first_exact(&LiteralValue::Number(0.0)),
             Some(3)
         );
+    }
+
+    #[test]
+    fn exact_index_answers_as_the_scan() {
+        use crate::builtins::lookup::lookup_utils::find_exact_index_in_view;
+        // The index is only built once a range has been searched a few times,
+        // and parallel evaluation decides which lookups come first, so any
+        // answer it gives that the scan would not makes results vary by run.
+        let midnight = LiteralValue::Time(NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+        let column = vec![
+            LiteralValue::Text("Nan".into()),
+            LiteralValue::Number(0.30000000000000004),
+            LiteralValue::Number(0.3),
+            LiteralValue::Text("inf".into()),
+            LiteralValue::Number(2.0000000000015),
+            LiteralValue::Number(2.0000000000005),
+            LiteralValue::Number(3.3),
+            LiteralValue::Boolean(true),
+            LiteralValue::Text("INFINITY".into()),
+            LiteralValue::Number(f64::INFINITY),
+            LiteralValue::Number(-0.0),
+            LiteralValue::Empty,
+            midnight.clone(),
+            LiteralValue::Number(1e15),
+            LiteralValue::Number(1e15 + 0.125),
+            LiteralValue::Text("3.3".into()),
+            LiteralValue::Number(0.3),
+            LiteralValue::Text("NAN".into()),
+            LiteralValue::Int(7),
+            LiteralValue::Number(7.0000000000001),
+        ];
+        let view = RangeView::from_owned_rows(
+            column.iter().cloned().map(|value| vec![value]).collect(),
+            DateSystem::Excel1900,
+        );
+        let BuildOutcome::Built(index) =
+            LookupIndex::build(&view, LookupAxis::ColumnInView(0), DateSystem::Excel1900).unwrap()
+        else {
+            panic!("expected a lookup index");
+        };
+        let needles = [
+            LiteralValue::Text("nan".into()),
+            LiteralValue::Text("NaN".into()),
+            LiteralValue::Text("Inf".into()),
+            LiteralValue::Text("infinity".into()),
+            LiteralValue::Text("3.3".into()),
+            LiteralValue::Number(0.1 + 0.2),
+            LiteralValue::Number(0.3),
+            LiteralValue::Number(1.1 * 3.0),
+            LiteralValue::Number(2.000000000001),
+            LiteralValue::Number(2.0),
+            LiteralValue::Number(0.0),
+            LiteralValue::Number(1e-13),
+            LiteralValue::Number(1e15),
+            LiteralValue::Number(1e15 + 0.125),
+            LiteralValue::Number(7.0),
+            LiteralValue::Int(7),
+            LiteralValue::Number(f64::INFINITY),
+            LiteralValue::Number(f64::NAN),
+            LiteralValue::Number(1.0),
+            LiteralValue::Boolean(true),
+            LiteralValue::Boolean(false),
+            LiteralValue::Empty,
+            midnight,
+        ];
+        // The last match is the scan's first match in the reversed column.
+        let reversed = RangeView::from_owned_rows(
+            column
+                .iter()
+                .rev()
+                .cloned()
+                .map(|value| vec![value])
+                .collect(),
+            DateSystem::Excel1900,
+        );
+        for needle in &needles {
+            let first =
+                find_exact_index_in_view(&view, needle, false, DateSystem::Excel1900).unwrap();
+            let last = find_exact_index_in_view(&reversed, needle, false, DateSystem::Excel1900)
+                .unwrap()
+                .map(|i| column.len() - 1 - i);
+            assert_eq!(index.find_first_exact(needle), first, "first {needle:?}");
+            assert_eq!(index.find_last_exact(needle), last, "last {needle:?}");
+        }
+        // Text that Rust would read as NaN or infinity is text.
+        assert_eq!(
+            index.find_first_exact(&LiteralValue::Text("nan".into())),
+            Some(0)
+        );
+        assert_eq!(
+            index.find_last_exact(&LiteralValue::Text("nan".into())),
+            Some(17)
+        );
+        assert_eq!(
+            index.find_first_exact(&LiteralValue::Text("Inf".into())),
+            Some(3)
+        );
+        // A number finds only the identical number: no tolerance, and a
+        // near-integer is not the integer it is filed under.
+        assert_eq!(index.find_first_exact(&LiteralValue::Number(0.3)), Some(2));
+        assert_eq!(index.find_last_exact(&LiteralValue::Number(0.3)), Some(16));
+        assert_eq!(
+            index.find_first_exact(&LiteralValue::Number(0.1 + 0.2)),
+            Some(1)
+        );
+        assert_eq!(
+            index.find_first_exact(&LiteralValue::Number(1.1 * 3.0)),
+            None
+        );
+        assert_eq!(
+            index.find_first_exact(&LiteralValue::Number(2.000000000001)),
+            None
+        );
+        assert_eq!(index.find_first_exact(&LiteralValue::Number(7.0)), Some(18));
+        assert_eq!(index.find_last_exact(&LiteralValue::Number(7.0)), Some(18));
     }
 
     #[test]
