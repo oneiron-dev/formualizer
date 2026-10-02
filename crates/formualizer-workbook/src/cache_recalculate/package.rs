@@ -297,7 +297,12 @@ fn metadata_refusal(part: &str) -> IoError {
 /// offsets, a #FIELD!'s `field` name) and a rich value may carry a fallback
 /// (`fb`). Returns that error per rich value (see [`Record`]); any rich
 /// value that is not such an error (images, linked data types) or whose keys
-/// index another rich value, array or property bag is unsupported.
+/// index another rich value, array or property bag is unsupported, and so
+/// is a part that breaks the rules these tags rest on: a structure's key
+/// names are unique (case-insensitively, CT_Key), a #SPILL! has integer
+/// `colOffset` and `rwOffset` (2.3.6.1.3.7), and each part's required
+/// `count` is the number of its structures or rich values
+/// (CT_RichValueStructures, CT_RichValueData).
 fn rich_errors(
     archive: &mut Archive<'_>,
     options: &XlsxRecalculateOptions,
@@ -317,12 +322,14 @@ fn rich_errors(
     // `errorType` among them.
     type Keys = Vec<(String, String)>;
     let mut structures: Vec<(Keys, Option<usize>)> = Vec::new();
+    let mut declared = None;
     let data = read_part(archive, RICH_STRUCTURES, options.limits.max_worksheet_bytes)?;
     xml::walk(&data, options, |path, node| {
         if !matches!(node.kind, xml::Kind::Open { .. }) {
             return Ok(());
         }
         if xml::path_is(path, RICH, &["rvStructures"]) {
+            declared = node.value("count").and_then(|n| n.parse::<usize>().ok());
             Ok(())
         } else if xml::path_is(path, RICH, &["rvStructures", "s"])
             && node.value("t") == Some("_error")
@@ -336,7 +343,10 @@ fn rich_errors(
             // Key names are case-insensitive ([MS-XLSX] CT_Key).
             let name = node.value("n").unwrap_or_default().to_ascii_lowercase();
             let kind = node.value("t").unwrap_or_default().to_owned();
-            if name == "errortype" && (kind != "i" || error_type.replace(keys.len()).is_some()) {
+            if keys.iter().any(|(n, _)| *n == name)
+                || (name == "errortype"
+                    && (kind != "i" || error_type.replace(keys.len()).is_some()))
+            {
                 return Err(metadata_refusal(RICH_STRUCTURES));
             }
             keys.push((name, kind));
@@ -345,11 +355,18 @@ fn rich_errors(
             Err(metadata_refusal(RICH_STRUCTURES))
         }
     })?;
+    if declared != Some(structures.len()) {
+        return Err(metadata_refusal(RICH_STRUCTURES));
+    }
     // Per rich value, its structure, its values and whether it has a fallback.
     let mut values: Vec<(usize, Vec<String>, bool)> = Vec::new();
+    let mut declared = None;
     let data = read_part(archive, RICH_VALUES, options.limits.max_worksheet_bytes)?;
     xml::walk(&data, options, |path, node| match &node.kind {
-        xml::Kind::Open { .. } if xml::path_is(path, RICH, &["rvData"]) => Ok(()),
+        xml::Kind::Open { .. } if xml::path_is(path, RICH, &["rvData"]) => {
+            declared = node.value("count").and_then(|n| n.parse::<usize>().ok());
+            Ok(())
+        }
         xml::Kind::Open { .. } if xml::path_is(path, RICH, &["rvData", "rv"]) => {
             let s = node
                 .required("s")?
@@ -382,6 +399,9 @@ fn rich_errors(
         }
         _ => Ok(()),
     })?;
+    if declared != Some(values.len()) {
+        return Err(metadata_refusal(RICH_VALUES));
+    }
     values
         .into_iter()
         .map(|(s, fields, fallback)| {
@@ -392,18 +412,28 @@ fn rich_errors(
                 .filter(|_| fields.len() == keys.len())
                 .and_then(|i| fields[i].trim().parse::<i64>().ok())
                 .ok_or_else(|| metadata_refusal(RICH_VALUES))?;
-            let field = |name: &str| {
-                let i = keys.iter().position(|(n, _)| n == name)?;
+            // An integer key's value.
+            let integer = |name: &str| {
+                let i = keys.iter().position(|(n, t)| n == name && t == "i")?;
                 fields[i].trim().parse::<u32>().ok()
             };
-            let error = RichError::from_error_type(code).map(|kind| RichError {
-                kind,
-                offsets: (kind == ExcelErrorKind::Spill)
-                    .then(|| field("coloffset").zip(field("rwoffset")))
-                    .flatten(),
-            });
+            let error = match RichError::from_error_type(code) {
+                Some(kind @ ExcelErrorKind::Spill) => Some(RichError {
+                    kind,
+                    offsets: Some(
+                        integer("coloffset")
+                            .zip(integer("rwoffset"))
+                            .ok_or_else(|| metadata_refusal(RICH_VALUES))?,
+                    ),
+                }),
+                Some(kind) => Some(RichError {
+                    kind,
+                    offsets: None,
+                }),
+                None => None,
+            };
             // Other cells holding the error may share a rich value that has
-            // just the keys the writer writes for it.
+            // just the keys the writer writes for it (key names are unique).
             let shared = !fallback
                 && error.is_some_and(|error| {
                     let wanted = RichError::keys(error.kind);
@@ -411,7 +441,6 @@ fn rich_errors(
                         && keys.iter().all(|(n, t)| {
                             t == "i" && wanted.iter().any(|w| w.eq_ignore_ascii_case(n))
                         })
-                        && (error.kind != ExcelErrorKind::Spill || error.offsets.is_some())
                 });
             Ok((error, shared))
         })

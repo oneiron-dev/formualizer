@@ -67,6 +67,12 @@ pub struct RangeView<'a> {
     rows: usize,
     cols: usize,
     cancel_token: Option<CancelToken>,
+    /// The rows and columns of the whole columns or rows this view reads over
+    /// their used part only (`A:A` is 1,048,576 rows however few hold data);
+    /// `None` when the view holds all of what it reads. A formula that
+    /// returns such a reference returns all of it (see
+    /// [`Self::with_reference_extent`]).
+    reference_extent: Option<(u32, u32)>,
 }
 
 impl<'a> core::fmt::Debug for RangeView<'a> {
@@ -299,6 +305,7 @@ impl<'a> RangeView<'a> {
             rows,
             cols,
             cancel_token: None,
+            reference_extent: None,
         }
     }
 
@@ -311,6 +318,51 @@ impl<'a> RangeView<'a> {
     pub fn with_cancel_token(mut self, token: Option<CancelToken>) -> Self {
         self.cancel_token = token;
         self
+    }
+
+    /// Records that this view is the value of `reference`: when that is an
+    /// open-ended range (whole columns or rows), which the engine reads over
+    /// its used part only, the view keeps the reference's full size for
+    /// [`Self::reference_extent`]. A view derived from this one (a sub-view,
+    /// a computed array) does not carry it.
+    #[must_use]
+    pub(crate) fn with_reference_extent(
+        mut self,
+        reference: &formualizer_parse::parser::ReferenceType,
+    ) -> Self {
+        const MAX_ROWS: u32 = 1_048_576;
+        const MAX_COLUMNS: u32 = 16_384;
+        if let formualizer_parse::parser::ReferenceType::Range {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            ..
+        } = reference
+            && (start_row.is_none()
+                || end_row.is_none()
+                || start_col.is_none()
+                || end_col.is_none())
+        {
+            let span = |start: Option<u32>, end: Option<u32>, max: u32| {
+                end.unwrap_or(max)
+                    .min(max)
+                    .abs_diff(start.unwrap_or(1).clamp(1, max))
+                    + 1
+            };
+            self.reference_extent = Some((
+                span(*start_row, *end_row, MAX_ROWS),
+                span(*start_col, *end_col, MAX_COLUMNS),
+            ));
+        }
+        self
+    }
+
+    /// The rows and columns of the open-ended reference this view is the
+    /// value of (see [`Self::with_reference_extent`]); `None` for any other
+    /// view, whose [`Self::dims`] are its whole size.
+    pub(crate) fn reference_extent(&self) -> Option<(u32, u32)> {
+        self.reference_extent
     }
 
     #[inline]
@@ -362,6 +414,7 @@ impl<'a> RangeView<'a> {
                 rows: 0,
                 cols: 0,
                 cancel_token,
+                reference_extent: None,
             });
         }
 
@@ -374,6 +427,7 @@ impl<'a> RangeView<'a> {
             rows: nrows,
             cols: ncols,
             cancel_token,
+            reference_extent: None,
         })
     }
 
@@ -429,6 +483,7 @@ impl<'a> RangeView<'a> {
             rows,
             cols,
             cancel_token: self.cancel_token.clone(),
+            reference_extent: None,
         }
     }
 
@@ -449,6 +504,7 @@ impl<'a> RangeView<'a> {
             rows,
             cols,
             cancel_token: self.cancel_token.clone(),
+            reference_extent: None,
         }
     }
 

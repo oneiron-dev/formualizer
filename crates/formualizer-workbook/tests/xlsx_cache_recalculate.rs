@@ -1095,10 +1095,13 @@ fn documented_rich_error_variants_are_admitted() {
     // Key names are case-insensitive; a #FIELD! names the missing field in
     // a string key.
     let s = p.get_mut(STRUCTURES).unwrap();
-    *s = s.replace("n=\"errorType\"", "n=\"ErrorType\"").replace(
-        "</rvStructures>",
-        "<s t=\"_error\"><k n=\"errorType\" t=\"i\"/><k n=\"field\" t=\"s\"/></s></rvStructures>",
-    );
+    *s = s
+        .replace("n=\"errorType\"", "n=\"ErrorType\"")
+        .replace("count=\"1\"", "count=\"2\"")
+        .replace(
+            "</rvStructures>",
+            "<s t=\"_error\"><k n=\"errorType\" t=\"i\"/><k n=\"field\" t=\"s\"/></s></rvStructures>",
+        );
     // A rich value may carry a fallback before its values.
     let v = p.get_mut(VALUES).unwrap();
     *v = v
@@ -1147,6 +1150,67 @@ fn documented_rich_error_variants_are_admitted() {
         assert!(text.contains(from), "{from} in {text}");
         *text = text.replace(from, to);
         reject(&bad);
+    }
+}
+#[test]
+fn rich_error_parts_that_break_their_rules_are_unsupported() {
+    // B1 reads A1's pasted #SPILL! (vm 1). [MS-XLSX] 2.3.6.1.3.7: a #SPILL!
+    // has integer colOffset and rwOffset; CT_Key: a structure's key names
+    // are unique, case-insensitively; CT_RichValueStructures and
+    // CT_RichValueData: the required count is the number of structures and
+    // rich values. The writer would otherwise read a spill without its
+    // offsets, share a structure without rwOffset for B1's new #SPILL! and
+    // keep wrong counts.
+    let rows = "<row r=\"1\"><c r=\"A1\" t=\"e\" vm=\"1\"><v>#VALUE!</v></c>\
+        <c r=\"B1\" t=\"e\" vm=\"1\"><f>A1</f><v>#VALUE!</v></c></row>";
+    const STRUCTURES: &str = "xl/richData/rdrichvaluestructure.xml";
+    const VALUES: &str = "xl/richData/rdrichvalue.xml";
+    let p = with_rich_values(parts(rows), &[(8, 0, 0)]);
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    assert!(sheet.contains("<c r=\"B1\" t=\"e\" vm=\""), "{sheet}");
+    let spill = "<k n=\"colOffset\" t=\"i\"/><k n=\"errorType\" t=\"i\"/><k n=\"rwOffset\" t=\"i\"/><k n=\"subType\" t=\"i\"/>";
+    let value = "<v>0</v><v>8</v><v>0</v><v>3</v>";
+    for (structure, values, count) in [
+        // No offsets.
+        ("<k n=\"errorType\" t=\"i\"/>", "<v>8</v>", "count=\"1\""),
+        // An offset that is not an integer key, or not a count.
+        (
+            "<k n=\"colOffset\" t=\"s\"/><k n=\"errorType\" t=\"i\"/><k n=\"rwOffset\" t=\"i\"/>",
+            "<v>0</v><v>8</v><v>0</v>",
+            "count=\"1\"",
+        ),
+        (spill, "<v>0</v><v>8</v><v>-1</v><v>3</v>", "count=\"1\""),
+        (spill, "<v>0</v><v>8</v><v>x</v><v>3</v>", "count=\"1\""),
+        // A key named twice, in any case.
+        (
+            "<k n=\"colOffset\" t=\"i\"/><k n=\"errorType\" t=\"i\"/><k n=\"colOffset\" t=\"i\"/>",
+            "<v>0</v><v>8</v><v>0</v>",
+            "count=\"1\"",
+        ),
+        (
+            "<k n=\"colOffset\" t=\"i\"/><k n=\"errorType\" t=\"i\"/><k n=\"rwOffset\" t=\"i\"/><k n=\"COLOFFSET\" t=\"i\"/>",
+            value,
+            "count=\"1\"",
+        ),
+        // Counts that are not the number of structures or rich values.
+        (spill, value, "count=\"0\""),
+        (spill, value, "count=\"2\""),
+        (spill, value, ""),
+    ] {
+        for part in [STRUCTURES, VALUES] {
+            if count == "count=\"1\"" && part == VALUES {
+                continue;
+            }
+            let mut bad = p.clone();
+            let s = bad.get_mut(STRUCTURES).unwrap();
+            *s = s.replace(spill, structure);
+            let v = bad.get_mut(VALUES).unwrap();
+            *v = v.replace(value, values);
+            let text = bad.get_mut(part).unwrap();
+            *text = text.replace("count=\"1\"", count);
+            reject(&bad);
+        }
     }
 }
 const RICH: &str = "http://schemas.microsoft.com/office/spreadsheetml/2017/richdata";

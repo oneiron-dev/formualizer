@@ -129,7 +129,7 @@ impl RichTags {
         let limit = options.limits.max_worksheet_bytes;
         let mut created: Vec<(&str, &str, String, &str)> = Vec::new();
         // Structures: one `_error` structure per kind, reusing a saved one
-        // with exactly these keys.
+        // with exactly these keys, each once.
         let mut kinds: Vec<ExcelErrorKind> = Vec::new();
         for error in &self.added {
             if !kinds.contains(&error.kind) {
@@ -153,10 +153,12 @@ impl RichTags {
                 .map(|k| k.to_ascii_lowercase())
                 .collect();
             let found = existing.iter().position(|keys| {
-                keys.len() == wanted.len()
-                    && keys
-                        .iter()
-                        .all(|(n, t)| t == "i" && wanted.contains(&n.to_ascii_lowercase()))
+                let names: HashSet<String> = keys
+                    .iter()
+                    .filter(|(_, t)| t == "i")
+                    .map(|(n, _)| n.to_ascii_lowercase())
+                    .collect();
+                names.len() == keys.len() && names == wanted
             });
             let entry = match found {
                 Some(i) => (i, existing[i].iter().map(|(n, _)| n.clone()).collect()),

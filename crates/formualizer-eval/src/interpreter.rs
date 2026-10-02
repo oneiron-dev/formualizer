@@ -1769,7 +1769,8 @@ impl<'a> Interpreter<'a> {
             }
             Err(error) => return Err(error),
         }
-        .with_cancel_token(self.context.cancellation_token());
+        .with_cancel_token(self.context.cancellation_token())
+        .with_reference_extent(reference);
         Ok(crate::traits::CalcValue::Range(view))
     }
 

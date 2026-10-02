@@ -230,6 +230,192 @@ fn whole_columns_through_functions_spill_past_the_last_row() {
     );
 }
 
+/// Formulas set one per column from `first_col` of `row`, two columns apart.
+fn set_formulas(engine: &mut Engine<TestWorkbook>, row: u32, first_col: u32, formulas: &[&str]) {
+    for (i, f) in formulas.iter().enumerate() {
+        engine
+            .set_cell_formula("Sheet1", row, first_col + 2 * i as u32, parse(f).unwrap())
+            .unwrap();
+    }
+}
+
+#[test]
+fn sheet_edge_applies_to_returned_arrays_not_failed_selections() {
+    // INDEX(A:A,0,2) is #REF! (A:A has one column), so IFERROR returns its
+    // fallback and nothing spills from a whole column; an error is the
+    // formula's value. A selection that cannot fail, or did not, still
+    // returns the whole column.
+    let mut engine = Engine::new(TestWorkbook::new(), serial_eval_config());
+    for r in 1..=3u32 {
+        engine
+            .set_cell_value("Sheet1", r, 1, LiteralValue::Int((r * 10 + 1) as i64))
+            .unwrap();
+    }
+    engine
+        .set_cell_value("Sheet1", 1, 3, LiteralValue::Int(1))
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 2, 3, LiteralValue::Int(2))
+        .unwrap();
+    let kept = [
+        "=IFERROR(INDEX(A:A,0,2),99)",
+        "=INDEX(A:A,0,2)",
+        "=IFERROR(INDEX(A:A,0,2),{1,2})",
+        "=IFERROR(SORT(A:A,2),0)",
+        "=INDEX(A:A,0,C2)",
+        "=INDEX(A:A,0,2)+{1,2}",
+        "=IFERROR(INDEX(A:A,0,C2),SEQUENCE(2))",
+    ];
+    let kept_too = [
+        ("=N(INDEX(A:A,0,1))", Some(11.0)),
+        ("=N(IF(TRUE,A:A,0))", Some(11.0)),
+        ("=T(INDEX(A:A,0,1))", None),
+        ("=INDEX(A:A,0,{1,1})", None),
+    ];
+    let spilling = [
+        "=INDEX(A:A,0,C1)",
+        "=INDEX(A:A,0,C1)*2",
+        "=IFERROR(SORT(A:A,1,-1),0)",
+        "=IFERROR(INDEX(A:C,0,2),0)",
+        "=-INDEX(A:A,0,1)",
+    ];
+    set_formulas(&mut engine, 2, 5, &kept);
+    set_formulas(&mut engine, 2, 5 + 2 * kept.len() as u32, &spilling);
+    // N and T read the first cell of the column INDEX or IF returns; INDEX
+    // lifted over an array of columns gives one value per element.
+    for (i, (f, _)) in kept_too.iter().enumerate() {
+        engine
+            .set_cell_formula("Sheet1", 6, 5 + 3 * i as u32, parse(f).unwrap())
+            .unwrap();
+    }
+    engine.evaluate_all().unwrap();
+    for (i, (f, value)) in kept_too.iter().enumerate() {
+        let got = engine.get_cell_value("Sheet1", 6, 5 + 3 * i as u32);
+        match value {
+            Some(v) => assert_eq!(got, Some(LiteralValue::Number(*v)), "{f}"),
+            None => assert!(
+                !matches!(&got, Some(LiteralValue::Error(e)) if e.kind == formualizer_common::ExcelErrorKind::Spill),
+                "{f}: {got:?}"
+            ),
+        }
+    }
+    let at = |i: usize, row: u32| engine.get_cell_value("Sheet1", row, 5 + 2 * i as u32);
+    let n = |v: f64| Some(LiteralValue::Number(v));
+    let is_ref = |v: Option<LiteralValue>| matches!(v, Some(LiteralValue::Error(e)) if e.kind == formualizer_common::ExcelErrorKind::Ref);
+    assert_eq!(at(0, 2), n(99.0));
+    assert!(is_ref(at(1, 2)), "{:?}", at(1, 2));
+    assert_eq!(
+        (at(2, 2), engine.get_cell_value("Sheet1", 2, 10)),
+        (n(1.0), n(2.0))
+    );
+    assert_eq!(at(3, 2), n(0.0));
+    assert!(is_ref(at(4, 2)), "{:?}", at(4, 2));
+    assert!(is_ref(at(5, 2)) && is_ref(engine.get_cell_value("Sheet1", 2, 16)));
+    assert_eq!((at(6, 2), at(6, 3)), (n(1.0), n(2.0)));
+    for (i, f) in spilling.iter().enumerate() {
+        assert_spill(at(kept.len() + i, 2), f);
+    }
+
+    // A whole column read over a used part of one row (on another sheet)
+    // is still a whole column.
+    let mut engine = Engine::new(TestWorkbook::new(), serial_eval_config());
+    engine
+        .set_cell_value("Data", 1, 1, LiteralValue::Int(5))
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 2, 2, parse("=Data!A:A*2").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_spill(engine.get_cell_value("Sheet1", 2, 2), "=Data!A:A*2");
+}
+
+#[test]
+fn whole_columns_returned_through_functions_spill_past_the_last_row() {
+    // IF, IFERROR, CHOOSE, SWITCH, XLOOKUP and LET return the whole column
+    // they select, whatever selects it, and INDIRECT the whole column its
+    // text names: 1,048,576 rows that cannot spill from row 2 (a whole row,
+    // 16,384 columns, not from column B).
+    let mut engine = Engine::new(TestWorkbook::new(), serial_eval_config());
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Int(11))
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 2, 1, LiteralValue::Int(22))
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 1, 2, LiteralValue::Boolean(true))
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 1, 3, LiteralValue::Int(1))
+        .unwrap();
+    let spilling = [
+        "=IF(B1,A:A,0)",
+        "=IF(1=1,A:A,99)",
+        "=IFERROR(1/0,A:A)",
+        "=INDIRECT(\"A:A\")",
+        "=LET(x,A:A,x)",
+        "=CHOOSE(C1,A:A,1)",
+        "=SWITCH(1,1,A:A)",
+        "=XLOOKUP(9,A:A,A:A,A:A)",
+    ];
+    let fitting = [
+        ("=IF(NOT(B1),A:A,0)", 0.0, None),
+        ("=TAKE(A:A,2)", 11.0, Some(22.0)),
+        ("=IF(B1,A1:A2,0)", 11.0, Some(22.0)),
+        ("=INDEX(A:A,C1+1)", 22.0, None),
+    ];
+    set_formulas(&mut engine, 2, 5, &spilling);
+    let first = 5 + 2 * spilling.len() as u32;
+    set_formulas(
+        &mut engine,
+        2,
+        first,
+        &fitting.iter().map(|f| f.0).collect::<Vec<_>>(),
+    );
+    engine
+        .set_cell_formula("Sheet1", 5, 2, parse("=INDIRECT(\"1:1\")").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    for (i, f) in spilling.iter().enumerate() {
+        let col = 5 + 2 * i as u32;
+        assert_spill(engine.get_cell_value("Sheet1", 2, col), f);
+        assert_eq!(engine.get_cell_value("Sheet1", 3, col), None, "{f}");
+    }
+    assert_spill(engine.get_cell_value("Sheet1", 5, 2), "=INDIRECT(\"1:1\")");
+    for (i, (f, anchor, below)) in fitting.iter().enumerate() {
+        let col = first + 2 * i as u32;
+        assert_eq!(
+            engine.get_cell_value("Sheet1", 2, col),
+            Some(LiteralValue::Number(*anchor)),
+            "{f}"
+        );
+        if let Some(below) = below {
+            assert_eq!(
+                engine.get_cell_value("Sheet1", 3, col),
+                Some(LiteralValue::Number(*below)),
+                "{f}"
+            );
+        }
+    }
+
+    // From row 1 the whole column fits.
+    let mut engine = Engine::new(TestWorkbook::new(), serial_eval_config());
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Int(11))
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 2, 1, LiteralValue::Int(22))
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 1, 3, parse("=IF(A1>0,A:A,0)").unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 2, 3),
+        Some(LiteralValue::Number(22.0))
+    );
+}
+
 #[test]
 fn blocked_spill_extent_is_the_result_that_could_not_spill() {
     // A1 =SEQUENCE(C1) is blocked by A2; E2 =A:A runs past the sheet's edge.

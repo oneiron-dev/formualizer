@@ -363,7 +363,9 @@ impl IndexFn {
                 view.as_1x1().unwrap_or(LiteralValue::Empty),
             ))
         } else {
-            Ok(crate::traits::CalcValue::Range(view))
+            Ok(crate::traits::CalcValue::Range(
+                view.with_reference_extent(reference),
+            ))
         }
     }
 
@@ -833,7 +835,9 @@ impl Function for OffsetFn {
                                 rv.as_1x1().unwrap_or(LiteralValue::Empty),
                             ))
                         } else {
-                            Ok(crate::traits::CalcValue::Range(rv))
+                            Ok(crate::traits::CalcValue::Range(
+                                rv.with_reference_extent(&r),
+                            ))
                         }
                     }
                     Err(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
@@ -1061,7 +1065,9 @@ impl Function for IndirectFn {
                                 rv.as_1x1().unwrap_or(LiteralValue::Empty),
                             ))
                         } else {
-                            Ok(crate::traits::CalcValue::Range(rv))
+                            Ok(crate::traits::CalcValue::Range(
+                                rv.with_reference_extent(&r),
+                            ))
                         }
                     }
                     Err(e) => {

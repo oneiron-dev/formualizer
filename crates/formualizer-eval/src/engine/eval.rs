@@ -1145,12 +1145,20 @@ fn fit_array_formula_result(value: LiteralValue, rows: u32, cols: u32) -> Litera
 /// `VLOOKUP(A:A,A:C,2,FALSE)`; see [`crate::lift::lift_spec`]). IF and CHOOSE
 /// yield the branch a constant selects (else at least their lifted test or
 /// index), IFERROR and IFNA at least their value, INDEX a whole column or row
-/// of its array for a constant 0 row or column, SORT and SORTBY their array
-/// and TRANSPOSE its array turned. Other functions (reductions, selections),
+/// of its array for a 0 row or column, SORT and SORTBY their array and
+/// TRANSPOSE its array turned. Other functions (reductions, selections),
 /// names and other references count as one cell, so this is a lower bound.
+///
+/// `succeeded`: the node's value is known not to be a single error. Without
+/// that the bound holds whatever the evaluation does, so a selection that can
+/// fail (INDEX past the edge of its array, SORT by a column it lacks) counts
+/// as the single error it then is: `IFERROR(INDEX(A:A,0,2),99)` is 99, not
+/// an array. A formula whose result is not an error succeeded, and so did an
+/// operand of an operator whose other operand is a single value.
 fn arena_result_extent(
     data_store: &crate::engine::arena::DataStore,
     root: AstNodeId,
+    succeeded: bool,
 ) -> (u64, u64) {
     use crate::engine::arena::{AstNodeData, CompactRefType};
     match data_store.get_node(root) {
@@ -1176,7 +1184,7 @@ fn arena_result_extent(
         Some(AstNodeData::UnaryOp { op_id, expr_id })
             if data_store.resolve_ast_string(*op_id) != "@" =>
         {
-            arena_result_extent(data_store, *expr_id)
+            arena_result_extent(data_store, *expr_id, succeeded)
         }
         Some(AstNodeData::BinaryOp {
             op_id,
@@ -1187,9 +1195,19 @@ fn arena_result_extent(
             "+" | "-" | "*" | "/" | "^" | "&" | "=" | "<>" | "<" | ">" | "<=" | ">="
         ) =>
         {
+            // A single error operand makes the result that error, unless the
+            // other operand is an array (an array of that error).
             broadcast_extent(
-                arena_result_extent(data_store, *left_id),
-                arena_result_extent(data_store, *right_id),
+                arena_result_extent(
+                    data_store,
+                    *left_id,
+                    succeeded && arena_single_value(data_store, *right_id),
+                ),
+                arena_result_extent(
+                    data_store,
+                    *right_id,
+                    succeeded && arena_single_value(data_store, *left_id),
+                ),
             )
         }
         Some(AstNodeData::Array { rows, cols, .. }) => (u64::from(*rows), u64::from(*cols)),
@@ -1205,9 +1223,44 @@ fn arena_result_extent(
                 std::borrow::Cow::Borrowed(name)
             };
             let args = data_store.get_args(root).unwrap_or(&[]);
-            function_result_extent(data_store, &name, args)
+            function_result_extent(data_store, &name, args, succeeded)
         }
         _ => (1, 1),
+    }
+}
+
+/// Whether the node is a single value whatever it evaluates to: a constant,
+/// a cell (not its spill range, `A1#`), `@`, or an operator over such values.
+fn arena_single_value(data_store: &crate::engine::arena::DataStore, node: AstNodeId) -> bool {
+    use crate::engine::arena::{AstNodeData, CompactRefType};
+    match data_store.get_node(node) {
+        Some(AstNodeData::Literal(value)) => {
+            !matches!(data_store.retrieve_value(*value), LiteralValue::Array(_))
+        }
+        Some(AstNodeData::Omitted)
+        | Some(AstNodeData::Reference {
+            ref_type: CompactRefType::Cell { .. },
+            ..
+        }) => true,
+        Some(AstNodeData::UnaryOp { op_id, expr_id }) => {
+            match data_store.resolve_ast_string(*op_id) {
+                "@" => true,
+                "-" | "+" | "%" => arena_single_value(data_store, *expr_id),
+                _ => false,
+            }
+        }
+        Some(AstNodeData::BinaryOp {
+            op_id,
+            left_id,
+            right_id,
+        }) => {
+            matches!(
+                data_store.resolve_ast_string(*op_id),
+                "+" | "-" | "*" | "/" | "^" | "&" | "=" | "<>" | "<" | ">" | "<=" | ">="
+            ) && arena_single_value(data_store, *left_id)
+                && arena_single_value(data_store, *right_id)
+        }
+        _ => false,
     }
 }
 
@@ -1221,17 +1274,17 @@ fn function_result_extent(
     data_store: &crate::engine::arena::DataStore,
     name: &str,
     args: &[AstNodeId],
+    succeeded: bool,
 ) -> (u64, u64) {
     use crate::engine::arena::AstNodeData;
     let node = |i: usize| args.get(i).and_then(|&id| data_store.get_node(id));
-    let extent = |i: usize| match (args.get(i), node(i)) {
-        (Some(&id), Some(n)) if !matches!(n, AstNodeData::Omitted) => {
-            arena_result_extent(data_store, id)
-        }
+    let given = |i: usize| node(i).is_some_and(|n| !matches!(n, AstNodeData::Omitted));
+    let extent = |i: usize, succeeded: bool| match args.get(i) {
+        Some(&id) if given(i) => arena_result_extent(data_store, id, succeeded),
         _ => (1, 1),
     };
-    // A number or logical constant.
-    let constant = |i: usize| match node(i) {
+    // A number or logical constant, negated or not (`-1`).
+    let literal = |node: Option<&AstNodeData>| match node {
         Some(AstNodeData::Literal(value)) => match data_store.retrieve_value(*value) {
             LiteralValue::Number(n) => Some(n),
             LiteralValue::Int(n) => Some(n as f64),
@@ -1240,44 +1293,106 @@ fn function_result_extent(
         },
         _ => None,
     };
+    let constant = |i: usize| match node(i) {
+        Some(AstNodeData::UnaryOp { op_id, expr_id }) => {
+            let value = literal(data_store.get_node(*expr_id))?;
+            match data_store.resolve_ast_string(*op_id) {
+                "-" => Some(-value),
+                "+" => Some(value),
+                _ => None,
+            }
+        }
+        other => literal(other),
+    };
+    // An omitted argument, or a constant from `low` to `high`.
+    let at_most = |i: usize, low: f64, high: u64| {
+        !given(i) || constant(i).is_some_and(|n| (low..=high as f64).contains(&n.trunc()))
+    };
     match name {
         // A constant test selects one branch whole; otherwise the result is
-        // at least as large as the test lifted over.
+        // at least as large as the test lifted over (an error test is IF's
+        // error).
         "IF" => match constant(0) {
-            Some(test) if test != 0.0 => extent(1),
-            Some(_) => extent(2),
-            None => extent(0),
+            Some(test) if test != 0.0 => extent(1, succeeded),
+            Some(_) => extent(2, succeeded),
+            None => extent(0, succeeded),
         },
         "CHOOSE" => match constant(0).map(f64::trunc) {
-            Some(index) if index >= 1.0 && (index as usize) < args.len() => extent(index as usize),
-            _ => extent(0),
+            Some(index) if index >= 1.0 && (index as usize) < args.len() => {
+                extent(index as usize, succeeded)
+            }
+            _ => extent(0, succeeded),
         },
-        "IFERROR" | "IFNA" => extent(0),
-        // Row (column) 0 selects every row (column) of the array.
+        // A value that may be a single error is replaced whole; one that is
+        // an array is replaced element by element.
+        "IFERROR" | "IFNA" => extent(0, false),
+        // Row (column) 0 selects every row (column) of the array, when the
+        // selection does not fail (a constant row and column within the
+        // array, the first area) and is not lifted over an array of indexes
+        // (each element is then one value).
         "INDEX" => {
-            let array = extent(0);
+            let array = extent(0, succeeded);
+            let single = |i: usize| match args.get(i) {
+                Some(&id) if given(i) => arena_single_value(data_store, id),
+                _ => true,
+            };
+            let selects = single(1)
+                && single(2)
+                && (succeeded
+                    || (given(1)
+                        && at_most(1, 0.0, array.0)
+                        && at_most(2, 0.0, array.1)
+                        && at_most(3, 1.0, 1)));
             let whole = |i: usize| constant(i).is_some_and(|n| n.trunc() == 0.0);
-            let selected = (
-                if whole(1) { array.0 } else { 1 },
-                if whole(2) { array.1 } else { 1 },
-            );
-            broadcast_extent(selected, broadcast_extent(extent(1), extent(2)))
+            let selected = if selects {
+                (
+                    if whole(1) { array.0 } else { 1 },
+                    if whole(2) { array.1 } else { 1 },
+                )
+            } else {
+                (1, 1)
+            };
+            broadcast_extent(
+                selected,
+                broadcast_extent(extent(1, false), extent(2, false)),
+            )
         }
-        "SORT" | "SORTBY" => extent(0),
+        // SORT by a column (row) of the array, either way: constants in range.
+        "SORT" => {
+            let array = extent(0, succeeded);
+            let by_column = constant(3).is_some_and(|b| b != 0.0);
+            let sorts = succeeded
+                || (at_most(1, 1.0, if by_column { array.0 } else { array.1 })
+                    && (!given(2) || constant(2).is_some_and(|o| o == 1.0 || o == -1.0))
+                    && (!given(3) || constant(3).is_some()));
+            if sorts { array } else { (1, 1) }
+        }
+        // SORTBY's by_arrays must fit its array.
+        "SORTBY" => {
+            if succeeded {
+                extent(0, true)
+            } else {
+                (1, 1)
+            }
+        }
         "TRANSPOSE" => {
-            let (rows, cols) = extent(0);
+            let (rows, cols) = extent(0, succeeded);
             (cols, rows)
         }
-        // N and T read the first cell of a reference; only an array value
-        // lifts them.
+        // N and T read the first cell of a reference, also one a function
+        // returns (`N(INDEX(A:A,0,1))`); only an array value lifts them.
         "N" | "T" => match node(0) {
-            Some(AstNodeData::Reference { .. }) => (1, 1),
-            _ => extent(0),
+            Some(
+                AstNodeData::Array { .. }
+                | AstNodeData::UnaryOp { .. }
+                | AstNodeData::BinaryOp { .. },
+            ) => extent(0, false),
+            _ => (1, 1),
         },
         _ => match crate::lift::lift_spec(name) {
             Some(spec) => (0..args.len())
                 .filter(|&i| spec.lifts(i))
-                .fold((1, 1), |acc, i| broadcast_extent(acc, extent(i))),
+                .fold((1, 1), |acc, i| broadcast_extent(acc, extent(i, false))),
             None => (1, 1),
         },
     }
@@ -5446,8 +5561,26 @@ where
         // last row or column of the sheet is #SPILL!. Whole columns and rows
         // are evaluated over their used part only, so their full extent comes
         // from the formula (TRANSPOSE(A:A) runs past the last column even
-        // from A1).
-        let (rows, cols) = arena_result_extent(self.graph.data_store(), ast_id);
+        // from A1) or from the whole columns or rows it returns
+        // (`IF(B1,A:A,0)`, `INDIRECT("A:A")`). An error is the formula's
+        // value, not an array (`INDEX(A:A,0,2)` is #REF!). Another single
+        // value may still be a whole column whose used part is one row (the
+        // engine returns such an array of one cell as its value), so it goes
+        // by the formula's extent, which counts only what the formula
+        // certainly returns.
+        if matches!(result.as_scalar(), Some(LiteralValue::Error(_))) {
+            return result.into_literal();
+        }
+        let returned = match &result {
+            crate::traits::CalcValue::Range(view) => view
+                .reference_extent()
+                .map_or((1, 1), |(rows, cols)| (u64::from(rows), u64::from(cols))),
+            _ => (1, 1),
+        };
+        let (rows, cols) = broadcast_extent(
+            arena_result_extent(self.graph.data_store(), ast_id, true),
+            returned,
+        );
         if u64::from(cell.coord.row()) + rows > u64::from(EXCEL_MAX_ROWS)
             || u64::from(cell.coord.col()) + cols > u64::from(EXCEL_MAX_COLUMNS)
         {
