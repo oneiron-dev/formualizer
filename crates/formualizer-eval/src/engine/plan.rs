@@ -90,6 +90,12 @@ fn no_local_bindings(
     crate::engine::refs::LocalBindingStyle::None
 }
 
+fn plan_current_sheet<'context>(
+    context: &'context PlanReferenceContext<'_>,
+) -> Option<&'context str> {
+    Some(context.sheet_reg.name(context.current_sheet))
+}
+
 fn plan_data_store<'context>(context: &'context PlanReferenceContext<'_>) -> &'context DataStore {
     context
         .data_store
@@ -309,6 +315,7 @@ where
                 ast,
                 &mut context,
                 no_local_bindings,
+                plan_current_sheet,
                 collect_plan_reference,
             )?;
         }
@@ -396,6 +403,7 @@ where
                     ast,
                     &mut context,
                     no_local_bindings,
+                    plan_current_sheet,
                     collect_plan_reference,
                 )?,
                 DependencyPlanAst::Arena(ast_id) => crate::engine::refs::visit_arena_references(
@@ -403,6 +411,7 @@ where
                     &mut context,
                     plan_data_store,
                     plan_sheet_registry,
+                    plan_current_sheet,
                     collect_plan_reference,
                 )?,
             }

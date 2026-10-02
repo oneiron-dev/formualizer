@@ -48,6 +48,12 @@ fn graph_no_local_bindings(
     crate::engine::refs::LocalBindingStyle::None
 }
 
+fn graph_current_sheet<'context>(
+    context: &'context GraphReferenceContext<'_>,
+) -> Option<&'context str> {
+    Some(context.graph.sheet_reg.name(context.current_sheet_id))
+}
+
 fn graph_data_store<'context>(
     context: &'context GraphReferenceContext<'_>,
 ) -> &'context super::super::arena::DataStore {
@@ -279,6 +285,7 @@ impl DependencyGraph {
             &mut context,
             graph_data_store,
             graph_sheet_registry,
+            graph_current_sheet,
             collect_graph_reference,
         )?;
 
@@ -330,6 +337,7 @@ impl DependencyGraph {
             ast,
             &mut context,
             graph_no_local_bindings,
+            graph_current_sheet,
             collect_graph_reference,
         )?;
 

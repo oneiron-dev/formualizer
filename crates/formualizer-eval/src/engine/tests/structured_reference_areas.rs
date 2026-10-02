@@ -956,3 +956,36 @@ fn unqualified_column_inside_a_table_is_its_column() {
     // A table of that name still wins, as `[Sales]` is Sales' data body.
     assert_eq!(eval(&mut engine, 4, 10, "=SUM([Sales])"), n(6.0));
 }
+
+/// A table's bare name in a union is the table's data body (Sales is
+/// A2:B4), also where the formula was not rewritten at entry; a LET name of
+/// the same name shadows it, and a LET value is no reference, so the union
+/// is #VALUE!.
+#[test]
+fn bare_table_name_in_a_union_is_its_data_body_unless_shadowed() {
+    use crate::interpreter::Interpreter;
+    let mut engine = engine();
+    engine
+        .set_cell_value("Sheet1", 1, 4, LiteralValue::Number(42.0))
+        .unwrap();
+    let interpreter = Interpreter::new(&engine, "Sheet1");
+    let evaluate = |formula: &str| {
+        interpreter
+            .evaluate_ast(&parse(formula).unwrap())
+            .unwrap()
+            .into_literal()
+    };
+    assert_eq!(
+        evaluate("=INDEX((Sales,D1),2,1,1)"),
+        LiteralValue::Text("b".into())
+    );
+    assert_eq!(
+        evaluate("=INDEX((Sales,D1),1,1,2)"),
+        LiteralValue::Number(42.0)
+    );
+    assert_error(
+        evaluate("=LET(Sales,5,INDEX((Sales,D1),1,1,2))"),
+        ExcelErrorKind::Value,
+        "a LET value shadowing the table",
+    );
+}

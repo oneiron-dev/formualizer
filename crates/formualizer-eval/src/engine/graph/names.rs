@@ -325,20 +325,8 @@ impl DependencyGraph {
     /// sheet's scope - substituting the default sheet for missing context is
     /// what leaked references onto unrelated sheets in issue #110.
     pub fn resolve_name_entry_in_scope(&self, name: &str, scope: NameScope) -> Option<&NamedRange> {
-        // `Sheet1!Name` / `'My Sheet'!Name` names the name as seen from that
-        // sheet: its sheet-level name, else the workbook-level one.
-        if let Some((sheet, local)) = name.rsplit_once('!')
-            && !local.is_empty()
-            && !sheet.is_empty()
-            && !sheet.starts_with('[')
-        {
-            let sheet = match sheet.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
-                Some(quoted) => quoted.replace("''", "'"),
-                None => sheet.to_string(),
-            };
-            if let Some(sheet_id) = self.sheet_id(&sheet) {
-                return self.resolve_name_entry_in_scope(local, NameScope::Sheet(sheet_id));
-            }
+        if let Some((sheet_id, local)) = self.sheet_qualified_name(name) {
+            return self.resolve_name_entry_in_scope(local, NameScope::Sheet(sheet_id));
         }
         let workbook_entry = || {
             if self.config.case_sensitive_names {
@@ -368,6 +356,21 @@ impl DependencyGraph {
                 }
             }
         }
+    }
+
+    /// `Sheet1!Name` / `'My Sheet'!Name` names the name as seen from that
+    /// sheet (its sheet-level name, else the workbook-level one): the sheet
+    /// and the name, when the sheet exists.
+    fn sheet_qualified_name<'n>(&self, name: &'n str) -> Option<(SheetId, &'n str)> {
+        let (sheet, local) = name.rsplit_once('!')?;
+        if local.is_empty() || sheet.is_empty() || sheet.starts_with('[') {
+            return None;
+        }
+        let sheet = match sheet.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+            Some(quoted) => quoted.replace("''", "'"),
+            None => sheet.to_string(),
+        };
+        Some((self.sheet_id(&sheet)?, local))
     }
 
     /// Resolve a name as seen from `current_sheet`: sheet scope shadows
@@ -467,6 +470,7 @@ impl DependencyGraph {
                 if !referenced_names.is_empty() {
                     self.attach_vertex_to_names(vertex, &referenced_names);
                 }
+                self.rebuild_area_numbering_name_consumers(&dependents);
                 // Propagate from the rebound name vertex itself, after its
                 // edges are current, so the transitive closure is reached.
                 self.mark_dirty_many(&[vertex]);
@@ -549,8 +553,12 @@ impl DependencyGraph {
             // an unresolved pending-name link otherwise, allowing a later define to heal the
             // formula without requiring re-ingest.
             for (vertex_id, ast) in formulas_to_rebuild {
-                self.rebuild_formula_dependencies(vertex_id, &ast);
+                self.rewire_formula_dependencies(vertex_id, &ast);
             }
+            let dependent_names = names_to_rebuild
+                .iter()
+                .map(|(vertex_id, _, _)| *vertex_id)
+                .collect::<Vec<_>>();
             for (vertex_id, definition, name_scope) in names_to_rebuild {
                 let referenced_names =
                     self.rebuild_name_dependencies(vertex_id, &definition, name_scope)?;
@@ -558,6 +566,9 @@ impl DependencyGraph {
                     self.attach_vertex_to_names(vertex_id, &referenced_names);
                 }
             }
+            // The formulas above are rebuilt already; those using the deleted
+            // name through another name are not.
+            self.rebuild_area_numbering_name_consumers(&dependent_names);
             // Dirty the affected set WITH propagation, once every dependency
             // edge above is current, so cells reading a formula-backed
             // dependent name recompute instead of serving a cached value.
@@ -567,6 +578,38 @@ impl DependencyGraph {
         } else {
             Err(ExcelError::new(ExcelErrorKind::Name)
                 .with_message(format!("Name not found: {name}")))
+        }
+    }
+
+    /// Re-wires the dependencies of the formulas that use a name whose
+    /// definition changed, given its dependents, directly or through other
+    /// names, when the formula's self-reference was decided from the areas
+    /// its INDEX selects: a compressed range of the formula covers its own
+    /// cell. INDEX numbers the areas of a union such as `(Areas,A:A)` through
+    /// every area of the names in it, so a new definition can make A:A
+    /// another area: `=INDEX((Areas,A:A),1,1,2)` in A1 selects A1 itself
+    /// once Areas is one area, and stops selecting it when Areas grows back
+    /// to two (or is deleted, when the union is `#NAME?`). Re-wiring decides
+    /// the self-reference afresh, as entering the formula again would.
+    pub(super) fn rebuild_area_numbering_name_consumers(&mut self, dependents: &[VertexId]) {
+        let mut stack = dependents.to_vec();
+        let mut seen = FxHashSet::default();
+        let mut formulas = Vec::new();
+        while let Some(vertex) = stack.pop() {
+            if !seen.insert(vertex) {
+                continue;
+            }
+            if let Some(named) = self.named_range_by_vertex(vertex) {
+                stack.extend(named.dependents.iter().copied());
+            } else if self.compressed_range_covers_self(vertex) {
+                formulas.push(vertex);
+            }
+        }
+        formulas.sort_unstable_by_key(|vertex| vertex.0);
+        for vertex in formulas {
+            if let Some(ast) = self.get_formula(vertex) {
+                self.rewire_formula_dependencies(vertex, &ast);
+            }
         }
     }
 
@@ -664,6 +707,8 @@ impl DependencyGraph {
         name: &str,
         formula_vertex: VertexId,
     ) {
+        // `Sheet2!Areas` waits for Areas as seen from Sheet2.
+        let (sheet_id, name) = self.sheet_qualified_name(name).unwrap_or((sheet_id, name));
         let key = self.name_lookup_key(name);
         self.pending_name_links
             .entry(key.clone())
@@ -701,8 +746,16 @@ impl DependencyGraph {
                     NameScope::Sheet(expected) => expected == sheet_id,
                 };
                 if attach {
-                    if let Some(ast) = self.get_formula(formula_vertex) {
-                        self.rebuild_formula_dependencies(formula_vertex, &ast);
+                    if let Some(named) = self.named_range_by_vertex(formula_vertex) {
+                        // A name defined through the new name (its definition
+                        // was rebuilt while the name was undefined, after a
+                        // delete or an update) now reads it.
+                        let (definition, name_scope) = (named.definition.clone(), named.scope);
+                        self.heal_name_dependencies(formula_vertex, &definition, name_scope);
+                    } else if let Some(ast) = self.get_formula(formula_vertex) {
+                        // A cycle through the new name stays a cycle the
+                        // evaluator reports, as for a redefined name.
+                        self.rewire_formula_dependencies(formula_vertex, &ast);
                     } else {
                         self.clear_pending_name_references(formula_vertex);
                     }
@@ -711,6 +764,30 @@ impl DependencyGraph {
                 }
             }
         }
+    }
+
+    /// Rebuilds the dependencies of a formula name that reads a name just
+    /// defined, and re-wires the formulas using it whose INDEX numbers its
+    /// areas (see [`Self::rebuild_area_numbering_name_consumers`]); they
+    /// recalculate.
+    fn heal_name_dependencies(
+        &mut self,
+        vertex: VertexId,
+        definition: &NamedDefinition,
+        scope: NameScope,
+    ) {
+        self.detach_vertex_from_names(vertex);
+        if let Ok(referenced_names) = self.rebuild_name_dependencies(vertex, definition, scope)
+            && !referenced_names.is_empty()
+        {
+            self.attach_vertex_to_names(vertex, &referenced_names);
+        }
+        let dependents = self
+            .named_range_by_vertex(vertex)
+            .map(|named| named.dependents.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        self.rebuild_area_numbering_name_consumers(&dependents);
+        self.mark_dirty_many(&[vertex]);
     }
 
     pub(super) fn name_depends_on_vertex(
@@ -746,13 +823,15 @@ impl DependencyGraph {
         definition: &NamedDefinition,
         scope: NameScope,
     ) -> Result<Vec<VertexId>, ExcelError> {
+        let current_sheet_id = match scope {
+            NameScope::Sheet(id) => id,
+            NameScope::Workbook => self.default_sheet_id,
+        };
+        let mut pending_names = Vec::new();
         let formula_dependencies = if let NamedDefinition::Formula { ast, .. } = definition {
-            let current_sheet_id = match scope {
-                NameScope::Sheet(id) => id,
-                NameScope::Workbook => self.default_sheet_id,
-            };
-            let (dependencies, range_dependencies, _, _, _pending_names) =
+            let (dependencies, range_dependencies, _, _, pending) =
                 self.extract_dependencies_with_pending_names(ast, current_sheet_id)?;
+            pending_names = pending;
             Some((dependencies, range_dependencies))
         } else {
             None
@@ -760,6 +839,13 @@ impl DependencyGraph {
 
         self.remove_dependent_edges(vertex);
         self.unregister_name_cell_dependencies(vertex);
+        // A name the definition reads that is not defined (deleted, or not
+        // defined yet) is pending: defining it rebuilds this name's
+        // dependencies, as it does a formula's.
+        self.clear_pending_name_references(vertex);
+        for name in &pending_names {
+            self.record_pending_name_reference(current_sheet_id, name, vertex);
+        }
 
         let mut dependencies: Vec<VertexId> = Vec::new();
         let mut range_dependencies: Vec<SharedRangeRef<'static>> = Vec::new();
@@ -966,6 +1052,7 @@ impl DependencyGraph {
     }
 
     pub(super) fn mark_named_vertex_deleted(&mut self, named_range: &NamedRange) {
+        self.clear_pending_name_references(named_range.vertex);
         self.detach_vertex_from_names(named_range.vertex);
         self.remove_dependent_edges(named_range.vertex);
         self.unregister_name_cell_dependencies(named_range.vertex);

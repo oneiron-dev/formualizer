@@ -95,6 +95,10 @@ fn no_local_bindings(_: &AstShapeContext<'_>, _: &str, _: usize) -> LocalBinding
     LocalBindingStyle::None
 }
 
+fn formula_sheet<'context>(context: &'context AstShapeContext<'_>) -> Option<&'context str> {
+    Some(context.graph.sheet_name(context.formula_cell.sheet_id))
+}
+
 fn resolve_sheet(
     graph: &DependencyGraph,
     declared: DeclaredSheet<'_>,
@@ -282,6 +286,7 @@ fn ast_shape(graph: &DependencyGraph, formula: VertexId) -> AstShapeContext<'_> 
         &ast,
         &mut context,
         no_local_bindings,
+        formula_sheet,
         collect_ast_reference,
     )
     .expect("retained formula reference collection must succeed");

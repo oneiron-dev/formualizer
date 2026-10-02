@@ -231,11 +231,11 @@ fn static_index_area(name: &str, arg_count: usize, area: Option<Option<i64>>) ->
 /// reads only the area it selects. From the first operand whose number of
 /// areas the formula alone does not settle (a name, which may be defined as
 /// several areas and be redefined later, a function, ...), every operand is
-/// kept. `single_area` gives a cell or range operand's sheet as written; the
-/// areas of a union lie on one sheet (it is `#VALUE!` otherwise), so operands
-/// are left out only when every cell or range names the same sheet, which the
-/// selected area then still ties the formula to. `None` when every operand
-/// is kept.
+/// kept. `single_area` gives a cell or range operand's sheet (see
+/// [`operand_sheet_key`]); the areas of a union lie on one sheet (it is
+/// `#VALUE!` otherwise), so operands are left out only when every cell or
+/// range lies on the same sheet, which the selected area then still ties the
+/// formula to. `None` when every operand is kept.
 fn index_read_operands<T: Copy, S: PartialEq>(
     operands: &[T],
     area: i64,
@@ -270,9 +270,22 @@ fn index_read_operands<T: Copy, S: PartialEq>(
     (read.len() < operands.len()).then_some(read)
 }
 
+/// The sheet a cell or range operand of INDEX's union lies on, as a key that
+/// matches whatever the case of its name: an unqualified operand lies on the
+/// formula's sheet, `current_sheet`, so `(A1,Sheet1!D1)` on Sheet1 is one
+/// sheet. `None` for an unqualified operand when the formula's sheet is not
+/// known, which then matches only other unqualified operands.
+fn operand_sheet_key(sheet: Option<&str>, current_sheet: Option<&str>) -> Option<String> {
+    sheet.or(current_sheet).map(str::to_lowercase)
+}
+
 /// The operands of INDEX's reference argument it may read (see
 /// [`index_read_operands`]); `None` when every one may be read.
-fn index_read_operands_tree<'a>(name: &str, args: &'a [ASTNode]) -> Option<Vec<&'a ASTNode>> {
+fn index_read_operands_tree<'a>(
+    name: &str,
+    args: &'a [ASTNode],
+    current_sheet: Option<&str>,
+) -> Option<Vec<&'a ASTNode>> {
     let area = static_index_area(
         name,
         args.len(),
@@ -297,7 +310,7 @@ fn index_read_operands_tree<'a>(name: &str, args: &'a [ASTNode]) -> Option<Vec<&
             ASTNodeType::Reference {
                 reference: ReferenceType::Cell { sheet, .. } | ReferenceType::Range { sheet, .. },
                 ..
-            } => Some(sheet.as_ref().map(|sheet| sheet.to_ascii_uppercase())),
+            } => Some(operand_sheet_key(sheet.as_deref(), current_sheet)),
             _ => None,
         }
     })
@@ -306,8 +319,10 @@ fn index_read_operands_tree<'a>(name: &str, args: &'a [ASTNode]) -> Option<Vec<&
 /// The arena form of [`index_read_operands_tree`].
 fn index_read_operands_arena(
     store: &DataStore,
+    sheet_registry: &SheetRegistry,
     name: &str,
     args: &[AstNodeId],
+    current_sheet: Option<&str>,
 ) -> Option<Vec<AstNodeId>> {
     let area = static_index_area(
         name,
@@ -336,10 +351,15 @@ fn index_read_operands_arena(
     index_read_operands(&operands, area, |operand| match store.get_node(operand) {
         Some(AstNodeData::Reference {
             ref_type:
-                crate::engine::arena::CompactRefType::Cell { sheet, .. }
-                | crate::engine::arena::CompactRefType::Range { sheet, .. },
+                ref_type @ (crate::engine::arena::CompactRefType::Cell { .. }
+                | crate::engine::arena::CompactRefType::Range { .. }),
             ..
-        }) => Some(*sheet),
+        }) => match store.reconstruct_reference_type_for_eval(ref_type, sheet_registry) {
+            ReferenceType::Cell { sheet, .. } | ReferenceType::Range { sheet, .. } => {
+                Some(operand_sheet_key(sheet.as_deref(), current_sheet))
+            }
+            _ => None,
+        },
         _ => None,
     })
 }
@@ -356,10 +376,14 @@ fn tree_cell_info(name: &str, args: &[ASTNode]) -> Option<String> {
     }
 }
 
+/// Streams the references `ast` reads to `visitor`, in source order.
+/// `current_sheet` gives the sheet the formula lies on, when known, which an
+/// unqualified reference means.
 pub(crate) fn visit_tree_references<C>(
     ast: &ASTNode,
     context: &mut C,
     local_binding_style: fn(&C, &str, usize) -> LocalBindingStyle,
+    current_sheet: fn(&C) -> Option<&str>,
     visitor: fn(&mut C, SemanticReference<'_>) -> Result<(), ExcelError>,
 ) -> Result<(), ExcelError> {
     enum Frame<'a> {
@@ -441,7 +465,8 @@ pub(crate) fn visit_tree_references<C>(
                     _ => {
                         let cell_info = tree_cell_info(name, args);
                         // INDEX reads only the area it selects.
-                        let index_operands = index_read_operands_tree(name, args);
+                        let index_operands =
+                            index_read_operands_tree(name, args, current_sheet(context));
                         for (index, arg) in args.iter().enumerate().rev() {
                             if index == 0
                                 && let Some(operands) = &index_operands
@@ -485,11 +510,13 @@ pub(crate) fn visit_tree_references<C>(
     Ok(())
 }
 
+/// The arena form of [`visit_tree_references`].
 pub(crate) fn visit_arena_references<C>(
     ast_id: AstNodeId,
     context: &mut C,
     data_store: fn(&C) -> &DataStore,
     sheet_registry: fn(&C) -> &SheetRegistry,
+    current_sheet: fn(&C) -> Option<&str>,
     visitor: fn(&mut C, SemanticReference<'_>) -> Result<(), ExcelError>,
 ) -> Result<(), ExcelError> {
     let node = data_store(context)
@@ -503,14 +530,33 @@ pub(crate) fn visit_arena_references<C>(
                 .reconstruct_reference_type_for_eval(&ref_type, sheet_registry(context));
             visitor(context, classify(&reference))
         }
-        AstNodeData::UnaryOp { expr_id, .. } => {
-            visit_arena_references(expr_id, context, data_store, sheet_registry, visitor)
-        }
+        AstNodeData::UnaryOp { expr_id, .. } => visit_arena_references(
+            expr_id,
+            context,
+            data_store,
+            sheet_registry,
+            current_sheet,
+            visitor,
+        ),
         AstNodeData::BinaryOp {
             left_id, right_id, ..
         } => {
-            visit_arena_references(left_id, context, data_store, sheet_registry, visitor)?;
-            visit_arena_references(right_id, context, data_store, sheet_registry, visitor)
+            visit_arena_references(
+                left_id,
+                context,
+                data_store,
+                sheet_registry,
+                current_sheet,
+                visitor,
+            )?;
+            visit_arena_references(
+                right_id,
+                context,
+                data_store,
+                sheet_registry,
+                current_sheet,
+                visitor,
+            )
         }
         AstNodeData::Function { name_id, .. } => {
             let store = data_store(context);
@@ -531,9 +577,15 @@ pub(crate) fn visit_arena_references<C>(
                 None
             };
             // INDEX reads only the area it selects.
-            let index_operands = store
-                .get_args(ast_id)
-                .and_then(|args| index_read_operands_arena(store, &name, args));
+            let index_operands = store.get_args(ast_id).and_then(|args| {
+                index_read_operands_arena(
+                    store,
+                    sheet_registry(context),
+                    &name,
+                    args,
+                    current_sheet(context),
+                )
+            });
             for index in 0..arg_count {
                 if index == 0
                     && let Some(operands) = &index_operands
@@ -544,6 +596,7 @@ pub(crate) fn visit_arena_references<C>(
                             context,
                             data_store,
                             sheet_registry,
+                            current_sheet,
                             visitor,
                         )?;
                     }
@@ -562,7 +615,14 @@ pub(crate) fn visit_arena_references<C>(
                 {
                     continue;
                 }
-                visit_arena_references(child, context, data_store, sheet_registry, visitor)?;
+                visit_arena_references(
+                    child,
+                    context,
+                    data_store,
+                    sheet_registry,
+                    current_sheet,
+                    visitor,
+                )?;
             }
             Ok(())
         }
@@ -575,7 +635,14 @@ pub(crate) fn visit_arena_references<C>(
                     .get_array_elems(ast_id)
                     .expect("array elements disappeared")
                     .2[index];
-                visit_arena_references(child, context, data_store, sheet_registry, visitor)?;
+                visit_arena_references(
+                    child,
+                    context,
+                    data_store,
+                    sheet_registry,
+                    current_sheet,
+                    visitor,
+                )?;
             }
             Ok(())
         }
@@ -597,6 +664,14 @@ mod tests {
 
     fn no_bindings(_: &Seen, _: &str, _: usize) -> LocalBindingStyle {
         LocalBindingStyle::None
+    }
+
+    fn no_sheet<C>(_: &C) -> Option<&str> {
+        None
+    }
+
+    fn sheet1<C>(_: &C) -> Option<&str> {
+        Some("Sheet1")
     }
 
     fn record(seen: &mut Seen, reference: SemanticReference<'_>) -> Result<(), ExcelError> {
@@ -635,7 +710,7 @@ mod tests {
         )
         .unwrap();
         let mut seen = Seen::default();
-        visit_tree_references(&ast, &mut seen, no_bindings, record).unwrap();
+        visit_tree_references(&ast, &mut seen, no_bindings, no_sheet, record).unwrap();
 
         assert_eq!(seen.0.len(), 10);
         assert!(seen.0[0].starts_with("cell:Current:1:1:false:true"));
@@ -677,8 +752,9 @@ mod tests {
         // With a constant area_num (1 when absent), an area of INDEX's union
         // that is numbered and not selected is no dependency. A name may hold
         // several areas, so the areas from it on stay dependencies; so do all
-        // of them when area_num is known only at run time.
-        let cases: [(&str, &[&str]); 13] = [
+        // of them when area_num is known only at run time. The formula lies
+        // on Sheet1, which its unqualified areas mean.
+        let cases: [(&str, &[&str]); 16] = [
             ("=INDEX((A1,B1:B2,C1),1,1,2)", &["finite"]),
             ("=INDEX((A1,B1:B2,C1),1,1,\"3\")", &["cell:Current:1:3"]),
             ("=INDEX((A1,B1:B2,C1),1,1,TRUE)", &["cell:Current:1:1"]),
@@ -708,13 +784,24 @@ mod tests {
                 "=INDEX((Data!A1,Data!B1),1,1,1)",
                 &["cell:Name(\"Data\"):1:1"],
             ),
+            // An unqualified area lies on the formula's sheet, whatever the
+            // case the other areas spell it in.
+            (
+                "=INDEX((A1,Sheet1!D1),1,1,2)",
+                &["cell:Name(\"Sheet1\"):1:4"],
+            ),
+            ("=INDEX((A1,SHEET1!D1),1,1,1)", &["cell:Current:1:1"]),
+            (
+                "=INDEX((sheet1!A1,Sheet1!D1),1,1,2)",
+                &["cell:Name(\"Sheet1\"):1:4"],
+            ),
         ];
         let sheets = SheetRegistry::new();
         let mut store = DataStore::new();
         for (formula, expected) in cases {
             let ast = parse(formula).unwrap();
             let mut seen = Seen::default();
-            visit_tree_references(&ast, &mut seen, no_bindings, record).unwrap();
+            visit_tree_references(&ast, &mut seen, no_bindings, sheet1, record).unwrap();
             assert_eq!(seen.0.len(), expected.len(), "{formula}: {:?}", seen.0);
             for (label, prefix) in seen.0.iter().zip(expected) {
                 assert!(label.starts_with(prefix), "{formula}: {label} vs {prefix}");
@@ -726,13 +813,27 @@ mod tests {
                 store: &store,
                 sheets: &sheets,
             };
-            visit_arena_references(id, &mut arena, arena_store, arena_sheets, record_arena)
-                .unwrap();
+            visit_arena_references(
+                id,
+                &mut arena,
+                arena_store,
+                arena_sheets,
+                sheet1,
+                record_arena,
+            )
+            .unwrap();
             assert_eq!(arena.seen.0.len(), expected.len(), "arena {formula}");
             for (label, prefix) in arena.seen.0.iter().zip(expected) {
                 assert!(label.starts_with(prefix), "arena {formula}: {label}");
             }
         }
+
+        // Without the formula's sheet, an unqualified area matches only other
+        // unqualified ones: every area is kept.
+        let ast = parse("=INDEX((A1,Sheet1!D1),1,1,2)").unwrap();
+        let mut seen = Seen::default();
+        visit_tree_references(&ast, &mut seen, no_bindings, no_sheet, record).unwrap();
+        assert_eq!(seen.0.len(), 2, "{:?}", seen.0);
     }
 
     #[test]
@@ -752,7 +853,7 @@ mod tests {
         fn none(_: &Option<(bool, Option<u64>)>, _: &str, _: usize) -> LocalBindingStyle {
             LocalBindingStyle::None
         }
-        visit_tree_references(&ast, &mut observed, none, capture).unwrap();
+        visit_tree_references(&ast, &mut observed, none, no_sheet, capture).unwrap();
         assert_eq!(observed, Some((true, Some(1))));
     }
 
@@ -779,7 +880,7 @@ mod tests {
         ] {
             let ast = parse(formula).unwrap();
             let mut observed = None;
-            visit_tree_references(&ast, &mut observed, none, capture).unwrap();
+            visit_tree_references(&ast, &mut observed, none, no_sheet, capture).unwrap();
             assert_eq!(observed, Some(expected), "{formula}");
         }
     }

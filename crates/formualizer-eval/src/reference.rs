@@ -198,9 +198,14 @@ pub fn combine_references(
 
 /// Intersect two references with the space operator (`A1:C3 B2:D4`).
 /// `Ok(None)` when they share no cell, which Excel reports as `#NULL!`.
+///
+/// An unqualified reference is on `current_sheet`, the formula's own sheet,
+/// and sheet names match whatever their case: `Data!A1:D1 A1:D1` on Sheet1
+/// shares no cell, while `sheet1!A1:B2 Sheet1!B1` does.
 pub fn intersect_references(
     a: &ReferenceType,
     b: &ReferenceType,
+    current_sheet: &str,
 ) -> Result<Option<ReferenceType>, ExcelError> {
     // Whole rows and columns span the sheet.
     fn to_bounds(r: &ReferenceType) -> Option<SheetBounds> {
@@ -231,10 +236,13 @@ pub fn intersect_references(
         || ExcelError::new(ExcelErrorKind::Value).with_message("Unsupported reference for ' '");
     let (sheet_a, (a_sr, a_sc, a_er, a_ec)) = to_bounds(a).ok_or_else(unsupported)?;
     let (sheet_b, (b_sr, b_sc, b_er, b_ec)) = to_bounds(b).ok_or_else(unsupported)?;
-    let sheet = match (sheet_a, sheet_b) {
-        (Some(x), Some(y)) if x != y => return Ok(None),
-        (x, y) => x.or(y),
-    };
+    if !same_sheet_name(
+        sheet_a.as_deref().unwrap_or(current_sheet),
+        sheet_b.as_deref().unwrap_or(current_sheet),
+    ) {
+        return Ok(None);
+    }
+    let sheet = sheet_a.or(sheet_b);
     let (sr, sc) = (a_sr.max(b_sr), a_sc.max(b_sc));
     let (er, ec) = (a_er.min(b_er), a_ec.min(b_ec));
     if sr > er || sc > ec {

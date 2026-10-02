@@ -4440,6 +4440,25 @@ impl DependencyGraph {
     /// `set_cell_formula[_with_volatility]` to preserve edge orientation, placeholder
     /// behavior, and name/range dependency semantics.
     pub(crate) fn rebuild_formula_dependencies(&mut self, vertex_id: VertexId, ast: &ASTNode) {
+        self.rebuild_formula_dependencies_with(vertex_id, ast, true);
+    }
+
+    /// Re-wires the dependencies of a formula whose own references did not
+    /// change, when what it reads through them did: a name it uses was
+    /// redefined, deleted or defined. A cycle through the name stays in the
+    /// graph for the evaluator to report, as it would have had the formula not
+    /// been re-wired, instead of turning the formula into a `#REF!` detached
+    /// from the name, which a later definition could then no longer reach.
+    pub(crate) fn rewire_formula_dependencies(&mut self, vertex_id: VertexId, ast: &ASTNode) {
+        self.rebuild_formula_dependencies_with(vertex_id, ast, false);
+    }
+
+    fn rebuild_formula_dependencies_with(
+        &mut self,
+        vertex_id: VertexId,
+        ast: &ASTNode,
+        reject_cycles: bool,
+    ) {
         let sheet_id = self.store.sheet_id(vertex_id);
 
         // Remove old dependency, name, and pending-name links first.
@@ -4463,12 +4482,12 @@ impl DependencyGraph {
 
         // Self-reference / name-cycle safety parity with set_cell_formula
         // (including the `CyclePolicy::Iterate` self-dependency relaxation).
-        if new_dependencies.contains(&vertex_id) && !self.config.cycle.allows_self_dependency() {
-            self.mark_as_ref_error(vertex_id);
-            return;
-        }
+        if reject_cycles && !self.config.cycle.allows_self_dependency() {
+            if new_dependencies.contains(&vertex_id) {
+                self.mark_as_ref_error(vertex_id);
+                return;
+            }
 
-        if !self.config.cycle.allows_self_dependency() {
             for &name_vertex in &named_dependencies {
                 let mut visited = FxHashSet::default();
                 if self.name_depends_on_vertex(name_vertex, vertex_id, &mut visited) {

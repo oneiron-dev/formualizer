@@ -300,6 +300,7 @@ impl<'a> Interpreter<'a> {
         crate::reference::intersect_references(
             &self.reference_as_area(a)?,
             &self.reference_as_area(b)?,
+            self.current_sheet,
         )
     }
 
@@ -529,13 +530,18 @@ impl<'a> Interpreter<'a> {
         node: &ASTNode,
     ) -> Option<Result<Vec<ReferenceType>, ExcelError>> {
         // A single area is the cells it selects: a structured reference is
-        // its A1 area on the table's sheet, as for `:` and ` `.
+        // its A1 area on the table's sheet, as for `:` and ` `, and a name
+        // that holds no reference is no area (`name_operand_area`).
         let side = |side: &ASTNode| match self.evaluate_ast_as_areas(side) {
             Some(areas) => areas,
-            None => self
-                .evaluate_ast_as_reference(side)
-                .and_then(|area| self.reference_as_area(area))
-                .map(|area| vec![area]),
+            None => match self.evaluate_ast_as_reference(side) {
+                Ok(ReferenceType::NamedRange(name)) => self
+                    .name_operand_area(name, || self.evaluate_ast(side))
+                    .map(|area| vec![area]),
+                area => area
+                    .and_then(|area| self.reference_as_area(area))
+                    .map(|area| vec![area]),
+            },
         };
         match &node.node_type {
             ASTNodeType::BinaryOp { op, left, right } if op == "," => {
@@ -544,7 +550,7 @@ impl<'a> Interpreter<'a> {
             ASTNodeType::BinaryOp { op, left, right }
                 if op == " " && (self.may_have_areas(left) || self.may_have_areas(right)) =>
             {
-                Some(Self::intersect_areas(side(left), || side(right)))
+                Some(self.intersect_areas(side(left), || side(right)))
             }
             ASTNodeType::Reference {
                 reference: ReferenceType::NamedRange(name),
@@ -572,10 +578,16 @@ impl<'a> Interpreter<'a> {
             sheet_registry,
         ) {
             Some(areas) => areas,
-            None => self
-                .evaluate_arena_ast_as_reference(side, data_store, sheet_registry)
-                .and_then(|area| self.reference_as_area(area))
-                .map(|area| vec![area]),
+            None => match self.evaluate_arena_ast_as_reference(side, data_store, sheet_registry) {
+                Ok(ReferenceType::NamedRange(name)) => self
+                    .name_operand_area(name, || {
+                        self.evaluate_arena_ast(side, data_store, sheet_registry)
+                    })
+                    .map(|area| vec![area]),
+                area => area
+                    .and_then(|area| self.reference_as_area(area))
+                    .map(|area| vec![area]),
+            },
         };
         match data_store.get_node(node_id)? {
             AstNodeData::BinaryOp {
@@ -587,7 +599,7 @@ impl<'a> Interpreter<'a> {
                 " " if self.arena_may_have_areas(*left_id, data_store, sheet_registry)
                     || self.arena_may_have_areas(*right_id, data_store, sheet_registry) =>
                 {
-                    Some(Self::intersect_areas(side(*left_id), || side(*right_id)))
+                    Some(self.intersect_areas(side(*left_id), || side(*right_id)))
                 }
                 _ => None,
             },
@@ -602,6 +614,48 @@ impl<'a> Interpreter<'a> {
             },
             _ => None,
         }
+    }
+
+    /// The area a name operand of a union or an intersection is when the name
+    /// resolves to no reference of its own: a table's bare name (not shadowed
+    /// by a LET or LAMBDA name) is the table's data body. Any other name holds
+    /// no reference, so the operator fails with the name's error when it
+    /// evaluates to one (`#NAME?` for a name defined nowhere, or for a name
+    /// for one), else with `#VALUE!` (a constant, a value).
+    fn name_operand_area(
+        &self,
+        name: String,
+        value: impl FnOnce() -> Result<crate::traits::CalcValue<'a>, ExcelError>,
+    ) -> Result<ReferenceType, ExcelError> {
+        use crate::traits::CalcValue;
+        use formualizer_parse::parser::{TableReference, TableSpecifier};
+        // A LET or LAMBDA name shadows a table of that name.
+        if self.resolve_local_name(&name).is_none() {
+            let table = ReferenceType::Table(TableReference {
+                name,
+                specifier: Some(TableSpecifier::Data),
+            });
+            match self.reference_as_area(table)? {
+                ReferenceType::Table(_) => {}
+                area => return Ok(area),
+            }
+        }
+        let error = match value() {
+            Err(error)
+            | Ok(
+                CalcValue::Scalar(LiteralValue::Error(error))
+                | CalcValue::AnnotatedScalar(LiteralValue::Error(error), _),
+            ) => Some(error),
+            Ok(CalcValue::Range(view)) if view.dims() == (1, 1) => match view.as_1x1() {
+                Some(LiteralValue::Error(error)) => Some(error),
+                _ => None,
+            },
+            Ok(_) => None,
+        };
+        Err(error.unwrap_or_else(|| {
+            ExcelError::new(ExcelErrorKind::Value)
+                .with_message("A union or an intersection joins references")
+        }))
     }
 
     /// Whether a reference expression can hold several areas: a union, a name
@@ -673,7 +727,7 @@ impl<'a> Interpreter<'a> {
         };
         let mut sheets = areas.iter().map(sheet_of);
         if let Some(first) = sheets.next()
-            && sheets.any(|sheet| !sheet.eq_ignore_ascii_case(&first))
+            && sheets.any(|sheet| !crate::reference::same_sheet_name(&sheet, &first))
         {
             return Err(ExcelError::new(ExcelErrorKind::Value)
                 .with_message("The areas of a reference must lie on one sheet"));
@@ -683,8 +737,11 @@ impl<'a> Interpreter<'a> {
 
     /// The areas of the intersection of `left` and `right`: the overlap of
     /// each area of `left` with each area of `right`, in that order, leaving
-    /// out the pairs that do not overlap (`#NULL!` when none does).
+    /// out the pairs that do not overlap (`#NULL!` when none does). Areas on
+    /// different sheets never overlap; an unqualified area is on the
+    /// formula's sheet.
     fn intersect_areas(
+        &self,
         left: Result<Vec<ReferenceType>, ExcelError>,
         right: impl FnOnce() -> Result<Vec<ReferenceType>, ExcelError>,
     ) -> Result<Vec<ReferenceType>, ExcelError> {
@@ -693,7 +750,9 @@ impl<'a> Interpreter<'a> {
         let mut areas = Vec::new();
         for left in &left {
             for right in &right {
-                if let Some(area) = crate::reference::intersect_references(left, right)? {
+                if let Some(area) =
+                    crate::reference::intersect_references(left, right, self.current_sheet)?
+                {
                     areas.push(area);
                 }
             }

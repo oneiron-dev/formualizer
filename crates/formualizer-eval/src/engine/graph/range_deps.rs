@@ -2,6 +2,18 @@ use super::*;
 use crate::engine::used_extent::{ExtentPolicy, OpenRangeBounds, resolve_used_extent};
 use formualizer_parse::parser::{ASTNode, ASTNodeType, ReferenceType};
 
+/// How many areas a reference INDEX selects in has, as far as the workbook
+/// fixes it before the formula runs.
+#[derive(Clone, Copy)]
+enum AreaCount {
+    /// A cell, a range, a union of them, or a name defined as one.
+    Count(i64),
+    /// `#NAME?`: a name defined nowhere, or a union or name holding one.
+    Undefined,
+    /// Known only when the formula runs: a function, an intersection, ...
+    Unknown,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RangeSelfUse {
     NoMatch,
@@ -330,6 +342,30 @@ impl DependencyGraph {
             && e_col.is_none_or(|e| c0 <= e)
     }
 
+    /// True when one of the formula's compressed range dependencies covers
+    /// its own cell, so whether the formula reads itself was decided by
+    /// [`Self::compressed_range_self_use`].
+    pub(super) fn compressed_range_covers_self(&self, dependent: VertexId) -> bool {
+        let Some(ranges) = self.formula_to_range_deps.get(&dependent) else {
+            return false;
+        };
+        let current_sheet_id = self.store.sheet_id(dependent);
+        ranges.iter().any(|range| {
+            let sheet_id = self
+                .sheet_reg
+                .resolve_locator(&range.sheet, current_sheet_id)
+                .unwrap_or(current_sheet_id);
+            self.range_region_contains_self(
+                dependent,
+                sheet_id,
+                range.start_row.map(|b| b.index),
+                range.end_row.map(|b| b.index),
+                range.start_col.map(|b| b.index),
+                range.end_col.map(|b| b.index),
+            )
+        })
+    }
+
     /// Record a self-loop edge (vertex → itself). The edge store and Tarjan
     /// both treat self-loops as cycles (`separate_cycles` via `has_self_loop`).
     fn record_self_loop(&mut self, vertex: VertexId) {
@@ -459,27 +495,28 @@ impl DependencyGraph {
             }
             // A symbol vertex has no position, so no range region can contain it.
             let coord = graph.store.grid_addr(dependent)?;
+            // The `n`th (1-based) row or column of `start..=end`; `None` past
+            // its end, however large `n` is, where INDEX is #REF! and reads
+            // nothing.
+            let nth = |start: u32, end: u32, n: i64| {
+                u32::try_from(n - 1)
+                    .ok()
+                    .and_then(|offset| start.checked_add(offset))
+                    .filter(|&at| at <= end)
+            };
             let contains = if row == 0 && col == 0 {
                 coord.row() >= sr && coord.row() <= er && coord.col() >= sc && coord.col() <= ec
             } else if col == 0 {
-                let selected_row = sr.checked_add(u32::try_from(row).ok()?.saturating_sub(1))?;
-                selected_row <= er
-                    && coord.row() == selected_row
-                    && coord.col() >= sc
-                    && coord.col() <= ec
+                nth(sr, er, row).is_some_and(|selected_row| {
+                    coord.row() == selected_row && coord.col() >= sc && coord.col() <= ec
+                })
             } else if row == 0 {
-                let selected_col = sc.checked_add(u32::try_from(col).ok()?.saturating_sub(1))?;
-                selected_col <= ec
-                    && coord.col() == selected_col
-                    && coord.row() >= sr
-                    && coord.row() <= er
+                nth(sc, ec, col).is_some_and(|selected_col| {
+                    coord.col() == selected_col && coord.row() >= sr && coord.row() <= er
+                })
             } else {
-                let selected_row = sr.checked_add(u32::try_from(row).ok()?.saturating_sub(1))?;
-                let selected_col = sc.checked_add(u32::try_from(col).ok()?.saturating_sub(1))?;
-                selected_row <= er
-                    && selected_col <= ec
-                    && coord.row() == selected_row
-                    && coord.col() == selected_col
+                nth(sr, er, row).is_some_and(|selected_row| coord.row() == selected_row)
+                    && nth(sc, ec, col).is_some_and(|selected_col| coord.col() == selected_col)
             };
             Some(contains)
         }
@@ -499,48 +536,123 @@ impl DependencyGraph {
         /// How many areas a reference operand has, when the workbook fixes
         /// it: a cell or a range is one area, a `,` union adds up its
         /// operands, and a name has the areas of its definition, read on the
-        /// name's own sheet when it is a sheet-level name. `None` for
-        /// anything else (a function, an intersection, a constant, ...).
+        /// name's own sheet when it is a sheet-level name. A name defined
+        /// nowhere (nor bound by the formula's LET or LAMBDA, `locals`) is
+        /// `#NAME?`, and so is a union holding one. Anything else (a
+        /// function, an intersection, a constant, ...) is known only when the
+        /// formula runs.
         fn static_area_count(
             graph: &DependencyGraph,
             node: &ASTNode,
             sheet: SheetId,
+            locals: &FxHashSet<String>,
             depth: u8,
-        ) -> Option<i64> {
+        ) -> AreaCount {
             use crate::engine::named_range::{NameScope, NamedDefinition};
             if depth > 16 {
-                return None;
+                return AreaCount::Unknown;
             }
             match &node.node_type {
                 ASTNodeType::BinaryOp { op, left, right } if op == "," => {
-                    static_area_count(graph, left, sheet, depth + 1)?
-                        .checked_add(static_area_count(graph, right, sheet, depth + 1)?)
+                    match (
+                        static_area_count(graph, left, sheet, locals, depth + 1),
+                        static_area_count(graph, right, sheet, locals, depth + 1),
+                    ) {
+                        (AreaCount::Undefined, _) | (_, AreaCount::Undefined) => {
+                            AreaCount::Undefined
+                        }
+                        (AreaCount::Count(left), AreaCount::Count(right)) => left
+                            .checked_add(right)
+                            .map_or(AreaCount::Unknown, AreaCount::Count),
+                        _ => AreaCount::Unknown,
+                    }
                 }
                 ASTNodeType::Reference {
                     reference: ReferenceType::Cell { .. } | ReferenceType::Range { .. },
                     ..
-                } => Some(1),
+                } => AreaCount::Count(1),
                 ASTNodeType::Reference {
                     reference: ReferenceType::NamedRange(name),
                     ..
                 } => {
-                    let named = graph.resolve_name_entry(name, sheet)?;
+                    if locals.contains(&name.to_uppercase()) {
+                        return AreaCount::Unknown;
+                    }
+                    let Some(named) = graph.resolve_name_entry(name, sheet) else {
+                        // A table's bare name or an external source is no
+                        // workbook name, but it is defined.
+                        return if graph.resolve_table_entry(name).is_some()
+                            || graph.resolve_source_scalar_entry(name).is_some()
+                        {
+                            AreaCount::Unknown
+                        } else {
+                            AreaCount::Undefined
+                        };
+                    };
                     match &named.definition {
-                        NamedDefinition::Cell(_) | NamedDefinition::Range(_) => Some(1),
+                        NamedDefinition::Cell(_) | NamedDefinition::Range(_) => AreaCount::Count(1),
                         NamedDefinition::Formula { ast, .. } => {
                             let sheet = match named.scope {
                                 NameScope::Sheet(id) => id,
                                 NameScope::Workbook => sheet,
                             };
-                            static_area_count(graph, ast, sheet, depth + 1)
+                            static_area_count(graph, ast, sheet, locals, depth + 1)
                         }
-                        NamedDefinition::Literal(_) => None,
+                        NamedDefinition::Literal(_) => AreaCount::Unknown,
                     }
                 }
-                _ => None,
+                _ => AreaCount::Unknown,
             }
         }
 
+        /// The names the formula binds with LET or LAMBDA, upper-cased: a
+        /// reference to one is a local value, not a workbook name.
+        fn local_names(node: &ASTNode, locals: &mut FxHashSet<String>) {
+            match &node.node_type {
+                ASTNodeType::Function { name, args } => {
+                    let function = name.strip_prefix("_xlfn.").unwrap_or(name);
+                    let bound: Box<dyn Iterator<Item = &ASTNode>> =
+                        if function.eq_ignore_ascii_case("LET") {
+                            Box::new(args.iter().take(args.len().saturating_sub(1)).step_by(2))
+                        } else if function.eq_ignore_ascii_case("LAMBDA") {
+                            Box::new(args.iter().take(args.len().saturating_sub(1)))
+                        } else {
+                            Box::new(std::iter::empty())
+                        };
+                    for parameter in bound {
+                        if let ASTNodeType::Reference {
+                            reference: ReferenceType::NamedRange(local),
+                            ..
+                        } = &parameter.node_type
+                        {
+                            locals.insert(local.to_uppercase());
+                        }
+                    }
+                    for arg in args {
+                        local_names(arg, locals);
+                    }
+                }
+                ASTNodeType::Call { callee, args } => {
+                    local_names(callee, locals);
+                    for arg in args {
+                        local_names(arg, locals);
+                    }
+                }
+                ASTNodeType::UnaryOp { expr, .. } => local_names(expr, locals),
+                ASTNodeType::BinaryOp { left, right, .. } => {
+                    local_names(left, locals);
+                    local_names(right, locals);
+                }
+                ASTNodeType::Array(rows) => {
+                    for item in rows.iter().flatten() {
+                        local_names(item, locals);
+                    }
+                }
+                ASTNodeType::Literal(_) | ASTNodeType::Omitted | ASTNodeType::Reference { .. } => {}
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
         fn visit(
             graph: &DependencyGraph,
             node: &ASTNode,
@@ -548,6 +660,7 @@ impl DependencyGraph {
             range_sheet: SheetId,
             range: (Option<u32>, Option<u32>, Option<u32>, Option<u32>),
             index: Option<(i64, Option<i64>)>,
+            locals: &FxHashSet<String>,
         ) -> RangeSelfUse {
             if matching_range(graph, node, dependent, range_sheet, range) {
                 return match index.and_then(|(row, col)| {
@@ -572,8 +685,15 @@ impl DependencyGraph {
                         Some(node) if matches!(node.node_type, ASTNodeType::Omitted) => Some(1),
                         Some(node) => static_index(node),
                     };
-                    let row = static_index(&args[1]);
-                    let col = args.get(2).and_then(static_index);
+                    // An omitted row_num or column_num is 0, as INDEX reads it
+                    // at run time: INDEX(A:A,1,) is row 1 of A:A, A1, and
+                    // INDEX(1:1,,4) column 4 of 1:1, D1.
+                    let selector = |node: &ASTNode| match node.node_type {
+                        ASTNodeType::Omitted => Some(0),
+                        _ => static_index(node),
+                    };
+                    let row = selector(&args[1]);
+                    let col = args.get(2).and_then(selector);
                     let selection = row.and_then(|row| {
                         if args.len() == 2 || col.is_some() {
                             Some((row, col))
@@ -584,58 +704,102 @@ impl DependencyGraph {
                     // The areas are numbered as the formula runs: a name in the
                     // union contributes every area of its definition. Past an
                     // operand whose areas are not fixed, the numbers are unknown.
+                    // A name defined nowhere makes the reference #NAME?, which
+                    // INDEX returns without reading any area.
                     let mut operands = Vec::new();
                     union_operands(&args[0], &mut operands);
                     let sheet = graph.get_vertex_sheet_id(dependent);
+                    let counts = operands
+                        .iter()
+                        .map(|node| static_area_count(graph, node, sheet, locals, 0))
+                        .collect::<Vec<_>>();
+                    let undefined = counts
+                        .iter()
+                        .any(|count| matches!(count, AreaCount::Undefined));
                     let mut first = Some(1i64);
                     let mut use_kind = RangeSelfUse::NoMatch;
-                    for node in operands {
-                        let numbers = first.and_then(|first| {
-                            let count = static_area_count(graph, node, sheet, 0)?;
-                            Some(first..first.checked_add(count)?)
+                    for (node, count) in operands.into_iter().zip(counts) {
+                        let numbers = first.and_then(|first| match count {
+                            AreaCount::Count(count) => Some(first..first.checked_add(count)?),
+                            AreaCount::Undefined | AreaCount::Unknown => None,
                         });
                         first = numbers.as_ref().map(|numbers| numbers.end);
-                        let selected = match (area, &numbers) {
-                            (Some(area), Some(numbers)) => numbers.contains(&area),
-                            _ => true,
-                        };
+                        let selected = !undefined
+                            && match (area, &numbers) {
+                                (Some(area), Some(numbers)) => numbers.contains(&area),
+                                _ => true,
+                            };
                         use_kind = use_kind.merge(if selected {
                             // Whichever area INDEX selects, row_num and
                             // column_num select within it.
-                            visit(graph, node, dependent, range_sheet, range, selection)
+                            visit(
+                                graph,
+                                node,
+                                dependent,
+                                range_sheet,
+                                range,
+                                selection,
+                                locals,
+                            )
                         } else if matching_range(graph, node, dependent, range_sheet, range) {
                             RangeSelfUse::Excluded
                         } else {
-                            visit(graph, node, dependent, range_sheet, range, None)
+                            visit(graph, node, dependent, range_sheet, range, None, locals)
                         });
                     }
                     for arg in &args[1..] {
-                        use_kind =
-                            use_kind.merge(visit(graph, arg, dependent, range_sheet, range, None));
+                        use_kind = use_kind.merge(visit(
+                            graph,
+                            arg,
+                            dependent,
+                            range_sheet,
+                            range,
+                            None,
+                            locals,
+                        ));
                     }
                     use_kind
                 }
                 ASTNodeType::Function { args, .. } => {
                     args.iter().fold(RangeSelfUse::NoMatch, |kind, arg| {
-                        kind.merge(visit(graph, arg, dependent, range_sheet, range, None))
+                        kind.merge(visit(
+                            graph,
+                            arg,
+                            dependent,
+                            range_sheet,
+                            range,
+                            None,
+                            locals,
+                        ))
                     })
                 }
                 ASTNodeType::UnaryOp { expr, .. } => {
-                    visit(graph, expr, dependent, range_sheet, range, None)
+                    visit(graph, expr, dependent, range_sheet, range, None, locals)
                 }
-                ASTNodeType::BinaryOp { left, right, .. } => visit(
-                    graph,
-                    left,
-                    dependent,
-                    range_sheet,
-                    range,
-                    None,
-                )
-                .merge(visit(graph, right, dependent, range_sheet, range, None)),
+                ASTNodeType::BinaryOp { left, right, .. } => {
+                    visit(graph, left, dependent, range_sheet, range, None, locals).merge(visit(
+                        graph,
+                        right,
+                        dependent,
+                        range_sheet,
+                        range,
+                        None,
+                        locals,
+                    ))
+                }
                 ASTNodeType::Call { callee, args } => {
-                    let mut kind = visit(graph, callee, dependent, range_sheet, range, None);
+                    let mut kind =
+                        visit(graph, callee, dependent, range_sheet, range, None, locals);
                     for arg in args {
-                        kind = kind.merge(visit(graph, arg, dependent, range_sheet, range, None));
+                        kind = kind.merge(visit(
+                            graph,
+                            arg,
+                            dependent,
+                            range_sheet,
+                            range,
+                            None,
+                            locals,
+                        ));
                     }
                     kind
                 }
@@ -643,7 +807,15 @@ impl DependencyGraph {
                     rows.iter()
                         .flatten()
                         .fold(RangeSelfUse::NoMatch, |kind, item| {
-                            kind.merge(visit(graph, item, dependent, range_sheet, range, None))
+                            kind.merge(visit(
+                                graph,
+                                item,
+                                dependent,
+                                range_sheet,
+                                range,
+                                None,
+                                locals,
+                            ))
                         })
                 }
                 ASTNodeType::Literal(_) | ASTNodeType::Omitted | ASTNodeType::Reference { .. } => {
@@ -652,7 +824,9 @@ impl DependencyGraph {
             }
         }
 
-        visit(self, &ast, dependent, range_sheet, range, None)
+        let mut locals = FxHashSet::default();
+        local_names(&ast, &mut locals);
+        visit(self, &ast, dependent, range_sheet, range, None, &locals)
     }
 
     pub(super) fn add_range_dependent_edges(

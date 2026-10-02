@@ -716,6 +716,11 @@ fn visit_formula_ast_references(
             _ => refs::LocalBindingStyle::None,
         }
     }
+    // The formula's sheet is not known here: an unqualified reference matches
+    // only other unqualified ones.
+    fn no_current_sheet<'context>(_: &'context Context<'_>) -> Option<&'context str> {
+        None
+    }
     fn consume(
         context: &mut Context<'_>,
         reference: refs::SemanticReference<'_>,
@@ -733,7 +738,8 @@ fn visit_formula_ast_references(
         visitor,
         stopped: false,
     };
-    let result = refs::visit_tree_references(ast, &mut context, local_bindings, consume);
+    let result =
+        refs::visit_tree_references(ast, &mut context, local_bindings, no_current_sheet, consume);
     if context.stopped {
         Ok(())
     } else {

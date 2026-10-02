@@ -444,6 +444,17 @@ impl<'a> IngestPipeline<'a> {
                 })
         }
 
+        fn current_sheet<'context>(
+            context: &'context Context<'_, '_, '_>,
+        ) -> Option<&'context str> {
+            Some(
+                context
+                    .pipeline
+                    .sheet_registry
+                    .name(context.current_sheet_id),
+            )
+        }
+
         fn consume(
             context: &mut Context<'_, '_, '_>,
             reference: crate::engine::refs::SemanticReference<'_>,
@@ -458,7 +469,13 @@ impl<'a> IngestPipeline<'a> {
             current_sheet_id,
             plan,
         };
-        crate::engine::refs::visit_tree_references(ast, &mut context, local_binding_style, consume)
+        crate::engine::refs::visit_tree_references(
+            ast,
+            &mut context,
+            local_binding_style,
+            current_sheet,
+            consume,
+        )
     }
 
     fn collect_reference(
