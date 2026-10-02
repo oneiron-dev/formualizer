@@ -482,11 +482,13 @@ pub fn underflow_to_zero(n: f64) -> f64 {
     normalize_zero(if n.is_subnormal() { 0.0 } else { n })
 }
 
-/// [`normalize_zero`] for a value: a number, or each number of an array (a
-/// function's array result, `ROUND({-0.4;0.4},0)`, holds no `-0` either).
+/// A function's number as Excel holds it: a number, or each number of an
+/// array (`ROUND({-0.4;0.4},0)` is `{0;0}`), has no `-0` and no denormalized
+/// value ([`underflow_to_zero`]): `PRODUCT(-1E-300,1E-10)` is 0, like the
+/// operator `-1E-300*1E-10`.
 pub fn normalize_zero_value(value: &mut LiteralValue) {
     match value {
-        LiteralValue::Number(n) => *n = normalize_zero(*n),
+        LiteralValue::Number(n) => *n = underflow_to_zero(*n),
         LiteralValue::Array(rows) => rows.iter_mut().flatten().for_each(normalize_zero_value),
         _ => {}
     }
@@ -1100,6 +1102,24 @@ mod tests {
         let mut scalar = LiteralValue::Number(-0.0);
         normalize_zero_value(&mut scalar);
         assert!(matches!(scalar, LiteralValue::Number(n) if n.is_sign_positive()));
+    }
+
+    #[test]
+    fn normalize_zero_value_underflows_denormalized_numbers() {
+        // Excel has no denormalized numbers, in a function's result either.
+        let mut value = LiteralValue::Array(vec![vec![
+            LiteralValue::Number(-1e-300 * 1e-10),
+            LiteralValue::Number(f64::MIN_POSITIVE),
+        ]]);
+        normalize_zero_value(&mut value);
+        let LiteralValue::Array(rows) = &value else {
+            panic!("array expected");
+        };
+        assert!(matches!(rows[0][0], LiteralValue::Number(n) if n == 0.0 && n.is_sign_positive()));
+        assert_eq!(rows[0][1], LiteralValue::Number(f64::MIN_POSITIVE));
+        let mut scalar = LiteralValue::Number(1e-310);
+        normalize_zero_value(&mut scalar);
+        assert_eq!(scalar, LiteralValue::Number(0.0));
     }
 
     #[test]

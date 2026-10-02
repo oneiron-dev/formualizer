@@ -198,10 +198,11 @@ pub(crate) enum LegacyContext {
 /// A function's error is its value: ISNUMBER(SEARCH("x",#REF!)) is FALSE and
 /// IF(FALSE,...) never sees it. Only cancellation aborts the formula.
 ///
-/// Excel has no negative zero, so a `-0` (ROUND(-0.4,0), TRUNC(-0.5)) is
+/// Excel has no negative zero and no denormalized numbers, so a `-0`
+/// (ROUND(-0.4,0), TRUNC(-0.5)) or an underflow (PRODUCT(-1E-300,1E-10)) is
 /// plain 0 before it reaches another function, as a number or as an element
-/// of an array value. (A lifted call's elements are normalized as they are
-/// collected by `lift::element`.)
+/// of an array value, whether the array is a value or one the function built
+/// as a range (MMULT's). A range viewing a sheet's cells is passed on as is.
 fn function_result<'a>(
     result: Result<crate::traits::CalcValue<'a>, ExcelError>,
 ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
@@ -218,6 +219,7 @@ fn function_result<'a>(
             crate::coercion::normalize_zero_value(&mut value);
             Ok(CalcValue::AnnotatedScalar(value, format))
         }
+        Ok(CalcValue::Range(view)) => view.with_excel_numbers().map(CalcValue::Range),
         other => other,
     }
 }
@@ -2753,5 +2755,30 @@ mod function_result_tests {
 
         let scalar = function_result(Ok(CalcValue::Scalar(LiteralValue::Number(-0.0))));
         assert!(positive_zero(&scalar.unwrap().into_literal()));
+    }
+
+    #[test]
+    fn array_results_built_as_ranges_hold_excel_numbers() {
+        // MMULT, MINVERSE, ... build their array as a range: no -0 and no
+        // denormalized number reaches the next function either.
+        let view = crate::engine::range_view::RangeView::from_owned_rows(
+            vec![
+                vec![LiteralValue::Number(-0.0)],
+                vec![LiteralValue::Number(-1e-300 * 1e-10)],
+                vec![LiteralValue::Number(-1.5)],
+                vec![LiteralValue::Text("-0".into())],
+            ],
+            crate::engine::DateSystem::Excel1900,
+        );
+        let LiteralValue::Array(rows) = function_result(Ok(CalcValue::Range(view)))
+            .unwrap()
+            .into_literal()
+        else {
+            panic!("array expected");
+        };
+        assert!(positive_zero(&rows[0][0]));
+        assert!(positive_zero(&rows[1][0]));
+        assert_eq!(rows[2][0], LiteralValue::Number(-1.5));
+        assert_eq!(rows[3][0], LiteralValue::Text("-0".into()));
     }
 }

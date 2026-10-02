@@ -335,6 +335,11 @@ fn parse_section(text: &str) -> Result<Section, ExcelError> {
     if (section.is_date() || section.has(&Tok::General)) && mixes_numbers(&section.toks) {
         return Err(ExcelError::new_value());
     }
+    // A section has at most one `General` (MS-OI29500 numFmt:
+    // [NFDateTime] [NFGeneral] [NFDateTime]).
+    if section.toks.iter().filter(|t| **t == Tok::General).count() > 1 {
+        return Err(ExcelError::new_value());
+    }
     resolve_minutes(&mut section.toks);
     Ok(section)
 }
@@ -1275,6 +1280,11 @@ mod tests {
             "AM/PM ?",
             "ss.0000",
             "General 0",
+            // At most one `General` in a section.
+            "General General",
+            "dddd General General",
+            "General d General",
+            "General\\ General",
             // `e`/`E` without a sign and `b`/`B` are year codes, so they cannot
             // stand beside digit placeholders either, in any section.
             "0E0",
@@ -1390,6 +1400,12 @@ mod tests {
         assert_eq!(fmt(45356.0, "dddd General"), "Tuesday 45356");
         assert_eq!(fmt(45356.75, "General dddd"), "45356.75 Tuesday");
         assert_eq!(fmt(45356.0, "d-mmm \\(General\\)"), "5-Mar (45356)");
+        // Only an unquoted `General` counts towards the one a section allows.
+        assert_eq!(
+            fmt(45356.0, "dddd \"General\" General"),
+            "Tuesday General 45356"
+        );
+        assert_eq!(fmt(45356.0, "General;General"), "45356");
     }
 
     #[test]

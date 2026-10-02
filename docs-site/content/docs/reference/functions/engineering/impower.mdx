@@ -11,18 +11,21 @@ Uses polar form and returns the principal-value result as complex text.
 
 ## Remarks
  - `inumber` is coerced to complex-number text; `n` is numerically coerced.
- - Returns `#NUM!` for undefined zero-power cases such as `0^0` or `0^-1`.
+ - Returns `#NUM!` for undefined zero-power cases such as `0^0` or `0^-1`;
+   any other number, however small, has powers.
+ - Each part is written as the polar form computes it, to 15 significant
+   digits, as Excel does (`IMPOWER("2+3i",3)` is `-46+9.00000000000001i`).
  - Invalid complex text returns `#NUM!`.
 
 ## Examples
 
-<Tabs items={["Square a complex value", "Negative real exponent"]}>
-<Tab value="Square a complex value">
+<Tabs items={["Cube a complex value", "Negative real exponent"]}>
+<Tab value="Cube a complex value">
 <FunctionSandbox
-  title="Square a complex value"
-  formula={`=IMPOWER("1+i",2)`}
+  title="Cube a complex value"
+  formula={`=IMPOWER("2+3i",3)`}
   grid={{}}
-  expected={"2i"}
+  expected={"-46+9.00000000000001i"}
 />
 </Tab>
 

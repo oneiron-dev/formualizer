@@ -265,7 +265,8 @@ fn array_results_reach_text_functions_as_zero() {
 #[test]
 fn a_zero_imaginary_coefficient_is_zero_whatever_its_sign() {
     // "-1-0i" is -1: its principal argument lies in (-pi, pi], so it is pi,
-    // and its square root is i, as for "-1+0i".
+    // and its square root is that of "-1+0i": i, with the tiny real part the
+    // polar form leaves (Excel's IMSQRT("-1") is "6.12323399573677E-17+i").
     let engine = engine_with(&[
         (1, 1, "=IMARGUMENT(\"-1-0i\")"),
         (2, 1, "=IMSQRT(\"-1-0i\")"),
@@ -280,7 +281,7 @@ fn a_zero_imaginary_coefficient_is_zero_whatever_its_sign() {
         (10, 1, "=IMSQRT(\"-1-0.5i\")=IMSQRT(\"-1+0.5i\")"),
     ]);
     assert_eq!(number(value(&engine, 1, 1)), std::f64::consts::PI);
-    assert_eq!(value(&engine, 2, 1), text("i"));
+    assert_eq!(value(&engine, 2, 1), text("6.12323399573677E-17+i"));
     for row in 3..=7 {
         assert_eq!(
             value(&engine, row, 1),
@@ -288,7 +289,7 @@ fn a_zero_imaginary_coefficient_is_zero_whatever_its_sign() {
             "row {row}"
         );
     }
-    assert_eq!(value(&engine, 8, 1), text("2i"));
+    assert_eq!(value(&engine, 8, 1), text("1.22464679914735E-16+2i"));
     assert_eq!(value(&engine, 9, 1), LiteralValue::Boolean(true));
     assert_eq!(value(&engine, 10, 1), LiteralValue::Boolean(false));
 }
@@ -322,4 +323,55 @@ fn arithmetic_underflow_is_zero() {
     assert_eq!(value(&engine, 7, 1), text("0"));
     assert_eq!(number(value(&engine, 8, 1)), f64::MIN_POSITIVE);
     assert_eq!(number(value(&engine, 9, 1)), -1e-300 * 1e-7);
+}
+
+#[test]
+fn function_results_underflow_to_zero() {
+    // A function's result below Excel's smallest number is 0 too, as a
+    // number or as an element of an array result: it equals 0, divides as 0
+    // and groups with 0.
+    let engine = engine_with(&[
+        (1, 1, "=PRODUCT(-1E-300,1E-10)=0"),
+        (2, 1, "=1/PRODUCT(-1E-300,1E-10)"),
+        (3, 1, "=PRODUCT(-1E-300,1E-10)"),
+        (4, 1, "=SUM(--(MMULT({1E-300;1E-300},{1E-10})=0))"),
+        (
+            5,
+            1,
+            "=ROWS(GROUPBY(MMULT({1E-300;0},{1E-10}),{1;2},SUM,0,0))",
+        ),
+        // Excel's smallest numbers are kept.
+        (6, 1, "=PRODUCT(-1E-300,1E-7)"),
+        (7, 1, "=INDEX(MMULT({1E-300;1E-300},{1E-7}),2,1)"),
+    ]);
+    assert_eq!(value(&engine, 1, 1), LiteralValue::Boolean(true));
+    assert!(matches!(
+        value(&engine, 2, 1),
+        LiteralValue::Error(e) if e.kind == formualizer_common::ExcelErrorKind::Div
+    ));
+    assert!(positive_zero(value(&engine, 3, 1)));
+    assert_eq!(number(value(&engine, 4, 1)), 2.0);
+    assert_eq!(number(value(&engine, 5, 1)), 1.0);
+    assert_eq!(number(value(&engine, 6, 1)), -1e-300 * 1e-7);
+    assert_eq!(number(value(&engine, 7, 1)), 1e-300 * 1e-7);
+}
+
+#[test]
+fn array_results_built_as_ranges_hold_no_negative_zero() {
+    // MMULT builds its array directly, not element by element: its zeros are
+    // positive before any other function or the grid sees them.
+    let wb = crate::test_workbook::TestWorkbook::new()
+        .with_function(std::sync::Arc::new(crate::builtins::math::matrix::MmultFn));
+    let interpreter = wb.interpreter();
+    let result = interpreter
+        .evaluate_ast(&parse("=MMULT({-1;-2},{0})").unwrap())
+        .unwrap()
+        .into_literal();
+    let LiteralValue::Array(rows) = result else {
+        panic!("array expected, got {result:?}");
+    };
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert!(positive_zero(row[0].clone()), "{row:?}");
+    }
 }

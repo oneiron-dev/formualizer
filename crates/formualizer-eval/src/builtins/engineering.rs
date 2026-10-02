@@ -2760,14 +2760,35 @@ impl Function for ErfPreciseFn {
 ///
 /// Excel has no negative zero: a zero coefficient is 0 whatever sign is
 /// written ("-1-0i" is -1), so the principal argument of a negative real
-/// number is pi (IMARGUMENT("-1-0i")) and its square root is "i".
+/// number is pi (IMARGUMENT("-1-0i")), and its square root is that of
+/// "-1+0i". Nor has it denormalized numbers, so a coefficient below
+/// 2.2250738585072E-308 is 0 as well. Any other coefficient, however small,
+/// is kept: "-1E-20" is a negative real number, not the origin.
 fn parse_complex(s: &str) -> Result<(f64, f64, char), ExcelError> {
     let (real, imag, suffix) = parse_complex_text(s)?;
     Ok((
-        crate::coercion::normalize_zero(real),
-        crate::coercion::normalize_zero(imag),
+        crate::coercion::underflow_to_zero(real),
+        crate::coercion::underflow_to_zero(imag),
         suffix,
     ))
+}
+
+/// Whether `real + imag*i` is the origin: both coefficients are 0. A small
+/// nonzero number ("1E-20", "-1E-20i") has a direction and a logarithm.
+fn is_complex_zero(real: f64, imag: f64) -> bool {
+    real == 0.0 && imag == 0.0
+}
+
+/// The modulus `sqrt(real^2 + imag^2)`. Coefficients so small or so large
+/// that their squares underflow or overflow take the scaled form, so a
+/// nonzero number never has modulus 0.
+fn complex_modulus(real: f64, imag: f64) -> f64 {
+    let squares = real * real + imag * imag;
+    if squares >= f64::MIN_POSITIVE && squares.is_finite() {
+        squares.sqrt()
+    } else {
+        real.hypot(imag)
+    }
 }
 
 /// The principal argument of `real + imag*i`, in (-pi, pi] as Microsoft
@@ -2857,26 +2878,14 @@ fn parse_complex_text(s: &str) -> Result<(f64, f64, char), ExcelError> {
     }
 }
 
-/// Clean up floating point noise by rounding values very close to integers
-fn clean_float(val: f64) -> f64 {
-    let rounded = val.round();
-    if (val - rounded).abs() < 1e-10 {
-        rounded
-    } else {
-        val
-    }
-}
-
 /// One part of a complex number as Excel writes it in text: at most 15
 /// significant digits (IMSIN("4+3i") is "-7.61923172032141-6.548120040911i"),
-/// whole numbers without a decimal point, and E notation once the integer
-/// part needs more than 15 digits ("1.79769313486232E+308").
+/// whole numbers without a decimal point, small parts as `&` writes them
+/// (IMSQRT("-1") is "6.12323399573677E-17+i"), and E notation once the
+/// integer part needs more than 15 digits ("1.79769313486232E+308").
 fn complex_part_text(val: f64) -> String {
     if !val.is_finite() {
         return format!("{val}");
-    }
-    if val == val.trunc() && val.abs() < 1e15 {
-        return format!("{}", val as i64);
     }
     let sci = format!("{val:.14e}");
     let (mantissa, exponent) = sci.split_once('e').expect("scientific");
@@ -2886,36 +2895,33 @@ fn complex_part_text(val: f64) -> String {
         let mantissa = mantissa.trim_end_matches('0').trim_end_matches('.');
         return format!("{mantissa}E+{exponent:02}");
     }
-    // Below 1e15 the 15-digit decimal round-trips through f64 exactly.
-    format!("{}", sci.parse::<f64>().unwrap_or(val))
+    crate::coercion::number_to_text(val)
 }
 
-/// Format a complex number as a string
+/// Format a complex number as a string.
+///
+/// Each coefficient is written as computed, to 15 significant digits: Excel
+/// does not clean up a part that is small or near a whole number
+/// (IMPOWER("2+3i",3) is "-46+9.00000000000001i", and IMREAL(COMPLEX(-1E-11,0))
+/// is -1E-11). Only a part that is 0 (or underflows to 0) is left out.
 fn format_complex(real: f64, imag: f64, suffix: char) -> String {
-    // Clean up floating point noise
-    let real = clean_float(real);
-    let imag = clean_float(imag);
+    let real = crate::coercion::underflow_to_zero(real);
+    let imag = crate::coercion::underflow_to_zero(imag);
 
-    // Handle special cases for cleaner output
-    let real_is_zero = real.abs() < 1e-15;
-    let imag_is_zero = imag.abs() < 1e-15;
-
-    if real_is_zero && imag_is_zero {
+    if real == 0.0 && imag == 0.0 {
         return "0".to_string();
     }
-    if imag_is_zero {
+    if imag == 0.0 {
         // Purely real
         return complex_part_text(real);
     }
 
-    let imag_str = if (imag - 1.0).abs() < 1e-15 {
-        suffix.to_string()
-    } else if (imag + 1.0).abs() < 1e-15 {
-        format!("-{suffix}")
-    } else {
-        format!("{}{suffix}", complex_part_text(imag))
+    let imag_str = match complex_part_text(imag).as_str() {
+        "1" => suffix.to_string(),
+        "-1" => format!("-{suffix}"),
+        part => format!("{part}{suffix}"),
     };
-    if real_is_zero {
+    if real == 0.0 {
         // Purely imaginary
         return imag_str;
     }
@@ -3354,7 +3360,7 @@ impl Function for ImArgumentFn {
         };
 
         // Excel returns #DIV/0! for IMARGUMENT(0)
-        if real.abs() < 1e-15 && imag.abs() < 1e-15 {
+        if is_complex_zero(real, imag) {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_div(),
             )));
@@ -3839,9 +3845,8 @@ impl Function for ImDivFn {
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
 
-        // Division by zero check - returns #DIV/0! for Excel compatibility
-        let denom = c * c + d * d;
-        if denom.abs() < 1e-15 {
+        // Only a zero divisor is #DIV/0!; a small one ("1E-20") divides.
+        if is_complex_zero(c, d) {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_div(),
             )));
@@ -3849,9 +3854,20 @@ impl Function for ImDivFn {
 
         let result_suffix = check_suffix_compatibility(suffix1, suffix2)?;
 
-        // (a + bi) / (c + di) = ((ac + bd) + (bc - ad)i) / (c^2 + d^2)
-        let real = (a * c + b * d) / denom;
-        let imag = (b * c - a * d) / denom;
+        // (a + bi) / (c + di) = ((ac + bd) + (bc - ad)i) / (c^2 + d^2); a
+        // divisor whose squares underflow or overflow is scaled to 1 first.
+        let denom = c * c + d * d;
+        let (real, imag) = if denom >= f64::MIN_POSITIVE && denom.is_finite() {
+            ((a * c + b * d) / denom, (b * c - a * d) / denom)
+        } else {
+            let scale = c.abs().max(d.abs());
+            let (c, d) = (c / scale, d / scale);
+            let denom = c * c + d * d;
+            (
+                (a * c + b * d) / denom / scale,
+                (b * c - a * d) / denom / scale,
+            )
+        };
 
         let result = format_complex(real, imag, result_suffix);
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(result)))
@@ -4015,13 +4031,13 @@ impl Function for ImLnFn {
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
 
-        // ln(0) is undefined
-        let modulus = (a * a + b * b).sqrt();
-        if modulus < 1e-15 {
+        // ln(0) is undefined; any other number, however small, has a logarithm
+        if is_complex_zero(a, b) {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_num(),
             )));
         }
+        let modulus = complex_modulus(a, b);
 
         // ln(z) = ln(|z|) + i*arg(z)
         let real = modulus.ln();
@@ -4105,13 +4121,13 @@ impl Function for ImLog10Fn {
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
 
-        // log10(0) is undefined
-        let modulus = (a * a + b * b).sqrt();
-        if modulus < 1e-15 {
+        // log10(0) is undefined; any other number, however small, has a logarithm
+        if is_complex_zero(a, b) {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_num(),
             )));
         }
+        let modulus = complex_modulus(a, b);
 
         // log10(z) = ln(z) / ln(10) = (ln(|z|) + i*arg(z)) / ln(10)
         let ln10 = 10.0_f64.ln();
@@ -4196,13 +4212,13 @@ impl Function for ImLog2Fn {
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
 
-        // log2(0) is undefined
-        let modulus = (a * a + b * b).sqrt();
-        if modulus < 1e-15 {
+        // log2(0) is undefined; any other number, however small, has a logarithm
+        if is_complex_zero(a, b) {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_num(),
             )));
         }
+        let modulus = complex_modulus(a, b);
 
         // log2(z) = ln(z) / ln(2) = (ln(|z|) + i*arg(z)) / ln(2)
         let ln2 = 2.0_f64.ln();
@@ -4220,14 +4236,17 @@ impl Function for ImLog2Fn {
 ///
 /// # Remarks
 /// - `inumber` is coerced to complex-number text; `n` is numerically coerced.
-/// - Returns `#NUM!` for undefined zero-power cases such as `0^0` or `0^-1`.
+/// - Returns `#NUM!` for undefined zero-power cases such as `0^0` or `0^-1`;
+///   any other number, however small, has powers.
+/// - Each part is written as the polar form computes it, to 15 significant
+///   digits, as Excel does (`IMPOWER("2+3i",3)` is `-46+9.00000000000001i`).
 /// - Invalid complex text returns `#NUM!`.
 ///
 /// # Examples
 /// ```yaml,sandbox
-/// title: "Square a complex value"
-/// formula: "=IMPOWER(\"1+i\",2)"
-/// expected: "2i"
+/// title: "Cube a complex value"
+/// formula: "=IMPOWER(\"2+3i\",3)"
+/// expected: "-46+9.00000000000001i"
 /// ```
 ///
 /// ```yaml,sandbox
@@ -4294,11 +4313,11 @@ impl Function for ImPowerFn {
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
 
-        let modulus = (a * a + b * b).sqrt();
+        let modulus = complex_modulus(a, b);
         let theta = principal_argument(a, b);
 
-        // Handle 0^n cases
-        if modulus < 1e-15 {
+        // Handle 0^n cases; any other number, however small, has powers
+        if is_complex_zero(a, b) {
             if n > 0.0 {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(
                     "0".to_string(),
@@ -4329,13 +4348,16 @@ impl Function for ImPowerFn {
 /// # Remarks
 /// - Input is coerced to complex-number text before parsing.
 /// - Returns the principal branch of the square root.
+/// - Each part is written as the polar form computes it, to 15 significant
+///   digits, as Excel does: the root of a negative real number keeps a tiny
+///   real part.
 /// - Invalid complex text returns `#NUM!`.
 ///
 /// # Examples
 /// ```yaml,sandbox
 /// title: "Square root of a negative real"
-/// formula: "=IMSQRT(\"-4\")"
-/// expected: "2i"
+/// formula: "=IMSQRT(\"-1\")"
+/// expected: "6.12323399573677E-17+i"
 /// ```
 ///
 /// ```yaml,sandbox
@@ -4395,7 +4417,7 @@ impl Function for ImSqrtFn {
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
 
-        let modulus = (a * a + b * b).sqrt();
+        let modulus = complex_modulus(a, b);
         let theta = principal_argument(a, b);
 
         // sqrt(z) = sqrt(|z|) * (cos(theta/2) + i*sin(theta/2))
@@ -5588,7 +5610,17 @@ mod tests {
             .with_function(Arc::new(ImSinhFn))
             .with_function(Arc::new(ImTanFn))
             .with_function(Arc::new(ConvertFn))
-            .with_function(Arc::new(ValueFn));
+            .with_function(Arc::new(ValueFn))
+            .with_function(Arc::new(ComplexFn))
+            .with_function(Arc::new(ImRealFn))
+            .with_function(Arc::new(ImaginaryFn))
+            .with_function(Arc::new(ImArgumentFn))
+            .with_function(Arc::new(ImDivFn))
+            .with_function(Arc::new(ImLnFn))
+            .with_function(Arc::new(ImLog10Fn))
+            .with_function(Arc::new(ImLog2Fn))
+            .with_function(Arc::new(ImPowerFn))
+            .with_function(Arc::new(ImSqrtFn));
         let interp = wb.interpreter();
         let ast = parse(formula).expect("parse");
         interp.evaluate_ast(&ast).expect("eval").into_literal()
@@ -5778,6 +5810,66 @@ mod tests {
         );
         assert_eq!(format_complex(0.0, 2.5e20, 'j'), "2.5E+20j");
         assert_eq!(format_complex(1e15, 0.0, 'i'), "1E+15");
+    }
+
+    fn text(s: &str) -> LiteralValue {
+        LiteralValue::Text(s.into())
+    }
+
+    #[test]
+    fn complex_parts_are_written_as_computed() {
+        // Excel writes each part to 15 digits without cleaning it up: a small
+        // or near-whole coefficient is kept, only 0 is left out.
+        assert_eq!(
+            eval("=IMREAL(COMPLEX(-1E-11,0))"),
+            LiteralValue::Number(-1e-11)
+        );
+        assert_eq!(
+            eval("=IMAGINARY(COMPLEX(0,-1E-11))"),
+            LiteralValue::Number(-1e-11)
+        );
+        assert_eq!(eval("=COMPLEX(2.00000000001,1)"), text("2.00000000001+i"));
+        assert_eq!(eval("=COMPLEX(1E-20,-1E-20)"), text("1E-20-1E-20i"));
+        assert_eq!(eval("=COMPLEX(0,0)"), text("0"));
+        // Microsoft's documented IMPOWER example, and the polar form's tiny
+        // real part of IMSQRT("-1") (Exceljet), are written out too.
+        assert_eq!(eval("=IMPOWER(\"2+3i\",3)"), text("-46+9.00000000000001i"));
+        assert_eq!(eval("=IMSQRT(\"-1\")"), text("6.12323399573677E-17+i"));
+        // Parts that round to 1 at 15 digits are written as i.
+        assert_eq!(eval("=IMSQRT(\"2i\")"), text("1+i"));
+        assert_eq!(eval("=IMSQRT(\"3+4i\")"), text("2+i"));
+    }
+
+    #[test]
+    fn only_the_origin_is_zero_in_complex_domain_checks() {
+        let pi = std::f64::consts::PI;
+        assert_eq!(eval("=IMARGUMENT(\"-1E-20\")"), LiteralValue::Number(pi));
+        assert_eq!(
+            eval("=IMARGUMENT(\"-1E-20i\")"),
+            LiteralValue::Number(-pi / 2.0)
+        );
+        assert_eq!(eval("=IMPOWER(\"-1E-20\",0)"), text("1"));
+        assert_eq!(eval("=IMSQRT(\"1E-200\")"), text("1E-100"));
+        assert_eq!(eval("=IMDIV(\"1\",\"1E-20\")"), text("1E+20"));
+        assert_eq!(eval("=IMDIV(\"1\",\"1E-200i\")"), text("-1E+200i"));
+        assert_number_close(eval("=IMREAL(IMLN(\"1E-200\"))"), -200.0 * 10f64.ln());
+        assert_number_close(eval("=IMREAL(IMLOG10(\"1E-20i\"))"), -20.0);
+        assert_number_close(eval("=IMREAL(IMLOG2(\"-1E-20\"))"), -20.0 * 10f64.log2());
+        // The origin itself.
+        for (formula, kind) in [
+            ("=IMARGUMENT(\"0\")", ExcelErrorKind::Div),
+            ("=IMDIV(\"1\",\"0\")", ExcelErrorKind::Div),
+            ("=IMLN(\"0\")", ExcelErrorKind::Num),
+            ("=IMLOG10(\"-0\")", ExcelErrorKind::Num),
+            ("=IMLOG2(\"0i\")", ExcelErrorKind::Num),
+            ("=IMPOWER(\"0\",0)", ExcelErrorKind::Num),
+        ] {
+            assert!(
+                matches!(eval(formula), LiteralValue::Error(e) if e.kind == kind),
+                "{formula}"
+            );
+        }
+        assert_eq!(eval("=IMPOWER(\"0\",2)"), text("0"));
     }
 
     #[test]

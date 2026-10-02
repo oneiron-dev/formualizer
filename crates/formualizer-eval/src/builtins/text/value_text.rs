@@ -820,6 +820,9 @@ mod tests {
             (LiteralValue::Text("abc".into()), "nn"),
             (LiteralValue::Boolean(true), "n@"),
             (LiteralValue::Number(1.0), "0;0;0;@;0"),
+            // A section holds at most one `General`.
+            (LiteralValue::Number(45356.0), "dddd General General"),
+            (LiteralValue::Number(1.0), "General General"),
         ] {
             let out = eval(value.clone(), format);
             assert!(

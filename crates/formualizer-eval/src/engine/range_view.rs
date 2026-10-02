@@ -381,6 +381,39 @@ impl<'a> RangeView<'a> {
         (self.rows, self.cols)
     }
 
+    /// An array value with its numbers as Excel holds them: a `-0` or a
+    /// denormalized number is 0 (MMULT({-1;-2},{0}) is {0;0}). Only an owned
+    /// array that holds such a number is rebuilt; a view of a sheet's cells is
+    /// returned as it is.
+    pub(crate) fn with_excel_numbers(self) -> Result<RangeView<'a>, ExcelError> {
+        if !matches!(self.backing, RangeBacking::Owned(_)) {
+            return Ok(self);
+        }
+        let changes = |n: f64| crate::coercion::underflow_to_zero(n).to_bits() != n.to_bits();
+        let mut found = false;
+        for slice in self.numbers_slices() {
+            let (_, _, cols) = slice?;
+            if cols.iter().any(|col| col.iter().flatten().any(changes)) {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Ok(self);
+        }
+        let mut rows = Vec::with_capacity(self.rows);
+        for r in 0..self.rows {
+            let mut row = Vec::with_capacity(self.cols);
+            for c in 0..self.cols {
+                let mut value = self.get_cell(r, c);
+                crate::coercion::normalize_zero_value(&mut value);
+                row.push(value);
+            }
+            rows.push(row);
+        }
+        RangeView::try_from_owned_rows(rows, self.sheet().date_system, self.cancel_token.clone())
+    }
+
     pub fn expand_to(&self, rows: usize, cols: usize) -> RangeView<'a> {
         let er = self.sr + rows.saturating_sub(1);
         let ec = self.sc + cols.saturating_sub(1);

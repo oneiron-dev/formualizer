@@ -1866,9 +1866,9 @@
     },
     {
       "formula": "=IMPOWER(\"1+i\", 2)",
-      "result": "2i",
+      "result": "1.22464679914735E-16+2i",
       "result_type": "str",
-      "description": "IMPOWER (1+i)^2 = 2i"
+      "description": "IMPOWER (1+i)^2 = 2i, with the tiny real part Excel's polar form leaves"
     },
     {
       "formula": "=IMSQRT(\"4\")",
@@ -1884,9 +1884,9 @@
     },
     {
       "formula": "=IMSQRT(\"-1\")",
-      "result": "i",
+      "result": "6.12323399573677E-17+i",
       "result_type": "str",
-      "description": "IMSQRT square root of -1"
+      "description": "IMSQRT square root of -1, with the tiny real part Excel's polar form leaves"
     },
     {
       "formula": "=IMSIN(\"0\")",

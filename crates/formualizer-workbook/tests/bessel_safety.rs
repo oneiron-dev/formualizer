@@ -6,8 +6,17 @@ fn bessel_safety_has_consistent_formula_results() {
         let mut wb =
             Workbook::new_with_config(WorkbookConfig::interactive().with_span_evaluation(span));
         wb.add_sheet("S").unwrap();
+        // J_100(0.06) is 5.5222739487265E-311, below Excel's smallest number
+        // (2.2250738585072E-308): Excel has no denormalized numbers, so the
+        // formula's result underflows to 0.
+        wb.set_formula("S", 1, 1, "BESSELJ(0.06,100)").unwrap();
+        wb.evaluate_all().unwrap();
+        assert!(
+            matches!(wb.get_value("S", 1, 1), Some(LiteralValue::Number(n)) if n == 0.0 && n.is_sign_positive()),
+            "BESSELJ(0.06,100): {:?}",
+            wb.get_value("S", 1, 1)
+        );
         for (row, formula, expected) in [
-            (1, "BESSELJ(0.06,100)", 5.522_273_948_726_5e-311),
             (2, "BESSELY(0.06,100)", -5.76410997427483e307),
             (3, "BESSELJ(1e-12,13)", 1.9603324996120135e-170),
             (4, "IFERROR(BESSELJ(3e9,2e9),42)", 42.0),
