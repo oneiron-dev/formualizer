@@ -563,13 +563,17 @@ impl Function for IsNaFn {
 }
 
 #[derive(Debug)]
-pub struct IsFormulaFn; // Requires provenance tracking (not yet) => always FALSE.
+pub struct IsFormulaFn;
 /// Returns whether a value originates from a formula.
 ///
-/// Current engine metadata does not track formula provenance at this call site.
+/// Reads the referenced cells' formulas, not their values.
 ///
 /// # Remarks
 /// - Returns TRUE when the referenced cell holds a formula, FALSE otherwise.
+/// - Over several cells it returns one result per cell, so
+///   `SUMPRODUCT(--ISFORMULA(A1:A9))` counts formulas; a formula entered without the array
+///   flag reads the first cell. Whole rows and columns report their first cell.
+/// - A structured reference is the cells it selects (`Table1[Qty]` is its data cells).
 /// - An argument that is not a reference returns `#VALUE!`.
 /// - Arity mismatch returns `#VALUE!`.
 ///
@@ -639,19 +643,56 @@ impl Function for IsFormulaFn {
             return value_error();
         }
         // TRUE when the referenced cell holds a formula; anything that is
-        // not a reference is #VALUE!.
+        // not a reference is #VALUE!. A structured reference is the cells it
+        // selects, `#This Row` at the formula's row.
         let Ok(reference) = args[0].as_reference_or_eval() else {
             return value_error();
         };
-        let Some(cell) = ctx
+        let reference = crate::traits::reference_as_area(ctx, reference)?;
+        let Some(first) = ctx
             .inspect_reference(&reference)?
             .and_then(|info| info.first_cell)
         else {
             return value_error();
         };
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Boolean(
-            ctx.formula_text_at_cell(cell)?.is_some(),
-        )))
+        let is_formula = |cell| {
+            ctx.formula_text_at_cell(cell)
+                .map(|text| LiteralValue::Boolean(text.is_some()))
+        };
+        // Over several cells ISFORMULA tests each one, as SUMPRODUCT(--
+        // ISFORMULA(A1:A9)) counts formulas: Microsoft lists it among the
+        // functions that return an array ("Excel functions that return ranges
+        // or arrays"). A formula entered without the array flag takes the
+        // first. Whole rows and columns, like ROW's, report their first cell.
+        let (rows, cols) = match &reference {
+            formualizer_parse::parser::ReferenceType::Range {
+                start_row: Some(sr),
+                start_col: Some(sc),
+                end_row: Some(er),
+                end_col: Some(ec),
+                ..
+            } => (sr.abs_diff(*er) + 1, sc.abs_diff(*ec) + 1),
+            _ => (1, 1),
+        };
+        if (rows, cols) == (1, 1) || args[0].in_legacy_value_context() {
+            return Ok(crate::traits::CalcValue::Scalar(is_formula(first)?));
+        }
+        let (row0, col0) = (first.coord.row(), first.coord.col());
+        let cells = (0..rows)
+            .map(|dr| {
+                (0..cols)
+                    .map(|dc| {
+                        is_formula(crate::reference::CellRef::new(
+                            first.sheet_id,
+                            crate::reference::Coord::new(row0 + dr, col0 + dc, true, true),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::traits::CalcValue::Range(
+            crate::engine::range_view::RangeView::from_owned_rows(cells, ctx.date_system()),
+        ))
     }
 }
 
@@ -739,6 +780,7 @@ impl Function for IsRefFn {
 ///
 /// # Remarks
 /// - Returns `#N/A` if the reference does not point at a formula cell.
+/// - An argument that is itself an error returns that error.
 /// - Staged formula text is preferred when present; otherwise canonical formula text is returned.
 ///
 /// ```yaml,sandbox
@@ -804,8 +846,18 @@ impl Function for FormulaTextFn {
         }
         let reference = match args[0].as_reference_or_eval() {
             Ok(reference) => reference,
-            Err(_) => return na_result(),
+            // An argument that is itself an error (`#This Row` on a totals
+            // row is #VALUE!) is the result, as in CELL.
+            Err(_) => {
+                return match args[0].value()?.into_literal() {
+                    LiteralValue::Error(error) => Ok(scalar(LiteralValue::Error(error))),
+                    _ => na_result(),
+                };
+            }
         };
+        // A structured reference is the cells it selects, `#This Row` at the
+        // formula's row; FORMULATEXT reads the upper-left one.
+        let reference = crate::traits::reference_as_area(ctx, reference)?;
         let Some(info) = ctx.inspect_reference(&reference)? else {
             return na_result();
         };
@@ -1769,7 +1821,12 @@ pub struct CellFn;
 /// - `"col"`      — the 1-based column of the upper-left cell
 /// - `"row"`      — the 1-based row of the upper-left cell
 /// - `"type"`     — `"b"` for a blank cell, `"l"` for text, `"v"` for any value
-/// - `"filename"` — `[Book.xlsx]Sheet` for a workbook read from a file, else `""`
+///   (an error value in the cell included)
+/// - `"filename"` — `[Book.xlsx]Sheet` for the reference's sheet in a workbook read from a
+///   file, else `""`
+///
+/// A structured reference is the cells it selects on its table's sheet (`Table1[Qty]` is
+/// its first data cell), `#This Row` at the formula's row.
 ///
 /// Other `info_type` values (`format`, `parentheses`, `prefix`,
 /// `protect`, `width`) and calls without a reference return `#VALUE!`, as do
@@ -1854,7 +1911,22 @@ impl Function for CellFn {
 
         // A reference argument that does not resolve is not automatically a
         // #VALUE!; see `non_reference_error`.
-        let reference = args[1].as_reference_or_eval().ok();
+        let mut reference = args[1].as_reference_or_eval().ok();
+
+        // A structured reference is the cells it selects on the table's sheet,
+        // `#This Row` at the formula's row; one that selects none is its error
+        // (#REF! for hidden headers, #VALUE! for `#This Row` off the body).
+        let mut structured = false;
+        if let Some(table @ formualizer_parse::parser::ReferenceType::Table(_)) = &reference {
+            match crate::traits::reference_as_area(ctx, table.clone()) {
+                Ok(formualizer_parse::parser::ReferenceType::Table(_)) => {}
+                Ok(area) => {
+                    reference = Some(area);
+                    structured = true;
+                }
+                Err(error) => return Ok(scalar(LiteralValue::Error(error))),
+            }
+        }
 
         // Excel's CELL rejects 3-D references outright rather than reporting on
         // the first sheet of the span.
@@ -1866,18 +1938,27 @@ impl Function for CellFn {
         // the reference position (`=CELL("type","")` is "l" in Excel). The
         // metadata info types (`address`, `col`, `row`) derive purely from
         // reference metadata and must not force the referenced value.
-        match info_type.as_str() {
-            "contents" => return Ok(scalar(cell_top_left(&args[1])?)),
-            "type" => {
-                let kind = match cell_top_left(&args[1])? {
-                    LiteralValue::Error(e) => return Ok(scalar(LiteralValue::Error(e))),
-                    LiteralValue::Empty => "b",
-                    LiteralValue::Text(_) => "l",
-                    _ => "v",
-                };
-                return Ok(scalar(LiteralValue::Text(kind.into())));
+        if matches!(info_type.as_str(), "contents" | "type") {
+            let value = match &reference {
+                Some(area) if structured => first_cell_value(ctx, area)?,
+                _ => cell_top_left(&args[1])?,
+            };
+            if info_type == "contents" {
+                return Ok(scalar(value));
             }
-            _ => {}
+            // "b" for a blank cell, "l" for text and "v" for anything else,
+            // an error value included: a valid reference to a cell holding
+            // #DIV/0! is "v". Only an argument that is no reference (an error
+            // itself, or one that does not resolve) propagates its error.
+            let kind = match value {
+                LiteralValue::Error(e) if !names_a_cell(ctx, reference.as_ref()) => {
+                    return Ok(scalar(LiteralValue::Error(e)));
+                }
+                LiteralValue::Empty => "b",
+                LiteralValue::Text(_) => "l",
+                _ => "v",
+            };
+            return Ok(scalar(LiteralValue::Text(kind.into())));
         }
 
         let Some(reference) = reference else {
@@ -1938,6 +2019,39 @@ fn cell_top_left<'a, 'b>(arg: &ArgumentHandle<'a, 'b>) -> Result<LiteralValue, E
             ExcelError::new(ExcelErrorKind::Calc).with_message("LAMBDA value must be invoked"),
         )),
     }
+}
+
+/// The value of the upper-left cell of `area`, an A1 reference.
+fn first_cell_value<'b>(
+    ctx: &dyn FunctionContext<'b>,
+    area: &formualizer_parse::parser::ReferenceType,
+) -> Result<LiteralValue, ExcelError> {
+    use formualizer_parse::parser::ReferenceType;
+    let first = match area {
+        ReferenceType::Range {
+            sheet,
+            start_row: Some(row),
+            start_col: Some(col),
+            ..
+        } => ReferenceType::cell(sheet.clone(), *row, *col),
+        other => other.clone(),
+    };
+    let view = ctx.resolve_range_view(&first, ctx.current_sheet())?;
+    Ok(view.get_cell(0, 0))
+}
+
+/// Whether `reference` resolves to a cell of the workbook, so the value read
+/// from it is that cell's content rather than the argument's own error.
+fn names_a_cell(
+    ctx: &dyn FunctionContext<'_>,
+    reference: Option<&formualizer_parse::parser::ReferenceType>,
+) -> bool {
+    reference.is_some_and(|reference| {
+        matches!(
+            ctx.inspect_reference(reference),
+            Ok(Some(info)) if info.first_cell.is_some()
+        )
+    })
 }
 
 /// The error CELL reports for an argument that did not resolve as a reference.

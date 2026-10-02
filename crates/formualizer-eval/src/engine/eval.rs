@@ -27382,6 +27382,28 @@ where
         Ok(Some(info))
     }
 
+    fn structured_reference_area(
+        &self,
+        table: &formualizer_parse::parser::TableReference,
+        current_sheet: &str,
+        current_cell: Option<CellRef>,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        let entry = self.graph.resolve_table_entry(&table.name)?;
+        let area = crate::engine::graph::tables::structured_area(
+            &entry.geometry(),
+            table.specifier.as_ref(),
+            current_cell.map(|cell| cell.coord.row()),
+        );
+        Some(area.map(|(r1, c1, r2, c2)| {
+            let sheet = self.graph.sheet_name(entry.sheet_id());
+            crate::engine::graph::tables::area_reference(
+                (!crate::reference::same_sheet_name(sheet, current_sheet))
+                    .then(|| sheet.to_string()),
+                (r1 + 1, c1 + 1, r2 + 1, c2 + 1),
+            )
+        }))
+    }
+
     fn formula_text_at_cell(&self, cell: CellRef) -> Result<Option<String>, ExcelError> {
         let sheet_name = self.graph.sheet_name(cell.sheet_id);
         if sheet_name.is_empty() {
@@ -27926,11 +27948,14 @@ where
                         | Some(formualizer_parse::parser::TableSpecifier::SpecialItem(
                             formualizer_parse::parser::SpecialItem::Headers,
                         )) => {
+                            // With the header row turned off, a reference
+                            // straight to the headers is #REF! (Microsoft,
+                            // "Using structured references with Excel tables").
                             if !has_headers {
-                                asheet.range_view(1, 1, 0, 0)
-                            } else {
-                                select(sr0, sc0, sr0, ec0)
+                                return Err(ExcelError::new(ExcelErrorKind::Ref)
+                                    .with_message("Table has no header row".to_string()));
                             }
+                            select(sr0, sc0, sr0, ec0)
                         }
                         Some(formualizer_parse::parser::TableSpecifier::Totals)
                         | Some(formualizer_parse::parser::TableSpecifier::SpecialItem(

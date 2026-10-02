@@ -67,6 +67,18 @@ impl TableEntrySnapshot {
         self.range.start.sheet_id
     }
 
+    fn geometry(&self) -> crate::engine::graph::tables::TableGeometry<'_> {
+        crate::engine::graph::tables::TableGeometry {
+            start_row: self.range.start.coord.row(),
+            start_col: self.range.start.coord.col(),
+            end_row: self.range.end.coord.row(),
+            end_col: self.range.end.coord.col(),
+            header_row: self.header_row,
+            totals_row: self.totals_row,
+            headers: &self.headers,
+        }
+    }
+
     /// The cells a structured reference into this table reads, as range
     /// dependencies, so formulas inside the table are computed first. A
     /// formula inside the area does not depend on its own column: a
@@ -78,17 +90,8 @@ impl TableEntrySnapshot {
         placement: Option<CellRef>,
     ) -> Vec<SharedRangeRef<'static>> {
         use formualizer_common::AxisBound;
-        let geometry = crate::engine::graph::tables::TableGeometry {
-            start_row: self.range.start.coord.row(),
-            start_col: self.range.start.coord.col(),
-            end_row: self.range.end.coord.row(),
-            end_col: self.range.end.coord.col(),
-            header_row: self.header_row,
-            totals_row: self.totals_row,
-            headers: &self.headers,
-        };
         let Some((r1, c1, r2, c2)) =
-            crate::engine::graph::tables::structured_dependency_area(&geometry, specifier)
+            crate::engine::graph::tables::structured_dependency_area(&self.geometry(), specifier)
         else {
             return Vec::new();
         };
@@ -117,13 +120,6 @@ impl TableEntrySnapshot {
             }
             _ => vec![area(c1, c2)],
         }
-    }
-
-    fn col_index(&self, header: &str) -> Option<usize> {
-        let header_key = header.to_lowercase();
-        self.headers
-            .iter()
-            .position(|h| h.to_lowercase() == header_key)
     }
 }
 
@@ -626,7 +622,13 @@ impl<'a> IngestPipeline<'a> {
     ) -> Result<bool, ExcelError> {
         match &mut node.node_type {
             ASTNodeType::Reference { reference, .. } => {
-                self.rewrite_structured_reference(reference, cell)
+                match self.rewrite_structured_reference(reference, cell) {
+                    Err(error) if crate::engine::graph::tables::is_placement_error(&error) => {
+                        node.node_type = ASTNodeType::Literal(LiteralValue::Error(error));
+                        Ok(true)
+                    }
+                    rewritten => rewritten,
+                }
             }
             ASTNodeType::UnaryOp { expr, .. } => {
                 self.rewrite_structured_references_node(expr, cell)
@@ -686,19 +688,23 @@ impl<'a> IngestPipeline<'a> {
         };
         if !tref.name.is_empty() {
             let Some(table) = self.tables.resolve(&tref.name) else {
-                return Ok(false);
-            };
-            let geometry = crate::engine::graph::tables::TableGeometry {
-                start_row: table.range.start.coord.row(),
-                start_col: table.range.start.coord.col(),
-                end_row: table.range.end.coord.row(),
-                end_col: table.range.end.coord.col(),
-                header_row: table.header_row,
-                totals_row: table.totals_row,
-                headers: &table.headers,
+                let column = self
+                    .tables
+                    .find_containing_cell(cell)
+                    .filter(|table| table.sheet_id() == cell.sheet_id)
+                    .and_then(|table| {
+                        crate::engine::graph::tables::unqualified_column_reference(
+                            &table.geometry(),
+                            tref,
+                        )
+                    });
+                return Ok(column.is_some_and(|column| {
+                    *reference = column;
+                    true
+                }));
             };
             let Some(area) = crate::engine::graph::tables::static_structured_area(
-                &geometry,
+                &table.geometry(),
                 tref.specifier.as_ref(),
                 cell.coord.row(),
             )?
@@ -753,47 +759,19 @@ impl<'a> IngestPipeline<'a> {
             }
         };
 
-        let Some(table) = self.tables.find_containing_cell(cell) else {
+        let Some(table) = self
+            .tables
+            .find_containing_cell(cell)
+            .filter(|table| table.sheet_id() == cell.sheet_id)
+        else {
             return Err(ExcelError::new(ExcelErrorKind::Name)
                 .with_message("This-row structured reference used outside a table".to_string()));
         };
-
-        let row0 = cell.coord.row();
-        let col0 = cell.coord.col();
-        let sr0 = table.range.start.coord.row();
-        let sc0 = table.range.start.coord.col();
-        let er0 = table.range.end.coord.row();
-        let ec0 = table.range.end.coord.col();
-
-        if table.sheet_id() != cell.sheet_id || row0 < sr0 || row0 > er0 || col0 < sc0 || col0 > ec0
-        {
-            return Err(ExcelError::new(ExcelErrorKind::Name)
-                .with_message("This-row structured reference used outside a table".to_string()));
-        }
-        if table.header_row && row0 == sr0 {
-            return Err(ExcelError::new(ExcelErrorKind::Ref).with_message(
-                "This-row structured references are not valid in the table header row".to_string(),
-            ));
-        }
-        let data_start = if table.header_row { sr0 + 1 } else { sr0 };
-        if row0 < data_start {
-            return Err(ExcelError::new(ExcelErrorKind::Ref).with_message(
-                "This-row structured references require a data/totals row context".to_string(),
-            ));
-        }
-
-        let Some(idx) = table.col_index(col_name) else {
-            return Err(ExcelError::new(ExcelErrorKind::Ref).with_message(format!(
-                "Unknown table column in this-row reference: {col_name}"
-            )));
-        };
-        *reference = ReferenceType::Cell {
-            sheet: None,
-            row: row0 + 1,
-            col: sc0 + idx as u32 + 1,
-            row_abs: true,
-            col_abs: true,
-        };
+        *reference = crate::engine::graph::tables::this_row_column_reference(
+            &table.geometry(),
+            col_name,
+            cell.coord.row(),
+        )?;
         Ok(true)
     }
 }

@@ -285,7 +285,14 @@ pub(crate) fn structured_reference_area(
     structured_area(table, specifier, None)
 }
 
-fn structured_area(
+/// The 0-based area `(r1, c1, r2, c2)` a structured reference selects, as
+/// [`structured_reference_area`], with `#This Row` read at `row0`, the formula
+/// cell's 0-based row (`None` outside any formula).
+///
+/// `#This Row` is that row of the data body only: on the header or totals row,
+/// or off the table, it is #VALUE! (Microsoft, "Using structured references
+/// with Excel tables").
+pub(crate) fn structured_area(
     table: &TableGeometry<'_>,
     specifier: Option<&formualizer_parse::parser::TableSpecifier>,
     row0: Option<u32>,
@@ -293,7 +300,7 @@ fn structured_area(
     use formualizer_parse::parser::{SpecialItem, TableRowSpecifier, TableSpecifier};
 
     let data_start = table.start_row + u32::from(table.header_row);
-    let data_end = table.end_row - u32::from(table.totals_row);
+    let data_end = table.end_row.saturating_sub(u32::from(table.totals_row));
     let reference_error = || ExcelError::new(ExcelErrorKind::Ref);
     let mut rows: Option<(u32, u32)> = None;
     let mut cols: Option<(u32, u32)> = None;
@@ -357,8 +364,9 @@ fn structured_area(
                 let Some(row0) = row0 else {
                     return Err(ExcelError::new(ExcelErrorKind::Value));
                 };
-                // Outside the table body the implicit intersection fails.
-                if row0 < data_start || row0 > table.end_row {
+                // Off the data body (the header and totals rows included)
+                // the implicit intersection fails.
+                if row0 < data_start || row0 > data_end {
                     return Err(ExcelError::new(ExcelErrorKind::Value));
                 }
                 union(&mut rows, row0, row0);
@@ -375,6 +383,52 @@ fn structured_area(
         return Err(reference_error());
     }
     Ok((r1, c1, r2, c2))
+}
+
+/// How ingest takes a structured-reference error: a reference that selects no
+/// cell of the table as it is placed (`#This Row` off the data body is
+/// #VALUE!; hidden headers, a missing totals row or column are #REF!) is a
+/// formula whose reference reads as that error, as in Excel, not a formula
+/// that cannot be entered. Anything else (an unsupported form) rejects it.
+pub(crate) fn is_placement_error(error: &ExcelError) -> bool {
+    matches!(error.kind, ExcelErrorKind::Value | ExcelErrorKind::Ref)
+}
+
+/// The cell `[@Col]` (`#This Row` of a column of the table holding the
+/// formula) names from the formula's 0-based row `row0`: #VALUE! on the header
+/// or totals row, #REF! for a column the table lacks.
+pub(crate) fn this_row_column_reference(
+    table: &TableGeometry<'_>,
+    column: &str,
+    row0: u32,
+) -> Result<formualizer_parse::parser::ReferenceType, ExcelError> {
+    use formualizer_parse::parser::{SpecialItem, TableSpecifier};
+    let specifier = TableSpecifier::Combination(vec![
+        Box::new(TableSpecifier::SpecialItem(SpecialItem::ThisRow)),
+        Box::new(TableSpecifier::Column(column.to_string())),
+    ]);
+    let (r1, c1, r2, c2) = structured_area(table, Some(&specifier), Some(row0))?;
+    Ok(area_reference(None, (r1 + 1, c1 + 1, r2 + 1, c2 + 1)))
+}
+
+/// An unqualified column reference written inside a table: `[Qty]` in a
+/// formula of `table` is that table's Qty data cells. The parser reads a lone
+/// bracketed name as the `[TableName]` data-body shorthand, so this applies
+/// only when no table has that name. `None` when `table` has no such column.
+pub(crate) fn unqualified_column_reference(
+    table: &TableGeometry<'_>,
+    tref: &formualizer_parse::parser::TableReference,
+) -> Option<formualizer_parse::parser::ReferenceType> {
+    use formualizer_parse::parser::{SpecialItem, TableSpecifier};
+    if !matches!(
+        tref.specifier,
+        Some(TableSpecifier::SpecialItem(SpecialItem::Data))
+    ) {
+        return None;
+    }
+    let column = TableSpecifier::Column(tref.name.clone());
+    let (r1, c1, r2, c2) = structured_area(table, Some(&column), None).ok()?;
+    Some(area_reference(None, (r1 + 1, c1 + 1, r2 + 1, c2 + 1)))
 }
 
 /// An A1 reference for a resolved structured-reference area.

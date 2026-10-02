@@ -118,29 +118,15 @@ fn resolve_reference_bounds<'b>(
         ReferenceType::Cell {
             sheet, row, col, ..
         } => Ok((sheet.clone(), *row, *col, *row, *col)),
-        // A structured reference is the area it selects on the table's own
-        // sheet: INDEX(Table1[Qty],2) is the second data cell of that column.
-        // Source tables resolve to owned values with no sheet position.
-        // Like the A1 form ingest writes for a structured reference, the area
-        // names its sheet only when that is not the formula's own, so it
-        // combines with plain references there (B2:INDEX(Table1[Qty],3)).
-        ReferenceType::Table(_) => {
-            let rv = ctx.resolve_range_view(base, ctx.current_sheet())?;
-            if rv.is_empty() || !rv.is_sheet_backed() {
-                return Err(ExcelError::new(ExcelErrorKind::Ref));
-            }
-            let sheet = rv.sheet_name();
-            Ok((
-                (!crate::reference::same_sheet_name(sheet, ctx.current_sheet()))
-                    .then(|| sheet.to_string()),
-                rv.start_row() as u32 + 1,
-                rv.start_col() as u32 + 1,
-                rv.end_row() as u32 + 1,
-                rv.end_col() as u32 + 1,
-            ))
-        }
         _ => Err(ExcelError::new(ExcelErrorKind::Ref)),
     }
+}
+
+/// The `n`th (1-based, `n >= 1`) row or column of the span `start..=end`, or
+/// `None` past its end, however large `n` is.
+fn nth_within(start: u32, end: u32, n: i64) -> Option<u32> {
+    let offset = u32::try_from(n.checked_sub(1)?).ok()?;
+    start.checked_add(offset).filter(|&at| at <= end)
 }
 
 #[derive(Debug)]
@@ -236,6 +222,13 @@ impl IndexFn {
             None
         };
 
+        // A structured reference is the area it selects on the table's own
+        // sheet, read from the table's placement without reading a cell:
+        // INDEX(Table1[Qty],2) is the second data cell of that column.
+        let base = match crate::traits::reference_as_area(ctx, base) {
+            Ok(base) => base,
+            Err(error) => return Some(Err(error)),
+        };
         let (sheet, sr, sc, er, ec) = match resolve_reference_bounds(ctx, &base) {
             Ok(bounds) => bounds,
             Err(error) => return Some(Err(error)),
@@ -268,22 +261,14 @@ impl IndexFn {
                 end_col_abs: false,
             }
         };
+        let off_reference = || Some(Err(ExcelError::new(ExcelErrorKind::Ref)));
         if col == 0 {
             if row == 0 {
-                // The whole reference. A structured reference is its A1 area,
-                // so INDEX(Table1,0,0):B9 combines like any range.
-                return Some(Ok(match base {
-                    ReferenceType::Table(_) if sr == er && sc == ec => {
-                        ReferenceType::cell(sheet, sr, sc)
-                    }
-                    ReferenceType::Table(_) => range_ref(sheet, sr, sc, er, ec),
-                    base => base,
-                }));
+                return Some(Ok(base));
             }
-            let r = sr + (row as u32) - 1;
-            if r > er {
-                return Some(Err(ExcelError::new(ExcelErrorKind::Ref)));
-            }
+            let Some(r) = nth_within(sr, er, row) else {
+                return off_reference();
+            };
             return Some(Ok(if sc == ec {
                 ReferenceType::cell(sheet, r, sc)
             } else {
@@ -291,22 +276,19 @@ impl IndexFn {
             }));
         }
         if row == 0 {
-            let c = sc + (col as u32) - 1;
-            if c > ec {
-                return Some(Err(ExcelError::new(ExcelErrorKind::Ref)));
-            }
+            let Some(c) = nth_within(sc, ec, col) else {
+                return off_reference();
+            };
             return Some(Ok(if sr == er {
                 ReferenceType::cell(sheet, sr, c)
             } else {
                 range_ref(sheet, sr, c, er, c)
             }));
         }
-        let r = sr + (row as u32) - 1;
-        let c = sc + (col as u32) - 1;
-        if r > er || c > ec {
-            return Some(Err(ExcelError::new(ExcelErrorKind::Ref)));
+        match (nth_within(sr, er, row), nth_within(sc, ec, col)) {
+            (Some(r), Some(c)) => Some(Ok(ReferenceType::cell(sheet, r, c))),
+            _ => off_reference(),
         }
-        Some(Ok(ReferenceType::cell(sheet, r, c)))
     }
 
     fn materialize_reference<'b>(
@@ -343,6 +325,7 @@ impl IndexFn {
         let Ok(FunctionResolution::Reference(base)) = argument.resolve_reference_or_value() else {
             return None;
         };
+        let base = crate::traits::reference_as_area(ctx, base).ok()?;
         let (rows, cols) = Self::bounded_dimensions(&base)?;
         if !Self::precise_single_cell_selection(args, rows, cols) {
             return None;
@@ -391,7 +374,9 @@ impl IndexFn {
 ///   selects the entire row, like `column_num` = `0` (Excel behavior).
 /// - A `row_num` or `column_num` of `0` selects the entire column or row respectively
 ///   (both `0` selects the whole range), matching Excel.
-/// - Negative or out-of-bounds indexes return `#REF!`.
+/// - Negative or out-of-bounds indexes return `#REF!`, however large.
+/// - A structured reference is the cells it selects: `INDEX(Table1[Qty],2)` is the second
+///   data cell of that column.
 /// - `row_num` and `column_num` are numbers: a blank cell is 0, TRUE and FALSE are 1 and 0,
 ///   and numeric text converts. Other text returns `#VALUE!`, and an error index returns
 ///   that error.
@@ -579,6 +564,10 @@ impl Function for IndexFn {
             if row < 0 || col < 0 {
                 return Ok(ref_err());
             }
+            // A position beyond the address space is past the array's end.
+            let (Ok(row), Ok(col)) = (usize::try_from(row), usize::try_from(col)) else {
+                return Ok(ref_err());
+            };
 
             // Wrap a multi-cell array result in a RangeView so aggregations
             // (SUM, etc.) iterate it, matching how the reference path returns
@@ -596,10 +585,10 @@ impl Function for IndexFn {
                     return Ok(as_range(table));
                 }
                 // INDEX(array, r, 0) -> the entire row r (scalar for a single-column array).
-                if row as usize > nrows {
+                if row > nrows {
                     return Ok(ref_err());
                 }
-                let r = &table[row as usize - 1];
+                let r = &table[row - 1];
                 if ncols == 1 {
                     return Ok(crate::traits::CalcValue::Scalar(
                         r.first().cloned().unwrap_or(LiteralValue::Empty),
@@ -609,10 +598,10 @@ impl Function for IndexFn {
             }
             if row == 0 {
                 // INDEX(array, 0, c) -> the entire column c (scalar for a single-row array).
-                if col as usize > ncols {
+                if col > ncols {
                     return Ok(ref_err());
                 }
-                let cidx = col as usize - 1;
+                let cidx = col - 1;
                 if single_row {
                     return Ok(crate::traits::CalcValue::Scalar(
                         table[0].get(cidx).cloned().unwrap_or(LiteralValue::Empty),
@@ -626,12 +615,12 @@ impl Function for IndexFn {
             }
 
             // 1-based positive indexing.
-            if row as usize > nrows || col as usize > ncols {
+            if row > nrows || col > ncols {
                 return Ok(ref_err());
             }
             let val = table
-                .get(row as usize - 1)
-                .and_then(|r| r.get(col as usize - 1))
+                .get(row - 1)
+                .and_then(|r| r.get(col - 1))
                 .cloned()
                 .unwrap_or_else(|| LiteralValue::Error(ExcelError::new(ExcelErrorKind::Ref)));
             Ok(crate::traits::CalcValue::Scalar(val))
@@ -770,7 +759,10 @@ fn offset_reference<'b>(
     if args.len() < 3 {
         return Err(ExcelError::new(ExcelErrorKind::Value));
     }
-    let base = args[0].as_reference_or_eval()?;
+    // A structured reference is the area it selects, taken from the table's
+    // placement: only the cells of the result are read, so OFFSET(Table1[Qty],
+    // 0,0,1,1) depends on the first data cell, not the whole column.
+    let base = crate::traits::reference_as_area(ctx, args[0].as_reference_or_eval()?)?;
     let rows = offset_number(&args[1])?;
     let cols = offset_number(&args[2])?;
 
@@ -934,8 +926,11 @@ impl Function for IndirectFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Option<Result<ReferenceType, ExcelError>> {
+        // A structured reference spelled at run time is the cells it selects,
+        // `#This Row` at the formula's row, like one written in the formula.
         Some(
             indirect_text_reference(args)
+                .and_then(|reference| crate::traits::reference_as_area(ctx, reference))
                 .and_then(|reference| indirect_reference_exists(reference, ctx)),
         )
     }

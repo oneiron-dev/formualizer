@@ -505,6 +505,16 @@ impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
     ) -> Result<Option<ReferenceInfo>, ExcelError> {
         self.engine.inspect_reference(reference, current_sheet)
     }
+    // Placement only: no cell is read, so nothing is recorded.
+    fn structured_reference_area(
+        &self,
+        table: &formualizer_parse::parser::TableReference,
+        current_sheet: &str,
+        current_cell: Option<CellRef>,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        self.engine
+            .structured_reference_area(table, current_sheet, current_cell)
+    }
     fn formula_text_at_cell(&self, cell: CellRef) -> Result<Option<String>, ExcelError> {
         self.engine.formula_text_at_cell(cell)
     }

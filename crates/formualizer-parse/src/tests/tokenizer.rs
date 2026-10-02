@@ -2126,6 +2126,33 @@ mod tests {
         }
 
         #[test]
+        fn colon_before_a_table_name_is_op() {
+            // =B2:Table1[Col] → a range whose second end is a table reference,
+            // as =Table1[Col]:B10 is one whose first end is.
+            for formula in [
+                "=B2:Table1[Col]",
+                "=$B$2:Table1[[#This Row],[Col]]",
+                "=Sheet1!B2:Table1[Col]",
+            ] {
+                let first = formula[1..formula.find(":T").unwrap()].to_string();
+                let table = formula[formula.find(":T").unwrap() + 1..].to_string();
+                let expected = vec![
+                    (TokenType::Operand, TokenSubType::Range, first),
+                    (TokenType::OpInfix, TokenSubType::None, ":".to_string()),
+                    (TokenType::Operand, TokenSubType::Range, table),
+                ];
+                assert_eq!(classic_non_ws(formula), expected, "{formula}");
+                assert_eq!(span_non_ws(formula), expected, "{formula}");
+            }
+            // An external book after the colon, and R1C1 shapes, keep their
+            // brackets in the operand.
+            for formula in ["=A1:[1]Sheet1!B2", "=R1C1:R[1]C"] {
+                assert_eq!(classic_non_ws(formula).len(), 1, "{formula}");
+                assert_eq!(span_non_ws(formula).len(), 1, "{formula}");
+            }
+        }
+
+        #[test]
         fn colon_after_postfix_hash_is_op() {
             // =A1#:B10
             let classic = classic_non_ws("=A1#:B10");

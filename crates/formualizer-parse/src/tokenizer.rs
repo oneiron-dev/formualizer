@@ -689,6 +689,29 @@ fn is_cell_reference_like(value: &str) -> bool {
     i == bytes.len() && i > row_start
 }
 
+/// `A1:Table1[Col]`: a range whose second end is a structured reference. When
+/// its `[` is reached the operand so far is `A1:Table1`; the byte offset of
+/// the `:` that closes the first end, when what follows it is a table name.
+fn structured_range_colon(value: &str) -> Option<usize> {
+    let colon = value.rfind(':')?;
+    let name = &value[colon + 1..];
+    let first = name.chars().next()?;
+    let is_name = (first.is_alphabetic() || first == '_' || first == '\\')
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '\\'));
+    // `R1C1:R[1]C` is R1C1 notation, not a table.
+    let r1c1 = {
+        let upper = name.to_ascii_uppercase();
+        let rest = upper.strip_prefix('R').unwrap_or(&upper);
+        let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+        let rest = rest.strip_prefix('C').unwrap_or(rest);
+        rest.trim_start_matches(|c: char| c.is_ascii_digit())
+            .is_empty()
+    };
+    (colon > 0 && is_name && !r1c1).then_some(colon)
+}
+
 fn reference_value_contains_range_colon(value: &str) -> bool {
     let value_part = value
         .rsplit_once('!')
@@ -1173,6 +1196,7 @@ impl<'a> SpanTokenizer<'a> {
     fn parse_brackets(&mut self) -> Result<(), SpanTokenizerError> {
         assert_eq!(self.formula.as_bytes()[self.offset], b'[');
 
+        self.split_structured_range_end();
         if !self.has_token() {
             self.start_token();
         }
@@ -1359,6 +1383,25 @@ impl<'a> SpanTokenizer<'a> {
                     && next_reference_has_sheet_qualifier(self.formula, self.offset + 1));
         }
         self.prev_is_reference_producing()
+    }
+
+    /// `A1:Table1[Col]`: when the operand so far is `A1:Table1`, close `A1` at
+    /// the `:` and emit the range operator, so the table name starts its own
+    /// operand, as it does in `Table1[Col]:A1`.
+    fn split_structured_range_end(&mut self) {
+        if !self.has_token() {
+            return;
+        }
+        let Some(colon) = structured_range_colon(&self.formula[self.token_start..self.token_end])
+        else {
+            return;
+        };
+        let colon = self.token_start + colon;
+        let (bracket, name_end) = (self.offset, self.token_end);
+        self.token_end = colon;
+        self.emit_infix_operator(colon, colon + 1);
+        self.offset = bracket;
+        self.token_end = name_end;
     }
 
     fn emit_infix_operator(&mut self, start: usize, end: usize) {
@@ -1921,6 +1964,7 @@ impl Tokenizer {
     fn parse_brackets(&mut self) -> Result<(), TokenizerError> {
         assert_eq!(self.formula.as_bytes()[self.offset], b'[');
 
+        self.split_structured_range_end();
         if !self.has_token() {
             self.start_token();
         }
@@ -2153,6 +2197,25 @@ impl Tokenizer {
                     && next_reference_has_sheet_qualifier(&self.formula, self.offset + 1));
         }
         self.prev_is_reference_producing()
+    }
+
+    /// `A1:Table1[Col]`: when the operand so far is `A1:Table1`, close `A1` at
+    /// the `:` and emit the range operator, so the table name starts its own
+    /// operand, as it does in `Table1[Col]:A1`.
+    fn split_structured_range_end(&mut self) {
+        if !self.has_token() {
+            return;
+        }
+        let Some(colon) = structured_range_colon(&self.formula[self.token_start..self.token_end])
+        else {
+            return;
+        };
+        let colon = self.token_start + colon;
+        let (bracket, name_end) = (self.offset, self.token_end);
+        self.token_end = colon;
+        self.emit_infix_operator(colon, colon + 1);
+        self.offset = bracket;
+        self.token_end = name_end;
     }
 
     fn emit_infix_operator(&mut self, start: usize, end: usize) {

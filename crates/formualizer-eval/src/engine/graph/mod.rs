@@ -2352,7 +2352,14 @@ impl DependencyGraph {
     ) -> Result<bool, ExcelError> {
         match &mut node.node_type {
             ASTNodeType::Reference { reference, .. } => {
-                self.rewrite_structured_reference(reference, cell)
+                match self.rewrite_structured_reference(reference, cell) {
+                    Err(error) if tables::is_placement_error(&error) => {
+                        node.node_type =
+                            ASTNodeType::Literal(formualizer_common::LiteralValue::Error(error));
+                        Ok(true)
+                    }
+                    rewritten => rewritten,
+                }
             }
             ASTNodeType::UnaryOp { expr, .. } => {
                 self.rewrite_structured_references_node(expr, cell)
@@ -2415,7 +2422,13 @@ impl DependencyGraph {
 
         if !tref.name.is_empty() {
             let Some(table) = self.resolve_table_entry(&tref.name) else {
-                return Ok(false);
+                let column = self.find_table_containing_cell(cell).and_then(|table| {
+                    tables::unqualified_column_reference(&table.geometry(), tref)
+                });
+                return Ok(column.is_some_and(|column| {
+                    *reference = column;
+                    true
+                }));
             };
             let Some(area) = tables::static_structured_area(
                 &table.geometry(),
@@ -2482,49 +2495,8 @@ impl DependencyGraph {
             return Err(ExcelError::new(ExcelErrorKind::Name)
                 .with_message("This-row structured reference used outside a table".to_string()));
         };
-
-        let row0 = cell.coord.row();
-        let col0 = cell.coord.col();
-        let sr0 = table.range.start.coord.row();
-        let sc0 = table.range.start.coord.col();
-        let er0 = table.range.end.coord.row();
-        let ec0 = table.range.end.coord.col();
-
-        if row0 < sr0 || row0 > er0 || col0 < sc0 || col0 > ec0 {
-            return Err(ExcelError::new(ExcelErrorKind::Name)
-                .with_message("This-row structured reference used outside a table".to_string()));
-        }
-
-        if table.header_row && row0 == sr0 {
-            return Err(ExcelError::new(ExcelErrorKind::Ref).with_message(
-                "This-row structured references are not valid in the table header row".to_string(),
-            ));
-        }
-
-        let data_start = if table.header_row { sr0 + 1 } else { sr0 };
-        if row0 < data_start {
-            return Err(ExcelError::new(ExcelErrorKind::Ref).with_message(
-                "This-row structured references require a data/totals row context".to_string(),
-            ));
-        }
-
-        let Some(idx) = table.col_index(col_name) else {
-            return Err(ExcelError::new(ExcelErrorKind::Ref).with_message(format!(
-                "Unknown table column in this-row reference: {col_name}"
-            )));
-        };
-        let target_col0 = sc0 + (idx as u32);
-        let target_row = row0 + 1;
-        let target_col = target_col0 + 1;
-
-        *reference = ReferenceType::Cell {
-            sheet: None,
-            row: target_row,
-            col: target_col,
-            row_abs: true,
-            col_abs: true,
-        };
-
+        *reference =
+            tables::this_row_column_reference(&table.geometry(), col_name, cell.coord.row())?;
         Ok(true)
     }
 

@@ -13,7 +13,9 @@ use std::borrow::Cow;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use formualizer_parse::parser::{ASTNode, ASTNodeType, ReferenceType, TableSpecifier};
+use formualizer_parse::parser::{
+    ASTNode, ASTNodeType, ReferenceType, TableReference, TableSpecifier,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReferenceInfo {
@@ -818,7 +820,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                     .collect();
                 let ctx = DefaultFunctionContext::new_with_sheet(
                     self.interp.context,
-                    None,
+                    self.interp.current_cell(),
                     self.interp.current_sheet(),
                 );
                 Some(fun.resolve_reference_or_value(&handles, &ctx, &|| self.value()))
@@ -864,7 +866,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                 };
                 let ctx = DefaultFunctionContext::new_with_sheet(
                     self.interp.context,
-                    None,
+                    self.interp.current_cell(),
                     self.interp.current_sheet(),
                 );
                 Some(self.interp.with_arena_call_handles(
@@ -1030,7 +1032,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         };
         let ctx = DefaultFunctionContext::new_with_sheet(
             self.interp.context,
-            None,
+            self.interp.current_cell(),
             self.interp.current_sheet(),
         );
         self.with_call_handles(fun.as_ref(), |handles| match spec {
@@ -2208,6 +2210,21 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
         Ok(None)
     }
 
+    /// The A1 reference for the cells a workbook table's structured reference
+    /// selects, on the table's own sheet (named when that is not
+    /// `current_sheet`): `Table1[Qty]` is that column's data cells and
+    /// `#This Row` the row of `current_cell`, the formula's cell. It reads no
+    /// cell, so it records no dependency. `None` when `table` names no
+    /// workbook table here (a source table, or a context without tables).
+    fn structured_reference_area(
+        &self,
+        _table: &TableReference,
+        _current_sheet: &str,
+        _current_cell: Option<CellRef>,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        None
+    }
+
     /// Retrieve formula text for a concrete cell, if that cell stores a formula.
     fn formula_text_at_cell(&self, _cell: CellRef) -> Result<Option<String>, ExcelError> {
         Ok(None)
@@ -2421,6 +2438,16 @@ pub trait FunctionContext<'ctx> {
         Ok(None)
     }
 
+    /// The A1 reference for the cells a workbook table's structured reference
+    /// selects, with `#This Row` at the formula's row; see
+    /// [`EvaluationContext::structured_reference_area`].
+    fn structured_reference_area(
+        &self,
+        _table: &TableReference,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        None
+    }
+
     fn formula_text_at_cell(&self, _cell: CellRef) -> Result<Option<String>, ExcelError> {
         Ok(None)
     }
@@ -2500,6 +2527,24 @@ pub trait FunctionContext<'ctx> {
     }
 }
 
+/// `reference` as the cells it selects: a workbook table's structured
+/// reference becomes their A1 reference (see
+/// [`FunctionContext::structured_reference_area`]), so `Table1[Qty]` is read,
+/// offset and combined like the range it names; any other reference is
+/// returned as it is. The error a structured reference selecting no cell
+/// evaluates to (`#This Row` off the data body, hidden headers) is the result.
+pub(crate) fn reference_as_area(
+    ctx: &dyn FunctionContext<'_>,
+    reference: ReferenceType,
+) -> Result<ReferenceType, ExcelError> {
+    if let ReferenceType::Table(table) = &reference
+        && let Some(area) = ctx.structured_reference_area(table)
+    {
+        return area;
+    }
+    Ok(reference)
+}
+
 /// Default adapter that wraps an EvaluationContext and provides the narrow FunctionContext.
 pub struct DefaultFunctionContext<'a> {
     pub base: &'a dyn EvaluationContext,
@@ -2559,6 +2604,14 @@ impl<'a> FunctionContext<'a> for DefaultFunctionContext<'a> {
         reference: &ReferenceType,
     ) -> Result<Option<ReferenceInfo>, ExcelError> {
         self.base.inspect_reference(reference, self.current_sheet)
+    }
+
+    fn structured_reference_area(
+        &self,
+        table: &TableReference,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        self.base
+            .structured_reference_area(table, self.current_sheet, self.current)
     }
 
     fn formula_text_at_cell(&self, cell: CellRef) -> Result<Option<String>, ExcelError> {

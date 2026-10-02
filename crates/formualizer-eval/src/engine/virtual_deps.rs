@@ -239,6 +239,16 @@ impl<'a, R: EvaluationContext> EvaluationContext for DynamicRefCollector<'a, R> 
         self.engine.workbook_file_name()
     }
 
+    fn structured_reference_area(
+        &self,
+        table: &TableReference,
+        current_sheet: &str,
+        current_cell: Option<crate::CellRef>,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        self.engine
+            .structured_reference_area(table, current_sheet, current_cell)
+    }
+
     fn cancellation_token(&self) -> Option<crate::engine::CancelToken> {
         self.engine.cancellation_token()
     }

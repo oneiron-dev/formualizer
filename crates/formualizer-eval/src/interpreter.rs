@@ -204,6 +204,50 @@ impl<'a> Interpreter<'a> {
         self.current_sheet
     }
 
+    /// The cell whose formula is being evaluated, when there is one.
+    pub(crate) fn current_cell(&self) -> Option<crate::CellRef> {
+        self.current_cell
+    }
+
+    /// `reference` as the cells it selects: a workbook table's structured
+    /// reference is their A1 reference, with `#This Row` at the formula's row,
+    /// so it composes with `:` and ` ` like the range it names.
+    fn reference_as_area(&self, reference: ReferenceType) -> Result<ReferenceType, ExcelError> {
+        if let ReferenceType::Table(table) = &reference
+            && let Some(area) =
+                self.context
+                    .structured_reference_area(table, self.current_sheet, self.current_cell)
+        {
+            return area;
+        }
+        Ok(reference)
+    }
+
+    /// The range operator `a:b`: the smallest area holding both references.
+    fn combine_reference_areas(
+        &self,
+        a: ReferenceType,
+        b: ReferenceType,
+    ) -> Result<ReferenceType, ExcelError> {
+        crate::reference::combine_references(
+            &self.reference_as_area(a)?,
+            &self.reference_as_area(b)?,
+            self.current_sheet,
+        )
+    }
+
+    /// The intersection operator `a b`: the cells both references hold.
+    fn intersect_reference_areas(
+        &self,
+        a: ReferenceType,
+        b: ReferenceType,
+    ) -> Result<Option<ReferenceType>, ExcelError> {
+        crate::reference::intersect_references(
+            &self.reference_as_area(a)?,
+            &self.reference_as_area(b)?,
+        )
+    }
+
     pub fn local_env(&self) -> &LocalEnv {
         &self.local_env
     }
@@ -371,7 +415,7 @@ impl<'a> Interpreter<'a> {
                         args.iter().map(|n| ArgumentHandle::new(n, self)).collect();
                     let fctx = DefaultFunctionContext::new_with_sheet(
                         self.context,
-                        None,
+                        self.current_cell,
                         self.current_sheet,
                     );
                     if let Some(res) = fun.eval_reference(&handles, &fctx) {
@@ -388,13 +432,13 @@ impl<'a> Interpreter<'a> {
             ASTNodeType::BinaryOp { op, left, right } if op == " " => {
                 let lref = self.evaluate_ast_as_reference(left)?;
                 let rref = self.evaluate_ast_as_reference(right)?;
-                crate::reference::intersect_references(&lref, &rref)?
+                self.intersect_reference_areas(lref, rref)?
                     .ok_or_else(|| ExcelError::new(ExcelErrorKind::Null))
             }
             ASTNodeType::BinaryOp { op, left, right } if op == ":" => {
                 let lref = self.evaluate_ast_as_reference(left)?;
                 let rref = self.evaluate_ast_as_reference(right)?;
-                crate::reference::combine_references(&lref, &rref, self.current_sheet)
+                self.combine_reference_areas(lref, rref)
             }
             ASTNodeType::Array(_)
             | ASTNodeType::UnaryOp { .. }
@@ -424,7 +468,11 @@ impl<'a> Interpreter<'a> {
             .iter()
             .map(|arg| ArgumentHandle::new(arg, self))
             .collect();
-        let fctx = DefaultFunctionContext::new_with_sheet(self.context, None, self.current_sheet);
+        let fctx = DefaultFunctionContext::new_with_sheet(
+            self.context,
+            self.current_cell,
+            self.current_sheet,
+        );
         fun.eval_reference(&handles, &fctx)
     }
 
@@ -455,8 +503,11 @@ impl<'a> Interpreter<'a> {
                     ExcelError::new(ExcelErrorKind::Value).with_message("Missing function args")
                 })?;
 
-                let fctx =
-                    DefaultFunctionContext::new_with_sheet(self.context, None, self.current_sheet);
+                let fctx = DefaultFunctionContext::new_with_sheet(
+                    self.context,
+                    self.current_cell,
+                    self.current_sheet,
+                );
 
                 self.with_arena_call_handles(
                     fun.as_ref(),
@@ -485,10 +536,11 @@ impl<'a> Interpreter<'a> {
                 let rref =
                     self.evaluate_arena_ast_as_reference(*right_id, data_store, sheet_registry)?;
                 if op == " " {
-                    return crate::reference::intersect_references(&lref, &rref)?
+                    return self
+                        .intersect_reference_areas(lref, rref)?
                         .ok_or_else(|| ExcelError::new(ExcelErrorKind::Null));
                 }
-                crate::reference::combine_references(&lref, &rref, self.current_sheet)
+                self.combine_reference_areas(lref, rref)
             }
             _ => Err(ExcelError::new(ExcelErrorKind::Ref)
                 .with_message("Expression cannot be used as a reference")),
@@ -528,7 +580,11 @@ impl<'a> Interpreter<'a> {
                 ));
             }
         };
-        let fctx = DefaultFunctionContext::new_with_sheet(self.context, None, self.current_sheet);
+        let fctx = DefaultFunctionContext::new_with_sheet(
+            self.context,
+            self.current_cell,
+            self.current_sheet,
+        );
         self.with_arena_call_handles(fun.as_ref(), args, data_store, sheet_registry, |handles| {
             fun.eval_reference(handles, &fctx)
         })
@@ -1016,7 +1072,7 @@ impl<'a> Interpreter<'a> {
                                 data_store,
                                 sheet_registry,
                             )?;
-                            crate::reference::intersect_references(&lref, &rref)
+                            self.intersect_reference_areas(lref, rref)
                         });
                     return self.intersection_value(intersection);
                 }
@@ -1029,7 +1085,7 @@ impl<'a> Interpreter<'a> {
                                 data_store,
                                 sheet_registry,
                             )?;
-                            crate::reference::combine_references(&lref, &rref, self.current_sheet)
+                            self.combine_reference_areas(lref, rref)
                         });
                     return self.range_value(range);
                 }
@@ -1640,14 +1696,14 @@ impl<'a> Interpreter<'a> {
         if op == " " {
             let intersection = self.evaluate_ast_as_reference(left_node).and_then(|lref| {
                 let rref = self.evaluate_ast_as_reference(right_node)?;
-                crate::reference::intersect_references(&lref, &rref)
+                self.intersect_reference_areas(lref, rref)
             });
             return self.intersection_value(intersection);
         }
         if op == ":" {
             let range = self.evaluate_ast_as_reference(left_node).and_then(|lref| {
                 let rref = self.evaluate_ast_as_reference(right_node)?;
-                crate::reference::combine_references(&lref, &rref, self.current_sheet)
+                self.combine_reference_areas(lref, rref)
             });
             return self.range_value(range);
         }
