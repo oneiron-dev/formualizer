@@ -350,6 +350,23 @@ pub(crate) fn array_rows(value: &CalcValue<'_>) -> Option<Vec<Vec<LiteralValue>>
     }
 }
 
+/// The element of a one-element array a function returned
+/// (`MODE.MULT({2,2})` is `{2}`). An array literal and a single cell are
+/// [`CalcValue::Range`] views, which already read as their element.
+fn single_element(value: &CalcValue<'_>) -> Option<LiteralValue> {
+    match value {
+        CalcValue::Scalar(LiteralValue::Array(rows))
+        | CalcValue::AnnotatedScalar(LiteralValue::Array(rows), _) => match rows.as_slice() {
+            [row] => match row.as_slice() {
+                [element] => Some(element.clone()),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Element `(row, col)` of `rows` broadcast to a larger shape: a single row or
 /// column repeats; positions beyond a longer dimension are `#N/A`.
 pub(crate) fn broadcast_get(rows: &[Vec<LiteralValue>], row: usize, col: usize) -> LiteralValue {
@@ -417,6 +434,8 @@ where
         return Ok(None);
     }
     let mut arrays = Vec::new();
+    // Single-value parameters holding a one-element array a function returned.
+    let mut singles = Vec::new();
     for (index, arg) in args.iter().enumerate() {
         if arg.is_omitted() {
             continue;
@@ -432,6 +451,9 @@ where
                 let Ok(value) = arg.value() else {
                     return Ok(None);
                 };
+                if let Some(element) = single_element(&value) {
+                    singles.push((index, vec![vec![literal_node(element)]]));
+                }
                 array_rows(&value).map(literal_nodes)
             }
         } else if references.is_some_and(|spec| spec.lifts(index)) {
@@ -443,6 +465,21 @@ where
             arrays.push((index, elements));
         }
     }
+    if arrays.is_empty() {
+        // A one-element array is evaluated as its element, the way an element
+        // of a larger array is (VLOOKUP(1,{1,42},MODE.MULT({2,2}),FALSE) is 42)
+        // and the way a one-element array literal already reads.
+        if singles.is_empty() {
+            return Ok(None);
+        }
+        let mut handles: Vec<ArgumentHandle<'_, 'b>> = args.to_vec();
+        for (index, nodes) in &singles {
+            handles[*index] = args[*index].literal(&nodes[0][0]);
+        }
+        return call(&handles).map(Some);
+    }
+    // Beside a larger array the element is broadcast to every position.
+    arrays.extend(singles);
     let lifted = each_element(args, &arrays, |handles| match call(handles) {
         Ok(value) => Ok(element(value)),
         Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
@@ -522,12 +559,12 @@ where
 
 fn literal_nodes(rows: Vec<Vec<LiteralValue>>) -> Vec<Vec<ASTNode>> {
     rows.into_iter()
-        .map(|row| {
-            row.into_iter()
-                .map(|value| ASTNode::new(ASTNodeType::Literal(value), None))
-                .collect()
-        })
+        .map(|row| row.into_iter().map(literal_node).collect())
         .collect()
+}
+
+fn literal_node(value: LiteralValue) -> ASTNode {
+    ASTNode::new(ASTNodeType::Literal(value), None)
 }
 
 /// Reference elements as absolute references, so a relocated evaluation

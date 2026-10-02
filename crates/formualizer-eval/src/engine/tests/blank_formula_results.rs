@@ -530,3 +530,122 @@ fn value_and_numbervalue_read_a_blank_as_zero() {
         }
     }
 }
+
+/// Evaluates each formula in its own cell of column A and checks the value
+/// each one publishes (an error by its kind).
+fn assert_formula_values(cases: &[(&str, LiteralValue)]) {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    for (i, (formula, _)) in cases.iter().enumerate() {
+        engine
+            .set_cell_formula("Sheet1", 1 + i as u32, 1, parse(formula).unwrap())
+            .unwrap();
+    }
+    engine.evaluate_all().unwrap();
+    for (i, (formula, expected)) in cases.iter().enumerate() {
+        let got = engine.get_cell_value("Sheet1", 1 + i as u32, 1);
+        match (expected, &got) {
+            (LiteralValue::Error(e), Some(LiteralValue::Error(g))) => {
+                assert_eq!(e.kind, g.kind, "{formula}")
+            }
+            _ => assert_eq!(got.as_ref(), Some(expected), "{formula}"),
+        }
+    }
+}
+
+#[test]
+fn non_finite_numeric_text_is_not_a_number() {
+    // "NaN" and "inf" are not numeric text in Excel: NUMBERVALUE, VALUE and
+    // arithmetic give #VALUE!, which an array col_index lookup and MEDIAN pass on.
+    let value_error = || LiteralValue::Error(formualizer_common::ExcelError::new_value());
+    assert_formula_values(&[
+        (
+            "=MEDIAN(VLOOKUP(1,HSTACK(1,NUMBERVALUE(\"NaN\"),1),{2,3},FALSE))",
+            value_error(),
+        ),
+        ("=NUMBERVALUE(\"NaN\")", value_error()),
+        ("=NUMBERVALUE(\"inf\")", value_error()),
+        ("=NUMBERVALUE(\"-infinity\")", value_error()),
+        ("=NUMBERVALUE(\"1E+400\")", value_error()),
+        ("=VALUE(\"NaN\")", value_error()),
+        ("=VALUE(\"inf\")", value_error()),
+        ("=VALUE(\"1E+400\")", value_error()),
+        ("=\"NaN\"+0", value_error()),
+        ("=NUMBERVALUE(\"1E+3\")", LiteralValue::Number(1000.0)),
+        ("=VALUE(\"1E+3\")", LiteralValue::Number(1000.0)),
+    ]);
+}
+
+#[test]
+fn a_one_element_index_array_is_evaluated_as_its_element() {
+    // MODE.MULT returns an array; here it holds one index, 2, which the lookup
+    // evaluates as it evaluates an element of a larger index array.
+    assert_formula_values(&[
+        (
+            "=VLOOKUP(1,{1,42},MODE.MULT({2,2}),FALSE)",
+            LiteralValue::Number(42.0),
+        ),
+        (
+            "=HLOOKUP(1,{1;42},MODE.MULT({2,2}),FALSE)",
+            LiteralValue::Number(42.0),
+        ),
+        ("=VLOOKUP(1,{1,42},{2},FALSE)", LiteralValue::Number(42.0)),
+        // Beside a larger array the element is used at every position.
+        (
+            "=SUM(VLOOKUP({1;3},{1,42;3,44},MODE.MULT({2,2}),FALSE))",
+            LiteralValue::Number(86.0),
+        ),
+        (
+            "=SUM(HLOOKUP({1,3},{1,3;42,44},MODE.MULT({2,2}),FALSE))",
+            LiteralValue::Number(86.0),
+        ),
+        // Other single-value parameters read it the same way.
+        ("=ISNUMBER(MODE.MULT({2,2}))", LiteralValue::Boolean(true)),
+        ("=ABS(MODE.MULT({-3,-3}))", LiteralValue::Number(3.0)),
+        (
+            "=INDEX({10,20,30},1,MODE.MULT({3,3}))",
+            LiteralValue::Number(30.0),
+        ),
+    ]);
+}
+
+#[test]
+fn numbervalue_follows_microsofts_separator_and_space_rules() {
+    let value_error = || LiteralValue::Error(formualizer_common::ExcelError::new_value());
+    assert_formula_values(&[
+        // Spaces are ignored, even in the middle of the text.
+        ("=NUMBERVALUE(\" 3 000 \")", LiteralValue::Number(3000.0)),
+        (
+            "=NUMBERVALUE(\"- 1 2 . 5 %\")",
+            LiteralValue::Number(-0.125),
+        ),
+        // Only the space U+0020 is ignored, as around VALUE's numeric text: a
+        // line feed, tab or no-break space is no space.
+        ("=NUMBERVALUE(\"5\"&CHAR(10))", value_error()),
+        ("=NUMBERVALUE(CHAR(9)&\"5\")", value_error()),
+        ("=NUMBERVALUE(\"3\"&UNICHAR(160)&\"000\")", value_error()),
+        // Only the first character of a separator argument is used.
+        (
+            "=NUMBERVALUE(\"1.234,56\",\",x\",\".y\")",
+            LiteralValue::Number(1234.56),
+        ),
+        (
+            "=NUMBERVALUE(\"2.500,27\",\",\",\".\")",
+            LiteralValue::Number(2500.27),
+        ),
+        ("=NUMBERVALUE(\"1,5\",\",x\",\",y\")", value_error()),
+        // A group separator before the decimal separator is ignored; after it,
+        // and a second decimal separator, are invalid.
+        ("=NUMBERVALUE(\"1,234.5\")", LiteralValue::Number(1234.5)),
+        ("=NUMBERVALUE(\"1,23,4\")", LiteralValue::Number(1234.0)),
+        ("=NUMBERVALUE(\"1.5,0\")", value_error()),
+        ("=NUMBERVALUE(\"1,234.5,0\")", value_error()),
+        ("=NUMBERVALUE(\"1.2.3\")", value_error()),
+        // A character that is neither separator nor part of a number.
+        ("=NUMBERVALUE(\"1.5\",\",\",\" \")", value_error()),
+        ("=NUMBERVALUE(\"12a\")", value_error()),
+        // Trailing percent signs divide by 100 each.
+        ("=NUMBERVALUE(\"9%%\")", LiteralValue::Number(0.0009)),
+        ("=NUMBERVALUE(\"3.5%\")", LiteralValue::Number(0.035)),
+        ("=NUMBERVALUE(\"%\")", value_error()),
+    ]);
+}

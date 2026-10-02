@@ -150,10 +150,12 @@ impl Function for ValueFn {
 /// # Remarks
 /// - The decimal separator defaults to `.`.
 /// - The group separator defaults to `,`.
-/// - Only the first character of each separator is used.
-/// - Spaces are ignored, even in the middle (`" 3 000 "` is 3000).
-/// - Group separators before the decimal separator are ignored; one after it,
-///   or a second decimal separator, is `#VALUE!`.
+/// - Only the first character of a separator argument is used.
+/// - Spaces are ignored anywhere in the text (`" 3 000 "` is `3000`); a tab, line feed or
+///   no-break space is no space and returns `#VALUE!`, as in VALUE. A space that is itself
+///   a separator is read as that separator.
+/// - A group separator before the decimal separator is ignored; one after it,
+///   or a second decimal separator, returns `#VALUE!`.
 /// - Percent suffixes are supported and scale the result by 100 per suffix.
 /// - Empty text `""` (or only spaces) returns `0`, as does a blank value (an empty cell,
 ///   or the empty target a lookup returns).
@@ -218,79 +220,88 @@ impl Function for NumberValueFn {
         }
 
         let text = to_text(&args[0])?;
+        // Only the first character of a separator argument is used.
         let decimal_sep = if args.len() >= 2 {
-            to_text(&args[1])?
+            to_text(&args[1])?.chars().next()
         } else {
-            ".".to_string()
+            Some('.')
         };
         let group_sep = if args.len() >= 3 {
-            to_text(&args[2])?
+            to_text(&args[2])?.chars().next()
         } else {
-            ",".to_string()
+            Some(',')
         };
 
-        // Microsoft's NUMBERVALUE remarks: only the first character of a
-        // separator is used, spaces are ignored anywhere, "" is 0, group
-        // separators before the decimal separator are ignored and one after it
-        // is invalid, and each trailing percent sign divides by 100.
-        let value_error = || {
-            Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+        let Some(decimal_sep) = decimal_sep.filter(|&d| Some(d) != group_sep) else {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_value(),
-            )))
+            )));
         };
-        let Some(decimal) = decimal_sep.chars().next() else {
-            return value_error();
-        };
-        let group = group_sep.chars().next();
-        if group == Some(decimal) {
-            return value_error();
-        }
-        // A space that is itself a separator stays, so its position is checked.
-        let mut body: String = text
-            .trim()
-            .chars()
-            .filter(|&c| c != ' ' || c == decimal || Some(c) == group)
-            .collect();
-        if body.is_empty() {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(0.0)));
-        }
-        // Each trailing percent sign divides by 100; spaces around them are
-        // ignored like any other space, even when space is a separator
-        // ("9% %" with group " " is 0.0009).
-        let mut pct_count = 0;
-        let mut number_len = body.len();
-        while let Some(rest) = body[..number_len].strip_suffix('%') {
-            number_len = rest.trim_end_matches(' ').len();
-            pct_count += 1;
-        }
-        body.truncate(number_len);
-        let (integer, fraction) = match body.split_once(decimal) {
-            Some((integer, fraction)) => (integer, Some(fraction)),
-            None => (body.as_str(), None),
-        };
-        if fraction.is_some_and(|f| f.contains(decimal) || group.is_some_and(|g| f.contains(g))) {
-            return value_error();
-        }
-        let mut plain: String = integer.chars().filter(|&c| Some(c) != group).collect();
-        // A "." that is not the decimal separator is not part of a number.
-        if plain.contains('.') || fraction.is_some_and(|f| f.contains('.')) {
-            return value_error();
-        }
-        if let Some(fraction) = fraction {
-            plain.push('.');
-            plain.push_str(fraction);
-        }
-        // A plain decimal number, and only a finite one: Rust's spellings
-        // "inf" and "NaN" and text beyond the double range are not numbers.
-        let Some(mut n) = crate::locale::parse_finite_number(&plain) else {
-            return value_error();
-        };
-        for _ in 0..pct_count {
-            n /= 100.0;
-        }
 
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(n)))
+        let value = match number_value(&text, decimal_sep, group_sep) {
+            Some(n) => LiteralValue::Number(n),
+            None => LiteralValue::Error(ExcelError::new_value()),
+        };
+        Ok(crate::traits::CalcValue::Scalar(value))
     }
+}
+
+/// The number NUMBERVALUE reads from `text`, or `None` (`#VALUE!`), following
+/// Microsoft's rules: spaces are ignored anywhere in the text (`" 3 000 "` is
+/// 3000; only U+0020, the one space Excel ignores around numeric text, so a
+/// tab, line feed or no-break space is an invalid character) and empty text
+/// is 0; the decimal separator may appear once; a group separator before it is
+/// ignored and one after it is invalid, a space included when the group
+/// separator is a space; trailing percent signs divide by 100 each, whatever
+/// spaces stand between them. The rest is a decimal number with an optional
+/// sign and exponent, read by [`crate::locale::parse_finite_number`]: words
+/// such as `NaN` or `inf` are not numbers, and neither is a value too large
+/// for a number.
+fn number_value(text: &str, decimal_sep: char, group_sep: Option<char>) -> Option<f64> {
+    // A space that is itself a separator stays, so its position is checked.
+    let kept: String = text
+        .chars()
+        .filter(|&c| c != ' ' || c == decimal_sep || Some(c) == group_sep)
+        .collect();
+    let mut body = kept.trim_matches(' ');
+    if body.is_empty() {
+        // Empty text is 0, and so is a blank (an empty cell, a lookup's empty
+        // target).
+        return Some(0.0);
+    }
+    // Each trailing percent sign divides by 100; spaces around them are
+    // ignored like any other space, even when space is a separator
+    // ("9% %" with group " " is 0.0009). Percent signs alone are no number.
+    let mut pct_count = 0;
+    while let Some(rest) = body.strip_suffix('%') {
+        body = rest.trim_end_matches(' ');
+        pct_count += 1;
+    }
+
+    let mut number = String::with_capacity(body.len());
+    let mut seen_decimal = false;
+    for c in body.chars() {
+        if c == decimal_sep {
+            if seen_decimal {
+                return None;
+            }
+            seen_decimal = true;
+            number.push('.');
+        } else if Some(c) == group_sep {
+            if seen_decimal {
+                return None;
+            }
+        } else if c.is_ascii_digit() || matches!(c, '+' | '-' | 'e' | 'E') {
+            number.push(c);
+        } else {
+            return None;
+        }
+    }
+    let mut n = crate::locale::parse_finite_number(&number)?;
+    for _ in 0..pct_count {
+        n /= 100.0;
+    }
+    Some(n)
 }
 
 // TEXT(value, format_text) - Excel number-format codes

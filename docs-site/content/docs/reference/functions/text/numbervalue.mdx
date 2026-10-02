@@ -13,6 +13,12 @@ Parses text using explicit decimal and group separators, independent of the
 ## Remarks
  - The decimal separator defaults to `.`.
  - The group separator defaults to `,`.
+ - Only the first character of a separator argument is used.
+ - Spaces are ignored anywhere in the text (`" 3 000 "` is `3000`); a tab, line feed or
+   no-break space is no space and returns `#VALUE!`, as in VALUE. A space that is itself
+   a separator is read as that separator.
+ - A group separator before the decimal separator is ignored; one after it,
+   or a second decimal separator, returns `#VALUE!`.
  - Percent suffixes are supported and scale the result by 100 per suffix.
  - Empty text `""` (or only spaces) returns `0`, as does a blank value (an empty cell,
    or the empty target a lookup returns).

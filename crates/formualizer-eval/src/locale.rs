@@ -299,6 +299,7 @@ mod tests {
         // Finite numeric text, exponents included, still parses.
         assert_eq!(loc.parse_number_invariant("1E+05"), Some(100000.0));
         assert_eq!(loc.parse_number_invariant(" -2.5e-1 "), Some(-0.25));
+        assert_eq!(loc.parse_number_invariant("1e300"), Some(1e300));
     }
 
     #[test]
