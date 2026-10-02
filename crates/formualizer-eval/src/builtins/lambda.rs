@@ -33,12 +33,13 @@ fn local_name_from_ast(node: &ASTNode, parameter: bool) -> Result<String, ExcelE
 
 /// Whether `name` may name a LET variable or, when `parameter`, a LAMBDA
 /// parameter. Microsoft gives them the Name Manager's rules ("Names in
-/// formulas"): a letter, `_` or `\` first, at most 255 characters, and
-/// neither `C`, `c`, `R` nor `r` (the LET page: `c` "conflicts with R1C1 style
-/// references") nor anything else that is a cell reference, in A1 (`B2`) or
-/// R1C1 (`R1C1`, `RC2`) style. A LAMBDA parameter has no period either. A
-/// workbook file spells these names with the `_xlpm.` prefix, which is no
-/// part of the name.
+/// formulas"): a letter, `_` or `\` first, at most 255 characters, and not
+/// an A1 cell reference (`B2`). Unlike a defined name, a LET or LAMBDA name may
+/// be `r` or `c`: Excel for Windows evaluates `LAMBDA(r,c,r*c)` (the pinned
+/// MAKEARRAY, BYROW and BYCOL goldens), so the Name Manager's R1C1 restriction
+/// is not applied here. A LAMBDA parameter has no period either. A workbook
+/// file spells these names with the `_xlpm.` prefix, which is no part of the
+/// name.
 fn is_valid_local_name(name: &str, parameter: bool) -> bool {
     let name = match name.get(..6) {
         Some(prefix) if prefix.eq_ignore_ascii_case("_xlpm.") => &name[6..],
@@ -50,28 +51,7 @@ fn is_valid_local_name(name: &str, parameter: bool) -> bool {
     (first.is_alphabetic() || first == '_' || first == '\\')
         && name.chars().count() <= 255
         && !(parameter && name.contains('.'))
-        && !is_r1c1_reference(name)
         && formualizer_common::parse_a1_1based(name).is_err()
-}
-
-/// Whether `name` is an R1C1-style reference to a cell, row or column: `R`,
-/// `C`, `RC`, each letter optionally followed by a row or column number
-/// (`R2`, `C3`, `R2C3`, `RC3`), in either case.
-fn is_r1c1_reference(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    let skip_digits = |text: &str| text.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-    let rest = match upper.strip_prefix('R') {
-        Some(after_row) => {
-            let after_number = &after_row[after_row.len() - skip_digits(after_row)..];
-            if after_number.is_empty() {
-                return true;
-            }
-            after_number
-        }
-        None => upper.as_str(),
-    };
-    rest.strip_prefix('C')
-        .is_some_and(|after_column| skip_digits(after_column) == 0)
 }
 
 fn binding_from_calc_value(cv: CalcValue<'_>) -> LocalBinding {
@@ -1141,18 +1121,10 @@ mod tests {
 
     #[test]
     fn let_and_lambda_names_follow_excel_name_rules() {
-        // Microsoft: LET names are names the Name Manager accepts ("c"
-        // conflicts with R1C1 references), and a LAMBDA parameter has no
-        // period; such a name in their place is #VALUE!.
+        // A cell reference or a period in a LAMBDA parameter is no name: #VALUE!.
         for formula in [
-            "=LET(c,1,c)",
-            "=LET(r,1,r)",
-            "=LET(C,1,C)",
-            "=LET(R,1,R)",
-            "=LET(rc,1,rc)",
-            "=LET(x,1,rc2,2,x)",
-            "=LAMBDA(c,c)(1)",
-            "=LAMBDA(x,r,x)(1,2)",
+            "=LET(B2,1,B2)",
+            "=LET(x,1,AB12,2,x)",
             "=LAMBDA(foo.bar,foo.bar)(1)",
             "=LAMBDA(_xlpm.a.b,1)(1)",
         ] {
@@ -1161,9 +1133,13 @@ mod tests {
                 other => panic!("{formula}: expected #VALUE!, got {other:?}"),
             }
         }
-        // Valid names: a period in a LET name, names that merely start like a
-        // reference, and the `_xlpm.` prefix a workbook file writes.
+        // Valid names: r and c (Excel for Windows evaluates LAMBDA(r,c,r*c)),
+        // a period in a LET name, names that merely start like a reference, and
+        // the `_xlpm.` prefix a workbook file writes.
         for (formula, expected) in [
+            ("=LAMBDA(r,c,r*c)(2,3)", 6.0),
+            ("=LAMBDA(c,c+1)(1)", 2.0),
+            ("=LET(r,1,c,2,r+c)", 3.0),
             ("=LET(foo.bar,1,foo.bar+1)", 2.0),
             ("=LET(rate,1,cr,2,rate+cr)", 3.0),
             ("=LET(_x,1,_x+1)", 2.0),
@@ -1171,16 +1147,6 @@ mod tests {
             ("=LET(_xlpm.total,1,_xlpm.total+1)", 2.0),
         ] {
             assert_eq!(eval(formula), LiteralValue::Number(expected), "{formula}");
-        }
-    }
-
-    #[test]
-    fn r1c1_references_are_recognised() {
-        for name in ["R", "c", "RC", "r12", "C3", "R2C3", "rc4", "R5c"] {
-            assert!(is_r1c1_reference(name), "{name}");
-        }
-        for name in ["Rate", "CR", "R1X", "RCC", "C1R1", "R_1", ""] {
-            assert!(!is_r1c1_reference(name), "{name}");
         }
     }
 
