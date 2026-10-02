@@ -16038,7 +16038,7 @@
     "minArgs": 1,
     "name": "CHAR",
     "registrationSource": "crates/formualizer-eval/src/builtins/text/char_code_rept.rs",
-    "shortSummary": "Returns the character specified by a number Excel uses Windows-1252 encoding for codes 1-255.",
+    "shortSummary": "Returns the character represented by a numeric code.",
     "signature": "CHAR(arg1: any@scalar)",
     "typeName": "CharFn",
     "variadic": false

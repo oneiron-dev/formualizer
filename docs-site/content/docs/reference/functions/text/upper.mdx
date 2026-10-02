@@ -10,7 +10,8 @@ description: "Converts text to uppercase."
 Converts text to uppercase.
 
 ## Remarks
- - Uses ASCII uppercasing semantics in this implementation.
+ - Letters of every script are uppercased, one character for one, so the text keeps its
+   length: `UPPER("ÿ")` is "Ÿ" and "ß", which has no single-letter capital, stays "ß".
  - Numbers and booleans are first converted to text.
  - Errors are propagated unchanged.
 
@@ -49,7 +50,7 @@ Converts text to uppercase.
 ## FAQ
 
 ### Is uppercasing fully Unicode-aware?
-This implementation uses ASCII uppercasing semantics, so non-ASCII case rules are limited.
+Yes, with Unicode's one-to-one mapping, as Excel does: accented and non-Latin letters are uppercased, and a letter whose capital takes two letters, such as ß, is left as it is.
 
 ## Runtime metadata
 

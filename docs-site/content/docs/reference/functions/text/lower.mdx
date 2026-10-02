@@ -10,7 +10,8 @@ description: "Converts text to lowercase."
 Converts text to lowercase.
 
 ## Remarks
- - Uses ASCII lowercasing semantics in this implementation.
+ - Letters of every script are lowercased, one character for one, so the text keeps its
+   length: `LOWER("Š")` is "š".
  - Numbers and booleans are first converted to text.
  - Errors are propagated unchanged.
 

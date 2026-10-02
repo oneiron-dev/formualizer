@@ -73,6 +73,39 @@ fn literal_to_text(v: &LiteralValue) -> Result<String, ExcelError> {
     })
 }
 
+/// The uppercase of `c` under Unicode's simple case mapping, which Excel's
+/// case functions use: each character maps to one character, so "ß" stays
+/// "ß" rather than becoming "SS" and the text keeps its length.
+fn simple_uppercase(c: char) -> char {
+    let mut upper = c.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(u), None) => u,
+        // A longer result is a full mapping. Of the characters that have one,
+        // only the Greek letters with ypogegrammeni have a simple mapping, to
+        // the same letter with prosgegrammeni; the others keep their case.
+        _ => match c {
+            '\u{1F80}'..='\u{1F87}' | '\u{1F90}'..='\u{1F97}' | '\u{1FA0}'..='\u{1FA7}' => {
+                char::from_u32(c as u32 + 8).unwrap_or(c)
+            }
+            '\u{1FB3}' | '\u{1FC3}' | '\u{1FF3}' => char::from_u32(c as u32 + 9).unwrap_or(c),
+            _ => c,
+        },
+    }
+}
+
+/// The lowercase of `c` under Unicode's simple case mapping (see
+/// [`simple_uppercase`]). Sigma lowercases to "σ" wherever it stands.
+fn simple_lowercase(c: char) -> char {
+    let mut lower = c.to_lowercase();
+    match (lower.next(), lower.next()) {
+        (Some(l), None) => l,
+        // "İ" is the one character whose full lowercase is longer ("i" and a
+        // combining dot above); its simple lowercase is "i".
+        _ if c == '\u{130}' => 'i',
+        _ => c,
+    }
+}
+
 fn legacy_scalar_value(arg: &ArgumentHandle<'_, '_>) -> Result<LiteralValue, ExcelError> {
     Ok(match arg.value_for_text()? {
         crate::traits::CalcValue::Scalar(LiteralValue::Array(rows)) => rows
@@ -265,7 +298,8 @@ pub struct UpperFn;
 /// Converts text to uppercase.
 ///
 /// # Remarks
-/// - Uses ASCII uppercasing semantics in this implementation.
+/// - Letters of every script are uppercased, one character for one, so the text keeps its
+///   length: `UPPER("ÿ")` is "Ÿ" and "ß", which has no single-letter capital, stays "ß".
 /// - Numbers and booleans are first converted to text.
 /// - Errors are propagated unchanged.
 ///
@@ -290,7 +324,7 @@ pub struct UpperFn;
 ///   - EXACT
 /// faq:
 ///   - q: "Is uppercasing fully Unicode-aware?"
-///     a: "This implementation uses ASCII uppercasing semantics, so non-ASCII case rules are limited."
+///     a: "Yes, with Unicode's one-to-one mapping, as Excel does: accented and non-Latin letters are uppercased, and a letter whose capital takes two letters, such as ß, is left as it is."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: UPPER
@@ -319,7 +353,7 @@ impl Function for UpperFn {
         _: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(
-            to_text(&args[0])?.to_ascii_uppercase(),
+            to_text(&args[0])?.chars().map(simple_uppercase).collect(),
         )))
     }
 }
@@ -328,7 +362,8 @@ pub struct LowerFn;
 /// Converts text to lowercase.
 ///
 /// # Remarks
-/// - Uses ASCII lowercasing semantics in this implementation.
+/// - Letters of every script are lowercased, one character for one, so the text keeps its
+///   length: `LOWER("Š")` is "š".
 /// - Numbers and booleans are first converted to text.
 /// - Errors are propagated unchanged.
 ///
@@ -382,7 +417,7 @@ impl Function for LowerFn {
         _: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(
-            to_text(&args[0])?.to_ascii_lowercase(),
+            to_text(&args[0])?.chars().map(simple_lowercase).collect(),
         )))
     }
 }
@@ -452,15 +487,11 @@ impl Function for ProperFn {
         let mut new_word = true;
         for ch in s.chars() {
             if ch.is_alphabetic() {
-                if new_word {
-                    for c in ch.to_uppercase() {
-                        out.push(c);
-                    }
+                out.push(if new_word {
+                    simple_uppercase(ch)
                 } else {
-                    for c in ch.to_lowercase() {
-                        out.push(c);
-                    }
-                }
+                    simple_lowercase(ch)
+                });
                 new_word = false;
             } else {
                 out.push(ch);

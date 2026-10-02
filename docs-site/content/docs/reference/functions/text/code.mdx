@@ -9,13 +9,15 @@ description: "Returns a numeric code for the first character in a text string."
 
 Returns the numeric code of the first character in text.
 
- `CODE` mirrors Excel behavior with Windows-1252 compatibility mappings.
+ `CODE` follows Excel for Windows and reports Windows-1252 codes.
 
 ## Remarks
  - Only the first character is inspected.
  - Empty text returns `#VALUE!`.
- - Text-like coercion is applied to non-text scalar inputs.
- - Known Unicode characters in the Windows-1252 extension map back to their Excel codes.
+ - Text-like coercion is applied to non-text scalar inputs; a logical reads as `TRUE` or
+   `FALSE`, so `CODE(TRUE)` is 84.
+ - ASCII characters and the characters 128-255 of Windows-1252 report their codes;
+   characters outside Windows-1252 report 63, the code of the "?" they convert to.
 
 ## Examples
 

@@ -1,20 +1,19 @@
 ---
 title: "CHAR"
-description: "Returns the character specified by a number Excel uses Windows-1252 encoding for codes 1-255."
+description: "Returns the character represented by a numeric code."
 ---
 
 <FunctionPageSchema id="text/char" />
 
 ## Summary
 
-Returns the character represented by a numeric code.
-
- `CHAR` follows Excel-style Windows-1252 behavior for codes `1..255`.
+`CHAR` follows Excel for Windows, which reads codes `1..255` in the Windows-1252 code page.
 
 ## Remarks
  - Input is truncated to an integer code.
  - Valid code range is `1` through `255`; outside this range returns `#VALUE!`.
- - Codes in the Windows-1252 extension range (128-159) are mapped to Unicode equivalents.
+ - Codes 128-255 map through Windows-1252 (`CHAR(128)` is the euro sign, `CHAR(160)` a
+   non-breaking space); its five undefined codes return the C1 control of the same code.
  - Errors are propagated unchanged.
 
 ## Examples
@@ -51,8 +50,8 @@ Returns the character represented by a numeric code.
 
 ## FAQ
 
-### Which character set does CHAR use for codes 128-159?
-It follows Excel-style Windows-1252 mappings, including extended symbols in that range.
+### Which character set does CHAR use for codes 128-255?
+Windows-1252, as Excel for Windows does: CHAR(128) is the euro sign and CHAR(160) a non-breaking space.
 
 ## Runtime metadata
 

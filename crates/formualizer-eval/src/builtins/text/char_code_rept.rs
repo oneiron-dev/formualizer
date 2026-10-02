@@ -130,9 +130,10 @@ pub struct CodeFn;
 /// # Remarks
 /// - Only the first character is inspected.
 /// - Empty text returns `#VALUE!`.
-/// - Text-like coercion is applied to non-text scalar inputs.
-/// - Characters 128-255 of Windows-1252 map back to their codes; other characters report
-///   63, the code of the "?" they convert to.
+/// - Text-like coercion is applied to non-text scalar inputs; a logical reads as `TRUE` or
+///   `FALSE`, so `CODE(TRUE)` is 84.
+/// - ASCII characters and the characters 128-255 of Windows-1252 report their codes;
+///   characters outside Windows-1252 report 63, the code of the "?" they convert to.
 ///
 /// # Examples
 ///
@@ -192,7 +193,7 @@ impl Function for CodeFn {
                 )));
             }
             LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
-            other => other.to_string(),
+            other => crate::coercion::to_text_invariant(&other),
         };
 
         if s.is_empty() {
@@ -296,7 +297,7 @@ impl Function for AscFn {
             LiteralValue::Text(t) => t,
             LiteralValue::Empty => String::new(),
             LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
-            other => other.to_string(),
+            other => crate::coercion::to_text_invariant(&other),
         };
         Ok(CalcValue::Scalar(LiteralValue::Text(asc_convert(&s))))
     }
@@ -369,7 +370,7 @@ impl Function for ReptFn {
             LiteralValue::Text(t) => t,
             LiteralValue::Empty => String::new(),
             LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
-            other => other.to_string(),
+            other => crate::coercion::to_text_invariant(&other),
         };
 
         let count = match count_val {
@@ -484,6 +485,24 @@ mod tests {
                 "{f} is #VALUE!"
             );
         }
+    }
+
+    #[test]
+    fn code_asc_and_rept_read_a_logical_as_true_or_false() {
+        use formualizer_parse::parser::parse;
+        let wb = TestWorkbook::new()
+            .with_function(std::sync::Arc::new(CodeFn))
+            .with_function(std::sync::Arc::new(AscFn))
+            .with_function(std::sync::Arc::new(ReptFn));
+        let ctx = interp(&wb);
+        let eval = |f: &str| ctx.evaluate_ast(&parse(f).unwrap()).unwrap().into_literal();
+        let text = |s: &str| LiteralValue::Text(s.into());
+        assert_eq!(eval("=CODE(TRUE)"), LiteralValue::Int(84));
+        assert_eq!(eval("=CODE(FALSE)"), LiteralValue::Int(70));
+        assert_eq!(eval("=ASC(TRUE)"), text("TRUE"));
+        assert_eq!(eval("=REPT(FALSE,2)"), text("FALSEFALSE"));
+        assert_eq!(eval("=CODE(-1.5)"), LiteralValue::Int(45));
+        assert_eq!(eval("=REPT(1.5,2)"), text("1.51.5"));
     }
 
     #[test]

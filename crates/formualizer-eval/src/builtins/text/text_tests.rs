@@ -295,6 +295,53 @@ mod tests {
     }
 
     #[test]
+    fn upper_lower_and_proper_map_each_letter_to_one_letter() {
+        use formualizer_parse::parser::parse;
+        let wb = TestWorkbook::new()
+            .with_function(Arc::new(UpperFn))
+            .with_function(Arc::new(LowerFn))
+            .with_function(Arc::new(ProperFn))
+            .with_function(Arc::new(crate::builtins::text::char_code_rept::CharFn));
+        let ctx = wb.interpreter();
+        let eval = |f: &str| ctx.evaluate_ast(&parse(f).unwrap()).unwrap().into_literal();
+        for (formula, want) in [
+            // Letters beyond ASCII, Windows-1252 ones included.
+            ("=UPPER(CHAR(154))", "\u{160}"),
+            ("=LOWER(CHAR(138))", "\u{161}"),
+            ("=UPPER(\"\u{ff}\")", "\u{178}"),
+            ("=LOWER(\"\u{178}\")", "\u{ff}"),
+            (
+                "=UPPER(\"cr\u{e8}me br\u{fb}l\u{e9}e\")",
+                "CR\u{c8}ME BR\u{db}L\u{c9}E",
+            ),
+            (
+                "=LOWER(\"\u{41f}\u{420}\u{418}\u{412}\u{415}\u{422}\")",
+                "\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}",
+            ),
+            // One letter for one: no "SS" for sharp s, no ligature or
+            // combining-dot expansion.
+            ("=UPPER(\"stra\u{df}e\")", "STRA\u{df}E"),
+            ("=UPPER(\"\u{fb01}\")", "\u{fb01}"),
+            ("=UPPER(\"\u{149}\")", "\u{149}"),
+            ("=UPPER(\"\u{1fb3}\")", "\u{1fbc}"),
+            ("=LOWER(\"\u{1e9e}\")", "\u{df}"),
+            ("=LOWER(\"\u{130}\")", "i"),
+            ("=UPPER(\"\u{131}\")", "I"),
+            // Sigma takes no final form.
+            (
+                "=LOWER(\"\u{39f}\u{394}\u{39f}\u{3a3}\")",
+                "\u{3bf}\u{3b4}\u{3bf}\u{3c3}",
+            ),
+            ("=UPPER(TRUE)", "TRUE"),
+            ("=LOWER(TRUE)", "true"),
+            ("=PROPER(\"stra\u{df}e\")", "Stra\u{df}e"),
+            ("=PROPER(\"\u{ff}ES \u{160}KODA\")", "\u{178}es \u{160}koda"),
+        ] {
+            assert_eq!(eval(formula), LiteralValue::Text(want.into()), "{formula}");
+        }
+    }
+
+    #[test]
     fn trim_removes_only_ascii_spaces() {
         let wb = TestWorkbook::new().with_function(Arc::new(TrimFn));
         let ctx = wb.interpreter();
