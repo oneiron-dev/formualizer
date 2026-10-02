@@ -218,3 +218,108 @@ fn groupby_puts_a_negative_zero_key_in_the_zero_group() {
     assert_eq!(number(value(&engine, 2, 1)), 3.0);
     assert_eq!(number(value(&engine, 3, 1)), 2.0);
 }
+
+#[test]
+fn array_results_reach_text_functions_as_zero() {
+    // ROUND({-0.4;0.4},0) is {0;0}, also when LET holds it. TEXTSPLIT splits
+    // each text of an array and keeps the first value of each split, and a
+    // one-value array is that value.
+    let engine = engine_with(&[
+        (
+            1,
+            1,
+            "=LET(a,ROUND({-0.4;0.4},0),INDEX(TEXTSPLIT(a,\"|\"),1,1))",
+        ),
+        (
+            2,
+            1,
+            "=LET(a,ROUND({-0.4;0.4},0),INDEX(TEXTSPLIT(a,\"|\"),2,1))",
+        ),
+        (
+            3,
+            1,
+            "=LET(a,ROUND({-1.4;0.4},0),INDEX(TEXTSPLIT(a,\"|\"),1,1))",
+        ),
+        (4, 1, "=ROWS(TEXTSPLIT({\"a,b\";\"c,d\"},\",\"))"),
+        (5, 1, "=COLUMNS(TEXTSPLIT({\"a,b\";\"c,d\"},\",\"))"),
+        (6, 1, "=INDEX(TEXTSPLIT({\"a,b\";\"c,d\"},\",\"),2,1)"),
+        (7, 1, "=INDEX(TEXTSPLIT({\"a,b\"},\",\"),1,2)"),
+        (
+            8,
+            1,
+            "=LET(a,ROUND({-0.4},0),INDEX(TEXTSPLIT(a,\",\"),1,1))",
+        ),
+        (9, 1, "=TEXTJOIN(\",\",TRUE,LET(a,ROUND({-0.4,0.4},0),a))"),
+    ]);
+    assert_eq!(value(&engine, 1, 1), text("0"));
+    assert_eq!(value(&engine, 2, 1), text("0"));
+    assert_eq!(value(&engine, 3, 1), text("-1"));
+    assert_eq!(number(value(&engine, 4, 1)), 2.0);
+    assert_eq!(number(value(&engine, 5, 1)), 1.0);
+    assert_eq!(value(&engine, 6, 1), text("c"));
+    assert_eq!(value(&engine, 7, 1), text("b"));
+    assert_eq!(value(&engine, 8, 1), text("0"));
+    assert_eq!(value(&engine, 9, 1), text("0,0"));
+}
+
+#[test]
+fn a_zero_imaginary_coefficient_is_zero_whatever_its_sign() {
+    // "-1-0i" is -1: its principal argument lies in (-pi, pi], so it is pi,
+    // and its square root is i, as for "-1+0i".
+    let engine = engine_with(&[
+        (1, 1, "=IMARGUMENT(\"-1-0i\")"),
+        (2, 1, "=IMSQRT(\"-1-0i\")"),
+        (3, 1, "=IMLN(\"-1-0i\")=IMLN(\"-1+0i\")"),
+        (4, 1, "=IMLOG10(\"-1-0i\")=IMLOG10(\"-1+0i\")"),
+        (5, 1, "=IMLOG2(\"-1-0i\")=IMLOG2(\"-1+0i\")"),
+        (6, 1, "=IMPOWER(\"-1-0i\",0.5)=IMPOWER(\"-1+0i\",0.5)"),
+        (7, 1, "=IMAGINARY(IMLN(\"-4-0j\"))>0"),
+        (8, 1, "=IMSQRT(\"-4-0i\")"),
+        // Nonzero imaginary parts keep their sign.
+        (9, 1, "=IMARGUMENT(\"-1-0.5i\")<0"),
+        (10, 1, "=IMSQRT(\"-1-0.5i\")=IMSQRT(\"-1+0.5i\")"),
+    ]);
+    assert_eq!(number(value(&engine, 1, 1)), std::f64::consts::PI);
+    assert_eq!(value(&engine, 2, 1), text("i"));
+    for row in 3..=7 {
+        assert_eq!(
+            value(&engine, row, 1),
+            LiteralValue::Boolean(true),
+            "row {row}"
+        );
+    }
+    assert_eq!(value(&engine, 8, 1), text("2i"));
+    assert_eq!(value(&engine, 9, 1), LiteralValue::Boolean(true));
+    assert_eq!(value(&engine, 10, 1), LiteralValue::Boolean(false));
+}
+
+#[test]
+fn arithmetic_underflow_is_zero() {
+    // Excel has no denormalized numbers: a result below its smallest positive
+    // number, 2.2250738585072E-308, is 0. It equals 0, prints as "0" and
+    // divides as 0.
+    let engine = engine_with(&[
+        (1, 1, "=(-1E-300*1E-10)=0"),
+        (2, 1, "=TEXT(-1E-300*1E-10,\"0\")"),
+        (3, 1, "=1/(-1E-300*1E-10)"),
+        (4, 1, "=-1E-300*1E-10"),
+        (5, 1, "=1E-300/1E10"),
+        (6, 1, "=2^-1023"),
+        (7, 1, "=-1E-300*1E-10&\"\""),
+        // Excel's smallest numbers are kept.
+        (8, 1, "=2^-1022"),
+        (9, 1, "=-1E-300*1E-7"),
+    ]);
+    assert_eq!(value(&engine, 1, 1), LiteralValue::Boolean(true));
+    assert_eq!(value(&engine, 2, 1), text("0"));
+    assert!(matches!(
+        value(&engine, 3, 1),
+        LiteralValue::Error(e) if e.kind == formualizer_common::ExcelErrorKind::Div
+    ));
+    assert!(positive_zero(value(&engine, 4, 1)));
+    assert!(positive_zero(value(&engine, 5, 1)));
+    assert!(positive_zero(value(&engine, 6, 1)));
+    assert_eq!(value(&engine, 7, 1), text("0"));
+    assert_eq!(number(value(&engine, 8, 1)), f64::MIN_POSITIVE);
+    assert_eq!(number(value(&engine, 9, 1)), -1e-300 * 1e-7);
+}

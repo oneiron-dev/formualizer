@@ -2756,8 +2756,29 @@ impl Function for ErfPreciseFn {
 /* ─────────────────────────── Complex Number Functions ──────────────────────────── */
 
 /// Parse a complex number string like "3+4i", "3-4i", "5i", "3", "-2j", etc.
-/// Returns (real, imaginary, suffix) where suffix is 'i' or 'j'
+/// Returns (real, imaginary, suffix) where suffix is 'i' or 'j'.
+///
+/// Excel has no negative zero: a zero coefficient is 0 whatever sign is
+/// written ("-1-0i" is -1), so the principal argument of a negative real
+/// number is pi (IMARGUMENT("-1-0i")) and its square root is "i".
 fn parse_complex(s: &str) -> Result<(f64, f64, char), ExcelError> {
+    let (real, imag, suffix) = parse_complex_text(s)?;
+    Ok((
+        crate::coercion::normalize_zero(real),
+        crate::coercion::normalize_zero(imag),
+        suffix,
+    ))
+}
+
+/// The principal argument of `real + imag*i`, in (-pi, pi] as Microsoft
+/// documents for IMARGUMENT and IMSQRT: a zero imaginary part is +0, so a
+/// negative real number's argument is pi, never -pi.
+fn principal_argument(real: f64, imag: f64) -> f64 {
+    crate::coercion::normalize_zero(imag).atan2(real)
+}
+
+/// The coefficients as written in complex number text (see [`parse_complex`]).
+fn parse_complex_text(s: &str) -> Result<(f64, f64, char), ExcelError> {
     let s = s.trim();
     if s.is_empty() {
         return Err(ExcelError::new_num());
@@ -3339,7 +3360,7 @@ impl Function for ImArgumentFn {
             )));
         }
 
-        let arg = imag.atan2(real);
+        let arg = principal_argument(real, imag);
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(arg)))
     }
 }
@@ -4004,7 +4025,7 @@ impl Function for ImLnFn {
 
         // ln(z) = ln(|z|) + i*arg(z)
         let real = modulus.ln();
-        let imag = b.atan2(a);
+        let imag = principal_argument(a, b);
 
         let result = format_complex(real, imag, suffix);
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(result)))
@@ -4095,7 +4116,7 @@ impl Function for ImLog10Fn {
         // log10(z) = ln(z) / ln(10) = (ln(|z|) + i*arg(z)) / ln(10)
         let ln10 = 10.0_f64.ln();
         let real = modulus.ln() / ln10;
-        let imag = b.atan2(a) / ln10;
+        let imag = principal_argument(a, b) / ln10;
 
         let result = format_complex(real, imag, suffix);
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(result)))
@@ -4186,7 +4207,7 @@ impl Function for ImLog2Fn {
         // log2(z) = ln(z) / ln(2) = (ln(|z|) + i*arg(z)) / ln(2)
         let ln2 = 2.0_f64.ln();
         let real = modulus.ln() / ln2;
-        let imag = b.atan2(a) / ln2;
+        let imag = principal_argument(a, b) / ln2;
 
         let result = format_complex(real, imag, suffix);
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(result)))
@@ -4274,7 +4295,7 @@ impl Function for ImPowerFn {
         };
 
         let modulus = (a * a + b * b).sqrt();
-        let theta = b.atan2(a);
+        let theta = principal_argument(a, b);
 
         // Handle 0^n cases
         if modulus < 1e-15 {
@@ -4375,7 +4396,7 @@ impl Function for ImSqrtFn {
         };
 
         let modulus = (a * a + b * b).sqrt();
-        let theta = b.atan2(a);
+        let theta = principal_argument(a, b);
 
         // sqrt(z) = sqrt(|z|) * (cos(theta/2) + i*sin(theta/2))
         let sqrt_r = modulus.sqrt();
@@ -5770,5 +5791,27 @@ mod tests {
             coerce_complex_str(&LiteralValue::Number(-2.5)).unwrap(),
             "-2.5"
         );
+    }
+
+    #[test]
+    fn a_zero_coefficient_written_with_a_minus_sign_is_zero() {
+        // Excel has no negative zero: "-1-0i" is -1, whose argument is pi.
+        let (real, imag, _) = parse_complex("-1-0i").unwrap();
+        assert_eq!(real, -1.0);
+        assert!(imag == 0.0 && imag.is_sign_positive());
+        let (real, imag, _) = parse_complex("-0-2j").unwrap();
+        assert!(real == 0.0 && real.is_sign_positive());
+        assert_eq!(imag, -2.0);
+        // Nonzero coefficients keep their sign.
+        assert_eq!(parse_complex("-1-0.5i").unwrap().1, -0.5);
+    }
+
+    #[test]
+    fn principal_argument_lies_in_minus_pi_to_pi() {
+        let pi = std::f64::consts::PI;
+        assert_eq!(principal_argument(-1.0, -0.0), pi);
+        assert_eq!(principal_argument(-1.0, 0.0), pi);
+        assert!(principal_argument(-1.0, -1e-300) < 0.0);
+        assert_eq!(principal_argument(0.0, -1.0), -pi / 2.0);
     }
 }

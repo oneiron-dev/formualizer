@@ -242,12 +242,12 @@ pub fn to_logical(value: &LiteralValue) -> Result<bool, ExcelError> {
 /// (`0.333333333333333`, `1234567890123460`, `1.23456789012346E-05`,
 /// `1.23456789012346E+20`). Like all of Excel's number formatting it rounds
 /// half away from zero (100000000000000.5 is `100000000000001`). Zero has
-/// no sign, and subnormal values read as 0.
+/// no sign, and subnormal values read as 0 ([`underflow_to_zero`]).
 pub fn number_to_text(n: f64) -> String {
     if !n.is_finite() {
         return n.to_string();
     }
-    if n.abs() < f64::MIN_POSITIVE {
+    if underflow_to_zero(n) == 0.0 {
         return "0".into();
     }
     let (mut digits, mut exponent) = significant_digits(n.abs(), 15);
@@ -442,18 +442,37 @@ pub fn excel_power(base: f64, exponent: f64) -> Result<f64, ExcelError> {
     sanitize_numeric(base.powf(exponent))
 }
 
-/// Operator/function result guard: NaN/Inf → #NUM!, and `-0` → `0`.
+/// Operator/function result guard: NaN/Inf → #NUM!, an underflow → `0`, and
+/// `-0` → `0` ([`underflow_to_zero`]).
 pub fn sanitize_numeric(n: f64) -> Result<f64, ExcelError> {
     if n.is_nan() || n.is_infinite() {
         return Err(ExcelError::new_num());
     }
-    Ok(normalize_zero(n))
+    Ok(underflow_to_zero(n))
 }
 
 /// Excel has no negative zero: `-1*0` or `-A1` with A1 = 0 is plain 0, so it
 /// prints as "0" and equals a 0 criterion. Only an exact zero changes sign.
 pub fn normalize_zero(n: f64) -> f64 {
     if n == 0.0 { 0.0 } else { n }
+}
+
+/// Excel's arithmetic underflows to 0: it has no denormalized numbers (its
+/// smallest positive number is 2.2250738585072E-308), so `-1E-300*1E-10` is
+/// 0, equals 0, prints as "0" and divides as 0 (`#DIV/0!`). Like every zero
+/// it has no sign ([`normalize_zero`]).
+pub fn underflow_to_zero(n: f64) -> f64 {
+    normalize_zero(if n.is_subnormal() { 0.0 } else { n })
+}
+
+/// [`normalize_zero`] for a value: a number, or each number of an array (a
+/// function's array result, `ROUND({-0.4;0.4},0)`, holds no `-0` either).
+pub fn normalize_zero_value(value: &mut LiteralValue) {
+    match value {
+        LiteralValue::Number(n) => *n = normalize_zero(*n),
+        LiteralValue::Array(rows) => rows.iter_mut().flatten().for_each(normalize_zero_value),
+        _ => {}
+    }
 }
 
 /// Coerce to Excel serial (date/time/duration) or error.
@@ -928,6 +947,43 @@ mod tests {
         assert_eq!(normalize_zero(-2.5), -2.5);
         assert_eq!(to_text_invariant(&LiteralValue::Number(-0.0)), "0");
         assert_eq!(to_text_invariant(&LiteralValue::Number(-2.0)), "-2");
+    }
+
+    #[test]
+    fn arithmetic_underflow_is_zero() {
+        // Excel has no denormalized numbers: below 2.2250738585072E-308 is 0.
+        let underflow = sanitize_numeric(-1e-300 * 1e-10).unwrap();
+        assert_eq!(underflow, 0.0);
+        assert!(underflow.is_sign_positive());
+        assert_eq!(sanitize_numeric(f64::from_bits(1)).unwrap(), 0.0);
+        assert!(underflow_to_zero(-f64::from_bits(1)).is_sign_positive());
+        // Excel's smallest numbers are kept.
+        assert_eq!(
+            sanitize_numeric(f64::MIN_POSITIVE).unwrap(),
+            f64::MIN_POSITIVE
+        );
+        assert_eq!(
+            sanitize_numeric(-f64::MIN_POSITIVE).unwrap(),
+            -f64::MIN_POSITIVE
+        );
+    }
+
+    #[test]
+    fn normalize_zero_value_reaches_array_elements() {
+        let mut value = LiteralValue::Array(vec![
+            vec![LiteralValue::Number(-0.0), LiteralValue::Number(-2.5)],
+            vec![LiteralValue::Text("-0".into()), LiteralValue::Number(0.0)],
+        ]);
+        normalize_zero_value(&mut value);
+        let LiteralValue::Array(rows) = &value else {
+            panic!("array expected");
+        };
+        assert!(matches!(rows[0][0], LiteralValue::Number(n) if n == 0.0 && n.is_sign_positive()));
+        assert_eq!(rows[0][1], LiteralValue::Number(-2.5));
+        assert_eq!(rows[1][0], LiteralValue::Text("-0".into()));
+        let mut scalar = LiteralValue::Number(-0.0);
+        normalize_zero_value(&mut scalar);
+        assert!(matches!(scalar, LiteralValue::Number(n) if n.is_sign_positive()));
     }
 
     #[test]

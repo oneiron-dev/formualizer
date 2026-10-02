@@ -285,8 +285,16 @@ impl Function for TextSplitFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
-        // Get text to split
-        let text_val = scalar_text_value(&args[0])?;
+        // Get text to split. An array of several values is lifted before
+        // this (one split per element); a one-value array is that value.
+        let text_val = match scalar_text_value(&args[0])? {
+            LiteralValue::Array(rows) => rows
+                .into_iter()
+                .next()
+                .and_then(|row| row.into_iter().next())
+                .unwrap_or(LiteralValue::Empty),
+            other => other,
+        };
         let text = match text_val {
             LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
             other => coerce_text(&other),

@@ -172,8 +172,10 @@ pub(crate) enum LegacyContext {
 /// A function's error is its value: ISNUMBER(SEARCH("x",#REF!)) is FALSE and
 /// IF(FALSE,...) never sees it. Only cancellation aborts the formula.
 ///
-/// Excel has no negative zero, so a scalar `-0` (ROUND(-0.4,0), TRUNC(-0.5))
-/// is plain 0 before it reaches another function.
+/// Excel has no negative zero, so a `-0` (ROUND(-0.4,0), TRUNC(-0.5)) is
+/// plain 0 before it reaches another function, as a number or as an element
+/// of an array value. (A lifted call's elements are normalized as they are
+/// collected by `lift::element`.)
 fn function_result<'a>(
     result: Result<crate::traits::CalcValue<'a>, ExcelError>,
 ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
@@ -182,14 +184,13 @@ fn function_result<'a>(
         Err(error) if error.kind != ExcelErrorKind::Cancelled => {
             Ok(CalcValue::Scalar(LiteralValue::Error(error)))
         }
-        Ok(CalcValue::Scalar(LiteralValue::Number(n))) => Ok(CalcValue::Scalar(
-            LiteralValue::Number(crate::coercion::normalize_zero(n)),
-        )),
-        Ok(CalcValue::AnnotatedScalar(LiteralValue::Number(n), format)) => {
-            Ok(CalcValue::AnnotatedScalar(
-                LiteralValue::Number(crate::coercion::normalize_zero(n)),
-                format,
-            ))
+        Ok(CalcValue::Scalar(mut value)) => {
+            crate::coercion::normalize_zero_value(&mut value);
+            Ok(CalcValue::Scalar(value))
+        }
+        Ok(CalcValue::AnnotatedScalar(mut value, format)) => {
+            crate::coercion::normalize_zero_value(&mut value);
+            Ok(CalcValue::AnnotatedScalar(value, format))
         }
         other => other,
     }
@@ -2574,5 +2575,32 @@ mod format_algebra_tests {
                 None
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod function_result_tests {
+    use super::*;
+    use crate::traits::CalcValue;
+
+    fn positive_zero(v: &LiteralValue) -> bool {
+        matches!(v, LiteralValue::Number(n) if *n == 0.0 && n.is_sign_positive())
+    }
+
+    #[test]
+    fn function_results_hold_no_negative_zero() {
+        // A LET can hold an array result (ROUND({-0.4;0.4},0)) as a value.
+        let array = CalcValue::Scalar(LiteralValue::Array(vec![
+            vec![LiteralValue::Number(-0.0)],
+            vec![LiteralValue::Number(-1.5)],
+        ]));
+        let LiteralValue::Array(rows) = function_result(Ok(array)).unwrap().into_literal() else {
+            panic!("array expected");
+        };
+        assert!(positive_zero(&rows[0][0]));
+        assert_eq!(rows[1][0], LiteralValue::Number(-1.5));
+
+        let scalar = function_result(Ok(CalcValue::Scalar(LiteralValue::Number(-0.0))));
+        assert!(positive_zero(&scalar.unwrap().into_literal()));
     }
 }

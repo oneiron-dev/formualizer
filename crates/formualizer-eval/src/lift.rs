@@ -66,6 +66,10 @@ pub(crate) fn lift_spec(name: &str) -> Option<Lift> {
         | "DOLLARFR" => Lift::All,
         // The delimiter may be an array of alternative delimiters.
         "TEXTBEFORE" | "TEXTAFTER" => Lift::Only(&[0, 2, 3, 4, 5]),
+        // The text is a single value; each element's split keeps its first
+        // value (an array of arrays is not a value). The delimiters are
+        // arrays of alternatives.
+        "TEXTSPLIT" => Lift::Only(&[0]),
         // Date and time
         "DATE" | "DATEDIF" | "DATEVALUE" | "DAY" | "DAYS" | "DAYS360" | "EDATE" | "EOMONTH"
         | "HOUR" | "ISOWEEKNUM" | "MINUTE" | "MONTH" | "SECOND" | "TIME" | "TIMEVALUE"
@@ -371,16 +375,20 @@ pub(crate) fn broadcast_dims<'r, T: 'r>(
     })
 }
 
-/// A lifted element result: nested arrays keep their top-left value.
+/// A lifted element result: nested arrays keep their top-left value
+/// (`TEXTSPLIT({"a,b";"c,d"},",")` is `{"a";"c"}`). Each element is a
+/// function's result, so a `-0` is plain 0 (`ROUND({-0.4;0.4},0)` is `{0;0}`).
 pub(crate) fn element(value: CalcValue<'_>) -> LiteralValue {
-    match value.into_literal() {
+    let mut element = match value.into_literal() {
         LiteralValue::Array(rows) => rows
             .into_iter()
             .next()
             .and_then(|row| row.into_iter().next())
             .unwrap_or(LiteralValue::Empty),
         other => other,
-    }
+    };
+    crate::coercion::normalize_zero_value(&mut element);
+    element
 }
 
 pub(crate) fn array_result<'b>(
@@ -612,4 +620,30 @@ where
         out.push(row);
     }
     Ok(Some(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn positive_zero(v: &LiteralValue) -> bool {
+        matches!(v, LiteralValue::Number(n) if *n == 0.0 && n.is_sign_positive())
+    }
+
+    #[test]
+    fn lifted_elements_hold_no_negative_zero() {
+        // Each element of ROUND({-0.4;0.4},0) is a function's result: 0.
+        assert!(positive_zero(&element(CalcValue::Scalar(
+            LiteralValue::Number(-0.0)
+        ))));
+        let nested = CalcValue::Scalar(LiteralValue::Array(vec![vec![
+            LiteralValue::Number(-0.0),
+            LiteralValue::Number(1.0),
+        ]]));
+        assert!(positive_zero(&element(nested)));
+        assert_eq!(
+            element(CalcValue::Scalar(LiteralValue::Number(-2.0))),
+            LiteralValue::Number(-2.0)
+        );
+    }
 }
