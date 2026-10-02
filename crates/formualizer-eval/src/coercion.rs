@@ -347,9 +347,11 @@ pub fn same_to_15_digits_bounds(n: f64) -> (f64, f64) {
 }
 
 /// Whether two finite numbers agree when rounded to 15 significant digits.
-/// The digits round like [`number_to_text`]'s, half away from zero, so a
-/// number always equals the number its own text reads as: a criterion built
-/// with `"="&A1` matches A1.
+/// The digits round like [`number_to_text`]'s, half away from zero, so from
+/// 1E-98 up to below 1E+99, where that text keeps all 15 digits, a number
+/// equals the number its own text reads as: a criterion built with `"="&A1`
+/// matches A1. Beyond, the text keeps only 14 digits, and with A1
+/// 1.23456789012355E+99 (text `1.2345678901236E+99`) it need not.
 pub fn same_to_15_digits(a: f64, b: f64) -> bool {
     if a == b {
         return a.is_finite();

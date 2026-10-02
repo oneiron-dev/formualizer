@@ -809,6 +809,31 @@ fn match_type_text_reads_as_its_number() {
 }
 
 #[test]
+fn match_type_logical_or_blank_reads_as_its_number() {
+    // match_type is a number parameter: FALSE and an empty cell are 0, an
+    // exact match that finds the first 2; TRUE is 1, the approximate match
+    // that finds the last. Numeric text below the smallest normal number is 0.
+    let mut engine = engine_with_config(EvalConfig::default());
+    let cases = [
+        ("=MATCH(2,{1,2,2,3},FALSE)", 2.0),
+        ("=MATCH(2,{1,2,2,3},C1)", 2.0),
+        ("=MATCH(2,{1,2,2,3},\"1E-310\")", 2.0),
+        ("=MATCH(2,{1,2,2,3},TRUE)", 3.0),
+        ("=MATCH(2,{1,2,2,3},)", 2.0),
+    ];
+    for (offset, (text, _)) in cases.iter().enumerate() {
+        formula(&mut engine, "Sheet1", offset as u32 + 1, 2, text);
+    }
+    engine.evaluate_all().unwrap();
+    for (offset, (text, expected)) in cases.iter().enumerate() {
+        let actual = engine
+            .get_cell_value("Sheet1", offset as u32 + 1, 2)
+            .unwrap_or(LiteralValue::Empty);
+        assert_lookup_expected(actual, LookupExpected::Number(*expected), text);
+    }
+}
+
+#[test]
 fn vlookup_against_table_with_errors_in_lookup_column() {
     single_formula_parity(
         |engine| {

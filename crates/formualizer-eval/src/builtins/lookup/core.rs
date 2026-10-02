@@ -184,10 +184,14 @@ impl Function for MatchFn {
                 match mt_val {
                     LiteralValue::Number(n) => match_type = n,
                     LiteralValue::Int(i) => match_type = i as f64,
-                    // Text that reads as a number, as the argument check
-                    // already read it (never "NaN" or "inf").
-                    text @ LiteralValue::Text(_) => {
-                        if let Ok(n) = crate::coercion::to_number_argument(&text) {
+                    // match_type is a number parameter: text that reads as a
+                    // number, as the argument check already read it (never
+                    // "NaN" or "inf"), a logical (FALSE is 0, an exact match)
+                    // and an empty cell (0) convert like any number argument.
+                    other @ (LiteralValue::Text(_)
+                    | LiteralValue::Boolean(_)
+                    | LiteralValue::Empty) => {
+                        if let Ok(n) = crate::coercion::to_number_argument(&other) {
                             match_type = n;
                         }
                     }

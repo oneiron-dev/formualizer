@@ -76,6 +76,37 @@ fn disjoint_intersection_is_null() {
 }
 
 #[test]
+fn one_cell_intersection_is_a_reference_argument() {
+    // The intersection operator yields a reference, so functions that skip the text,
+    // logicals and blanks of a reference skip them in a one-cell intersection too, as they
+    // do for the cell itself (H1 = "5", H2 = TRUE).
+    let got = eval_all_with(
+        &[
+            (1, 8, LiteralValue::Text("5".into())),
+            (2, 8, LiteralValue::Boolean(true)),
+        ],
+        &[
+            "=SUM(H1 H1)",
+            "=SUM(H1)",
+            "=COUNT(H1 H1)",
+            "=SUM(H2 H2,1)",
+            "=COUNTA(H1 H1)",
+            "=ISREF(H1 H1)",
+            "=SUM(A1:C3 B2:B2)",
+            "=ERROR.TYPE(A1:A2 C1:C2)",
+        ],
+    );
+    assert_eq!(got[0], n(0.0));
+    assert_eq!(got[1], n(0.0));
+    assert_eq!(got[2], n(0.0));
+    assert_eq!(got[3], n(1.0));
+    assert_eq!(got[4], n(1.0));
+    assert_eq!(got[5], LiteralValue::Boolean(true));
+    assert_eq!(got[6], n(6.0));
+    assert_eq!(got[7], n(1.0));
+}
+
+#[test]
 fn error_inspecting_functions_see_errors() {
     let got = eval_all(&[
         "=ERROR.TYPE(qwertyzz)",

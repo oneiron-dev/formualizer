@@ -44,8 +44,46 @@ impl Locale {
 /// float spellings `NaN`, `inf` and `infinity` (any case or sign) are text to
 /// Excel, and text beyond the double range (`1e400`) is not a number either;
 /// all of them give `None`.
+///
+/// Excel keeps 15 significant digits of the number it reads and changes any
+/// digit past the fifteenth to zero (Microsoft, "Last digits are changed to
+/// zeros when you type long numbers in cells of Excel"): `"1000000000000005"`
+/// is 1000000000000000 and `"1234567890123456789"` is 1234567890123450000.
+/// It has no denormalized numbers either, so text below the smallest normal
+/// number (`"1E-310"`) reads as 0, as arithmetic underflows to 0
+/// ([`crate::coercion::underflow_to_zero`]).
 pub fn parse_finite_number(text: &str) -> Option<f64> {
-    text.parse::<f64>().ok().filter(|n| n.is_finite())
+    keep_15_significant_digits(text)
+        .parse::<f64>()
+        .ok()
+        .filter(|n| n.is_finite())
+        .map(crate::coercion::underflow_to_zero)
+}
+
+/// `text` with every significant digit of its mantissa past the fifteenth
+/// written as 0 (the exponent is left alone).
+fn keep_15_significant_digits(text: &str) -> std::borrow::Cow<'_, str> {
+    let mut significant = 0;
+    let mut truncated: Option<Vec<u8>> = None;
+    for (i, b) in text.bytes().enumerate() {
+        match b {
+            b'e' | b'E' => break,
+            b'0'..=b'9' => {
+                if significant > 0 || b != b'0' {
+                    significant += 1;
+                }
+                if significant > 15 && b != b'0' {
+                    truncated.get_or_insert_with(|| text.as_bytes().to_vec())[i] = b'0';
+                }
+            }
+            _ => {}
+        }
+    }
+    match truncated {
+        // Only ASCII digits were replaced by an ASCII digit.
+        Some(bytes) => std::borrow::Cow::Owned(String::from_utf8(bytes).expect("ASCII edit")),
+        None => std::borrow::Cow::Borrowed(text),
+    }
 }
 
 /// A number written in one of the constant number formats Excel for Windows
@@ -338,9 +376,50 @@ mod tests {
         assert_eq!(parse_finite_number("5"), Some(5.0));
         assert_eq!(parse_finite_number(".5"), Some(0.5));
         assert_eq!(parse_finite_number("-2.5E-1"), Some(-0.25));
+        // The largest double's text, read to its 15 significant digits.
         assert_eq!(
             parse_finite_number("1.7976931348623157e308"),
-            Some(f64::MAX)
+            Some(1.79769313486231e308)
         );
+    }
+
+    #[test]
+    fn numeric_text_keeps_15_significant_digits() {
+        let loc = Locale::invariant();
+        for (text, n) in [
+            ("1000000000000005", 1000000000000000.0),
+            ("1000000000000009", 1000000000000000.0),
+            ("1234567890123456789", 1234567890123450000.0),
+            ("-1234567890123456789", -1234567890123450000.0),
+            ("1,234,567,890,123,456", 1234567890123450.0),
+            ("$1,234,567,890,123,456.78", 1234567890123450.0),
+            ("0.1234567890123456789", 0.123456789012345),
+            ("0.000012345678901234567", 0.0000123456789012345),
+            ("1.23456789012345678E+20", 1.23456789012345E+20),
+            ("12345678901234567%", 123456789012345.0),
+            ("0.30000000000000004", 0.3),
+            // Up to 15 significant digits nothing changes; leading zeros and
+            // the exponent are not significant digits.
+            ("123456789012345", 123456789012345.0),
+            ("000123456789012345", 123456789012345.0),
+            ("0.354166666666667", 0.354166666666667),
+            ("1E-305", 1E-305),
+        ] {
+            assert_eq!(loc.parse_number_invariant(text), Some(n), "{text}");
+        }
+    }
+
+    #[test]
+    fn numeric_text_below_the_smallest_normal_number_is_zero() {
+        let loc = Locale::invariant();
+        for text in [
+            "1E-310", "-1E-310", "1e-308", "2.2E-308", "4.9E-324", "1e-330",
+        ] {
+            let n = loc.parse_number_invariant(text).unwrap();
+            assert!(n == 0.0 && n.is_sign_positive(), "{text}: {n}");
+        }
+        // Normal numbers just above it stay numbers.
+        assert_eq!(loc.parse_number_invariant("2.3E-308"), Some(2.3E-308));
+        assert_eq!(parse_finite_number("3E-308"), Some(3E-308));
     }
 }

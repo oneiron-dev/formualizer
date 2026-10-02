@@ -508,6 +508,9 @@ fn accumulate_npv_cash_flow(
         LiteralValue::Boolean(_) if ignore_non_numeric => None,
         LiteralValue::Boolean(b) => Some(if b { 1.0 } else { 0.0 }),
         LiteralValue::Text(_) | LiteralValue::Empty if ignore_non_numeric => None,
+        // Numeric text typed straight into the list converts as a number
+        // argument does (`NPV(0.1,"100")` counts 100); other text is #VALUE!.
+        ref text @ LiteralValue::Text(_) => Some(crate::coercion::to_number_argument(text)?),
         LiteralValue::Error(error) => return Err(error),
         // A date cell is a number on the sheet; take its serial rather than #VALUE!.
         ref other

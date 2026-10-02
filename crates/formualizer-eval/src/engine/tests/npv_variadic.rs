@@ -223,6 +223,95 @@ fn npv_computed_arrays_count_only_numbers() {
 }
 
 #[test]
+fn npv_direct_numeric_text_counts_as_its_number() {
+    // Numeric text typed straight into the list converts as a number argument does (en-US
+    // currency and exponents included); text that is no number stays #VALUE!. The same text
+    // inside an array or a reference is skipped.
+    assert_number("=NPV(A1,\"100\")", 90.9090909090909);
+    assert_number(
+        "=NPV(A1,\"$100\",\"1E2\")",
+        100.0 / 1.1 + 100.0 / 1.1f64.powi(2),
+    );
+    assert_number("=NPV(A1,{\"100\"},100)", 90.9090909090909);
+    assert_error("=NPV(A1,\"n/a\")", ExcelErrorKind::Value);
+}
+
+#[test]
+fn npv_one_cell_intersections_skip_non_numbers() {
+    // An intersection is a reference, so it skips text, logicals and blanks without taking a
+    // period, as M1, K1 and L1 themselves do.
+    assert_number("=NPV(A1,M1 M1,100)", 90.9090909090909);
+    assert_number("=NPV(A1,K1 K1,100)", 90.9090909090909);
+    assert_number("=NPV(A1,L1 L1,100)", 90.9090909090909);
+    assert_number(
+        "=NPV(A1,K1:N1 N1:N4,100)",
+        100.0 / 1.1 + 100.0 / 1.1f64.powi(2),
+    );
+    // A number still counts, and an error still fails.
+    assert_number("=NPV(A1,N1 N1)", 90.9090909090909);
+    assert_error("=NPV(A1,O1 O1)", ExcelErrorKind::Div);
+}
+
+/// A function that counts its calls and returns the call number.
+#[derive(Debug)]
+struct Tick {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl crate::function::Function for Tick {
+    fn name(&self) -> &'static str {
+        "TICK"
+    }
+
+    fn eval<'a, 'b, 'c>(
+        &self,
+        _args: &'c [crate::traits::ArgumentHandle<'a, 'b>],
+        _ctx: &dyn crate::traits::FunctionContext<'b>,
+    ) -> Result<crate::traits::CalcValue<'b>, formualizer_common::ExcelError> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
+            call as f64,
+        )))
+    }
+}
+
+#[test]
+fn npv_evaluates_a_reference_operator_argument_once() {
+    // Telling that an intersection or a `:` range is a reference takes no second evaluation
+    // of its sides: TICK() runs once and returns 1, so the intersection is A1 and the range
+    // A1:A2.
+    for (formula, expected) in [
+        ("=NPV(0,INDEX(A1:A2,TICK()) A1:A2)", 100.0),
+        ("=NPV(0,INDEX(A1:A2,TICK()):A2)", 300.0),
+    ] {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let workbook = TestWorkbook::new().with_function(std::sync::Arc::new(Tick {
+            calls: calls.clone(),
+        }));
+        let mut engine = Engine::new(workbook, EvalConfig::default());
+        for (row, value) in [(1, 100), (2, 200)] {
+            engine
+                .set_cell_value("Sheet1", row, 1, LiteralValue::Int(value))
+                .unwrap();
+        }
+        engine
+            .set_cell_formula("Sheet1", 1, 3, parse(formula).unwrap())
+            .unwrap();
+        engine.evaluate_all().unwrap();
+        assert_eq!(
+            engine.get_cell_value("Sheet1", 1, 3),
+            Some(LiteralValue::Number(expected)),
+            "{formula}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{formula}"
+        );
+    }
+}
+
+#[test]
 fn npv_enforces_excel_total_argument_limit() {
     let accepted = format!("=NPV(A1,{})", vec!["1"; 254].join(","));
     assert!(

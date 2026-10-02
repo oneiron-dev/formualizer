@@ -243,3 +243,94 @@ fn negative_zero_criterion_is_zero() {
         }
     }
 }
+
+#[test]
+fn numeric_text_cells_keep_15_significant_digits() {
+    // Text reads as a number to its first 15 significant digits, the rest
+    // zeros, as Excel reads typed numbers: "1000000000000005" is
+    // 1000000000000000, not a number that rounds to 1000000000000010, so it
+    // meets "<>1000000000000010" and not "=1000000000000010".
+    let a = [
+        LiteralValue::Text("1000000000000005".into()),
+        LiteralValue::Text("1000000000000012".into()),
+    ];
+    let b = [10.0, 20.0];
+    for bulk in [false, true] {
+        let mut engine = if bulk {
+            let mut engine = Engine::new(TestWorkbook::new(), arrow_eval_config());
+            let mut ab = engine.begin_bulk_ingest_arrow();
+            ab.add_sheet("Sheet1", 2, 2);
+            for (a, b) in a.iter().zip(b) {
+                ab.append_row("Sheet1", &[a.clone(), LiteralValue::Number(b)])
+                    .unwrap();
+            }
+            ab.finish().unwrap();
+            engine
+        } else {
+            let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+            for (i, (a, b)) in a.iter().zip(b).enumerate() {
+                let row = i as u32 + 1;
+                engine.set_cell_value("Sheet1", row, 1, a.clone()).unwrap();
+                engine
+                    .set_cell_value("Sheet1", row, 2, LiteralValue::Number(b))
+                    .unwrap();
+            }
+            engine
+        };
+        let cases = [
+            ("=COUNTIF(A1:A2, \"<>1000000000000010\")", 1.0),
+            ("=SUMIF(A1:A2, \"<>1000000000000010\", B1:B2)", 10.0),
+            ("=COUNTIF(A1:A2, \"=1000000000000010\")", 1.0),
+            ("=SUMIF(A1:A2, 1000000000000000, B1:B2)", 10.0),
+            // The criterion's text keeps 15 digits too.
+            ("=SUMIF(A1:A2, \"1000000000000019\", B1:B2)", 20.0),
+            ("=VALUE(\"1000000000000005\")", 1000000000000000.0),
+        ];
+        for (formula, expected) in cases {
+            assert_eq!(
+                eval(&mut engine, formula),
+                LiteralValue::Number(expected),
+                "bulk={bulk}: {formula}"
+            );
+        }
+    }
+}
+
+#[test]
+fn database_criteria_read_numeric_text_records_to_15_digits() {
+    // E1:F2 is the database (n = "1000000000000005" as text, v = 10); the
+    // record reads as 1000000000000000, so neither "=1000000000000010" nor
+    // ">=1000000000000010" selects it.
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    let text = |s: &str| LiteralValue::Text(s.into());
+    engine.set_cell_value("Sheet1", 1, 5, text("n")).unwrap();
+    engine.set_cell_value("Sheet1", 1, 6, text("v")).unwrap();
+    engine
+        .set_cell_value("Sheet1", 2, 5, text("1000000000000005"))
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 2, 6, LiteralValue::Number(10.0))
+        .unwrap();
+    for (col, criterion) in [
+        (7, "=1000000000000010"),
+        (8, ">=1000000000000010"),
+        (9, "=1000000000000000"),
+    ] {
+        engine.set_cell_value("Sheet1", 1, col, text("n")).unwrap();
+        engine
+            .set_cell_value("Sheet1", 2, col, text(criterion))
+            .unwrap();
+    }
+    let cases = [
+        ("=DSUM(E1:F2, \"v\", G1:G2)", 0.0),
+        ("=DCOUNT(E1:F2, \"v\", H1:H2)", 0.0),
+        ("=DSUM(E1:F2, \"v\", I1:I2)", 10.0),
+    ];
+    for (formula, expected) in cases {
+        assert_eq!(
+            eval(&mut engine, formula),
+            LiteralValue::Number(expected),
+            "{formula}"
+        );
+    }
+}

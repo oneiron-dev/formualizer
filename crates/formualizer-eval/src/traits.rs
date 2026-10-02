@@ -357,6 +357,21 @@ impl<'a, 'b> Clone for ArgumentHandle<'a, 'b> {
     }
 }
 
+/// The reference argument an intersection forms from the areas it holds
+/// (`Interpreter::evaluate_ast_as_areas`): `Some(Some(Ok(area)))` for a single
+/// area, `Some(Some(Err(_)))` for its error and `Some(None)` for several areas,
+/// which are not one reference. `None` when no side can hold several areas, so
+/// the intersection resolves as a plain reference.
+fn single_area(
+    areas: Option<Result<Vec<ReferenceType>, ExcelError>>,
+) -> Option<Option<Result<ReferenceType, ExcelError>>> {
+    match areas? {
+        Ok(mut areas) if areas.len() == 1 => Some(Some(Ok(areas.remove(0)))),
+        Ok(_) => Some(None),
+        Err(error) => Some(Some(Err(error))),
+    }
+}
+
 /// The argument IF or CHOOSE selects with a single condition or index.
 fn selected_branch(name: &str, args: &[ArgumentHandle<'_, '_>]) -> Option<usize> {
     let selector = args.first()?.value().ok()?.into_literal();
@@ -457,7 +472,26 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
     /// are included only when they actually produce a reference. A computed array remains a value
     /// even though both it and a cell range are represented by [`CalcValue::Range`].
     pub(crate) fn has_reference_semantics(&self) -> bool {
-        self.reference_attempt().is_some()
+        // The range and intersection operators always yield a reference (or
+        // its error), which needs no second evaluation of their sides to
+        // tell: a selector such as `INDEX(A1:A4,n) A1:A4` or `INDEX(A1:A4,n):A4`
+        // runs only for the argument's value.
+        self.is_reference_operator() || self.reference_attempt().is_some()
+    }
+
+    /// Whether this argument is written with the `:` range or the space
+    /// intersection operator.
+    fn is_reference_operator(&self) -> bool {
+        match &self.expr {
+            ArgumentExpr::Ast(node) => {
+                matches!(&node.node_type, ASTNodeType::BinaryOp { op, .. } if op == ":" || op == " ")
+            }
+            ArgumentExpr::Arena { id, data_store, .. } => matches!(
+                data_store.get_node(*id),
+                Some(crate::engine::arena::AstNodeData::BinaryOp { op_id, .. })
+                    if matches!(data_store.resolve_ast_string(*op_id), ":" | " ")
+            ),
+        }
     }
 
     /// Whether this argument is written as a reference into a linked workbook,
@@ -491,7 +525,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                 ASTNodeType::Reference { reference, .. } => {
                     !matches!(reference, ReferenceType::NamedRange(name) if self.interp.is_local_value_name(name))
                 }
-                ASTNodeType::BinaryOp { op, .. } => op == ":",
+                ASTNodeType::BinaryOp { op, .. } => op == ":" || op == " ",
                 ASTNodeType::Function { name, .. } => self
                     .interp
                     .context
@@ -508,7 +542,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                             .is_local_value_name(data_store.resolve_ast_string(*name_id))
                 ),
                 Some(crate::engine::arena::AstNodeData::BinaryOp { op_id, .. }) => {
-                    data_store.resolve_ast_string(*op_id) == ":"
+                    matches!(data_store.resolve_ast_string(*op_id), ":" | " ")
                 }
                 Some(crate::engine::arena::AstNodeData::Function { name_id, .. }) => self
                     .interp
@@ -915,6 +949,15 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                 ASTNodeType::BinaryOp { op, .. } if op == ":" => {
                     Some(self.interp.evaluate_ast_as_reference(node))
                 }
+                // The intersection operator yields a reference as well: the
+                // cells both sides hold, so `NPV(r,A2 A2,...)` and
+                // `SUM(A2 A2)` skip the text or logical A2 holds as they do
+                // for A2. An intersection that holds several areas (through a
+                // union or a multi-area name) stays a value.
+                ASTNodeType::BinaryOp { op, .. } if op == " " => {
+                    single_area(self.interp.evaluate_ast_as_areas(node))
+                        .unwrap_or_else(|| Some(self.interp.evaluate_ast_as_reference(node)))
+                }
                 ASTNodeType::Function { name, .. }
                     if self
                         .interp
@@ -962,6 +1005,23 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                             data_store,
                             sheet_registry,
                         ))
+                    }
+                    // Same rules as the AST branch above.
+                    crate::engine::arena::AstNodeData::BinaryOp { op_id, .. }
+                        if data_store.resolve_ast_string(*op_id) == " " =>
+                    {
+                        single_area(self.interp.evaluate_arena_ast_as_areas(
+                            *id,
+                            data_store,
+                            sheet_registry,
+                        ))
+                        .unwrap_or_else(|| {
+                            Some(self.interp.evaluate_arena_ast_as_reference(
+                                *id,
+                                data_store,
+                                sheet_registry,
+                            ))
+                        })
                     }
                     crate::engine::arena::AstNodeData::Function { name_id, .. } => {
                         let name = data_store.resolve_ast_string(*name_id);
