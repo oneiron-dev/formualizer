@@ -1255,6 +1255,14 @@ fn retain_last_value_index_selecting_another_cell_of_its_column_calculates() {
     assert_eq!(ids, vec![1.0, 2.0, 1.0, 3.0, 2.0]);
     assert_eq!(num(&engine, "Sheet1", 7, 2), 42.0);
     assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 1);
+    assert!(engine.kept_last_calculated_value("Sheet1", 7, 2));
+    assert!((2..=6).all(|row| !engine.kept_last_calculated_value("Sheet1", row, 2)));
+
+    // Calculated again (the cycle broken), B7 no longer keeps a value.
+    set_formula(&mut engine, "Sheet1", 7, 2, "=INDEX(B:B,ROW()-1)+1");
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 7, 2), 3.0);
+    assert!(!engine.kept_last_calculated_value("Sheet1", 7, 2));
 }
 
 /// With iteration off Excel accepts a formula that refers to its own cell

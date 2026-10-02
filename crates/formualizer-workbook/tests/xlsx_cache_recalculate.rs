@@ -1001,6 +1001,27 @@ fn rich_error_tags_are_kept_only_while_the_cell_holds_that_error() {
     );
 }
 #[test]
+fn a_circular_formula_keeps_the_rich_error_of_its_last_calculated_value() {
+    // A1 reads itself (B1 is TRUE): with iteration off it keeps its last
+    // calculated value, the #SPILL! of a two-row result (rwOffset 1) its
+    // cached #VALUE! is tagged with, spill range included. C1 reads it.
+    let rows = "<row r=\"1\"><c r=\"A1\" t=\"e\" vm=\"1\"><f>IF(B1,A1,1)</f><v>#VALUE!</v></c>\
+        <c r=\"B1\" t=\"b\"><v>1</v></c><c r=\"C1\" t=\"b\"><f>ISERROR(A1)</f><v>0</v></c></row>";
+    let p = with_rich_values(parts(rows), &[(8, 0, 1)]);
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    assert!(
+        sheet.contains("<c r=\"A1\" t=\"e\" vm=\"1\"><f>IF(B1,A1,1)</f><v>#VALUE!</v></c>"),
+        "{sheet}"
+    );
+    assert!(sheet.contains("<f>ISERROR(A1)</f><v>1</v>"), "{sheet}");
+    assert_eq!(out.cache_cells_changed, 1);
+    assert_eq!(
+        member(&out.bytes, "xl/richData/rdrichvalue.xml"),
+        p["xl/richData/rdrichvalue.xml"]
+    );
+}
+#[test]
 fn rich_values_other_than_error_tags_stay_unsupported() {
     let rows = "<row r=\"1\"><c r=\"A1\" t=\"e\" vm=\"1\"><f>1+1</f><v>#VALUE!</v></c></row>";
     assert!(

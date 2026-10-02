@@ -746,10 +746,21 @@ pub fn recalculate_xlsx_bytes(
                     errors.locations_truncated += 1;
                 }
             }
-            let wanted = rich_error(
-                &value,
-                engine.blocked_spill_extent(&sheet.name, cell.row, cell.col),
-            );
+            // A formula left uncalculated on a circular reference keeps its
+            // last calculated value with the rich error that tags it (the
+            // spill range of a #SPILL!).
+            let kept = engine
+                .kept_last_calculated_value(&sheet.name, cell.row, cell.col)
+                .then(|| cell.value_metadata.as_ref())
+                .flatten()
+                .and_then(|(vm, _)| tags.get(*vm))
+                .filter(|tag| matches!(&value, LiteralValue::Error(e) if e.kind == tag.kind));
+            let wanted = kept.or_else(|| {
+                rich_error(
+                    &value,
+                    engine.blocked_spill_extent(&sheet.name, cell.row, cell.col),
+                )
+            });
             let cache = Cache::from_value(value, engine.config.date_system)?;
             let stale = !cache.matches(cell);
             if stale {

@@ -1546,6 +1546,12 @@ pub struct Engine<R> {
     /// they held before the request. Cleared at every request boundary.
     request_prior_values: FxHashMap<VertexId, LiteralValue>,
 
+    /// Formulas the latest evaluation request left uncalculated on a live
+    /// circular reference with their last calculated value
+    /// (`CyclePolicy::RetainLastValue`). Cleared when a request begins and
+    /// when a formula is evaluated again.
+    kept_last_values: FxHashSet<VertexId>,
+
     /// Global function-registry semantic epoch observed after the latest
     /// conservative FormulaPlane invalidation.
     function_semantic_epoch_seen: u64,
@@ -3363,6 +3369,7 @@ where
             last_calculated_seed: FxHashMap::default(),
             last_calculated_carry: FxHashMap::default(),
             request_prior_values: FxHashMap::default(),
+            kept_last_values: FxHashSet::default(),
             function_semantic_epoch_seen: crate::function_registry::semantic_epoch(),
             function_provider_revision_seen,
             #[cfg(test)]
@@ -3538,6 +3545,7 @@ where
             last_calculated_seed: FxHashMap::default(),
             last_calculated_carry: FxHashMap::default(),
             request_prior_values: FxHashMap::default(),
+            kept_last_values: FxHashSet::default(),
             function_semantic_epoch_seen: crate::function_registry::semantic_epoch(),
             function_provider_revision_seen,
             #[cfg(test)]
@@ -4316,6 +4324,7 @@ where
         // that errored out mid-walk must not leak its members into this one.
         self.pending_iterative_redirty.clear();
         self.request_prior_values = FxHashMap::default();
+        self.kept_last_values.clear();
         self.reconcile_retained_sccs_at_request_begin();
         // Spec §7.11: NOW()/TODAY() sample the clock ONCE per recalc; every
         // read within this request (including SCC iteration passes) observes
@@ -5528,12 +5537,36 @@ where
         self.blocked_spill_extents.get(&vertex).copied()
     }
 
-    /// A formula is being evaluated again: its spill is no longer blocked
-    /// unless this evaluation finds it so.
+    /// A formula is being evaluated again: its spill is no longer blocked,
+    /// nor its last calculated value kept, unless this evaluation finds it so.
     fn forget_blocked_spill(&mut self, vertex_id: VertexId) {
         if !self.blocked_spill_extents.is_empty() {
             self.blocked_spill_extents.remove(&vertex_id);
         }
+        if !self.kept_last_values.is_empty() {
+            self.kept_last_values.remove(&vertex_id);
+        }
+    }
+
+    /// Whether the latest evaluation request left the formula at
+    /// `sheet`!(`row`, `col`) (1-based) uncalculated on a circular reference
+    /// with its last calculated value ([`CyclePolicy::RetainLastValue`]). A
+    /// file writer keeps what it saved with that value, such as the spill
+    /// range of a `#SPILL!`.
+    pub fn kept_last_calculated_value(&self, sheet: &str, row: u32, col: u32) -> bool {
+        if self.kept_last_values.is_empty() || row == 0 || col == 0 {
+            return false;
+        }
+        let Some(sheet_id) = self.graph.sheet_id(sheet) else {
+            return false;
+        };
+        let cell = crate::reference::CellRef::new(
+            sheet_id,
+            crate::reference::Coord::new(row - 1, col - 1, true, true),
+        );
+        self.graph
+            .get_vertex_for_cell(&cell)
+            .is_some_and(|vertex| self.kept_last_values.contains(&vertex))
     }
 
     /// Supply the last calculated value of the formula at `sheet`!`row`,`col`
@@ -29282,6 +29315,7 @@ where
                                     self.graph.update_vertex_value(vertex, value.clone());
                                     self.mirror_vertex_value_to_overlay(vertex, &value);
                                 }
+                                self.kept_last_values.insert(vertex);
                                 excluded[i] = true;
                                 last_value[i] = value;
                             }
