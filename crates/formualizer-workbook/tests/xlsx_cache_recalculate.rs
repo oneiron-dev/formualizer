@@ -2470,6 +2470,46 @@ fn references_that_only_look_circular_are_calculated() {
     }
 }
 #[test]
+fn circular_references_keep_their_cached_values_with_iteration_off() {
+    // With iterative calculation off (no calcPr iterate) Excel cannot
+    // calculate a formula on a circular reference: it keeps its last
+    // calculated value, the cache, or 0 when it has none, and formulas that
+    // read it calculate from that value. A self-read in an untaken branch is
+    // not circular.
+    let p = parts(
+        "<row r=\"1\"><c r=\"B1\"><v>10</v></c><c r=\"C1\"><f>B6*2</f><v>0</v></c>\
+         <c r=\"D1\"><f>E1+1</f><v>5</v></c><c r=\"E1\"><f>D1+1</f><v>6</v></c><c r=\"F1\"><f>D1+E1</f><v>0</v></c>\
+         <c r=\"G1\"><f>G1+1</f></c><c r=\"H1\" t=\"str\"><f>\"x\"&amp;COUNTA(H1:H200)</f><v>x9</v></c>\
+         <c r=\"I1\" t=\"e\"><f>I1/0</f><v>#DIV/0!</v></c><c r=\"J1\"><f>J1+1</f><v>1&#50;</v></c>\
+         <c r=\"K1\"><f>J1+1</f><v>0</v></c></row>\
+         <row r=\"2\"><c r=\"B2\"><v>20</v></c></row>\
+         <row r=\"6\"><c r=\"A6\" t=\"inlineStr\"><is><t>E</t></is></c><c r=\"B6\"><f>MAX(B1:B100)+1</f><v>7</v></c>\
+         <c r=\"C6\" t=\"str\"><f>IF(A6=\"E\",\"\",MAX(C1:C100)+1)</f><v>3</v></c></row>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for (cell, expected) in [
+        ("B6", "<v>7</v>"),
+        ("C1", "<v>14</v>"),
+        ("D1", "<v>5</v>"),
+        ("E1", "<v>6</v>"),
+        ("F1", "<v>11</v>"),
+        ("G1", "<v>0</v>"),
+        ("H1", "<v>x9</v>"),
+        ("I1", "<v>#DIV/0!</v>"),
+        ("J1", "<v>1&#50;</v>"),
+        ("K1", "<v>13</v>"),
+        ("C6", "<v></v>"),
+    ] {
+        let at = sheet.find(&format!("r=\"{cell}\"")).unwrap();
+        let end = at + sheet[at..].find("</c>").unwrap();
+        assert!(
+            sheet[at..end].contains(expected),
+            "{cell}={expected}: {sheet}"
+        );
+    }
+}
+#[test]
 fn whole_columns_span_the_grid() {
     // A:A and D:D line up row by row, and INDEX reaches rows past the data.
     let p = parts(

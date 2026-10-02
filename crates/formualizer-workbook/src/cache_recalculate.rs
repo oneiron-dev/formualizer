@@ -11,7 +11,7 @@ use crate::{CalamineAdapter, IoError, SpreadsheetReader, workbook::WBResolver};
 use formualizer_common::{CellAddress, DateSystem, ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_eval::engine::ingest::EngineLoadStream;
 use formualizer_eval::engine::inspect::{SnapshotOptions, Staleness};
-use formualizer_eval::engine::{CancelToken, Engine, EvalConfig, FormulaParsePolicy};
+use formualizer_eval::engine::{CancelToken, CyclePolicy, Engine, EvalConfig, FormulaParsePolicy};
 use std::collections::{BTreeMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::Read;
@@ -206,6 +206,59 @@ impl Cache {
             _ => false,
         }
     }
+}
+/// The result a formula cell's cache records: a number, `t="b"` boolean,
+/// `t="str"` text or `t="e"` Excel error. Inline, shared-string and date
+/// caches, and absent ones, give `None`.
+fn cached_result(cell: &sheet::Cell) -> Option<LiteralValue> {
+    use formualizer_common::{ExcelError, ExcelErrorKind as K};
+    if cell.inline.is_some() {
+        return None;
+    }
+    let text = &cell.value.as_ref()?.text;
+    match cell.kind.as_deref() {
+        None | Some("n") => text
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite())
+            .map(LiteralValue::Number),
+        Some("b") => match text.trim() {
+            "1" => Some(LiteralValue::Boolean(true)),
+            "0" => Some(LiteralValue::Boolean(false)),
+            _ => None,
+        },
+        Some("str") => Some(LiteralValue::Text(text.clone())),
+        Some("e") => K::try_parse(text)
+            .filter(|kind| {
+                matches!(
+                    kind,
+                    K::Null
+                        | K::Div
+                        | K::Value
+                        | K::Ref
+                        | K::Name
+                        | K::Num
+                        | K::Na
+                        | K::Spill
+                        | K::Calc
+                )
+            })
+            .map(|kind| LiteralValue::Error(ExcelError::new(kind))),
+        _ => None,
+    }
+}
+/// The last calculated value a formula cell's cache records: its
+/// [`cached_result`], or the error a rich value tags its cached #VALUE! with
+/// (a #SPILL! or #CALC!).
+fn last_calculated_value(cell: &sheet::Cell, tags: &rich::RichTags) -> Option<LiteralValue> {
+    if let Some((vm, _)) = &cell.value_metadata
+        && cell.kind.as_deref() == Some("e")
+        && let Some(error) = tags.get(*vm)
+    {
+        return Some(LiteralValue::Error(ExcelError::new(error.kind)));
+    }
+    cached_result(cell)
 }
 struct Patch {
     span: Range<usize>,
@@ -508,6 +561,13 @@ pub fn recalculate_xlsx_bytes(
     if let Some(settings) = crate::traits::SpreadsheetReader::calc_settings(&adapter) {
         config.cycle = crate::calc_pr::apply_calc_settings_to_cycle(&settings, config.cycle);
     }
+    // With iterative calculation off (Excel's default), Excel cannot
+    // calculate a formula on a real circular reference: it leaves it with
+    // its last calculated value, the result this file caches for it.
+    let retain_last_values = config.cycle.policy == CyclePolicy::Error;
+    if retain_last_values {
+        config.cycle.policy = CyclePolicy::RetainLastValue;
+    }
     // XLSX dates are serial caches. Native chrono materialization cannot retain
     // Excel-1900 phantom serial 60 and can discard fractional duration precision.
     config.temporal_egress = formualizer_eval::engine::TemporalEgress::Serial;
@@ -542,6 +602,17 @@ pub fn recalculate_xlsx_bytes(
                     LiteralValue::Error(ExcelError::new(kind)),
                 )
                 .map_err(IoError::Engine)?;
+        }
+    }
+    // The ingestion view may have cleared a cache Calamine cannot read; the
+    // package's own caches are the last calculated values.
+    if retain_last_values {
+        for (sheet, (_, scan)) in sheets.iter().zip(&plans) {
+            for cell in &scan.cells {
+                if let Some(value) = last_calculated_value(cell, &tags) {
+                    engine.set_last_calculated_value(&sheet.name, cell.row, cell.col, value);
+                }
+            }
         }
     }
     // Only array formulas produce arrays; a formula stored without the array

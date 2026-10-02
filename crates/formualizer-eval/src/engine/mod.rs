@@ -1072,6 +1072,12 @@ impl CycleConfig {
     /// rejected at build: [`EvalConfig::with_cycle`] and engine construction
     /// both panic on `Err`.
     pub fn validate(&self) -> Result<(), String> {
+        if self.policy == CyclePolicy::RetainLastValue && self.detection == CycleDetection::Static {
+            return Err(
+                "CyclePolicy::RetainLastValue requires CycleDetection::Runtime (spec §2)"
+                    .to_string(),
+            );
+        }
         if let CyclePolicy::Iterate {
             max_iterations,
             max_change,
@@ -1095,13 +1101,17 @@ impl CycleConfig {
     }
 
     /// Whether ingest may accept formulas whose dependencies include the
-    /// formula's own cell (`=B1+A1` in B1). Excel accepts these only with
-    /// iterative calculation enabled; everywhere else the edit-time
-    /// "Self-reference detected" rejection stands.
+    /// formula's own cell (`=B1+A1` in B1). Excel accepts these with
+    /// iterative calculation enabled, and with it disabled it accepts them
+    /// too and leaves them uncalculated (`RetainLastValue`); under `Error`
+    /// the edit-time "Self-reference detected" rejection stands.
     #[inline]
     pub(crate) fn allows_self_dependency(&self) -> bool {
         self.detection == CycleDetection::Runtime
-            && matches!(self.policy, CyclePolicy::Iterate { .. })
+            && matches!(
+                self.policy,
+                CyclePolicy::Iterate { .. } | CyclePolicy::RetainLastValue
+            )
     }
 }
 
@@ -1124,6 +1134,20 @@ pub enum CyclePolicy {
     /// Live cycles produce `#CIRC!`.
     #[default]
     Error,
+    /// Excel with iterative calculation disabled: Excel cannot calculate a
+    /// formula that refers to its own cell, directly or indirectly, so it
+    /// leaves the formula uncalculated and the cell "displays either a zero
+    /// or the last calculated value" — the value from the last successful
+    /// calculation (Microsoft, "Remove or allow a circular reference").
+    /// Every member of a live cycle keeps its last calculated value: the
+    /// value it held before this recalculation, or the one supplied with
+    /// [`Engine::set_last_calculated_value`] (a file's cached result) before
+    /// the engine first calculated it, else `0`. Formulas that read a
+    /// member, inside or outside the SCC, calculate with that value. Phantom
+    /// SCCs produce ordinary values, as under `Error`; spill anchors and
+    /// members whose result is an array keep the conservative `#CIRC!`
+    /// verdict (spec §7.9).
+    RetainLastValue,
     /// Excel-style iterative calculation (RFC #113, spec §3.5/§6):
     /// live cycles keep running full passes over all SCC members in member
     /// order (Gauss–Seidel: each result is committed before the next member

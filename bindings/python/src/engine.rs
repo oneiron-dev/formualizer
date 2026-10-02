@@ -323,6 +323,7 @@ impl PyEvaluationConfig {
     pub fn get_cycle_policy(&self) -> String {
         match self.inner.cycle.policy {
             CyclePolicy::Error => "error".to_string(),
+            CyclePolicy::RetainLastValue => "retain_last_value".to_string(),
             CyclePolicy::Iterate { .. } => "iterate".to_string(),
         }
     }
@@ -338,7 +339,9 @@ impl PyEvaluationConfig {
                 // Preserve existing knobs if already iterating, else Excel defaults.
                 let policy = match self.inner.cycle.policy {
                     CyclePolicy::Iterate { .. } => self.inner.cycle.policy,
-                    CyclePolicy::Error => CyclePolicy::iterate_excel_defaults(),
+                    CyclePolicy::Error | CyclePolicy::RetainLastValue => {
+                        CyclePolicy::iterate_excel_defaults()
+                    }
                 };
                 self.enable_iterate(policy)
             }
@@ -355,7 +358,9 @@ impl PyEvaluationConfig {
     pub fn get_iterate_max_iterations(&self) -> u32 {
         match self.inner.cycle.policy {
             CyclePolicy::Iterate { max_iterations, .. } => max_iterations,
-            CyclePolicy::Error => CyclePolicy::EXCEL_DEFAULT_MAX_ITERATIONS,
+            CyclePolicy::Error | CyclePolicy::RetainLastValue => {
+                CyclePolicy::EXCEL_DEFAULT_MAX_ITERATIONS
+            }
         }
     }
 
@@ -363,7 +368,9 @@ impl PyEvaluationConfig {
     pub fn set_iterate_max_iterations(&mut self, value: u32) -> PyResult<()> {
         let max_change = match self.inner.cycle.policy {
             CyclePolicy::Iterate { max_change, .. } => max_change,
-            CyclePolicy::Error => CyclePolicy::EXCEL_DEFAULT_MAX_CHANGE,
+            CyclePolicy::Error | CyclePolicy::RetainLastValue => {
+                CyclePolicy::EXCEL_DEFAULT_MAX_CHANGE
+            }
         };
         self.enable_iterate(CyclePolicy::Iterate {
             max_iterations: value,
@@ -378,7 +385,9 @@ impl PyEvaluationConfig {
     pub fn get_iterate_max_change(&self) -> f64 {
         match self.inner.cycle.policy {
             CyclePolicy::Iterate { max_change, .. } => max_change,
-            CyclePolicy::Error => CyclePolicy::EXCEL_DEFAULT_MAX_CHANGE,
+            CyclePolicy::Error | CyclePolicy::RetainLastValue => {
+                CyclePolicy::EXCEL_DEFAULT_MAX_CHANGE
+            }
         }
     }
 
@@ -386,7 +395,9 @@ impl PyEvaluationConfig {
     pub fn set_iterate_max_change(&mut self, value: f64) -> PyResult<()> {
         let max_iterations = match self.inner.cycle.policy {
             CyclePolicy::Iterate { max_iterations, .. } => max_iterations,
-            CyclePolicy::Error => CyclePolicy::EXCEL_DEFAULT_MAX_ITERATIONS,
+            CyclePolicy::Error | CyclePolicy::RetainLastValue => {
+                CyclePolicy::EXCEL_DEFAULT_MAX_ITERATIONS
+            }
         };
         self.enable_iterate(CyclePolicy::Iterate {
             max_iterations,

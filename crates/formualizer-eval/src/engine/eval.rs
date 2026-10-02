@@ -1514,6 +1514,14 @@ pub struct Engine<R> {
     /// something iterated — zero cost otherwise.
     iterative_state_values: FxHashMap<VertexId, LiteralValue>,
 
+    /// Last calculated values a host supplied for formula cells the engine
+    /// has not calculated yet (an XLSX file's cached results), keyed by
+    /// `(sheet, row0, col0)`. Under `CyclePolicy::RetainLastValue` a member
+    /// of a live cycle keeps this value. Consumed by the next evaluation
+    /// request: afterwards the engine's own results are the last calculated
+    /// values. Empty unless a host supplies values — zero cost otherwise.
+    last_calculated_seed: FxHashMap<(SheetId, u32, u32), LiteralValue>,
+
     /// Global function-registry semantic epoch observed after the latest
     /// conservative FormulaPlane invalidation.
     function_semantic_epoch_seen: u64,
@@ -3324,6 +3332,7 @@ where
             retained_scc_provider_revision_seen: None,
             retained_scc_dirty_at_begin: Vec::new(),
             iterative_state_values: FxHashMap::default(),
+            last_calculated_seed: FxHashMap::default(),
             function_semantic_epoch_seen: crate::function_registry::semantic_epoch(),
             function_provider_revision_seen,
             #[cfg(test)]
@@ -3496,6 +3505,7 @@ where
             retained_scc_provider_revision_seen: None,
             retained_scc_dirty_at_begin: Vec::new(),
             iterative_state_values: FxHashMap::default(),
+            last_calculated_seed: FxHashMap::default(),
             function_semantic_epoch_seen: crate::function_registry::semantic_epoch(),
             function_provider_revision_seen,
             #[cfg(test)]
@@ -4289,6 +4299,9 @@ where
     /// `graph.redirty_volatiles()` call at every evaluation-flow exit; must
     /// run AFTER the flow's `clear_dirty_flags`.
     fn redirty_for_next_recalc(&mut self) {
+        // Supplied last calculated values describe the state before this
+        // request; the engine's results replace them from here on.
+        self.last_calculated_seed = FxHashMap::default();
         self.volatile_redirtied = self.graph.redirty_volatiles().into_iter().collect();
         let pending = std::mem::take(&mut self.pending_iterative_redirty);
         let dirty_at_begin = std::mem::take(&mut self.retained_scc_dirty_at_begin);
@@ -4348,6 +4361,7 @@ where
         std::mem::discriminant(&config.cycle.detection).hash(&mut hasher);
         match config.cycle.policy {
             CyclePolicy::Error => 0u8.hash(&mut hasher),
+            CyclePolicy::RetainLastValue => 2u8.hash(&mut hasher),
             CyclePolicy::Iterate {
                 max_iterations,
                 max_change,
@@ -5485,6 +5499,30 @@ where
     fn forget_blocked_spill(&mut self, vertex_id: VertexId) {
         if !self.blocked_spill_extents.is_empty() {
             self.blocked_spill_extents.remove(&vertex_id);
+        }
+    }
+
+    /// Supply the last calculated value of the formula at `sheet`!`row`,`col`
+    /// (1-based) from before this engine calculated it — a file's cached
+    /// result. Under [`CyclePolicy::RetainLastValue`] a formula left
+    /// uncalculated on a live circular reference keeps this value, as Excel
+    /// keeps the last calculated value when iteration is off. Values apply to
+    /// the next evaluation request only; afterwards the engine's own results
+    /// are the last calculated values. Inserting or deleting rows or columns
+    /// drops supplied values. Unknown sheets and row/col 0 are ignored.
+    pub fn set_last_calculated_value(
+        &mut self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+        value: LiteralValue,
+    ) {
+        if row == 0 || col == 0 {
+            return;
+        }
+        if let Some(sheet_id) = self.graph.sheet_id(sheet) {
+            self.last_calculated_seed
+                .insert((sheet_id, row - 1, col - 1), value);
         }
     }
 
@@ -18078,6 +18116,9 @@ where
     }
 
     fn clear_computed_overlay_after_row(&mut self, sheet: &str, start_row0: usize) {
+        // Supplied last calculated values are keyed by the cells they were
+        // read from; cells moved, so they no longer line up.
+        self.last_calculated_seed.clear();
         if !(self.config.arrow_storage_enabled && self.config.write_formula_overlay_enabled) {
             return;
         }
@@ -18139,6 +18180,9 @@ where
     }
 
     fn clear_computed_overlay_after_col(&mut self, sheet: &str, start_col0: usize) {
+        // Supplied last calculated values are keyed by the cells they were
+        // read from; cells moved, so they no longer line up.
+        self.last_calculated_seed.clear();
         if !(self.config.arrow_storage_enabled && self.config.write_formula_overlay_enabled) {
             return;
         }
@@ -28511,6 +28555,26 @@ where
         self.mirror_vertex_value_to_overlay(vertex_id, circ_error);
     }
 
+    /// The value a live-cycle member keeps under
+    /// [`CyclePolicy::RetainLastValue`]: the host-supplied last calculated
+    /// value of a cell the engine has not calculated yet (see
+    /// [`Self::set_last_calculated_value`]), else the value the member held
+    /// before this SCC task, else `0` — Excel's value for a circular formula
+    /// that never calculated.
+    fn last_calculated_value(&self, cell: &Option<CellRef>, before: &LiteralValue) -> LiteralValue {
+        if let Some(cell) = cell
+            && let Some(value) =
+                self.last_calculated_seed
+                    .get(&(cell.sheet_id, cell.coord.row(), cell.coord.col()))
+        {
+            return value.clone();
+        }
+        match before {
+            LiteralValue::Empty | LiteralValue::Pending => LiteralValue::Number(0.0),
+            value => value.clone(),
+        }
+    }
+
     /// Dispatch point for one `ScheduleUnit::Cycle` (RFC #112, Stage 2).
     ///
     /// * `CycleDetection::Static` — today's behavior, byte-for-byte: stamp
@@ -28835,6 +28899,9 @@ where
         // Error flow `1 + settle_passes == passes`, preserving Stage-2
         // behavior exactly).
         let mut settle_passes = 0usize;
+        // Members a `RetainLastValue` round left uncalculated, with the value
+        // each keeps.
+        let mut retained: Vec<(VertexId, LiteralValue)> = Vec::new();
         loop {
             // Drain this pass's recordings; members that ran replace their
             // out-edge set, members that didn't keep last-known edges.
@@ -28871,6 +28938,48 @@ where
                 // accumulating so the count stays "distinct live cycles".
                 witnessed_cycles = witnessed_cycles.max(analysis.cycle_count);
                 match policy {
+                    CyclePolicy::RetainLastValue => {
+                        // POLICY (RetainLastValue): Excel with iteration off
+                        // leaves every member of a live cycle uncalculated with
+                        // its last calculated value. The remaining members then
+                        // run in live-topological order from those values and
+                        // the loop classifies their fresh reads again: a
+                        // retained value can flip a branch, so stale readers
+                        // settle exactly and a newly live cycle is retained too.
+                        // Each round retains at least one more member.
+                        for i in 0..n {
+                            if analysis.in_cycle[i] && !excluded[i] {
+                                let value =
+                                    self.last_calculated_value(&members[i].cell, &snapshot[i]);
+                                self.graph
+                                    .update_vertex_value(members[i].vertex, value.clone());
+                                self.mirror_vertex_value_to_overlay(members[i].vertex, &value);
+                                excluded[i] = true;
+                                last_value[i] = value.clone();
+                                retained.push((members[i].vertex, value));
+                            }
+                        }
+                        check_cancel(cancel_flag)?;
+                        prev_pass = None;
+                        for x in pos.iter_mut() {
+                            *x = -1;
+                        }
+                        changed.fill(false);
+                        let order: Vec<usize> = analysis
+                            .topo
+                            .iter()
+                            .map(|&i| i as usize)
+                            .filter(|&i| !excluded[i])
+                            .collect();
+                        if !order.is_empty() {
+                            passes += 1;
+                            for (p, i) in order.into_iter().enumerate() {
+                                run_member!(i);
+                                pos[i] = p as i64;
+                            }
+                        }
+                        continue;
+                    }
                     CyclePolicy::Error => {
                         // POLICY (Error): stamp every member of a live cycle,
                         // then one settling pass over the remaining members in
@@ -29060,6 +29169,20 @@ where
             converged = true;
         }
 
+        // Each member's committed result (calculated or retained) is now its
+        // last calculated value; a supplied one no longer applies.
+        if !self.last_calculated_seed.is_empty() {
+            for m in &members {
+                if let Some(cell) = m.cell {
+                    self.last_calculated_seed.remove(&(
+                        cell.sheet_id,
+                        cell.coord.row(),
+                        cell.coord.col(),
+                    ));
+                }
+            }
+        }
+
         // ── 5. End of task: one delta per member whose final value differs
         // from the pre-task snapshot (spec §3 side-effect rule, G11).
         collector.clear_current();
@@ -29137,6 +29260,12 @@ where
             for m in members.iter() {
                 self.iterative_state_values.remove(&m.vertex);
             }
+        }
+        // A retained value is cycle state like an iterated one, not a
+        // recomputable cache: keep it where structural edits that clear
+        // computed overlays cannot reset it (step 0b re-seeds it).
+        for (vertex, value) in retained {
+            self.iterative_state_values.insert(vertex, value);
         }
 
         {

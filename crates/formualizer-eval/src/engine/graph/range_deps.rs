@@ -866,9 +866,23 @@ impl DependencyGraph {
         keys: &[crate::engine::plan::RangeKey],
         current_sheet_id: SheetId,
     ) {
+        self.add_range_deps_from_keys_reporting_self_loop(dependent, keys, current_sheet_id);
+    }
+
+    /// [`Self::add_range_deps_from_keys`], returning whether one of the
+    /// ranges covers the formula's own cell and so recorded the #120
+    /// self-loop. A bulk builder that installs the formula's out-edges from
+    /// its own adjacency row must carry that edge in the row.
+    pub(crate) fn add_range_deps_from_keys_reporting_self_loop(
+        &mut self,
+        dependent: VertexId,
+        keys: &[crate::engine::plan::RangeKey],
+        current_sheet_id: SheetId,
+    ) -> bool {
         use crate::engine::plan::RangeKey as RK;
+        let mut self_loop = false;
         if keys.is_empty() {
-            return;
+            return self_loop;
         }
 
         let mut shared_ranges: Vec<SharedRangeRef<'static>> = Vec::with_capacity(keys.len());
@@ -923,7 +937,7 @@ impl DependencyGraph {
         }
 
         if shared_ranges.is_empty() {
-            return;
+            return self_loop;
         }
 
         self.formula_to_range_deps
@@ -948,6 +962,7 @@ impl DependencyGraph {
                     != RangeSelfUse::Excluded
             {
                 self.record_self_loop(dependent);
+                self_loop = true;
             }
 
             // #376: an all-unbounded range means "the whole sheet". The stripe
@@ -1054,5 +1069,6 @@ impl DependencyGraph {
                 }
             }
         }
+        self_loop
     }
 }

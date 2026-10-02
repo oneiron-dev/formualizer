@@ -988,8 +988,22 @@ impl CalamineAdapter {
             }
 
             // Preserve existing KeepCachedValue behavior: a formula's cached
-            // value is not handed to the value plane.
+            // value is not handed to the value plane. With iteration off it
+            // is the formula's last calculated value, which a formula left
+            // uncalculated on a circular reference keeps.
             if has_formula {
+                if engine.config.cycle.policy
+                    == formualizer_eval::engine::CyclePolicy::RetainLastValue
+                {
+                    // A date-formatted cache is still the serial calculated.
+                    let value = match &record.value {
+                        DataRef::DateTime(dt) => Some(LiteralValue::Number(dt.as_f64())),
+                        value => data_ref_to_literal(value, engine.config.date_system),
+                    };
+                    if let Some(value) = value {
+                        engine.set_last_calculated_value(sheet, row0 + 1, col0 + 1, value);
+                    }
+                }
                 continue;
             }
             // Nor is an array formula member's: it is the anchor's result.

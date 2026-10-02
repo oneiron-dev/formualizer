@@ -86,7 +86,7 @@ fn workbook_config_from_options(
             max_iterations,
             max_change,
         } => (max_iterations, max_change),
-        CyclePolicy::Error => (
+        CyclePolicy::Error | CyclePolicy::RetainLastValue => (
             CyclePolicy::EXCEL_DEFAULT_MAX_ITERATIONS,
             CyclePolicy::EXCEL_DEFAULT_MAX_CHANGE,
         ),

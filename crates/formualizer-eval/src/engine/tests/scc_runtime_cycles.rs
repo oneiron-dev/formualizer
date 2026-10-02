@@ -1121,3 +1121,220 @@ fn evaluate_all_logged_handles_runtime_cycles_directly() {
     assert!(is_circ(&engine, "Sheet1", 2, 2));
     assert_eq!(res.cycle_errors, 1);
 }
+
+/* ───────── Excel with iteration off: CyclePolicy::RetainLastValue ───────── */
+
+fn retain_engine() -> Engine<TestWorkbook> {
+    Engine::new(
+        TestWorkbook::new(),
+        EvalConfig::default().with_cycle(CycleConfig {
+            detection: CycleDetection::Runtime,
+            policy: CyclePolicy::RetainLastValue,
+        }),
+    )
+}
+
+#[test]
+fn retain_last_value_requires_runtime_detection() {
+    let config = CycleConfig {
+        detection: CycleDetection::Static,
+        policy: CyclePolicy::RetainLastValue,
+    };
+    assert!(config.validate().is_err());
+}
+
+/// Excel cannot calculate a circular formula with iteration off; the cell
+/// shows "either a zero or the last calculated value". Members of a live
+/// cycle that never calculated hold 0, and formulas reading them calculate
+/// from that value.
+#[test]
+fn retain_last_value_live_cycle_without_prior_values_holds_zero() {
+    let mut engine = retain_engine();
+    set_formula(&mut engine, "Sheet1", 1, 1, "=B1+1");
+    set_formula(&mut engine, "Sheet1", 1, 2, "=A1+1");
+    set_formula(&mut engine, "Sheet1", 1, 3, "=A1+B1+1");
+    let res = engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 0.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 0.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 3), 1.0);
+    assert_eq!(res.cycle_errors, 0);
+    let t = engine.last_cycle_telemetry();
+    assert_eq!(t.live_cycles_witnessed, 1);
+    assert_eq!(t.circ_cells_stamped, 0);
+}
+
+/// Last calculated values supplied for cells the engine has not calculated
+/// (an XLSX file's cached results) are what live-cycle members keep; the
+/// rest of the SCC and its dependents calculate from them.
+#[test]
+fn retain_last_value_keeps_supplied_last_calculated_values() {
+    let mut engine = retain_engine();
+    set_value(&mut engine, "Sheet1", 1, 4, LiteralValue::Number(1.0)); // D1
+    set_formula(&mut engine, "Sheet1", 1, 1, "=B1+D1"); // A1
+    set_formula(&mut engine, "Sheet1", 1, 2, "=A1+1"); // B1
+    set_formula(&mut engine, "Sheet1", 1, 3, "=A1+B1"); // C1, downstream
+    engine.set_last_calculated_value("Sheet1", 1, 1, LiteralValue::Number(5.0));
+    engine.set_last_calculated_value("Sheet1", 1, 2, LiteralValue::Number(6.0));
+    engine.set_last_calculated_value("Sheet1", 1, 3, LiteralValue::Number(0.0));
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 5.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 6.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 3), 11.0);
+
+    // A later recalculation of the cycle keeps the values it holds now.
+    set_value(&mut engine, "Sheet1", 1, 4, LiteralValue::Number(2.0));
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 5.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 6.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 3), 11.0);
+}
+
+/// Microsoft's example: an IF formula calculates until an argument makes it
+/// calculate itself, then "Excel retains the value from the last successful
+/// calculation". Supplied values only describe the state before the first
+/// recalculation, so the formula keeps its own result, not the file's.
+#[test]
+fn retain_last_value_keeps_the_last_successful_result_when_a_guard_flips() {
+    let mut engine = retain_engine();
+    set_value(&mut engine, "Sheet1", 1, 7, LiteralValue::Boolean(true)); // G1
+    for r in 1..=10u32 {
+        if r != 5 {
+            set_value(&mut engine, "Sheet1", r, 2, LiteralValue::Number(1.0));
+        }
+    }
+    set_formula(&mut engine, "Sheet1", 5, 1, "=IF(G1,5,SUM(B1:B10))"); // A5
+    set_formula(&mut engine, "Sheet1", 5, 2, "=A5"); // B5
+    set_formula(&mut engine, "Sheet1", 6, 1, "=A5*10"); // A6, downstream
+    engine.set_last_calculated_value("Sheet1", 5, 1, LiteralValue::Number(99.0));
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 5, 1), 5.0, "phantom SCC calculates");
+    assert_eq!(num(&engine, "Sheet1", 5, 2), 5.0);
+    assert_eq!(engine.last_cycle_telemetry().phantom_sccs, 1);
+
+    set_value(&mut engine, "Sheet1", 1, 7, LiteralValue::Boolean(false));
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 5, 1), 5.0);
+    assert_eq!(num(&engine, "Sheet1", 5, 2), 5.0);
+    assert_eq!(num(&engine, "Sheet1", 6, 1), 50.0);
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 1);
+}
+
+/// With iteration off Excel accepts a formula that refers to its own cell
+/// (it warns and leaves it uncalculated): the edit is not rejected and the
+/// new formula, which has no earlier result, holds 0.
+#[test]
+fn retain_last_value_accepts_a_direct_self_reference() {
+    let mut engine = retain_engine();
+    set_formula(&mut engine, "Sheet1", 1, 1, "=A1+1");
+    set_formula(&mut engine, "Sheet1", 1, 2, "=A1+2");
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 0.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 2.0);
+}
+
+/// A bulk-loaded formula whose range covers its own cell
+/// (`MAX(B1:B100)+1` in B6) is a self-reference, as it is when the formula
+/// is set interactively (#120): `#CIRC!` under the default policy, the last
+/// calculated value with iteration off, and an ordinary value while the
+/// read sits in an untaken branch.
+#[test]
+fn bulk_loaded_range_covering_its_own_cell_is_a_self_reference() {
+    use crate::engine::{FormulaIngestBatch, FormulaIngestRecord};
+
+    fn load(engine: &mut Engine<TestWorkbook>, formulas: &[(u32, u32, &str)]) {
+        engine.add_sheet("Sheet1").ok();
+        for r in 1..=5u32 {
+            set_value(engine, "Sheet1", r, 2, LiteralValue::Number(f64::from(r)));
+        }
+        let records = formulas
+            .iter()
+            .map(|(row, col, formula)| {
+                let ast_id = engine.intern_formula_ast(&parse(formula).unwrap());
+                FormulaIngestRecord::new(*row, *col, ast_id, Some(Arc::<str>::from(*formula)))
+            })
+            .collect();
+        engine
+            .ingest_formula_batches(vec![FormulaIngestBatch::new("Sheet1", records)])
+            .unwrap();
+    }
+    let formulas = [(6, 2, "=MAX(B1:B100)+1"), (1, 3, "=B6*2")];
+
+    let mut engine = static_engine();
+    load(&mut engine, &formulas);
+    engine.evaluate_all().unwrap();
+    assert!(is_circ(&engine, "Sheet1", 6, 2));
+
+    let mut engine = runtime_engine();
+    load(&mut engine, &formulas);
+    engine.evaluate_all().unwrap();
+    assert!(is_circ(&engine, "Sheet1", 6, 2));
+
+    let mut engine = retain_engine();
+    load(&mut engine, &formulas);
+    engine.set_last_calculated_value("Sheet1", 6, 2, LiteralValue::Number(7.0));
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 6, 2), 7.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 3), 14.0);
+
+    let mut engine = retain_engine();
+    load(
+        &mut engine,
+        &[(6, 1, "=\"E\""), (6, 2, "=IF(A6=\"E\",0,MAX(B1:B100)+1)")],
+    );
+    engine.set_last_calculated_value("Sheet1", 6, 2, LiteralValue::Number(7.0));
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        num(&engine, "Sheet1", 6, 2),
+        0.0,
+        "untaken branch: not circular"
+    );
+    assert_eq!(engine.last_cycle_telemetry().phantom_sccs, 1);
+}
+
+/// A retained value can flip a branch of another SCC member: the members
+/// left to calculate settle from the retained values in their new read
+/// order (C1 reads D1 once A1 holds 0, so D1 must calculate first).
+#[test]
+fn retain_last_value_settles_members_whose_branches_flip() {
+    let mut engine = retain_engine();
+    set_formula(&mut engine, "Sheet1", 1, 1, "=IF(TRUE,B1+1,C1)"); // A1
+    set_formula(&mut engine, "Sheet1", 1, 2, "=A1+1"); // B1
+    set_formula(&mut engine, "Sheet1", 1, 3, "=IF(A1=0,D1,5)"); // C1
+    set_formula(&mut engine, "Sheet1", 1, 4, "=IF(A1=0,9,C1)"); // D1
+    set_formula(&mut engine, "Sheet1", 1, 5, "=C1+D1"); // E1, downstream
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 0.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 0.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 3), 9.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 4), 9.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 5), 18.0);
+}
+
+/// A retained value is the cell's value, not a recomputable cache: moving
+/// the cell by a row insertion keeps it. Supplied values are keyed by the
+/// cells they came from, so an insertion before the first recalculation
+/// drops them rather than hand them to other cells.
+#[test]
+fn retain_last_value_survives_row_insertion() {
+    let mut engine = retain_engine();
+    set_formula(&mut engine, "Sheet1", 1, 2, "=B1+1");
+    set_formula(&mut engine, "Sheet1", 1, 3, "=B1*2");
+    engine.set_last_calculated_value("Sheet1", 1, 2, LiteralValue::Number(7.0));
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 7.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 3), 14.0);
+    engine.insert_rows("Sheet1", 1, 1).unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 2, 2), 7.0);
+    assert_eq!(num(&engine, "Sheet1", 2, 3), 14.0);
+
+    let mut engine = retain_engine();
+    set_formula(&mut engine, "Sheet1", 1, 2, "=B1+1");
+    set_formula(&mut engine, "Sheet1", 2, 2, "=B2+1");
+    engine.set_last_calculated_value("Sheet1", 1, 2, LiteralValue::Number(7.0));
+    engine.set_last_calculated_value("Sheet1", 2, 2, LiteralValue::Number(9.0));
+    engine.insert_rows("Sheet1", 1, 1).unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 2, 2), 0.0);
+    assert_eq!(num(&engine, "Sheet1", 3, 2), 0.0);
+}

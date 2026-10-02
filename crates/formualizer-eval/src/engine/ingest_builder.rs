@@ -544,7 +544,17 @@ impl<'g> BulkIngestBuilder<'g> {
                         let tr0 = Instant::now();
                         if let Some(rks) = plan.per_formula_ranges.get(fi) {
                             n_range_deps += rks.len();
-                            self.g.add_range_deps_from_keys(tvid, rks, stage.id);
+                            // A range covering the formula's own cell (MAX(B$7:B377)
+                            // in B323) is a self-reference: the one-shot CSR build
+                            // below installs this row as the formula's out-edges, so
+                            // the row carries the self-loop the range recorded.
+                            if self
+                                .g
+                                .add_range_deps_from_keys_reporting_self_loop(tvid, rks, stage.id)
+                                && !row.contains(&tvid.0)
+                            {
+                                row.push(tvid.0);
+                            }
                         }
                         t_ranges_ms += tr0.elapsed().as_millis();
                         if let Some(names) = plan.per_formula_names.get(fi)
