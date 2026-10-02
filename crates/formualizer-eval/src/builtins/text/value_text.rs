@@ -533,6 +533,10 @@ mod tests {
             ("2024-03-05", "aaaa", "Tuesday"),
             ("45356", "\u{c5}\u{c5}\u{c5} d", "Tue 5"),
             ("abc", "aaaa", "abc"),
+            // `General` beside a weekday code shows the value; a weekday alone
+            // is the serial's own day, even a moment before midnight.
+            ("45356", "aaaa General", "Tuesday 45356"),
+            ("45356.999999", "aaaa", "Tuesday"),
             ("abc", "00", "abc"),
             ("1.234,56", "00", "1.234,56"),
             ("abc", "\"<\"@\">\"", "<abc>"),
@@ -555,6 +559,29 @@ mod tests {
                 "TEXT({input:?},{format:?})"
             );
         }
+    }
+
+    #[test]
+    fn text_elapsed_span_too_long_to_count_is_value_error() {
+        let wb = TestWorkbook::new().with_function(std::sync::Arc::new(TextFn));
+        let ctx = wb.interpreter();
+        let f = ctx.context.get_function("", "TEXT").unwrap();
+        let v = lit(LiteralValue::Number(1e20));
+        let fmt = lit(LiteralValue::Text("[h]".into()));
+        let out = f
+            .dispatch(
+                &[
+                    ArgumentHandle::new(&v, &ctx),
+                    ArgumentHandle::new(&fmt, &ctx),
+                ],
+                &ctx.function_context(None),
+            )
+            .unwrap()
+            .into_literal();
+        assert!(
+            matches!(&out, LiteralValue::Error(e) if e.kind == ExcelErrorKind::Value),
+            "TEXT(1E20,\"[h]\") = {out:?}"
+        );
     }
 
     #[test]

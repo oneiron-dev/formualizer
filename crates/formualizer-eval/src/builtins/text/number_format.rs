@@ -990,13 +990,40 @@ fn format_date(section: &Section, value: f64, system: DateSystem) -> Result<Stri
                 .count();
         }
     }
-    let unit = 10f64.powi(sub_digits as i32);
-    // Round to the displayed precision of seconds, then split fields.
+    // A section showing a time of day or an elapsed time rounds to the seconds
+    // it shows (whole, or `.0`-`.000`) before the fields split, so 23:59:59.6
+    // shown to the second is the next day's 0:00:00. A section showing no
+    // hour, minute or second keeps the serial's own date, whose fraction is
+    // only the time within that day; it rounds at the millisecond, the finest
+    // time a format shows, so arithmetic noise just below a whole day still
+    // reads as that day.
+    let shows_time = toks.iter().any(|t| {
+        matches!(
+            t,
+            Tok::Hour(_) | Tok::Minute(_) | Tok::Second(_) | Tok::Elapsed(..)
+        )
+    });
+    let unit = if shows_time {
+        10f64.powi(sub_digits as i32)
+    } else {
+        1000.0
+    };
     let total = (value * 86_400.0 * unit).round() / unit;
     let days = (total / 86_400.0).floor();
     let secs = total - days * 86_400.0;
     let whole_secs = secs.floor() as i64;
     let fraction = secs - whole_secs as f64;
+    // `[h]`/`[m]`/`[s]` count whole elapsed seconds; a span too long to count
+    // is #VALUE! rather than a wrapped, negative number.
+    let elapsed_secs = if elapsed {
+        let counted = total.floor();
+        if counted >= i64::MAX as f64 {
+            return Err(ExcelError::new_value());
+        }
+        counted as i64
+    } else {
+        0
+    };
     let (hour, minute, second) = (whole_secs / 3600, (whole_secs / 60) % 60, whole_secs % 60);
     let needs_date = toks.iter().any(|t| {
         matches!(
@@ -1090,9 +1117,9 @@ fn format_date(section: &Section, value: f64, system: DateSystem) -> Result<Stri
             }),
             Tok::Elapsed(unit_char, n) => {
                 let amount = match unit_char {
-                    'h' => (days as i64) * 24 + hour,
-                    'm' => ((days as i64) * 24 + hour) * 60 + minute,
-                    _ => (((days as i64) * 24 + hour) * 60 + minute) * 60 + second,
+                    'h' => elapsed_secs / 3600,
+                    'm' => elapsed_secs / 60,
+                    _ => elapsed_secs,
                 };
                 out.push_str(&format!("{amount:0width$}", width = *n));
             }
@@ -1125,7 +1152,10 @@ fn format_date(section: &Section, value: f64, system: DateSystem) -> Result<Stri
             Tok::Comma => out.push(','),
             Tok::Percent => out.push('%'),
             Tok::Slash => out.push('/'),
-            Tok::At | Tok::General | Tok::Exp { .. } => {}
+            // A section may pair date and time codes with `General`, which
+            // shows the value itself in the General format.
+            Tok::General => out.push_str(&format_general(value)),
+            Tok::At | Tok::Exp { .. } => {}
         }
         i += 1;
     }
@@ -1351,5 +1381,46 @@ mod tests {
         assert_eq!(fmt(45356.0, "d ö"), "5 ö");
         assert_eq!(fmt(45356.0, "d \"Åå\""), "5 Åå");
         assert_eq!(fmt(45356.5, "h AM/PM"), "12 PM");
+    }
+
+    #[test]
+    fn general_beside_date_codes_shows_the_value() {
+        // 2024-03-05 is a Tuesday.
+        assert_eq!(fmt(45356.0, "aaaa General"), "Tuesday 45356");
+        assert_eq!(fmt(45356.0, "dddd General"), "Tuesday 45356");
+        assert_eq!(fmt(45356.75, "General dddd"), "45356.75 Tuesday");
+        assert_eq!(fmt(45356.0, "d-mmm \\(General\\)"), "5-Mar (45356)");
+    }
+
+    #[test]
+    fn a_date_without_a_time_field_is_the_serials_own_day() {
+        // 45356.999999 is 2024-03-05 (a Tuesday) at 23:59:59.91.
+        assert_eq!(fmt(45356.999999, "aaaa"), "Tuesday");
+        assert_eq!(fmt(45356.999999, "dddd"), "Tuesday");
+        assert_eq!(fmt(45356.999999, "yyyy-mm-dd"), "2024-03-05");
+        // 2958465 is 9999-12-31, a Friday, the last day of the calendar.
+        assert_eq!(fmt(2958465.999999, "aaaa"), "Friday");
+        assert_eq!(fmt(2958465.999999, "m/d/yyyy"), "12/31/9999");
+        // Arithmetic noise just under a whole day still reads as that day.
+        assert_eq!(fmt(45357.0 - 1e-11, "dddd"), "Wednesday");
+        // A shown time rounds to the seconds it shows and carries into the date.
+        assert_eq!(fmt(45356.999999, "dddd h:mm:ss"), "Wednesday 0:00:00");
+        assert_eq!(fmt(45356.999999, "hh:mm:ss.000"), "23:59:59.914");
+    }
+
+    #[test]
+    fn elapsed_spans_never_wrap() {
+        assert_eq!(fmt(1.5, "[h]"), "36");
+        assert_eq!(fmt(1.5, "[m]"), "2160");
+        assert_eq!(fmt(1.5, "[s]"), "129600");
+        assert_eq!(fmt(-1.5, "[h]:mm"), "-36:00");
+        assert_eq!(fmt(1e9, "[h]"), "24000000000");
+        // Spans too long to count in whole seconds are #VALUE!.
+        for (value, code) in [(1e20, "[h]"), (-1e20, "[s]"), (1e300, "[m]:ss")] {
+            assert!(
+                format_number(value, code, DateSystem::Excel1900).is_err(),
+                "{value} {code:?}"
+            );
+        }
     }
 }
