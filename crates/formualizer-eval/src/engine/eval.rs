@@ -1517,10 +1517,34 @@ pub struct Engine<R> {
     /// Last calculated values a host supplied for formula cells the engine
     /// has not calculated yet (an XLSX file's cached results), keyed by
     /// `(sheet, row0, col0)`. Under `CyclePolicy::RetainLastValue` a member
-    /// of a live cycle keeps this value. Consumed by the next evaluation
-    /// request: afterwards the engine's own results are the last calculated
-    /// values. Empty unless a host supplies values — zero cost otherwise.
+    /// of a live cycle keeps this value. A value applies until the engine
+    /// calculates that formula: an evaluation request drops the values of
+    /// the formulas it calculated (see
+    /// [`Self::consume_last_calculated_values`]), and a row/column edit
+    /// moves the values of the cells it shifts into
+    /// [`Self::last_calculated_carry`]. Empty unless a host supplies values —
+    /// zero cost otherwise.
     last_calculated_seed: FxHashMap<(SheetId, u32, u32), LiteralValue>,
+
+    /// Last calculated values of formulas whose computed value a row/column
+    /// edit cleared while moving them (`clear_computed_overlay_after_row/
+    /// _col`), keyed by vertex so they follow the cell. Under
+    /// `CyclePolicy::RetainLastValue` only: the last calculated value of a
+    /// formula is its latest result, whichever calculation produced it, and
+    /// moving the cell neither erases it nor brings back an older one.
+    /// Dropped once the engine calculates the formula again. Empty unless a
+    /// structural edit moved formulas under that policy.
+    last_calculated_carry: FxHashMap<VertexId, LiteralValue>,
+
+    /// The values formulas held when the current evaluation request first
+    /// scheduled them, kept under `CyclePolicy::RetainLastValue` (runtime
+    /// detection) while the request schedules dynamic references. A circular
+    /// reference made through `INDIRECT`/`OFFSET` is only found once the
+    /// reference has been calculated, after the formulas on it have already
+    /// calculated once without knowing they are circular; that one-pass
+    /// result is not a successful calculation, so the members keep the value
+    /// they held before the request. Cleared at every request boundary.
+    request_prior_values: FxHashMap<VertexId, LiteralValue>,
 
     /// Global function-registry semantic epoch observed after the latest
     /// conservative FormulaPlane invalidation.
@@ -1985,6 +2009,8 @@ where
             // of leaving an unlogged shifted span behind.
             self.engine
                 .demote_spans_preserving_computed_overlays(sheet_id, affected_region)?;
+            self.engine
+                .carry_last_calculated_values_before_shift(sheet_id, false, before0, 0);
 
             // Graph structural insert (logged) - no snapshot bump.
             let summary = {
@@ -2064,6 +2090,8 @@ where
             let affected_region = Engine::<R>::structural_col_region(sheet_id, before0);
             self.engine
                 .demote_spans_preserving_computed_overlays(sheet_id, affected_region)?;
+            self.engine
+                .carry_last_calculated_values_before_shift(sheet_id, true, before0, 0);
 
             let summary = {
                 let capture = unsafe { &mut *capture_ptr };
@@ -3333,6 +3361,8 @@ where
             retained_scc_dirty_at_begin: Vec::new(),
             iterative_state_values: FxHashMap::default(),
             last_calculated_seed: FxHashMap::default(),
+            last_calculated_carry: FxHashMap::default(),
+            request_prior_values: FxHashMap::default(),
             function_semantic_epoch_seen: crate::function_registry::semantic_epoch(),
             function_provider_revision_seen,
             #[cfg(test)]
@@ -3506,6 +3536,8 @@ where
             retained_scc_dirty_at_begin: Vec::new(),
             iterative_state_values: FxHashMap::default(),
             last_calculated_seed: FxHashMap::default(),
+            last_calculated_carry: FxHashMap::default(),
+            request_prior_values: FxHashMap::default(),
             function_semantic_epoch_seen: crate::function_registry::semantic_epoch(),
             function_provider_revision_seen,
             #[cfg(test)]
@@ -4283,6 +4315,7 @@ where
         // Defensive: consumed at the end of the previous request; a request
         // that errored out mid-walk must not leak its members into this one.
         self.pending_iterative_redirty.clear();
+        self.request_prior_values = FxHashMap::default();
         self.reconcile_retained_sccs_at_request_begin();
         // Spec §7.11: NOW()/TODAY() sample the clock ONCE per recalc; every
         // read within this request (including SCC iteration passes) observes
@@ -4299,9 +4332,10 @@ where
     /// `graph.redirty_volatiles()` call at every evaluation-flow exit; must
     /// run AFTER the flow's `clear_dirty_flags`.
     fn redirty_for_next_recalc(&mut self) {
-        // Supplied last calculated values describe the state before this
-        // request; the engine's results replace them from here on.
-        self.last_calculated_seed = FxHashMap::default();
+        // Must run before anything below re-marks vertices dirty: a formula
+        // still dirty here was not calculated by this request.
+        self.consume_last_calculated_values();
+        self.request_prior_values = FxHashMap::default();
         self.volatile_redirtied = self.graph.redirty_volatiles().into_iter().collect();
         let pending = std::mem::take(&mut self.pending_iterative_redirty);
         let dirty_at_begin = std::mem::take(&mut self.retained_scc_dirty_at_begin);
@@ -5506,10 +5540,12 @@ where
     /// (1-based) from before this engine calculated it — a file's cached
     /// result. Under [`CyclePolicy::RetainLastValue`] a formula left
     /// uncalculated on a live circular reference keeps this value, as Excel
-    /// keeps the last calculated value when iteration is off. Values apply to
-    /// the next evaluation request only; afterwards the engine's own results
-    /// are the last calculated values. Inserting or deleting rows or columns
-    /// drops supplied values. Unknown sheets and row/col 0 are ignored.
+    /// keeps the last calculated value when iteration is off. A value applies
+    /// until the engine calculates that formula (an evaluation request that
+    /// does not reach it leaves it in place); afterwards the engine's own
+    /// result is the last calculated value. Inserting or deleting rows or
+    /// columns moves a value with its cell and drops the values of deleted
+    /// cells. Unknown sheets and row/col 0 are ignored.
     pub fn set_last_calculated_value(
         &mut self,
         sheet: &str,
@@ -5523,6 +5559,122 @@ where
         if let Some(sheet_id) = self.graph.sheet_id(sheet) {
             self.last_calculated_seed
                 .insert((sheet_id, row - 1, col - 1), value);
+        }
+    }
+
+    /// End of an evaluation request: a supplied or carried last calculated
+    /// value applies until the engine calculates that formula, so drop the
+    /// values of formulas this request calculated (no longer dirty) and of
+    /// cells that no longer hold a formula. Formulas the request did not
+    /// reach — a targeted calculation of an unrelated cell — keep theirs.
+    /// A supplied value for a cell with no vertex yet (a formula still
+    /// staged) is kept.
+    fn consume_last_calculated_values(&mut self) {
+        let graph = &self.graph;
+        if !self.last_calculated_seed.is_empty() {
+            self.last_calculated_seed
+                .retain(|&(sheet_id, row0, col0), _| {
+                    let cell = graph.make_cell_ref_internal(sheet_id, row0, col0);
+                    graph
+                        .get_vertex_id_for_address(&cell)
+                        .is_none_or(|&v| graph.is_live_formula_vertex(v) && graph.is_dirty(v))
+                });
+        }
+        if !self.last_calculated_carry.is_empty() {
+            self.last_calculated_carry
+                .retain(|&v, _| graph.is_live_formula_vertex(v) && graph.is_dirty(v));
+        }
+    }
+
+    /// Keep the value each of `vertices` holds before this request first
+    /// calculates it (see [`Self::request_prior_values`]). Only under
+    /// `RetainLastValue` with runtime detection, and only once the request
+    /// schedules a dynamic reference — no cost otherwise.
+    fn note_request_prior_values(&mut self, vertices: &[VertexId]) {
+        if self.config.cycle.policy != CyclePolicy::RetainLastValue
+            || self.config.cycle.detection != CycleDetection::Runtime
+        {
+            return;
+        }
+        if self.request_prior_values.is_empty()
+            && !vertices.iter().any(|&v| self.graph.is_dynamic(v))
+        {
+            return;
+        }
+        for &vertex in vertices {
+            if self.request_prior_values.contains_key(&vertex) {
+                continue;
+            }
+            let value = match self.graph.get_vertex_kind(vertex) {
+                VertexKind::FormulaScalar | VertexKind::FormulaArray => {
+                    self.graph.get_cell_ref(vertex).and_then(|cell| {
+                        let sheet_name = self.graph.sheet_name(cell.sheet_id);
+                        self.get_cell_value(sheet_name, cell.coord.row() + 1, cell.coord.col() + 1)
+                    })
+                }
+                _ => self.graph.get_value(vertex),
+            }
+            .unwrap_or(LiteralValue::Empty);
+            self.request_prior_values.insert(vertex, value);
+        }
+    }
+
+    /// Before a row/column edit shifts `sheet_id` from `start0` on (the
+    /// `deleted` rows/columns at `start0` are removed), keep the last
+    /// calculated value of every formula it moves: the edit clears the
+    /// computed values of the cells it shifts, and under
+    /// [`CyclePolicy::RetainLastValue`] a formula on a circular reference
+    /// keeps its last calculated value wherever the cell moves. A supplied
+    /// value moves with its formula; the values of deleted cells go.
+    fn carry_last_calculated_values_before_shift(
+        &mut self,
+        sheet_id: SheetId,
+        columns: bool,
+        start0: u32,
+        deleted: u32,
+    ) {
+        let index = |row0: u32, col0: u32| if columns { col0 } else { row0 };
+        let shifted = |row0: u32, col0: u32| index(row0, col0) >= start0;
+        if self.config.cycle.policy != CyclePolicy::RetainLastValue {
+            if !self.last_calculated_seed.is_empty() {
+                self.last_calculated_seed
+                    .retain(|&(sheet, row0, col0), _| sheet != sheet_id || !shifted(row0, col0));
+            }
+            return;
+        }
+        let sheet_name = self.graph.sheet_name(sheet_id).to_string();
+        for vertex in self.graph.formula_vertices() {
+            if !matches!(
+                self.graph.get_vertex_kind(vertex),
+                VertexKind::FormulaScalar | VertexKind::FormulaArray
+            ) {
+                continue;
+            }
+            let Some(cell) = self.graph.get_cell_ref(vertex) else {
+                continue;
+            };
+            let (row0, col0) = (cell.coord.row(), cell.coord.col());
+            if cell.sheet_id != sheet_id || !shifted(row0, col0) {
+                continue;
+            }
+            let seed = self.last_calculated_seed.remove(&(sheet_id, row0, col0));
+            if index(row0, col0) - start0 < deleted {
+                self.last_calculated_carry.remove(&vertex);
+                continue;
+            }
+            let value = seed.or_else(|| {
+                self.get_cell_value(&sheet_name, row0 + 1, col0 + 1)
+                    .filter(|value| !matches!(value, LiteralValue::Empty))
+            });
+            // A formula whose value an earlier edit already cleared, and that
+            // has not calculated since, keeps the value carried then.
+            if let Some(value) = value {
+                self.last_calculated_carry.insert(vertex, value);
+            }
+        }
+        if !self.last_calculated_seed.is_empty() {
+            self.last_calculated_seed
+                .retain(|&(sheet, row0, col0), _| sheet != sheet_id || !shifted(row0, col0));
         }
     }
 
@@ -17334,6 +17486,7 @@ where
             count,
         };
         self.demote_spans_for_structural_op(op, affected_region)?;
+        self.carry_last_calculated_values_before_shift(sheet_id, false, before0, 0);
         let summary = {
             let mut editor =
                 VertexEditor::new(&mut self.graph).with_structural_occupancy(occupancy);
@@ -17377,6 +17530,7 @@ where
             count,
         };
         self.demote_spans_for_structural_op(op, affected_region)?;
+        self.carry_last_calculated_values_before_shift(sheet_id, false, start0, count);
         let summary = {
             let mut editor =
                 VertexEditor::new(&mut self.graph).with_structural_occupancy(occupancy);
@@ -17425,6 +17579,7 @@ where
             count,
         };
         self.demote_spans_for_structural_op(op, affected_region)?;
+        self.carry_last_calculated_values_before_shift(sheet_id, true, before0, 0);
         let summary = {
             let mut editor =
                 VertexEditor::new(&mut self.graph).with_structural_occupancy(occupancy);
@@ -17472,6 +17627,7 @@ where
             count,
         };
         self.demote_spans_for_structural_op(op, affected_region)?;
+        self.carry_last_calculated_values_before_shift(sheet_id, true, start0, count);
         let summary = {
             let mut editor =
                 VertexEditor::new(&mut self.graph).with_structural_occupancy(occupancy);
@@ -18116,9 +18272,6 @@ where
     }
 
     fn clear_computed_overlay_after_row(&mut self, sheet: &str, start_row0: usize) {
-        // Supplied last calculated values are keyed by the cells they were
-        // read from; cells moved, so they no longer line up.
-        self.last_calculated_seed.clear();
         if !(self.config.arrow_storage_enabled && self.config.write_formula_overlay_enabled) {
             return;
         }
@@ -18180,9 +18333,6 @@ where
     }
 
     fn clear_computed_overlay_after_col(&mut self, sheet: &str, start_col0: usize) {
-        // Supplied last calculated values are keyed by the cells they were
-        // read from; cells moved, so they no longer line up.
-        self.last_calculated_seed.clear();
         if !(self.config.arrow_storage_enabled && self.config.write_formula_overlay_enabled) {
             return;
         }
@@ -21346,6 +21496,7 @@ where
             if precedents_to_eval.is_empty() {
                 break;
             }
+            self.note_request_prior_values(&precedents_to_eval);
             #[cfg(any(test, feature = "benchmark_internal"))]
             {
                 self.recalc_reuse_probe
@@ -21390,9 +21541,10 @@ where
             let changed = self.changed_virtual_dep_vertices(&precedents_to_eval, &old_vdeps);
             self.resource_checkpoint(0)?;
             self.graph.clear_dirty_flags(&precedents_to_eval);
-            for vertex in &changed {
-                self.graph.set_dirty(*vertex, true);
-            }
+            // A formula whose dynamic references changed calculates again,
+            // and so does everything that reads it (a static dependent may
+            // close a circular reference through the new reference).
+            self.graph.mark_dirty_many(&changed);
             if changed.is_empty() {
                 break;
             }
@@ -22855,11 +23007,14 @@ where
                     }
                 }
                 let (virtual_dependencies, _) = VirtualDepBuilder::new(self).build(&[*vertex]);
+                // A dynamic read of the formula's own cell (a virtual
+                // self-edge) is not a read of another producer.
                 for dependency in virtual_dependencies
                     .get(vertex)
                     .into_iter()
                     .flatten()
                     .copied()
+                    .filter(|dependency| dependency != vertex)
                 {
                     let Some(cell) = self.graph.get_cell_ref_for_vertex(dependency) else {
                         continue;
@@ -24699,9 +24854,10 @@ where
 
             self.resource_checkpoint(0)?;
             self.graph.clear_dirty_flags(&to_evaluate);
-            for v in &changed_vertices {
-                self.graph.set_dirty(*v, true);
-            }
+            // A formula whose dynamic references changed calculates again,
+            // and so does everything that reads it (a static dependent may
+            // close a circular reference through the new reference).
+            self.graph.mark_dirty_many(&changed_vertices);
             let spill_readers = spill_passes < MAX_SPILL_PASSES && self.dirty_spill_readers();
             self.spill_writes.clear();
             if spill_readers {
@@ -24856,9 +25012,10 @@ where
             }
             self.resource_checkpoint(0)?;
             self.graph.clear_dirty_flags(&to_evaluate);
-            for v in &changed_vertices {
-                self.graph.set_dirty(*v, true);
-            }
+            // A formula whose dynamic references changed calculates again,
+            // and so does everything that reads it (a static dependent may
+            // close a circular reference through the new reference).
+            self.graph.mark_dirty_many(&changed_vertices);
             let spill_readers = spill_passes < MAX_SPILL_PASSES && self.dirty_spill_readers();
             self.spill_writes.clear();
             if spill_readers {
@@ -25222,6 +25379,7 @@ where
         {
             self.recalc_reuse_probe.get_mut().unwrap().schedule_requests += 1;
         }
+        self.note_request_prior_values(to_evaluate);
         // Fold pending edge deltas once per schedule build so traversal uses
         // the zero-allocation CSR slices (#125).
         self.graph.flush_pending_edge_deltas();
@@ -25803,9 +25961,10 @@ where
             }
             self.resource_checkpoint(0)?;
             self.graph.clear_dirty_flags(&to_evaluate);
-            for v in &changed_vertices {
-                self.graph.set_dirty(*v, true);
-            }
+            // A formula whose dynamic references changed calculates again,
+            // and so does everything that reads it (a static dependent may
+            // close a circular reference through the new reference).
+            self.graph.mark_dirty_many(&changed_vertices);
             let spill_readers = spill_passes < MAX_SPILL_PASSES && self.dirty_spill_readers();
             self.spill_writes.clear();
             if spill_readers {
@@ -28556,12 +28715,18 @@ where
     }
 
     /// The value a live-cycle member keeps under
-    /// [`CyclePolicy::RetainLastValue`]: the host-supplied last calculated
-    /// value of a cell the engine has not calculated yet (see
-    /// [`Self::set_last_calculated_value`]), else the value the member held
-    /// before this SCC task, else `0` — Excel's value for a circular formula
-    /// that never calculated.
-    fn last_calculated_value(&self, cell: &Option<CellRef>, before: &LiteralValue) -> LiteralValue {
+    /// [`CyclePolicy::RetainLastValue`]: its last calculated value — the
+    /// host-supplied value of a formula the engine has not calculated yet
+    /// (see [`Self::set_last_calculated_value`]), else the result a
+    /// row/column edit carried for it ([`Self::last_calculated_carry`]),
+    /// else `before`, the value it held before this calculation — or `0`, the
+    /// value of a circular formula that never calculated.
+    fn last_calculated_value(
+        &self,
+        vertex: VertexId,
+        cell: &Option<CellRef>,
+        before: &LiteralValue,
+    ) -> LiteralValue {
         if let Some(cell) = cell
             && let Some(value) =
                 self.last_calculated_seed
@@ -28569,10 +28734,105 @@ where
         {
             return value.clone();
         }
+        if let Some(value) = self.last_calculated_carry.get(&vertex) {
+            return value.clone();
+        }
         match before {
             LiteralValue::Empty | LiteralValue::Pending => LiteralValue::Number(0.0),
             value => value.clone(),
         }
+    }
+
+    /// The cells an array formula at `cell` covers, with the values they hold
+    /// now, when they are more than its own cell: the area of a legacy (CSE)
+    /// array formula, else the spill it currently anchors. `None` for a
+    /// formula that covers only its own cell.
+    fn array_formula_block(
+        &self,
+        vertex: VertexId,
+        cell: CellRef,
+    ) -> Option<Vec<Vec<LiteralValue>>> {
+        let (rows, cols) = match self
+            .array_formula_shapes
+            .as_ref()
+            .and_then(|shapes| shapes.get(&(cell.sheet_id, cell.coord.row(), cell.coord.col())))
+        {
+            Some(ArrayFormulaShape::Fixed { rows, cols }) => (*rows, *cols),
+            _ => {
+                let spilled = self.graph.spill_cells_for_anchor(vertex)?;
+                let rows = spilled
+                    .iter()
+                    .map(|c| c.coord.row().saturating_sub(cell.coord.row()) + 1)
+                    .max()?;
+                let cols = spilled
+                    .iter()
+                    .map(|c| c.coord.col().saturating_sub(cell.coord.col()) + 1)
+                    .max()?;
+                (rows, cols)
+            }
+        };
+        if rows.saturating_mul(cols) <= 1 {
+            return None;
+        }
+        let sheet_name = self.graph.sheet_name(cell.sheet_id);
+        Some(
+            (0..rows)
+                .map(|r| {
+                    (0..cols)
+                        .map(|c| {
+                            self.get_cell_value(
+                                sheet_name,
+                                cell.coord.row() + r + 1,
+                                cell.coord.col() + c + 1,
+                            )
+                            .unwrap_or(LiteralValue::Empty)
+                        })
+                        .collect()
+                })
+                .collect(),
+        )
+    }
+
+    /// The last calculated value of an array formula whose cells held
+    /// `block` before this calculation: `anchor` (its own cell's last
+    /// calculated value) at the top left, and in each other cell the value
+    /// supplied for it, else the value it held, else `0`.
+    fn last_calculated_array(
+        &self,
+        cell: CellRef,
+        block: &[Vec<LiteralValue>],
+        anchor: LiteralValue,
+    ) -> LiteralValue {
+        let mut anchor = Some(anchor);
+        let rows = block
+            .iter()
+            .enumerate()
+            .map(|(r, row)| {
+                row.iter()
+                    .enumerate()
+                    .map(|(c, held)| {
+                        if r == 0 && c == 0 {
+                            return anchor.take().unwrap_or(LiteralValue::Number(0.0));
+                        }
+                        let key = (
+                            cell.sheet_id,
+                            cell.coord.row() + r as u32,
+                            cell.coord.col() + c as u32,
+                        );
+                        match self.last_calculated_seed.get(&key) {
+                            Some(value) => value.clone(),
+                            None => match held {
+                                LiteralValue::Empty | LiteralValue::Pending => {
+                                    LiteralValue::Number(0.0)
+                                }
+                                value => value.clone(),
+                            },
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        LiteralValue::Array(rows)
     }
 
     /// Dispatch point for one `ScheduleUnit::Cycle` (RFC #112, Stage 2).
@@ -28760,8 +29020,21 @@ where
         let mut excluded = vec![false; n];
         let mut last_value = snapshot.clone();
         let mut stamped = 0usize;
+        // Under `RetainLastValue` an array formula is an ordinary member: an
+        // array result is not by itself a circular reference, so it
+        // calculates and spills like any formula, and on a live cycle it
+        // keeps the values its cells held (`array_before`).
+        let arrays_calculate = self.config.cycle.policy == CyclePolicy::RetainLastValue;
+        let array_before: Vec<Option<Vec<Vec<LiteralValue>>>> = members
+            .iter()
+            .map(|m| match (arrays_calculate, m.cell) {
+                (true, Some(cell)) => self.array_formula_block(m.vertex, cell),
+                _ => None,
+            })
+            .collect();
         for (i, m) in members.iter().enumerate() {
             match self.graph.get_vertex_kind(m.vertex) {
+                VertexKind::FormulaArray if arrays_calculate => {}
                 VertexKind::FormulaArray => {
                     // Deltas for the cleared spill-region cells (non-members)
                     // can only be recorded here; the anchor's own delta is
@@ -28777,6 +29050,9 @@ where
         }
 
         let collector = LiveEdgeCollector::new_with_names(&cell_refs, &name_keys);
+        // Spill writes this task records; readers of an array member's cells
+        // need calculating again only if the task changed what they hold.
+        let spill_writes_start = self.spill_writes.len();
 
         // Per-member live out-edges, refreshed whenever a member re-runs.
         let mut out_edges: Vec<Vec<u32>> = vec![Vec::new(); n];
@@ -28802,7 +29078,19 @@ where
                     }
                 };
                 let is_cell_formula = m.cell.is_some();
-                if is_cell_formula && matches!(value, LiteralValue::Array(_)) {
+                if is_cell_formula && arrays_calculate && matches!(value, LiteralValue::Array(_)) {
+                    // Spill (or #SPILL!) like an ordinary array result;
+                    // whether the member is circular is decided from its
+                    // reads, as for any member.
+                    self.apply_parallel_vertex_result(
+                        m.vertex,
+                        value.clone(),
+                        delta.as_deref_mut(),
+                        None,
+                    )?;
+                    changed[i] = last_value[i] != value;
+                    last_value[i] = value;
+                } else if is_cell_formula && matches!(value, LiteralValue::Array(_)) {
                     // A member that *would* spill inside an SCC gets the
                     // conservative §7.9 verdict. It has never spilled before
                     // (a prior spill would make it FormulaArray, pre-stamped
@@ -28813,8 +29101,21 @@ where
                     changed[i] = last_value[i] != circ_error;
                     last_value[i] = circ_error.clone();
                 } else {
-                    self.graph.update_vertex_value(m.vertex, value.clone());
-                    self.mirror_vertex_value_to_overlay(m.vertex, &value);
+                    if arrays_calculate
+                        && is_cell_formula
+                        && self.graph.spill_registry_has_anchor(m.vertex)
+                    {
+                        // A former spill anchor with a scalar result: take
+                        // its spill down, as an ordinary result would.
+                        self.apply_non_array_result_from_parallel(
+                            m.vertex,
+                            value.clone(),
+                            delta.as_deref_mut(),
+                        );
+                    } else {
+                        self.graph.update_vertex_value(m.vertex, value.clone());
+                        self.mirror_vertex_value_to_overlay(m.vertex, &value);
+                    }
                     // §7.14 invariant (G2): a formula member must never be
                     // shadowed by a user/delta overlay entry, or iteration
                     // reads would silently diverge from committed values.
@@ -28899,9 +29200,6 @@ where
         // Error flow `1 + settle_passes == passes`, preserving Stage-2
         // behavior exactly).
         let mut settle_passes = 0usize;
-        // Members a `RetainLastValue` round left uncalculated, with the value
-        // each keeps.
-        let mut retained: Vec<(VertexId, LiteralValue)> = Vec::new();
         loop {
             // Drain this pass's recordings; members that ran replace their
             // out-edge set, members that didn't keep last-known edges.
@@ -28949,14 +29247,43 @@ where
                         // Each round retains at least one more member.
                         for i in 0..n {
                             if analysis.in_cycle[i] && !excluded[i] {
-                                let value =
-                                    self.last_calculated_value(&members[i].cell, &snapshot[i]);
-                                self.graph
-                                    .update_vertex_value(members[i].vertex, value.clone());
-                                self.mirror_vertex_value_to_overlay(members[i].vertex, &value);
+                                let before = self
+                                    .request_prior_values
+                                    .get(&members[i].vertex)
+                                    .unwrap_or(&snapshot[i]);
+                                let value = self.last_calculated_value(
+                                    members[i].vertex,
+                                    &members[i].cell,
+                                    before,
+                                );
+                                let value = match (&array_before[i], members[i].cell) {
+                                    (Some(block), Some(cell)) => {
+                                        self.last_calculated_array(cell, block, value)
+                                    }
+                                    _ => value,
+                                };
+                                let vertex = members[i].vertex;
+                                if matches!(value, LiteralValue::Array(_)) {
+                                    self.apply_parallel_vertex_result(
+                                        vertex,
+                                        value.clone(),
+                                        delta.as_deref_mut(),
+                                        None,
+                                    )?;
+                                } else if self.graph.spill_registry_has_anchor(vertex) {
+                                    // An array this calculation spilled is not
+                                    // a last calculated value: take it down.
+                                    self.apply_non_array_result_from_parallel(
+                                        vertex,
+                                        value.clone(),
+                                        delta.as_deref_mut(),
+                                    );
+                                } else {
+                                    self.graph.update_vertex_value(vertex, value.clone());
+                                    self.mirror_vertex_value_to_overlay(vertex, &value);
+                                }
                                 excluded[i] = true;
-                                last_value[i] = value.clone();
-                                retained.push((members[i].vertex, value));
+                                last_value[i] = value;
                             }
                         }
                         check_cancel(cancel_flag)?;
@@ -29169,16 +29496,23 @@ where
             converged = true;
         }
 
-        // Each member's committed result (calculated or retained) is now its
-        // last calculated value; a supplied one no longer applies.
-        if !self.last_calculated_seed.is_empty() {
-            for m in &members {
-                if let Some(cell) = m.cell {
-                    self.last_calculated_seed.remove(&(
-                        cell.sheet_id,
-                        cell.coord.row(),
-                        cell.coord.col(),
-                    ));
+        // The passes above may spill and retract an array member's values
+        // several times; a member whose cells end holding what they held
+        // before the task changed nothing for the formulas that read them.
+        if arrays_calculate && self.spill_writes.len() > spill_writes_start {
+            let task_writes: Vec<_> = self.spill_writes.drain(spill_writes_start..).collect();
+            for write in task_writes {
+                let unchanged = members.iter().enumerate().any(|(i, m)| {
+                    m.vertex == write.0
+                        && match (&array_before[i], m.cell) {
+                            (Some(block), Some(cell)) => {
+                                self.array_formula_block(m.vertex, cell).as_ref() == Some(block)
+                            }
+                            _ => false,
+                        }
+                });
+                if !unchanged {
+                    self.spill_writes.push(write);
                 }
             }
         }
@@ -29260,12 +29594,6 @@ where
             for m in members.iter() {
                 self.iterative_state_values.remove(&m.vertex);
             }
-        }
-        // A retained value is cycle state like an iterated one, not a
-        // recomputable cache: keep it where structural edits that clear
-        // computed overlays cannot reset it (step 0b re-seeds it).
-        for (vertex, value) in retained {
-            self.iterative_state_values.insert(vertex, value);
         }
 
         {
@@ -30987,12 +31315,15 @@ where
                             // ChangeLog in this path only records SpillClear /
                             // SpillCommit events; WriteCell effects are never
                             // logged (see `apply_write_cell`). Runtime SCC tasks
-                            // write values directly and never spill (§7.9 stamps
-                            // would-be anchors), and their spill *teardown* is the
-                            // same unlogged `stamp_cycle_error` the Static path
-                            // already uses here — so direct commits coexist with
-                            // the journal cleanly, with identical semantics to
-                            // Static. Pinned by `scc_runtime_cycles` tests.
+                            // write values directly; under `Error`/`Iterate` they
+                            // never spill (§7.9 stamps would-be anchors), and their
+                            // spill *teardown* is the same unlogged
+                            // `stamp_cycle_error` the Static path already uses
+                            // here — so direct commits coexist with the journal
+                            // cleanly, with identical semantics to Static. Under
+                            // `RetainLastValue` an array member spills through the
+                            // direct (unlogged) spill commit. Pinned by
+                            // `scc_runtime_cycles` tests.
                             if self.handle_cycle_unit(schedule.unit_cycle(i), None, None, None)? > 0
                             {
                                 cycle_errors += 1;
@@ -31011,9 +31342,10 @@ where
                 }
                 self.resource_checkpoint(0)?;
                 self.graph.clear_dirty_flags(&to_evaluate);
-                for v in &changed_vertices {
-                    self.graph.set_dirty(*v, true);
-                }
+                // A formula whose dynamic references changed calculates again,
+                // and so does everything that reads it (a static dependent may
+                // close a circular reference through the new reference).
+                self.graph.mark_dirty_many(&changed_vertices);
 
                 if changed_vertices.is_empty() {
                     if let Some(t) = telemetry.as_mut() {

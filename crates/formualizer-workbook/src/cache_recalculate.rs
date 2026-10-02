@@ -564,10 +564,12 @@ pub fn recalculate_xlsx_bytes(
     // With iterative calculation off (Excel's default), Excel cannot
     // calculate a formula on a real circular reference: it leaves it with
     // its last calculated value, the result this file caches for it.
-    let retain_last_values = config.cycle.policy == CyclePolicy::Error;
-    if retain_last_values {
+    if config.cycle.policy == CyclePolicy::Error {
         config.cycle.policy = CyclePolicy::RetainLastValue;
     }
+    // Whether the policy came from the file or from the caller, the
+    // package's caches are what a retained circular formula keeps.
+    let retain_last_values = config.cycle.policy == CyclePolicy::RetainLastValue;
     // XLSX dates are serial caches. Native chrono materialization cannot retain
     // Excel-1900 phantom serial 60 and can discard fractional duration precision.
     config.temporal_egress = formualizer_eval::engine::TemporalEgress::Serial;
@@ -605,10 +607,12 @@ pub fn recalculate_xlsx_bytes(
         }
     }
     // The ingestion view may have cleared a cache Calamine cannot read; the
-    // package's own caches are the last calculated values.
+    // package's own caches are the last calculated values — of an array
+    // formula, those of every cell of its extent.
     if retain_last_values {
         for (sheet, (_, scan)) in sheets.iter().zip(&plans) {
-            for cell in &scan.cells {
+            let members = scan.members.iter().map(|member| &member.cell);
+            for cell in scan.cells.iter().chain(members) {
                 if let Some(value) = last_calculated_value(cell, &tags) {
                     engine.set_last_calculated_value(&sheet.name, cell.row, cell.col, value);
                 }

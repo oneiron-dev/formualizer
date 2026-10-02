@@ -143,8 +143,9 @@ impl<'a> Scheduler<'a> {
         let sccs = self.tarjan_scc_with_virtual(vertices, vdeps)?;
         #[cfg(feature = "tracing")]
         drop(_scc_span);
-        // 2. Separate cycles and acyclic components
-        let (cycles, acyclic_sccs) = self.separate_cycles(sccs);
+        // 2. Separate cycles and acyclic components; a virtual self-edge (a
+        // dynamic reference reaching the formula's own cell) is a self-loop.
+        let (cycles, acyclic_sccs) = self.separate_cycles_with_virtual(sccs, vdeps);
         // 3. Build layers over combined adjacency (graph + vdeps)
         #[cfg(feature = "tracing")]
         let _layers_span = tracing::info_span!("build_layers_with_virtual").entered();
@@ -660,6 +661,29 @@ impl<'a> Scheduler<'a> {
             }
         }
 
+        (cycles, acyclic)
+    }
+
+    fn separate_cycles_with_virtual(
+        &self,
+        sccs: Vec<Vec<VertexId>>,
+        vdeps: &FxHashMap<VertexId, Vec<VertexId>>,
+    ) -> (Vec<Vec<VertexId>>, Vec<Vec<VertexId>>) {
+        let mut cycles = Vec::new();
+        let mut acyclic = Vec::new();
+        for scc in sccs {
+            let virtual_self_loop = scc.len() == 1
+                && vdeps
+                    .get(&scc[0])
+                    .is_some_and(|deps| deps.contains(&scc[0]));
+            if virtual_self_loop {
+                cycles.push(scc);
+            } else {
+                let (mut c, mut a) = self.separate_cycles(vec![scc]);
+                cycles.append(&mut c);
+                acyclic.append(&mut a);
+            }
+        }
         (cycles, acyclic)
     }
 

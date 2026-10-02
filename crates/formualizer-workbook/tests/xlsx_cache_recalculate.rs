@@ -2510,6 +2510,56 @@ fn circular_references_keep_their_cached_values_with_iteration_off() {
     }
 }
 #[test]
+fn array_formulas_on_circular_references_follow_the_iteration_off_rule() {
+    // An array result is not by itself circular: A1:A2 reads its own cells
+    // only in an untaken branch, so both cells calculate. C1:C2 reads its own
+    // cells: it keeps the cached values of both, and D1 reads them.
+    let p = parts(
+        "<row r=\"1\"><c r=\"A1\"><f t=\"array\" ref=\"A1:A2\">IF(TRUE,7,SUM(A1:A100))</f><v>0</v></c>\
+         <c r=\"C1\"><f t=\"array\" ref=\"C1:C2\">{1;2}+SUM(C1:C100)</f><v>5</v></c>\
+         <c r=\"D1\"><f>C2*10</f><v>0</v></c></row>\
+         <row r=\"2\"><c r=\"A2\"><v>0</v></c><c r=\"C2\"><v>6</v></c></row>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for (cell, expected) in [
+        ("A1", "<v>7</v>"),
+        ("A2", "<v>7</v>"),
+        ("C1", "<v>5</v>"),
+        ("C2", "<v>6</v>"),
+        ("D1", "<v>60</v>"),
+    ] {
+        let at = sheet.find(&format!("r=\"{cell}\"")).unwrap();
+        let end = at + sheet[at..].find("</c>").unwrap();
+        assert!(
+            sheet[at..end].contains(expected),
+            "{cell}={expected}: {sheet}"
+        );
+    }
+}
+#[test]
+fn an_explicit_retain_last_value_policy_reads_the_package_caches_too() {
+    // Choosing the policy Excel applies with iteration off explicitly reads
+    // the same caches as the default: `1&#50;` is the cached 12 however it is
+    // encoded.
+    use formualizer_eval::engine::{CycleConfig, CycleDetection, CyclePolicy};
+    let p = parts(
+        "<row r=\"1\"><c r=\"A1\"><f>A1+1</f><v>1&#50;</v></c>\
+         <c r=\"B1\"><f>A1+1</f><v>0</v></c></row>",
+    );
+    for policy in [CyclePolicy::Error, CyclePolicy::RetainLastValue] {
+        let mut options = XlsxRecalculateOptions::default();
+        options.eval_config.cycle = CycleConfig {
+            detection: CycleDetection::Runtime,
+            policy,
+        };
+        let out = recalculate_xlsx_bytes(&pack(&p), options).unwrap();
+        let sheet = member(&out.bytes, SHEET);
+        assert!(sheet.contains("<v>1&#50;</v>"), "{policy:?}: {sheet}");
+        assert!(sheet.contains("<v>13</v>"), "{policy:?}: {sheet}");
+    }
+}
+#[test]
 fn whole_columns_span_the_grid() {
     // A:A and D:D line up row by row, and INDEX reaches rows past the data.
     let p = parts(

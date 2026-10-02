@@ -2262,11 +2262,12 @@ impl DependencyGraph {
         // Editing a formula clears any prior structural #REF! marking for this vertex.
         self.ref_error_vertices.remove(&addr_vertex_id);
 
-        // Under `CyclePolicy::Iterate` (Runtime detection) self-dependencies
-        // are accepted, mirroring Excel with iterative calculation enabled:
-        // the self-edge forms a single-vertex SCC that the scheduler emits as
-        // a Cycle unit and `evaluate_scc_unit` iterates (RFC #113, spec §7.1/
-        // §7.6/§7.8). Everywhere else the edit-time rejection stands.
+        // Under `CyclePolicy::Iterate` and `RetainLastValue` (Runtime
+        // detection) self-dependencies are accepted, mirroring Excel with
+        // iterative calculation enabled or disabled: the self-edge forms a
+        // single-vertex SCC that the scheduler emits as a Cycle unit and
+        // `evaluate_scc_unit` iterates or retains (RFC #113, spec §7.1/§7.6/
+        // §7.8). Everywhere else the edit-time rejection stands.
         //
         // Scope note (persistence contract, pinned by
         // `formualizer-workbook/tests/cycle_persistence.rs`): this rejection
@@ -2282,11 +2283,17 @@ impl DependencyGraph {
                 .with_message("Self-reference detected".to_string()));
         }
 
-        for &name_vertex in &named_dependencies {
-            let mut visited = FxHashSet::default();
-            if self.name_depends_on_vertex(name_vertex, addr_vertex_id, &mut visited) {
-                return Err(ExcelError::new(ExcelErrorKind::Circ)
-                    .with_message("Circular reference through named range".to_string()));
+        // A name whose definition covers the formula's own cell is the same
+        // self-reference reached through a name: accepted wherever direct
+        // self-references are (Excel accepts both and warns, and a read in
+        // an untaken branch is not circular).
+        if !self.config.cycle.allows_self_dependency() {
+            for &name_vertex in &named_dependencies {
+                let mut visited = FxHashSet::default();
+                if self.name_depends_on_vertex(name_vertex, addr_vertex_id, &mut visited) {
+                    return Err(ExcelError::new(ExcelErrorKind::Circ)
+                        .with_message("Circular reference through named range".to_string()));
+                }
             }
         }
 
@@ -4461,11 +4468,13 @@ impl DependencyGraph {
             return;
         }
 
-        for &name_vertex in &named_dependencies {
-            let mut visited = FxHashSet::default();
-            if self.name_depends_on_vertex(name_vertex, vertex_id, &mut visited) {
-                self.mark_as_ref_error(vertex_id);
-                return;
+        if !self.config.cycle.allows_self_dependency() {
+            for &name_vertex in &named_dependencies {
+                let mut visited = FxHashSet::default();
+                if self.name_depends_on_vertex(name_vertex, vertex_id, &mut visited) {
+                    self.mark_as_ref_error(vertex_id);
+                    return;
+                }
             }
         }
 

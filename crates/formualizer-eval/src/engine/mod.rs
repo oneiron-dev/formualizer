@@ -1101,10 +1101,12 @@ impl CycleConfig {
     }
 
     /// Whether ingest may accept formulas whose dependencies include the
-    /// formula's own cell (`=B1+A1` in B1). Excel accepts these with
-    /// iterative calculation enabled, and with it disabled it accepts them
-    /// too and leaves them uncalculated (`RetainLastValue`); under `Error`
-    /// the edit-time "Self-reference detected" rejection stands.
+    /// formula's own cell (`=B1+A1` in B1), directly or through a name whose
+    /// definition covers it. Excel accepts these with iterative calculation
+    /// enabled, and with it disabled it accepts them too and leaves them
+    /// uncalculated (`RetainLastValue`); under `Error` the edit-time
+    /// "Self-reference detected" / "Circular reference through named range"
+    /// rejections stand.
     #[inline]
     pub(crate) fn allows_self_dependency(&self) -> bool {
         self.detection == CycleDetection::Runtime
@@ -1139,14 +1141,18 @@ pub enum CyclePolicy {
     /// leaves the formula uncalculated and the cell "displays either a zero
     /// or the last calculated value" — the value from the last successful
     /// calculation (Microsoft, "Remove or allow a circular reference").
-    /// Every member of a live cycle keeps its last calculated value: the
-    /// value it held before this recalculation, or the one supplied with
+    /// Every member of a live cycle keeps its last calculated value — its
+    /// latest result, whichever calculation produced it, carried with the
+    /// cell through row/column edits; or the value supplied with
     /// [`Engine::set_last_calculated_value`] (a file's cached result) before
-    /// the engine first calculated it, else `0`. Formulas that read a
-    /// member, inside or outside the SCC, calculate with that value. Phantom
-    /// SCCs produce ordinary values, as under `Error`; spill anchors and
-    /// members whose result is an array keep the conservative `#CIRC!`
-    /// verdict (spec §7.9).
+    /// the engine first calculated it; else `0`. A cycle closed through a
+    /// reference found while calculating (`INDIRECT`, `OFFSET`) is one too,
+    /// and the one-pass results computed before it was found are not
+    /// calculated values. Formulas that read a member, inside or outside the
+    /// SCC, calculate with that value. Phantom SCCs produce ordinary values,
+    /// as under `Error`. An array result is not by itself circular: array
+    /// members calculate and spill like other formulas, and on a live cycle
+    /// every cell of the array keeps its last calculated value.
     RetainLastValue,
     /// Excel-style iterative calculation (RFC #113, spec §3.5/§6):
     /// live cycles keep running full passes over all SCC members in member

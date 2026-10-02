@@ -441,11 +441,22 @@ impl<'a, R: EvaluationContext> VirtualDepBuilder<'a, R> {
             rustc_hash::FxHashMap::default();
         let augmented_vertices: Vec<VertexId> = Vec::new(); // Will be populated in Phase 3
 
+        // Under runtime cycle detection a dynamic reference that reaches the
+        // formula's own cell (`INDIRECT("A1")` in A1) is a circular
+        // reference like a direct one: it is kept as a virtual self-edge, so
+        // the scheduler hands the formula to SCC evaluation, which decides
+        // from the reads that actually happen.
+        let keep_self =
+            self.engine.config.cycle.detection == crate::engine::CycleDetection::Runtime;
         for &v in candidates {
             let mut deps = RangeVirtualDepProvider::get_virtual_deps(self.engine, v);
-            let dynamic_deps = DynamicRefVirtualDepProvider::get_virtual_deps(self.engine, v);
+            let (dynamic_deps, _, reads_self) =
+                DynamicRefVirtualDepProvider::collect(self.engine, v);
 
             deps.extend(dynamic_deps);
+            if keep_self && reads_self {
+                deps.push(v);
+            }
             deps.sort_unstable();
             deps.dedup();
 
@@ -461,15 +472,17 @@ impl<'a, R: EvaluationContext> VirtualDepBuilder<'a, R> {
 pub struct DynamicRefVirtualDepProvider;
 
 impl DynamicRefVirtualDepProvider {
+    /// The formula vertices and regions `v`'s dynamic references reach,
+    /// and whether they reach `v` itself (left out of the vertices).
     fn collect<R: EvaluationContext>(
         engine: &Engine<R>,
         v: VertexId,
-    ) -> (Vec<VertexId>, Vec<Region>) {
+    ) -> (Vec<VertexId>, Vec<Region>, bool) {
         if !engine.graph.is_dynamic(v) {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), false);
         }
         let Some(ast_id) = engine.graph.get_formula_id(v) else {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), false);
         };
         let sheet_id = engine.graph.get_vertex_sheet_id(v);
         let sheet_name = engine.graph.sheet_name(sheet_id);
@@ -484,14 +497,14 @@ impl DynamicRefVirtualDepProvider {
             engine.graph.data_store(),
             engine.graph.sheet_reg(),
         );
-        let mut deps = collector
-            .collected
-            .lock()
-            .unwrap()
+        let collected = collector.collected.lock().unwrap();
+        let reads_self = collected.contains(&v);
+        let mut deps = collected
             .iter()
             .copied()
             .filter(|&dependency| dependency != v)
             .collect::<Vec<_>>();
+        drop(collected);
         deps.sort_unstable();
         deps.dedup();
         let mut regions = collector
@@ -506,7 +519,7 @@ impl DynamicRefVirtualDepProvider {
             (region.sheet_id(), rows.query_bounds(), cols.query_bounds())
         });
         regions.dedup();
-        (deps, regions)
+        (deps, regions, reads_self)
     }
 
     pub fn get_virtual_deps<R: EvaluationContext>(

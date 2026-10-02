@@ -893,9 +893,9 @@ fn cancellation_is_honored_at_settle_pass_boundaries() {
 fn indirect_cycle_through_replan_then_target_change_breaks_it() {
     // A1 = INDIRECT(D1)+1 with D1 → "B1" and B1 = A1+1: the virtual edge
     // closes a 2-vertex SCC (tarjan_scc_with_virtual); both members are
-    // live (arithmetic) → #CIRC. (A single-vertex virtual SELF-edge does not
-    // form a cycle unit today — pre-existing scheduler behavior, identical
-    // under Static — so the pair shape is the canonical G12 case.)
+    // live (arithmetic) → #CIRC. (A single-vertex virtual self-edge forms a
+    // cycle unit too under Runtime; see
+    // `dynamic_self_reference_is_a_circular_reference`.)
     let mut engine = runtime_engine();
     set_value(
         &mut engine,
@@ -1311,9 +1311,9 @@ fn retain_last_value_settles_members_whose_branches_flip() {
 }
 
 /// A retained value is the cell's value, not a recomputable cache: moving
-/// the cell by a row insertion keeps it. Supplied values are keyed by the
-/// cells they came from, so an insertion before the first recalculation
-/// drops them rather than hand them to other cells.
+/// the cell by a row insertion keeps it. Supplied values move with the cells
+/// they were supplied for, so an insertion before the first recalculation
+/// hands each to its own formula, not to the cell now at its old address.
 #[test]
 fn retain_last_value_survives_row_insertion() {
     let mut engine = retain_engine();
@@ -1335,6 +1335,331 @@ fn retain_last_value_survives_row_insertion() {
     engine.set_last_calculated_value("Sheet1", 2, 2, LiteralValue::Number(9.0));
     engine.insert_rows("Sheet1", 1, 1).unwrap();
     engine.evaluate_all().unwrap();
-    assert_eq!(num(&engine, "Sheet1", 2, 2), 0.0);
-    assert_eq!(num(&engine, "Sheet1", 3, 2), 0.0);
+    assert_eq!(num(&engine, "Sheet1", 2, 2), 7.0);
+    assert_eq!(num(&engine, "Sheet1", 3, 2), 9.0);
+}
+
+/// The last calculated value of a formula is its latest result, whichever
+/// calculation produced it: a phantom SCC's ordinary values are what the
+/// members keep when the cycle later becomes live, and moving the cells by a
+/// row insertion in between neither erases nor replaces that history.
+#[test]
+fn retain_last_value_keeps_the_latest_result_across_row_insertion() {
+    let mut engine = retain_engine();
+    set_value(&mut engine, "Sheet1", 1, 7, LiteralValue::Boolean(true)); // G1
+    set_formula(&mut engine, "Sheet1", 1, 1, "=IF(G1,5,B1)"); // A1
+    set_formula(&mut engine, "Sheet1", 1, 2, "=A1+1"); // B1
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 5.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 6.0);
+    assert_eq!(engine.last_cycle_telemetry().phantom_sccs, 1);
+
+    engine.insert_rows("Sheet1", 1, 1).unwrap();
+    set_value(&mut engine, "Sheet1", 2, 7, LiteralValue::Boolean(false)); // G2
+    engine.evaluate_all().unwrap();
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 1);
+    assert_eq!(num(&engine, "Sheet1", 2, 1), 5.0);
+    assert_eq!(num(&engine, "Sheet1", 2, 2), 6.0);
+
+    // Columns too, and a later insertion keeps what the first one carried.
+    engine.insert_columns("Sheet1", 1, 1).unwrap();
+    engine.insert_rows("Sheet1", 1, 1).unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 3, 2), 5.0);
+    assert_eq!(num(&engine, "Sheet1", 3, 3), 6.0);
+}
+
+/// A cycle that dissolves calculates ordinary results; those, not the values
+/// it kept while circular, are what it keeps when it becomes circular again
+/// after its cells moved.
+#[test]
+fn retain_last_value_does_not_revive_values_kept_before_a_later_result() {
+    let mut engine = retain_engine();
+    set_value(&mut engine, "Sheet1", 1, 4, LiteralValue::Text("B1".into())); // D1
+    set_value(&mut engine, "Sheet1", 1, 3, LiteralValue::Number(10.0)); // C1
+    set_formula(&mut engine, "Sheet1", 1, 1, "=INDIRECT(D1)+1"); // A1
+    set_formula(&mut engine, "Sheet1", 1, 2, "=A1+1"); // B1
+    engine.set_last_calculated_value("Sheet1", 1, 1, LiteralValue::Number(7.0));
+    engine.set_last_calculated_value("Sheet1", 1, 2, LiteralValue::Number(8.0));
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 7.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 8.0);
+
+    set_value(&mut engine, "Sheet1", 1, 4, LiteralValue::Text("C1".into()));
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 11.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 12.0);
+
+    engine.insert_rows("Sheet1", 1, 1).unwrap();
+    set_value(&mut engine, "Sheet1", 2, 4, LiteralValue::Text("B2".into())); // D2
+    engine.evaluate_all().unwrap();
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 1);
+    assert_eq!(num(&engine, "Sheet1", 2, 1), 11.0);
+    assert_eq!(num(&engine, "Sheet1", 2, 2), 12.0);
+}
+
+/// Supplied last calculated values move with their cells on row and column
+/// edits (a deleted cell's value goes with it).
+#[test]
+fn retain_last_value_supplied_values_move_with_their_cells() {
+    let mut engine = retain_engine();
+    set_formula(&mut engine, "Sheet1", 3, 2, "=B3+1"); // B3
+    set_formula(&mut engine, "Sheet1", 4, 2, "=B4+1"); // B4
+    set_formula(&mut engine, "Sheet1", 1, 1, "=A1+1"); // A1, above the edit
+    engine.set_last_calculated_value("Sheet1", 3, 2, LiteralValue::Number(7.0));
+    engine.set_last_calculated_value("Sheet1", 4, 2, LiteralValue::Number(9.0));
+    engine.set_last_calculated_value("Sheet1", 1, 1, LiteralValue::Number(4.0));
+    engine.insert_rows("Sheet1", 2, 2).unwrap(); // B3 -> B5, B4 -> B6
+    engine.delete_rows("Sheet1", 6, 1).unwrap(); // B6 (was B4) goes
+    engine.insert_columns("Sheet1", 1, 1).unwrap(); // B5 -> C5, A1 -> B1
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 5, 3), 7.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 4.0);
+    assert!(matches!(
+        engine.get_cell_value("Sheet1", 6, 3),
+        None | Some(LiteralValue::Empty)
+    ));
+}
+
+/// Calculating an unrelated cell does not calculate a circular formula, so
+/// the value supplied for it still applies to the next full calculation.
+#[test]
+fn retain_last_value_targeted_calculation_keeps_untouched_supplied_values() {
+    let mut engine = retain_engine();
+    set_formula(&mut engine, "Sheet1", 1, 1, "=A1+1"); // A1
+    set_formula(&mut engine, "Sheet1", 1, 2, "=2"); // B1
+    set_formula(&mut engine, "Sheet1", 1, 3, "=A1+1"); // C1
+    engine.set_last_calculated_value("Sheet1", 1, 1, LiteralValue::Number(7.0));
+    engine.evaluate_cell("Sheet1", 1, 2).unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 7.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 3), 8.0);
+}
+
+/// A name whose range covers the formula's own cell is the same circular
+/// reference reached through a name: with iteration off it is accepted
+/// (Excel warns), the formula keeps its last calculated value (0 here), and
+/// a read in an untaken branch is not circular.
+#[test]
+fn retain_last_value_accepts_named_self_references() {
+    fn cover(engine: &mut Engine<TestWorkbook>) {
+        let sheet_id = engine.sheet_id("Sheet1").unwrap();
+        let nr = RangeRef::new(
+            CellRef::new(sheet_id, Coord::from_excel(1, 1, true, true)),
+            CellRef::new(sheet_id, Coord::from_excel(10, 1, true, true)),
+        );
+        engine
+            .define_name("COVER", NamedDefinition::Range(nr), NameScope::Workbook)
+            .unwrap();
+        for r in 1..=4u32 {
+            set_value(engine, "Sheet1", r, 1, LiteralValue::Number(1.0));
+        }
+    }
+    let mut engine = retain_engine();
+    cover(&mut engine);
+    set_formula(&mut engine, "Sheet1", 5, 1, "=SUM(COVER)");
+    set_formula(&mut engine, "Sheet1", 5, 2, "=A5+1");
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 5, 1), 0.0);
+    assert_eq!(num(&engine, "Sheet1", 5, 2), 1.0);
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 1);
+
+    let mut engine = retain_engine();
+    cover(&mut engine);
+    set_formula(&mut engine, "Sheet1", 5, 1, "=IF(TRUE,7,SUM(COVER))");
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 5, 1), 7.0);
+
+    // A name defined after the formula follows the same rule.
+    let mut engine = retain_engine();
+    set_formula(&mut engine, "Sheet1", 5, 1, "=IF(TRUE,7,SUM(COVER))");
+    cover(&mut engine);
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 5, 1), 7.0);
+}
+
+/// Circularity includes references found while calculating: `INDIRECT` of
+/// the formula's own cell is a self-reference like `=A1+1`.
+#[test]
+fn dynamic_self_reference_is_a_circular_reference() {
+    let mut engine = runtime_engine();
+    set_formula(&mut engine, "Sheet1", 1, 1, "=INDIRECT(\"A1\")+1");
+    engine.evaluate_all().unwrap();
+    assert!(is_circ(&engine, "Sheet1", 1, 1));
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 1);
+
+    let mut engine = retain_engine();
+    set_formula(&mut engine, "Sheet1", 1, 1, "=INDIRECT(\"A1\")+1");
+    set_formula(&mut engine, "Sheet1", 1, 2, "=A1+1");
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 0.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 1.0);
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 1);
+
+    // Read only in an untaken branch, it is not circular.
+    let mut engine = retain_engine();
+    set_formula(&mut engine, "Sheet1", 1, 1, "=IF(TRUE,5,INDIRECT(\"A1\"))");
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 5.0);
+}
+
+/// A circular reference whose `INDIRECT` text is itself calculated is only
+/// found once that text is known, after the formulas on it calculated once
+/// without knowing they are circular. That one-pass result is not a
+/// successful calculation: the members keep their last calculated values
+/// (0 for formulas that never calculated, else the supplied values).
+#[test]
+fn circular_reference_found_through_a_calculated_reference_keeps_last_values() {
+    fn build(engine: &mut Engine<TestWorkbook>) {
+        set_formula(engine, "Sheet1", 1, 4, "=\"B1\""); // D1
+        set_formula(engine, "Sheet1", 1, 1, "=INDIRECT(D1)+1"); // A1
+        set_formula(engine, "Sheet1", 1, 2, "=A1+1"); // B1
+        set_formula(engine, "Sheet1", 1, 3, "=B1*10"); // C1, downstream
+    }
+    let mut engine = retain_engine();
+    build(&mut engine);
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 0.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 0.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 3), 0.0);
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 1);
+
+    let mut engine = retain_engine();
+    build(&mut engine);
+    engine.set_last_calculated_value("Sheet1", 1, 1, LiteralValue::Number(5.0));
+    engine.set_last_calculated_value("Sheet1", 1, 2, LiteralValue::Number(6.0));
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 5.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 6.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 3), 60.0);
+
+    // A formula that calculated before keeps that result when an edit
+    // makes it circular through a calculated reference.
+    let mut engine = retain_engine();
+    set_value(&mut engine, "Sheet1", 1, 5, LiteralValue::Text("C5".into())); // E1
+    set_value(&mut engine, "Sheet1", 5, 3, LiteralValue::Number(10.0)); // C5
+    set_formula(&mut engine, "Sheet1", 1, 4, "=E1&\"\""); // D1
+    set_formula(&mut engine, "Sheet1", 1, 1, "=INDIRECT(D1)+1"); // A1
+    set_formula(&mut engine, "Sheet1", 1, 2, "=A1+1"); // B1
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 11.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 12.0);
+    set_value(&mut engine, "Sheet1", 1, 5, LiteralValue::Text("B1".into()));
+    engine.evaluate_all().unwrap();
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 1);
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 11.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 12.0);
+
+    // Under the default policy the same cycle is #CIRC!.
+    let mut engine = runtime_engine();
+    build(&mut engine);
+    engine.evaluate_all().unwrap();
+    assert!(is_circ(&engine, "Sheet1", 1, 1));
+    assert!(is_circ(&engine, "Sheet1", 1, 2));
+}
+
+/// When a dynamic reference resolves only after its formula first
+/// calculated (its target calculates later in the same request), the
+/// formula calculates again — and so does every formula that reads it.
+#[test]
+fn formulas_reading_a_recalculated_dynamic_reference_calculate_again() {
+    for cfg in [EvalConfig::default(), runtime_cfg()] {
+        let mut engine = Engine::new(TestWorkbook::new(), cfg);
+        set_value(&mut engine, "Sheet1", 1, 24, LiteralValue::Number(1.0)); // X1
+        set_formula(&mut engine, "Sheet1", 2, 24, "=X1+1"); // X2
+        set_formula(&mut engine, "Sheet1", 3, 24, "=X2+1"); // X3
+        set_formula(&mut engine, "Sheet1", 5, 3, "=X3+7"); // C5 = 10
+        set_formula(&mut engine, "Sheet1", 1, 4, "=\"C5\""); // D1
+        set_formula(&mut engine, "Sheet1", 1, 1, "=INDIRECT(D1)+1"); // A1
+        set_formula(&mut engine, "Sheet1", 1, 2, "=A1+1"); // B1
+        engine.evaluate_all().unwrap();
+        assert_eq!(num(&engine, "Sheet1", 1, 1), 11.0);
+        assert_eq!(num(&engine, "Sheet1", 1, 2), 12.0);
+    }
+}
+
+/// Bulk-load `formulas` (with the range self-loops bulk ingest records) and
+/// declare the legacy (CSE) array formulas `arrays` as `(row, col, rows)`.
+fn load_with_arrays(
+    engine: &mut Engine<TestWorkbook>,
+    formulas: &[(u32, u32, &str)],
+    arrays: &[(u32, u32, u32)],
+) {
+    use crate::engine::{FormulaIngestBatch, FormulaIngestRecord};
+    engine.add_sheet("Sheet1").ok();
+    let records = formulas
+        .iter()
+        .map(|(row, col, formula)| {
+            let ast_id = engine.intern_formula_ast(&parse(formula).unwrap());
+            FormulaIngestRecord::new(*row, *col, ast_id, Some(Arc::<str>::from(*formula)))
+        })
+        .collect();
+    engine
+        .ingest_formula_batches(vec![FormulaIngestBatch::new("Sheet1", records)])
+        .unwrap();
+    engine.use_legacy_array_semantics();
+    for &(row, col, rows) in arrays {
+        engine.declare_array_formula("Sheet1", row, col, rows, 1, false);
+    }
+}
+
+/// An array result is not by itself a circular reference: an array formula
+/// whose range covers its own cells only in an untaken branch calculates in
+/// every cell of its area, as Excel does.
+#[test]
+fn retain_last_value_array_formula_with_untaken_self_read_calculates() {
+    let mut engine = retain_engine();
+    load_with_arrays(
+        &mut engine,
+        &[(1, 1, "=IF(TRUE,7,SUM(A1:A100))"), (1, 2, "=A2*10")],
+        &[(1, 1, 2)],
+    );
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 7.0);
+    assert_eq!(num(&engine, "Sheet1", 2, 1), 7.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 70.0);
+    assert_eq!(engine.last_cycle_telemetry().circ_cells_stamped, 0);
+}
+
+/// An array formula on a live circular reference keeps the last calculated
+/// values of all its cells (0 where it never calculated), and formulas that
+/// read them calculate from those values.
+#[test]
+fn retain_last_value_circular_array_formula_keeps_its_cells_values() {
+    let formulas = [(1, 1, "={1;2}+SUM(A1:A100)"), (1, 2, "=A2*10")];
+    let mut engine = retain_engine();
+    load_with_arrays(&mut engine, &formulas, &[(1, 1, 2)]);
+    engine.set_last_calculated_value("Sheet1", 1, 1, LiteralValue::Number(5.0));
+    engine.set_last_calculated_value("Sheet1", 2, 1, LiteralValue::Number(6.0));
+    engine.evaluate_all().unwrap();
+    assert!(engine.last_cycle_telemetry().live_cycles_witnessed >= 1);
+    assert_eq!(engine.last_cycle_telemetry().circ_cells_stamped, 0);
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 5.0);
+    assert_eq!(num(&engine, "Sheet1", 2, 1), 6.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 60.0);
+
+    let mut engine = retain_engine();
+    load_with_arrays(&mut engine, &formulas, &[(1, 1, 2)]);
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 0.0);
+    assert_eq!(num(&engine, "Sheet1", 2, 1), 0.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 0.0);
+}
+
+/// A dynamic array that spilled keeps its spilled values when a later edit
+/// makes it circular.
+#[test]
+fn retain_last_value_spilled_array_keeps_its_spill_when_it_becomes_circular() {
+    let mut engine = retain_engine();
+    set_value(&mut engine, "Sheet1", 1, 3, LiteralValue::Number(3.0)); // C1
+    set_formula(&mut engine, "Sheet1", 1, 2, "=SEQUENCE(C1)"); // B1:B3
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 3, 2), 3.0);
+
+    set_formula(&mut engine, "Sheet1", 1, 3, "=B1+2"); // C1 closes the cycle
+    engine.evaluate_all().unwrap();
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 1);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 1.0);
+    assert_eq!(num(&engine, "Sheet1", 2, 2), 2.0);
+    assert_eq!(num(&engine, "Sheet1", 3, 2), 3.0);
 }
