@@ -2970,7 +2970,7 @@ fn compute_criteria_mask(
     pred: &crate::args::CriteriaPredicate,
 ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
     use crate::compute_prelude::{boolean, concat_arrays};
-    use arrow::compute::kernels::comparison::{ilike, nilike};
+    use arrow::compute::kernels::comparison::{like, nlike};
     use arrow_array::{Array as _, ArrayRef, BooleanArray, StringArray, builder::BooleanBuilder};
 
     // Check if this is a numeric predicate that can be applied per-chunk
@@ -3070,12 +3070,18 @@ fn compute_criteria_mask(
         }
     }
 
-    // The scalar wildcard contract includes numeric/boolean string forms and
-    // Empty. The lowered base lane is text-only, unlike the overlay lane. Keep
-    // the vectorized path for text-only data, but build a scalar-equivalent
+    // A wildcard pattern matches text only: blanks, numbers, dates, durations
+    // and logicals never match it (and always match "<>pattern"). The lowered
+    // base lane is text-only, but the overlay lane spells numbers, temporal
+    // serials and logicals out as text, which LIKE would match. Keep the
+    // vectorized path for text-only data, but build a scalar-equivalent
     // Boolean mask for mixed data. The existing bounded criteria cache can
     // reuse that mask without retaining strings for every numeric input.
-    if matches!(pred, crate::args::CriteriaPredicate::TextLike { .. }) {
+    if matches!(
+        pred,
+        crate::args::CriteriaPredicate::TextLike { .. }
+            | crate::args::CriteriaPredicate::NotTextLike { .. }
+    ) {
         for tags in view.type_tags_slices() {
             let (_, _, cols) = tags.ok()?;
             let tags = cols.get(col_in_view)?;
@@ -3083,6 +3089,8 @@ fn compute_criteria_mask(
                 *tag == crate::arrow_store::TypeTag::Empty as u8
                     || *tag == crate::arrow_store::TypeTag::Number as u8
                     || *tag == crate::arrow_store::TypeTag::Boolean as u8
+                    || *tag == crate::arrow_store::TypeTag::DateTime as u8
+                    || *tag == crate::arrow_store::TypeTag::Duration as u8
             }) {
                 let mut mask = BooleanBuilder::new();
                 for chunk in view.iter_row_chunks() {
@@ -3101,6 +3109,11 @@ fn compute_criteria_mask(
 
     // TEXT PATH: build masks per row-chunk using lowered text slices.
     // This avoids concatenating full-string columns just to compute a boolean mask.
+    // The lanes and the patterns are folded with `str::to_lowercase`, exactly as
+    // the scalar matcher folds both sides, so the comparison itself is
+    // case-sensitive LIKE: ILIKE would add Unicode case folding of its own
+    // (U+017F matching "s", final sigma matching sigma) that the scalar
+    // matcher does not apply, and "=p" and "<>p" would stop being complements.
     let (text_kind, text_pat, empty_special) = match pred {
         crate::args::CriteriaPredicate::Eq(formualizer_common::LiteralValue::Text(t)) => (
             0u8,
@@ -3110,22 +3123,32 @@ fn compute_criteria_mask(
         crate::args::CriteriaPredicate::Ne(formualizer_common::LiteralValue::Text(t)) => {
             (1u8, criteria_like_pattern(&t.to_lowercase(), false), false)
         }
+        // A case-sensitive pattern cannot be read on the lowered lane; the
+        // caller takes the per-cell matcher.
         crate::args::CriteriaPredicate::TextLike {
             pattern,
-            case_insensitive,
-        } => {
-            let p = if *case_insensitive {
-                pattern.to_lowercase()
-            } else {
-                pattern.clone()
-            };
-            (2u8, criteria_like_pattern(&p, true), false)
-        }
+            case_insensitive: true,
+        } => (
+            2u8,
+            criteria_like_pattern(&pattern.to_lowercase(), true),
+            false,
+        ),
+        crate::args::CriteriaPredicate::NotTextLike {
+            pattern,
+            case_insensitive: true,
+        } => (
+            3u8,
+            criteria_like_pattern(&pattern.to_lowercase(), true),
+            false,
+        ),
         _ => return None,
     };
 
     let text_pat_is_empty = text_pat.is_empty();
-    let ne_matches_blank = text_kind == 1 && !text_pat_is_empty;
+    // Null text is a cell without text (blank, number, logical, error), which
+    // "<>text" and "<>pattern" keep. For "<>pattern" only error and pending
+    // cells get here: other mixed data took the per-cell mask above.
+    let ne_matches_blank = (text_kind == 1 && !text_pat_is_empty) || text_kind == 3;
     let pat = StringArray::new_scalar(text_pat);
     let mut bool_parts: Vec<BooleanArray> = Vec::new();
 
@@ -3179,7 +3202,7 @@ fn compute_criteria_mask(
                     bb.append_n(cs.row_len, true);
                     bool_parts.push(bb.finish());
                 } else {
-                    // For non-empty patterns, ilike/nilike return null on null inputs.
+                    // For non-empty patterns, like/nlike return null on null inputs.
                     bool_parts.push(BooleanArray::new_null(cs.row_len));
                 }
                 continue;
@@ -3188,17 +3211,16 @@ fn compute_criteria_mask(
 
         let seg_sa = seg.as_any().downcast_ref::<StringArray>()?;
         let mut m = match text_kind {
-            0 => ilike(seg_sa, &pat).ok()?,
-            1 => nilike(seg_sa, &pat).ok()?,
-            2 => ilike(seg_sa, &pat).ok()?,
+            0 | 2 => like(seg_sa, &pat).ok()?,
+            1 | 3 => nlike(seg_sa, &pat).ok()?,
             _ => return None,
         };
 
         // Only fold blank/Empty (null) cells into the mask when the segment
         // actually contains any. The null-fill loop + or_kleene are pure
         // overhead on blank-free chunks, so a `<>text` (or `=""`) aggregation
-        // over a column with no blanks stays fully vectorized on the ilike/
-        // nilike result.
+        // over a column with no blanks stays fully vectorized on the like/
+        // nlike result.
         if ((text_kind == 0 && empty_special) || ne_matches_blank) && seg_sa.null_count() > 0 {
             // Treat nulls as equal to empty string
             let mut bb = BooleanBuilder::with_capacity(seg_sa.len());

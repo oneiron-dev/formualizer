@@ -136,10 +136,13 @@ fn criteria_error(text: &str) -> Option<ExcelErrorKind> {
 }
 
 /// Criteria text is a wildcard pattern when it holds `*` (any run of
-/// characters), `?` (one character) or the escape `~` (`~*`, `~?` and `~~`
-/// stand for the character itself, so `"~~"` matches a lone tilde).
+/// characters) or `?` (one character). Inside a pattern `~` escapes the
+/// character after it (`~*`, `~?` and `~~` stand for the character itself).
+/// A tilde alone does not make a pattern: COUNTIF compares criteria text
+/// without `*` or `?` whole, so `"a~b"` matches the text a~b and `"a~~b"`
+/// matches a~~b, not a~b.
 fn is_criteria_pattern(text: &str) -> bool {
-    text.contains(['*', '?', '~'])
+    text.contains(['*', '?'])
 }
 
 /// Parse a criteria value (`">=5"`, `"<5/3/2011"`, `"a*"`, `7`) into a
@@ -222,7 +225,7 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
 
             let plain = unquote(s);
 
-            // Wildcards * or ?, or the ~ escape => TextLike
+            // Wildcards * or ? => TextLike (where ~ escapes the next character)
             if is_criteria_pattern(&plain) {
                 return Ok(CriteriaPredicate::TextLike {
                     pattern: plain,
@@ -715,17 +718,17 @@ mod criteria_tests {
 
     #[test]
     fn tilde_escapes_wildcards_with_and_without_an_operator() {
-        // "~*", "~?" and "~~" stand for the character itself, after "=", after
-        // "<>" and with no operator; "~~" makes a pattern on its own.
+        // In a pattern "~*", "~?" and "~~" stand for the character itself,
+        // after "=", after "<>" and with no operator.
         let cells = ["a*b", "axb", "a?b", "a~b", "ab", "*"];
         for (criterion, matched) in [
             ("a~*b", &["a*b"][..]),
             ("=a~*b", &["a*b"]),
             ("<>a~*b", &["axb", "a?b", "a~b", "ab", "*"]),
             ("A~?B", &["a?b"]),
-            ("=a~~b", &["a~b"]),
-            ("a~~b", &["a~b"]),
-            ("<>a~~b", &["a*b", "axb", "a?b", "ab", "*"]),
+            ("=a~~?", &["a~b"]),
+            ("a~~*", &["a~b"]),
+            ("<>a~~?", &["a*b", "axb", "a?b", "ab", "*"]),
             ("~*", &["*"]),
             ("<>~*", &["a*b", "axb", "a?b", "a~b", "ab"]),
             ("a~**", &["a*b"]),
@@ -743,6 +746,45 @@ mod criteria_tests {
         let ne = parse_criteria(&text("<>~*")).unwrap();
         assert!(criteria_match(&ne, &LiteralValue::Empty));
         assert!(criteria_match(&ne, &LiteralValue::Number(1.0)));
+    }
+
+    #[test]
+    fn tilde_without_a_wildcard_is_compared_literally() {
+        // Criteria text without "*" or "?" is compared whole, tilde included:
+        // COUNTIF(r,"a~b") counts the text a~b, and "a~~b" is not an escape
+        // for it. A tilde escapes only inside a pattern, where it also drops
+        // before an ordinary character ("a~b*" reads as "ab*").
+        let cells = ["a~b", "ab", "a~~b", "~", "~~", "axb"];
+        for (criterion, matched) in [
+            ("a~b", &["a~b"][..]),
+            ("=a~b", &["a~b"]),
+            ("A~B", &["a~b"]),
+            ("<>a~b", &["ab", "a~~b", "~", "~~", "axb"]),
+            ("a~~b", &["a~~b"]),
+            ("=a~~b", &["a~~b"]),
+            ("~", &["~"]),
+            ("~~", &["~~"]),
+            ("<>~", &["a~b", "ab", "a~~b", "~~", "axb"]),
+            ("a~b*", &["ab"]),
+            ("a~~*", &["a~b", "a~~b"]),
+        ] {
+            let pred = parse_criteria(&text(criterion)).unwrap();
+            for cell in cells {
+                assert_eq!(
+                    criteria_match(&pred, &text(cell)),
+                    matched.contains(&cell),
+                    "{criterion} on {cell}"
+                );
+            }
+        }
+        assert!(matches!(
+            parse_criteria(&text("a~b")).unwrap(),
+            CriteriaPredicate::Eq(LiteralValue::Text(_))
+        ));
+        assert!(matches!(
+            parse_criteria(&text("<>a~b")).unwrap(),
+            CriteriaPredicate::Ne(LiteralValue::Text(_))
+        ));
     }
 
     #[test]
