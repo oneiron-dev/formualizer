@@ -21,6 +21,9 @@ description: "MATCH: Returns the relative position of a lookup value in a one-di
  - `lookup_array` is searched when it is a reference or an array (`{1}` included). A single
    value there is not searched: a number, a logical or numeric text gives `#N/A`, other text
    `#VALUE!` (`MATCH(1,1,0)` is `#N/A`, `MATCH("a","a",0)` is `#VALUE!`).
+ - An array stays an array through a calculation and a LET name (`LET(x,{1}+0,MATCH(1,x+0,0))`
+   is 1); a function that consumes an array returns a single value (`MATCH(1,SUM({1}),0)` is
+   `#N/A`), and IF returns the argument it selects (`MATCH(1,IF(FALSE,{1},1),0)` is `#N/A`).
 
 ## Examples
 

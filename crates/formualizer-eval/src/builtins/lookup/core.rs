@@ -60,6 +60,9 @@ pub struct MatchFn;
 /// - `lookup_array` is searched when it is a reference or an array (`{1}` included). A single
 ///   value there is not searched: a number, a logical or numeric text gives `#N/A`, other text
 ///   `#VALUE!` (`MATCH(1,1,0)` is `#N/A`, `MATCH("a","a",0)` is `#VALUE!`).
+/// - An array stays an array through a calculation and a LET name (`LET(x,{1}+0,MATCH(1,x+0,0))`
+///   is 1); a function that consumes an array returns a single value (`MATCH(1,SUM({1}),0)` is
+///   `#N/A`), and IF returns the argument it selects (`MATCH(1,IF(FALSE,{1},1),0)` is `#N/A`).
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -199,7 +202,12 @@ impl Function for MatchFn {
         } else {
             0
         };
-        let arr_ref = args[1].as_reference_or_eval().ok();
+        // A LET name or LAMBDA parameter bound to a value is that value.
+        let arr_ref = if args[1].is_local_value_name() {
+            None
+        } else {
+            args[1].as_reference_or_eval().ok()
+        };
         if let Some(r) = arr_ref {
             let current_sheet = ctx.current_sheet();
             match ctx.resolve_range_view(&r, current_sheet) {
@@ -308,8 +316,11 @@ impl Function for MatchFn {
                     LiteralValue::Error(e) => {
                         return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
                     }
-                    // A one-element array, held as a single value.
-                    value if args[1].has_array_source() => vec![vec![value]],
+                    // A one-element array, held as a single value (or a value
+                    // whose shape the expression does not tell).
+                    value if args[1].result_shape() != crate::traits::ResultShape::Single => {
+                        vec![vec![value]]
+                    }
                     value => {
                         return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                             unsearched_lookup_array(&value, &args[1], ctx),

@@ -17,6 +17,9 @@ use formualizer_parse::parser::{
     ASTNode, ASTNodeType, ReferenceType, TableReference, TableSpecifier,
 };
 
+mod result_shape;
+pub(crate) use result_shape::ResultShape;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReferenceInfo {
     /// Excel-style 1-based index of the first sheet covered by the reference.
@@ -123,6 +126,14 @@ pub trait CustomCallable: Send + Sync {
             values.push(interp.binding_value(arg)?.into_literal());
         }
         self.invoke(interp, &values)
+    }
+
+    /// The parameters, body and captured local names of a callable written
+    /// as a LAMBDA, so that the shape of its result (an array or a single
+    /// value) can be read from its body. `None` for other callables.
+    #[doc(hidden)]
+    fn lambda_parts(&self) -> Option<(&[String], &ASTNode, &crate::interpreter::LocalEnv)> {
+        None
     }
 }
 
@@ -509,41 +520,13 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         }
     }
 
-    /// Whether this argument's expression contains an array: an array constant
-    /// or a call to a function that returns an array (SEQUENCE, SORT,
-    /// TRANSPOSE, MMULT, ...). The engine holds a one-element array as a single
-    /// value where Excel keeps a 1x1 array, so `{1}+0`, `SEQUENCE(1)` and
-    /// `LET(x,SEQUENCE(1),x)` are arrays to Excel although their value here is
-    /// not. Functions that pass a value through (IF, CHOOSE, IFERROR, IFS,
-    /// SWITCH, LET, LAMBDA) are arrays only through their arguments.
-    pub(crate) fn has_array_source(&self) -> bool {
-        fn contains_array(interp: &Interpreter<'_>, node: &ASTNode) -> bool {
-            use crate::function::FnCaps;
-            match &node.node_type {
-                ASTNodeType::Array(_) | ASTNodeType::Literal(LiteralValue::Array(_)) => true,
-                ASTNodeType::Function { name, args } => {
-                    interp
-                        .context
-                        .function_capabilities("", name)
-                        .is_some_and(|caps| {
-                            caps.contains(FnCaps::MAY_SPILL)
-                                && !caps
-                                    .intersects(FnCaps::SHORT_CIRCUIT | FnCaps::LOCAL_ENVIRONMENT)
-                        })
-                        || args.iter().any(|arg| contains_array(interp, arg))
-                }
-                ASTNodeType::Call { callee, args } => {
-                    contains_array(interp, callee)
-                        || args.iter().any(|arg| contains_array(interp, arg))
-                }
-                ASTNodeType::UnaryOp { expr, .. } => contains_array(interp, expr),
-                ASTNodeType::BinaryOp { left, right, .. } => {
-                    contains_array(interp, left) || contains_array(interp, right)
-                }
-                _ => false,
-            }
-        }
-        contains_array(self.interp, self.ast())
+    /// Whether this argument evaluates to an array or to a single value, as
+    /// Excel types it (see [`ResultShape`]). The engine holds a one-element
+    /// array as its single value, so a function that treats the two
+    /// differently (MATCH searches an array but not a single value) reads the
+    /// shape here.
+    pub(crate) fn result_shape(&self) -> ResultShape {
+        result_shape::of(self)
     }
 
     pub fn value(&self) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
@@ -1167,6 +1150,13 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                 _ => None,
             },
         }
+    }
+
+    /// Whether this argument is a LET name or LAMBDA parameter bound to a
+    /// value rather than to a reference: it reads as that value.
+    pub(crate) fn is_local_value_name(&self) -> bool {
+        self.name_reference()
+            .is_some_and(|name| self.interp.is_local_value_name(name))
     }
 
     /// The function name of a call written as this argument.

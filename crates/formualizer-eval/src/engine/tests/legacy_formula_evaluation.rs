@@ -213,6 +213,115 @@ fn match_searches_references_and_arrays_but_not_single_values() {
 }
 
 #[test]
+fn match_searches_a_one_element_array_bound_to_a_name_or_returned_by_a_lambda() {
+    for legacy_file in [true, false] {
+        let results = evaluate(
+            legacy_file,
+            &[
+                // A LET name bound to a one-element array, and a calculation
+                // over it, is still that array.
+                (5, 4, "=LET(x,{1}+0,MATCH(1,x+0,0))"),
+                (5, 5, "=LET(x,SEQUENCE(1),MATCH(1,ABS(x),0))"),
+                (5, 6, "=LET(x,{1},y,x*1,MATCH(1,y,0))"),
+                (5, 7, "=LET(x,{1}+0,LET(y,1,MATCH(1,x*y,0)))"),
+                (5, 8, "=MATCH(1,LET(x,{1}+0,x+0),0)"),
+                // A LAMBDA returning one, called through a name or in place.
+                (5, 9, "=LET(f,LAMBDA(z,{1}+0),MATCH(1,f(0),0))"),
+                (5, 10, "=MATCH(1,LET(f,LAMBDA(z,z+0),f({1})),0)"),
+                (5, 11, "=MATCH(1,LAMBDA(z,SEQUENCE(z))(1),0)"),
+                // The name itself is the array, not a reference.
+                (5, 12, "=LET(x,{1},MATCH(1,x,0))"),
+                (5, 13, "=LET(x,{1}+0,MATCH(1,x,0))"),
+            ],
+        );
+        assert!(
+            results.iter().all(|value| *value == number(1.0)),
+            "legacy={legacy_file}: {results:?}"
+        );
+        assert_eq!(
+            evaluate(legacy_file, &[(5, 4, "=LET(x,{1,2},MATCH(2,x,0))")])[0],
+            number(2.0),
+            "legacy={legacy_file}"
+        );
+        // Names and LAMBDAs holding single values are single values.
+        let results = evaluate(
+            legacy_file,
+            &[
+                (6, 4, "=LET(x,1,MATCH(1,x+0,0))"),
+                (6, 5, "=LET(x,SUM({1}),MATCH(1,x,0))"),
+                (6, 6, "=LET(f,LAMBDA(z,z+0),MATCH(1,f(1),0))"),
+                (6, 7, "=LET(f,LAMBDA(z,{1}+0),MATCH(1,SUM(f(0)),0))"),
+                (6, 8, "=LET(f,LAMBDA(z,1),MATCH(1,f(0),0))"),
+                (6, 9, "=LET(x,1,MATCH(1,x,0))"),
+            ],
+        );
+        let kinds: Vec<_> = results.into_iter().map(error_kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                ExcelErrorKind::Na,
+                ExcelErrorKind::Na,
+                ExcelErrorKind::Na,
+                ExcelErrorKind::Na,
+                ExcelErrorKind::Na,
+                ExcelErrorKind::Na,
+            ],
+            "legacy={legacy_file}"
+        );
+    }
+}
+
+#[test]
+fn match_does_not_search_a_single_value_computed_from_arrays() {
+    for legacy_file in [true, false] {
+        let results = evaluate(
+            legacy_file,
+            &[
+                // A function that consumes an array returns a single value.
+                (7, 4, "=MATCH(1,SUM({1}),0)"),
+                (7, 5, "=MATCH(\"x\",TEXTJOIN(\"\",TRUE,{\"x\"}),0)"),
+                (7, 6, "=MATCH(1,ROWS(SEQUENCE(1)),0)"),
+                // IF and CHOOSE return the argument they select.
+                (7, 7, "=MATCH(1,IF(FALSE,SEQUENCE(1),1),0)"),
+                (7, 8, "=MATCH(1,CHOOSE(2,{1},1),0)"),
+                (7, 9, "=MATCH(1,IF(A1=1,1,{1}),0)"),
+                // LET returns its calculation, whatever else it binds.
+                (7, 10, "=MATCH(1,LET(unused,SEQUENCE(1),1),0)"),
+            ],
+        );
+        let kinds: Vec<_> = results.into_iter().map(error_kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                ExcelErrorKind::Na,
+                ExcelErrorKind::Value,
+                ExcelErrorKind::Na,
+                ExcelErrorKind::Na,
+                ExcelErrorKind::Na,
+                ExcelErrorKind::Na,
+                ExcelErrorKind::Na,
+            ],
+            "legacy={legacy_file}"
+        );
+        // The selected argument is the array.
+        let results = evaluate(
+            legacy_file,
+            &[
+                (8, 4, "=MATCH(1,IF(TRUE,SEQUENCE(1),1),0)"),
+                (8, 5, "=MATCH(1,CHOOSE(1,{1},1),0)"),
+                (8, 6, "=MATCH(1,IF(A1=1,{1},1),0)"),
+                (8, 7, "=MATCH(1,IFERROR({1},1),0)"),
+                (8, 8, "=MATCH(1,IF({TRUE},1,0),0)"),
+            ],
+        );
+        assert!(
+            results.iter().all(|value| *value == number(1.0)),
+            "legacy={legacy_file}: {results:?}"
+        );
+    }
+}
+
+#[test]
 fn row_and_column_return_their_first_index_as_values() {
     assert_eq!(legacy(5, "=SUM(ROW(A1:A3))"), number(1.0));
     assert_eq!(legacy(5, "=SUM(COLUMN(A1:C1))"), number(1.0));

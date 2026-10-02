@@ -85,7 +85,9 @@ pub struct LocalEnv {
 #[derive(Clone)]
 struct EnvFrame {
     parent: Option<Arc<EnvFrame>>,
-    bindings: FxHashMap<String, LocalBinding>,
+    /// Each name's binding, with the shape of the value it was bound to when
+    /// that was recorded (see [`LocalEnv::with_shaped_binding`]).
+    bindings: FxHashMap<String, (LocalBinding, Option<crate::traits::ResultShape>)>,
 }
 
 impl LocalEnv {
@@ -99,40 +101,64 @@ impl LocalEnv {
     }
 
     pub fn lookup(&self, name: &str) -> Option<LocalBinding> {
+        self.find(name).map(|(binding, _)| binding.clone())
+    }
+
+    /// The innermost binding of `name`, with its recorded shape.
+    fn find(&self, name: &str) -> Option<&(LocalBinding, Option<crate::traits::ResultShape>)> {
         self.head.as_ref()?;
         let key = Self::norm(name);
-        let mut cur = self.head.as_ref().cloned();
+        let mut cur = self.head.as_deref();
         while let Some(frame) = cur {
-            if let Some(v) = frame.bindings.get(&key) {
-                return Some(v.clone());
+            if let Some(entry) = frame.bindings.get(&key) {
+                return Some(entry);
             }
-            cur = frame.parent.clone();
+            cur = frame.parent.as_deref();
         }
         None
     }
 
     /// [`Self::lookup`] without copying the binding.
     pub(crate) fn get(&self, name: &str) -> Option<&LocalBinding> {
-        let key = Self::norm(name);
-        let mut frame = self.head.as_deref();
-        while let Some(current) = frame {
-            if let Some(binding) = current.bindings.get(&key) {
-                return Some(binding);
-            }
-            frame = current.parent.as_deref();
-        }
-        None
+        self.find(name).map(|(binding, _)| binding)
     }
 
     pub fn with_binding(&self, name: &str, value: LocalBinding) -> Self {
+        self.with_shaped_binding(name, value, None)
+    }
+
+    /// Binds `name` to a value whose shape is known: a LET name bound to a
+    /// one-element array is held as its single value but stays an array to
+    /// Excel (`LET(x,{1}+0,...)`), and a name bound to a single value stays
+    /// one.
+    pub(crate) fn with_shaped_binding(
+        &self,
+        name: &str,
+        value: LocalBinding,
+        shape: Option<crate::traits::ResultShape>,
+    ) -> Self {
         let mut bindings = FxHashMap::default();
-        bindings.insert(Self::norm(name), value);
+        bindings.insert(Self::norm(name), (value, shape));
         Self {
             head: Some(Arc::new(EnvFrame {
                 parent: self.head.clone(),
                 bindings,
             })),
         }
+    }
+
+    /// Whether `name` is bound to an array or to a single value; `None` when
+    /// it is not bound here. A reference or a LAMBDA is not an array, and a
+    /// value bound without a recorded shape (a LAMBDA parameter, which may
+    /// have been passed a one-element array) is of unknown shape.
+    pub(crate) fn binding_shape(&self, name: &str) -> Option<crate::traits::ResultShape> {
+        use crate::traits::ResultShape;
+        Some(match self.find(name)? {
+            (LocalBinding::Value(LiteralValue::Array(_)), _) => ResultShape::Array,
+            (LocalBinding::Value(_), shape) => shape.unwrap_or(ResultShape::Unknown),
+            (LocalBinding::Reference(_) | LocalBinding::Callable(_), _) => ResultShape::Single,
+            (LocalBinding::References(_), _) => ResultShape::Unknown,
+        })
     }
 }
 

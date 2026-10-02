@@ -61,6 +61,21 @@ fn let_binding(value: &ArgumentHandle<'_, '_>) -> Result<LocalBinding, ExcelErro
     Ok(binding_from_calc_value(bound))
 }
 
+/// Whether a LET name bound to a single value holds an array to Excel: the
+/// engine holds a one-element array (`{1}+0`, `SEQUENCE(1)`) as its single
+/// value, which the expression bound tells apart from a single value
+/// (`SUM({1})`). Other bindings carry their shape themselves.
+fn bound_shape(
+    value: &ArgumentHandle<'_, '_>,
+    binding: &LocalBinding,
+) -> Option<crate::traits::ResultShape> {
+    match binding {
+        LocalBinding::Value(LiteralValue::Array(_)) => None,
+        LocalBinding::Value(_) => Some(value.result_shape()),
+        _ => None,
+    }
+}
+
 #[derive(Debug)]
 pub struct LetFn;
 
@@ -181,8 +196,12 @@ impl Function for LetFn {
                 Err(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
             };
 
-            let binding = args[pair_idx + 1].with_env(env.clone(), let_binding)?;
-            env = env.with_binding(&name, binding);
+            let (binding, shape) = args[pair_idx + 1].with_env(env.clone(), |value| {
+                let binding = let_binding(value)?;
+                let shape = bound_shape(value, &binding);
+                Ok::<_, ExcelError>((binding, shape))
+            })?;
+            env = env.with_shaped_binding(&name, binding, shape);
         }
 
         args[args.len() - 1].value_with_env(env)
@@ -235,6 +254,10 @@ impl CustomCallable for LambdaClosure {
 
         let scoped = interp.with_local_env(env);
         scoped.evaluate_ast(&self.body)
+    }
+
+    fn lambda_parts(&self) -> Option<(&[String], &ASTNode, &LocalEnv)> {
+        Some((&self.params, &self.body, &self.captured_env))
     }
 }
 
