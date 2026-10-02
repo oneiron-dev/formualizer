@@ -24,7 +24,7 @@
 //! - Multiple columns in same row have AND relationship
 //! - Supports comparison operators (>, <, >=, <=, <>), wildcards (*, ?)
 
-use super::utils::{ARG_ANY_ONE, coerce_num, criteria_match};
+use super::utils::{ARG_ANY_ONE, criteria_match};
 use crate::args::{ArgSchema, CriteriaPredicate, parse_criteria};
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, CalcValue, FunctionContext};
@@ -286,7 +286,7 @@ fn eval_d_function<'a, 'b>(
                 }
                 LiteralValue::Text(s) => {
                     // Try numeric coercion for text
-                    if let Ok(n) = coerce_num(&cell_val) {
+                    if let Ok(n) = crate::coercion::to_number_lenient(&cell_val) {
                         values.push(n);
                     }
                     // Non-numeric text is skipped
@@ -447,7 +447,7 @@ fn eval_d_stat_function<'a, 'b>(
                     values.push(if *b { 1.0 } else { 0.0 });
                 }
                 LiteralValue::Text(s) => {
-                    if let Ok(n) = coerce_num(&cell_val) {
+                    if let Ok(n) = crate::coercion::to_number_lenient(&cell_val) {
                         values.push(n);
                     }
                 }

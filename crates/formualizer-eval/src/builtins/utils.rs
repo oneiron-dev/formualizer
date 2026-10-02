@@ -18,13 +18,15 @@ pub fn aggregate_result(n: f64) -> LiteralValue {
     }
 }
 
-/// Coerce a `LiteralValue` to `f64` using Excel semantics.
+/// Coerce a value passed to a function's number parameter to `f64`, as Excel
+/// does ([`crate::coercion::to_number_argument`]).
 /// - Number/Int map to f64
 /// - Boolean maps to 1.0/0.0
 /// - Empty maps to 0.0
+/// - Text converts like VALUE(): numeric text, then date/time text
 /// - Others -> `#VALUE!`
 pub fn coerce_num(value: &LiteralValue) -> Result<f64, ExcelError> {
-    crate::coercion::to_number_lenient(value)
+    crate::coercion::to_number_argument(value)
 }
 
 /// Get a single numeric argument, with count and error checks.
@@ -107,10 +109,7 @@ where
                 for cell in row.iter() {
                     let num_opt = match cell {
                         LiteralValue::Error(e) => return Err(e.clone()),
-                        other => {
-                            crate::coercion::to_number_lenient_with_locale(other, &ctx.locale())
-                                .ok()
-                        }
+                        other => crate::coercion::to_number_argument(other).ok(),
                     };
                     match num_opt {
                         Some(n) => out_row.push(f(n)?),
@@ -136,10 +135,7 @@ where
                 for cell in row {
                     let num_opt = match &cell {
                         LiteralValue::Error(e) => return Err(e.clone()),
-                        other => {
-                            crate::coercion::to_number_lenient_with_locale(other, &ctx.locale())
-                                .ok()
-                        }
+                        other => crate::coercion::to_number_argument(other).ok(),
                     };
                     match num_opt {
                         Some(n) => out_row.push(f(n)?),
@@ -235,15 +231,11 @@ where
 
                 let n0 = match &lv0 {
                     LiteralValue::Error(e) => return Err(e.clone()),
-                    other => {
-                        crate::coercion::to_number_lenient_with_locale(other, &ctx.locale()).ok()
-                    }
+                    other => crate::coercion::to_number_argument(other).ok(),
                 };
                 let n1 = match &lv1 {
                     LiteralValue::Error(e) => return Err(e.clone()),
-                    other => {
-                        crate::coercion::to_number_lenient_with_locale(other, &ctx.locale()).ok()
-                    }
+                    other => crate::coercion::to_number_argument(other).ok(),
                 };
 
                 let out_cell = match (n0, n1) {

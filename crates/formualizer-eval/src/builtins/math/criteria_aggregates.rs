@@ -1,4 +1,4 @@
-use super::super::utils::{ARG_ANY_ONE, coerce_num, criteria_match};
+use super::super::utils::{ARG_ANY_ONE, criteria_match};
 use super::{AggregateArgument, resolve_aggregate_argument};
 use crate::args::ArgSchema;
 use crate::compute_prelude::{boolean, cmp, filter_array};
@@ -903,7 +903,7 @@ fn eval_if_family<'a, 'b>(
                                 }
                                 total_count += f64_arr.len() as i64 - f64_arr.null_count() as i64;
                             } else if let Some(ref s) = sum_scalar
-                                && let Ok(n) = coerce_num(s)
+                                && let Ok(n) = crate::coercion::to_number_lenient(s)
                             {
                                 let count = (0..mask.len())
                                     .filter(|&i| mask.is_valid(i) && mask.value(i))
@@ -927,7 +927,7 @@ fn eval_if_family<'a, 'b>(
                                 }
                                 total_count += tc.len() as i64 - tc.null_count() as i64;
                             } else if let Some(ref s) = sum_scalar
-                                && let Ok(n) = coerce_num(s)
+                                && let Ok(n) = crate::coercion::to_number_lenient(s)
                             {
                                 total_sum += n * row_len as f64;
                                 total_count += row_len as i64;
@@ -967,7 +967,7 @@ fn eval_if_family<'a, 'b>(
             if agg_type == AggregationType::Count {
                 total_count = (dims.0 * dims.1) as i64;
             } else if let Some(ref s) = sum_scalar
-                && let Ok(n) = coerce_num(s)
+                && let Ok(n) = crate::coercion::to_number_lenient(s)
             {
                 total_sum = n * (dims.0 * dims.1) as f64;
                 total_count = (dims.0 * dims.1) as i64;

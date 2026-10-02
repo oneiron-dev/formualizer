@@ -1311,7 +1311,7 @@ fn sortby_ascending(arg: &ArgumentHandle<'_, '_>) -> Result<bool, ExcelError> {
             .unwrap_or(LiteralValue::Empty),
         value => value,
     };
-    Ok(crate::coercion::to_number_lenient(&value)? >= 0.0)
+    Ok(crate::coercion::to_number_argument(&value)? >= 0.0)
 }
 
 #[derive(Debug)]
@@ -2261,7 +2261,7 @@ impl Function for SequenceFn {
                 LiteralValue::Int(i) => Ok(i as f64),
                 LiteralValue::Number(n) => Ok(n),
                 LiteralValue::Error(e) => Err(e),
-                other => crate::coercion::to_number_lenient(&other)
+                other => crate::coercion::to_number_argument(&other)
                     .map_err(|_| ExcelError::new(ExcelErrorKind::Value)),
             }
         };

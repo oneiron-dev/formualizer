@@ -378,8 +378,7 @@ impl Function for AverageFn {
                     if let LiteralValue::Error(e) = v {
                         return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
                     }
-                    if let Ok(n) = crate::coercion::to_number_lenient_with_locale(&v, &ctx.locale())
-                    {
+                    if let Ok(n) = crate::coercion::to_number_argument(&v) {
                         sum += n;
                         cnt += 1;
                     }
@@ -546,7 +545,7 @@ impl Function for SumProductFn {
                         LiteralValue::Error(e) => {
                             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
                         }
-                        _ => match super::super::utils::coerce_num(&lv) {
+                        _ => match crate::coercion::to_number_lenient(&lv) {
                             Ok(n) => {
                                 prod *= n;
                             }

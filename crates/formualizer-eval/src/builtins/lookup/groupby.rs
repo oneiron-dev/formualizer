@@ -57,7 +57,7 @@ fn optional_arg(
 
 fn optional_int(args: &[ArgumentHandle<'_, '_>], index: usize) -> Result<Option<i64>, ExcelError> {
     optional_arg(args, index)?
-        .map(|v| crate::coercion::to_number_lenient(&v).map(|n| n.trunc() as i64))
+        .map(|v| crate::coercion::to_number_argument(&v).map(|n| n.trunc() as i64))
         .transpose()
 }
 
@@ -78,7 +78,7 @@ fn sort_spec(
         .iter()
         .map(|v| match v {
             LiteralValue::Error(e) => Err(e.clone()),
-            v => crate::coercion::to_number_lenient(v).map(|n| n.trunc() as i64),
+            v => crate::coercion::to_number_argument(v).map(|n| n.trunc() as i64),
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Some)

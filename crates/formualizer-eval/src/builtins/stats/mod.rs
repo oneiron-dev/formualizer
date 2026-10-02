@@ -56,7 +56,7 @@ fn collect_numeric_stats(args: &[ArgumentHandle]) -> Result<Vec<f64>, ExcelError
                     match cell {
                         LiteralValue::Error(e) => return Err(e),
                         other => {
-                            if let Ok(n) = coerce_num(&other) {
+                            if let Ok(n) = crate::coercion::to_number_lenient(&other) {
                                 out.push(n);
                             }
                         }
@@ -2367,7 +2367,7 @@ fn eval_maxminifs<'a, 'b>(
                 }
             }
             if all_match {
-                return match coerce_num(&target_val) {
+                return match crate::coercion::to_number_lenient(&target_val) {
                     Ok(n) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(n))),
                     Err(_) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(0.0))),
                 };

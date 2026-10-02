@@ -781,7 +781,7 @@ fn dimension_arg(
     if let LiteralValue::Error(_) = value {
         return Ok(Err(value));
     }
-    Ok(match crate::coercion::to_number_lenient(&value) {
+    Ok(match crate::coercion::to_number_argument(&value) {
         Ok(n) if n.trunc() >= 1.0 && n.trunc() <= max => Ok(n.trunc() as usize),
         _ => Err(error_value(
             ExcelErrorKind::Value,

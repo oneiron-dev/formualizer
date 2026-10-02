@@ -35,6 +35,63 @@ pub fn to_number_lenient(value: &LiteralValue) -> Result<f64, ExcelError> {
     }
 }
 
+thread_local! {
+    /// Date system and clock year of the function call being evaluated on
+    /// this thread, which [`to_number_argument`] reads date text in.
+    static ARGUMENT_DATE_CONTEXT: std::cell::Cell<(DateSystem, Option<i32>)> =
+        const { std::cell::Cell::new((DateSystem::Excel1900, None)) };
+}
+
+/// Restores the enclosing call's argument date context when dropped.
+pub(crate) struct ArgumentDateContextGuard {
+    previous: (DateSystem, Option<i32>),
+}
+
+impl Drop for ArgumentDateContextGuard {
+    fn drop(&mut self) {
+        ARGUMENT_DATE_CONTEXT.with(|context| context.set(self.previous));
+    }
+}
+
+/// Make [`to_number_argument`] read date text in `system`, with year-less
+/// dates in `current_year`, until the returned guard drops. Function dispatch
+/// enters it for every call.
+pub(crate) fn enter_argument_date_context(
+    system: DateSystem,
+    current_year: Option<i32>,
+) -> ArgumentDateContextGuard {
+    let previous = ARGUMENT_DATE_CONTEXT.with(|context| context.replace((system, current_year)));
+    ArgumentDateContextGuard { previous }
+}
+
+/// Excel's conversion of a value passed to a function's number parameter.
+///
+/// Text converts as VALUE() and the arithmetic operators convert it: numeric
+/// text as [`to_number_lenient`], then date and time text in en-US order
+/// (`"01/09/2020 15:02:40"` is 9 January 2020, 15:02:40), so `INT(A2)` with
+/// that text in A2 is the date's serial rather than `#VALUE!`. The date system
+/// and the year of year-less dates are those of the function call being
+/// evaluated ([`enter_argument_date_context`]); outside a call they are the
+/// 1900 system and no year-less dates.
+///
+/// Only a single value converts this way. Cells of a range and elements of an
+/// array argument that Excel skips or zeroes when they hold text keep
+/// [`to_number_lenient`].
+pub fn to_number_argument(value: &LiteralValue) -> Result<f64, ExcelError> {
+    match value {
+        LiteralValue::Text(s) => to_number_lenient(value).or_else(|error| {
+            let (system, current_year) = ARGUMENT_DATE_CONTEXT.with(std::cell::Cell::get);
+            formualizer_common::parse_excel_datetime_text_to_serial_in_year_for(
+                system,
+                s,
+                current_year,
+            )
+            .ok_or(error)
+        }),
+        _ => to_number_lenient(value),
+    }
+}
+
 /// Lenient numeric coercion that resolves temporal values in a date system.
 ///
 /// Identical to [`to_number_lenient`] except that date-bearing literals are
@@ -261,6 +318,31 @@ mod tests {
             0.905
         );
         assert!(to_number_lenient(&LiteralValue::Text("abc%".into())).is_err());
+    }
+
+    #[test]
+    fn number_argument_reads_date_text_in_the_call_context() {
+        let text = |s: &str| LiteralValue::Text(s.into());
+        // Outside a function call: the 1900 system, no year-less dates.
+        assert_eq!(to_number_argument(&text(" 42 ")).unwrap(), 42.0);
+        assert_eq!(to_number_argument(&text("1/1/03")).unwrap(), 37_622.0);
+        assert_eq!(to_number_argument(&text("12:00")).unwrap(), 0.5);
+        assert!(to_number_argument(&text("Jan 3")).is_err());
+        assert!(to_number_argument(&text("abc")).is_err());
+        assert!(to_number_lenient(&text("1/1/03")).is_err());
+        {
+            let _outer = enter_argument_date_context(DateSystem::Excel1904, Some(2024));
+            assert_eq!(to_number_argument(&text("1/1/03")).unwrap(), 36_160.0);
+            {
+                let _inner = enter_argument_date_context(DateSystem::Excel1900, Some(2003));
+                assert_eq!(to_number_argument(&text("Jan 1")).unwrap(), 37_622.0);
+            }
+            // Leaving the inner call restores the outer call's context.
+            assert_eq!(to_number_argument(&text("Jan 1 2003")).unwrap(), 36_160.0);
+            assert_eq!(to_number_argument(&text("Jan 3")).unwrap(), 43_832.0);
+        }
+        assert!(to_number_argument(&text("Jan 3")).is_err());
+        assert_eq!(to_number_argument(&text("1/1/03")).unwrap(), 37_622.0);
     }
 
     #[test]

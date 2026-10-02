@@ -393,10 +393,6 @@ fn non_arithmetic_text_semantics_are_unchanged() {
     let cases = [
         ("=\"5\"+\"3\"", Expected::Number(8.0)),
         ("=\"5\"-\"3\"", Expected::Number(2.0)),
-        (
-            "=SUM(\"1/1/03\",\"1\")",
-            Expected::Error(ExcelErrorKind::Value),
-        ),
         ("=N(\"1/1/03\")", Expected::Number(0.0)),
         ("=T(\"1/1/03\")", Expected::Text("1/1/03")),
         ("=\"1/1/03\"&\"\"", Expected::Text("1/1/03")),
@@ -509,5 +505,104 @@ fn numeric_month_and_number_that_is_no_day_reads_as_month_year() {
             "excel",
             Expected::Error(ExcelErrorKind::Value),
         );
+    }
+}
+
+/// Evaluate `formula` in B1 of a sheet whose A1 holds `a1` as text.
+fn eval_with_text_a1(system: DateSystem, a1: &str, formula: &str) -> LiteralValue {
+    let mut engine = Engine::new(
+        TestWorkbook::new(),
+        EvalConfig::default().with_date_system(system),
+    );
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Text(a1.into()))
+        .unwrap();
+    engine
+        .set_cell_value("Sheet1", 2, 1, LiteralValue::Number(2.0))
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 1, 2, parse(formula).unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    engine
+        .get_cell_value("Sheet1", 1, 2)
+        .unwrap_or(LiteralValue::Empty)
+}
+
+#[test]
+fn number_arguments_read_date_text_like_value() {
+    // Excel converts text passed to a function's number parameter as VALUE()
+    // and the operators do, date and time text included (en-US M/d/yyyy):
+    // INT(A2) with A2 holding "01/09/2020 15:02:40" is 43839, not #VALUE!.
+    let stamp = "01/09/2020 15:02:40";
+    let fraction = (15.0 * 3600.0 + 2.0 * 60.0 + 40.0) / 86400.0;
+    for (system, offset) in [
+        (DateSystem::Excel1900, 0.0),
+        (DateSystem::Excel1904, 1462.0),
+    ] {
+        let day = 43839.0 - offset;
+        for (formula, expected) in [
+            ("=INT(A1)", day),
+            ("=TRUNC(A1)", day),
+            ("=ROUNDDOWN(A1,0)", day),
+            ("=ABS(\"1/9/2020\")", day),
+            ("=MAX(\"1/9/2020\",1)", day),
+            ("=SUM(\"1/9/2020\",\"1\")", day + 1.0),
+            ("=AVERAGE(\"1/9/2020\",\"1/11/2020\")", day + 1.0),
+            ("=COUNT(\"1/9/2020\",\"12:00\")", 2.0),
+            ("=SUM(INT({\"1/9/2020\",\"2\"}))", day + 2.0),
+            ("=MOD(\"1/9/2020 12:00\",1)", 0.5),
+            ("=ROUND(\"12:00\",2)", 0.5),
+        ] {
+            let actual = eval_with_text_a1(system, stamp, formula);
+            let actual = match actual {
+                LiteralValue::Number(n) => n,
+                LiteralValue::Int(n) => n as f64,
+                other => other
+                    .as_serial_number_for(system)
+                    .unwrap_or_else(|| panic!("{formula} ({system:?}): {other:?}")),
+            };
+            assert_eq!(actual, expected, "{formula} ({system:?})");
+        }
+        match eval_with_text_a1(system, stamp, "=A1-INT(A1)") {
+            LiteralValue::Number(n) => assert!((n - fraction).abs() < 1e-9, "{n}"),
+            other => panic!("A1-INT(A1) ({system:?}): {other:?}"),
+        }
+        // Year-less date text reads in the clock's year, as the operators do.
+        assert_eq!(
+            eval_with_text_a1(system, "Jan 3", "=INT(A1)"),
+            eval_with_text_a1(system, "Jan 3", "=A1+0"),
+            "INT of year-less date text ({system:?})"
+        );
+    }
+}
+
+#[test]
+fn date_text_in_references_and_non_number_text_are_unchanged() {
+    for system in [DateSystem::Excel1900, DateSystem::Excel1904] {
+        // Text in a reference is no number to SUM, COUNT or SUMPRODUCT, even
+        // when it reads as a date.
+        for (formula, expected) in [
+            ("=SUM(A1)", 0.0),
+            ("=SUM(A1:A2)", 2.0),
+            ("=COUNT(A1:A2)", 1.0),
+            ("=SUMPRODUCT(A1:A2)", 2.0),
+            ("=MEDIAN({\"1/9/2020\",5})", 5.0),
+            ("=N(A1)", 0.0),
+        ] {
+            assert_eq!(
+                eval_with_text_a1(system, "1/9/2020", formula),
+                LiteralValue::Number(expected),
+                "{formula} ({system:?})"
+            );
+        }
+        for formula in ["=INT(A1)", "=ABS(\"1/9/2020x\")", "=SUM(\"13/13/2020\")"] {
+            match eval_with_text_a1(system, "abc", formula) {
+                LiteralValue::Error(error) => {
+                    assert_eq!(error.kind, ExcelErrorKind::Value, "{formula}")
+                }
+                other => panic!("{formula} ({system:?}): expected #VALUE!, got {other:?}"),
+            }
+        }
     }
 }

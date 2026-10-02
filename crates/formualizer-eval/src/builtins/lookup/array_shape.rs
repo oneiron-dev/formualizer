@@ -137,7 +137,7 @@ fn ignore_mode<'b>(args: &[ArgumentHandle<'_, 'b>]) -> Result<i64, ExcelError> {
         LiteralValue::Int(i) => i,
         LiteralValue::Number(n) => n as i64,
         LiteralValue::Error(e) => return Err(e),
-        other => crate::coercion::to_number_lenient(&other)? as i64,
+        other => crate::coercion::to_number_argument(&other)? as i64,
     };
     if !(0..=3).contains(&n) {
         return Err(
@@ -317,7 +317,7 @@ fn optional_arg<'b>(
 fn size_value(value: LiteralValue) -> Result<f64, ExcelError> {
     match value {
         LiteralValue::Error(e) => Err(e),
-        other => Ok(crate::coercion::to_number_lenient(&other)?.trunc()),
+        other => Ok(crate::coercion::to_number_argument(&other)?.trunc()),
     }
 }
 

@@ -1985,7 +1985,7 @@ impl Function for MultinomialFn {
                     LiteralValue::Error(e) => {
                         return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
                     }
-                    other => coerce_num(&other)?.trunc() as i64,
+                    other => crate::coercion::to_number_lenient(&other)?.trunc() as i64,
                 };
                 if n < 0 {
                     return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -2119,7 +2119,7 @@ impl Function for SeriesSumFn {
             AggregateArgument::Range(view) => view.for_each_cell(&mut |cell| {
                 match cell {
                     LiteralValue::Error(e) => return Err(e.clone()),
-                    other => coeffs.push(coerce_num(other)?),
+                    other => coeffs.push(crate::coercion::to_number_lenient(other)?),
                 }
                 Ok(())
             })?,

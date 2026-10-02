@@ -51,7 +51,7 @@ fn coerce_to_int(arg: &ArgumentHandle) -> Result<i64, ExcelError> {
     if let LiteralValue::Error(e) = v {
         return Err(e);
     }
-    crate::coercion::to_number_lenient(&v)
+    crate::coercion::to_number_argument(&v)
         .map(|f| f.trunc() as i64)
         .map_err(|_| ExcelError::new_value())
 }
