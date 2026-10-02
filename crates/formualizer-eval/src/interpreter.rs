@@ -2217,7 +2217,7 @@ impl<'a> Interpreter<'a> {
 
     fn cmp_f64(&self, a: f64, b: f64, op: &str) -> bool {
         // Excel compares numbers to 15 significant digits: 0.1+0.2=0.3.
-        let (a, b) = if a != b && same_to_15_digits(a, b) {
+        let (a, b) = if a != b && crate::coercion::same_to_15_digits(a, b) {
             (a, a)
         } else {
             (a, b)
@@ -2249,18 +2249,6 @@ impl<'a> Interpreter<'a> {
             },
         )
     }
-}
-
-/// Whether two numbers agree when rounded to 15 significant digits.
-fn same_to_15_digits(a: f64, b: f64) -> bool {
-    if !a.is_finite() || !b.is_finite() {
-        return false;
-    }
-    let scale = a.abs().max(b.abs());
-    if (a - b).abs() > scale * 1e-14 {
-        return false;
-    }
-    format!("{a:.14e}") == format!("{b:.14e}")
 }
 
 fn relocate_reference_for_offset(

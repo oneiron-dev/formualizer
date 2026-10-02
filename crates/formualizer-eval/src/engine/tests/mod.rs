@@ -124,6 +124,7 @@ mod config_defaults;
 mod context_default_noops;
 mod countifs_arrow_overlay;
 mod countifs_date_criteria;
+mod criteria_15_digits;
 mod criteria_ingest_blank;
 mod criteria_ingest_perf;
 mod criteria_mask_oob_column;

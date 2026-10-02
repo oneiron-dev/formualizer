@@ -1,7 +1,7 @@
-use super::super::utils::{ARG_ANY_ONE, criteria_match};
+use super::super::utils::{ARG_ANY_ONE, criteria_match, numeric_criteria_mask};
 use super::{AggregateArgument, resolve_aggregate_argument};
 use crate::args::ArgSchema;
-use crate::compute_prelude::{boolean, cmp, filter_array};
+use crate::compute_prelude::{boolean, filter_array};
 use crate::function::Function;
 use crate::function_contract::{CriteriaValueRange, FunctionArityRule, FunctionDependencyContract};
 use crate::traits::{ArgumentHandle, FunctionContext};
@@ -605,26 +605,20 @@ fn eval_if_family<'a, 'b>(
                         .and_then(|cols| cols.get(c).and_then(|a| a.as_ref()));
 
                     let m = match (pred, num_col) {
-                        (crate::args::CriteriaPredicate::Gt(n), Some(nc)) => {
-                            cmp::gt(nc.as_ref(), &Float64Array::new_scalar(*n)).unwrap()
-                        }
-                        (crate::args::CriteriaPredicate::Ge(n), Some(nc)) => {
-                            cmp::gt_eq(nc.as_ref(), &Float64Array::new_scalar(*n)).unwrap()
-                        }
-                        (crate::args::CriteriaPredicate::Lt(n), Some(nc)) => {
-                            cmp::lt(nc.as_ref(), &Float64Array::new_scalar(*n)).unwrap()
-                        }
-                        (crate::args::CriteriaPredicate::Le(n), Some(nc)) => {
-                            cmp::lt_eq(nc.as_ref(), &Float64Array::new_scalar(*n)).unwrap()
-                        }
+                        (
+                            crate::args::CriteriaPredicate::Gt(_)
+                            | crate::args::CriteriaPredicate::Ge(_)
+                            | crate::args::CriteriaPredicate::Lt(_)
+                            | crate::args::CriteriaPredicate::Le(_),
+                            Some(nc),
+                        ) => numeric_criteria_mask(nc.as_ref(), pred)
+                            .expect("an ordered criterion is numeric"),
                         (crate::args::CriteriaPredicate::Eq(v), nc) => {
                             match v {
-                                LiteralValue::Number(x) => {
-                                    let nx = *x;
+                                LiteralValue::Number(_) | LiteralValue::Int(_) => {
                                     if let Some(nc) = nc {
-                                        let m0 =
-                                            cmp::eq(nc.as_ref(), &Float64Array::new_scalar(nx))
-                                                .unwrap();
+                                        let m0 = numeric_criteria_mask(nc.as_ref(), pred)
+                                            .expect("a number criterion is numeric");
                                         if m0.null_count() == 0 {
                                             m0
                                         } else {
@@ -665,47 +659,6 @@ fn eval_if_family<'a, 'b>(
                                         bb.finish()
                                     }
                                 }
-                                LiteralValue::Int(x) => {
-                                    let nx = *x as f64;
-                                    if let Some(nc) = nc {
-                                        let m0 =
-                                            cmp::eq(nc.as_ref(), &Float64Array::new_scalar(nx))
-                                                .unwrap();
-                                        if m0.null_count() == 0 {
-                                            m0
-                                        } else {
-                                            let view = crit_specs[j].0.as_ref().unwrap();
-                                            let mut bb =
-                                                arrow_array::builder::BooleanBuilder::with_capacity(
-                                                    row_len,
-                                                );
-                                            for i in 0..row_len {
-                                                if m0.is_valid(i) {
-                                                    bb.append_value(m0.value(i));
-                                                } else {
-                                                    bb.append_value(criteria_match(
-                                                        pred,
-                                                        &view.get_cell(row_start + i, c),
-                                                    ));
-                                                }
-                                            }
-                                            bb.finish()
-                                        }
-                                    } else {
-                                        let mut bb =
-                                            arrow_array::builder::BooleanBuilder::with_capacity(
-                                                row_len,
-                                            );
-                                        let view = crit_specs[j].0.as_ref().unwrap();
-                                        for i in 0..row_len {
-                                            bb.append_value(criteria_match(
-                                                pred,
-                                                &view.get_cell(row_start + i, c),
-                                            ));
-                                        }
-                                        bb.finish()
-                                    }
-                                }
                                 _ => {
                                     // Use fallback for text and other types to ensure Excel parity (e.g. blank matching)
                                     let mut bb =
@@ -724,51 +677,10 @@ fn eval_if_family<'a, 'b>(
                             }
                         }
                         (crate::args::CriteriaPredicate::Ne(v), nc) => match v {
-                            LiteralValue::Number(x) => {
-                                let nx = *x;
+                            LiteralValue::Number(_) | LiteralValue::Int(_) => {
                                 if let Some(nc) = nc {
-                                    let m0 = cmp::neq(nc.as_ref(), &Float64Array::new_scalar(nx))
-                                        .unwrap();
-                                    if m0.null_count() == 0 {
-                                        m0
-                                    } else {
-                                        let view = crit_specs[j].0.as_ref().unwrap();
-                                        let mut bb =
-                                            arrow_array::builder::BooleanBuilder::with_capacity(
-                                                row_len,
-                                            );
-                                        for i in 0..row_len {
-                                            if m0.is_valid(i) {
-                                                bb.append_value(m0.value(i));
-                                            } else {
-                                                bb.append_value(criteria_match(
-                                                    pred,
-                                                    &view.get_cell(row_start + i, c),
-                                                ));
-                                            }
-                                        }
-                                        bb.finish()
-                                    }
-                                } else {
-                                    let mut bb =
-                                        arrow_array::builder::BooleanBuilder::with_capacity(
-                                            row_len,
-                                        );
-                                    let view = crit_specs[j].0.as_ref().unwrap();
-                                    for i in 0..row_len {
-                                        bb.append_value(criteria_match(
-                                            pred,
-                                            &view.get_cell(row_start + i, c),
-                                        ));
-                                    }
-                                    bb.finish()
-                                }
-                            }
-                            LiteralValue::Int(x) => {
-                                let nx = *x as f64;
-                                if let Some(nc) = nc {
-                                    let m0 = cmp::neq(nc.as_ref(), &Float64Array::new_scalar(nx))
-                                        .unwrap();
+                                    let m0 = numeric_criteria_mask(nc.as_ref(), pred)
+                                        .expect("a number criterion is numeric");
                                     if m0.null_count() == 0 {
                                         m0
                                     } else {
@@ -2012,6 +1924,44 @@ mod tests {
         assert!(arrays_and_owners + table_bytes <= CRITERIA_MASK_MEMO_BYTES);
         assert!(memo.bytes <= CRITERIA_MASK_MEMO_BYTES);
         assert!(memo.masks.len() < 16_384);
+    }
+
+    #[test]
+    fn numeric_criteria_compare_to_15_digits_on_numeric_lanes() {
+        // Without cached criteria masks the IF family filters each chunk's
+        // numeric lane. It compares to 15 significant digits like the scalar
+        // matcher: 8:30 (0.35416666666666669) meets ">=0.354166666666667",
+        // the criterion ">="&A1 makes from 8:30, and 0.1+0.2 is 0.3.
+        let wb = TestWorkbook::new()
+            .with_function(std::sync::Arc::new(CountIfFn))
+            .with_function(std::sync::Arc::new(CountIfsFn))
+            .with_function(std::sync::Arc::new(SumIfFn))
+            .with_function(std::sync::Arc::new(SumIfsFn))
+            .with_function(std::sync::Arc::new(AverageIfsFn))
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Number(8.5 / 24.0))
+            .with_cell_a1("Sheet1", "A2", LiteralValue::Number(0.1 + 0.2))
+            .with_cell_a1("Sheet1", "A3", LiteralValue::Number(5.0))
+            .with_cell_a1("Sheet1", "B1", LiteralValue::Number(1.0))
+            .with_cell_a1("Sheet1", "B2", LiteralValue::Number(2.0))
+            .with_cell_a1("Sheet1", "B3", LiteralValue::Number(4.0));
+        let cases = [
+            ("=COUNTIF(A1:A3, \">=0.354166666666667\")", 2.0),
+            ("=COUNTIFS(A1:A3, \"<0.354166666666667\")", 1.0),
+            ("=COUNTIFS(A1:A3, \"=0.354166666666667\")", 1.0),
+            ("=COUNTIFS(A1:A3, \"<>0.354166666666667\")", 2.0),
+            ("=SUMIF(A1:A3, \">0.3\", B1:B3)", 5.0),
+            ("=SUMIFS(B1:B3, A1:A3, \"<=0.3\")", 2.0),
+            ("=SUMIFS(B1:B3, A1:A3, \"<>0.3\")", 5.0),
+            ("=AVERAGEIFS(B1:B3, A1:A3, 0.3)", 2.0),
+        ];
+        for (formula, expected) in cases {
+            let got = wb
+                .interpreter()
+                .evaluate_ast(&formualizer_parse::parser::parse(formula).unwrap())
+                .unwrap()
+                .into_literal();
+            assert_eq!(got, LiteralValue::Number(expected), "{formula}");
+        }
     }
 
     #[test]

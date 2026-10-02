@@ -297,6 +297,61 @@ pub fn int_to_text(i: i64) -> String {
     }
 }
 
+/// How Excel orders two numbers it compares, with the comparison operators
+/// (`=`, `<`, ...) and with the criteria of COUNTIF(S), SUMIF(S),
+/// AVERAGEIF(S), MAXIFS, MINIFS and the D functions (`">="&A1`, `"=0.3"`,
+/// `5`): numbers that agree to 15 significant digits are equal. So 0.1+0.2=0.3
+/// is TRUE, and 8:30 (0.35416666666666669) meets `">=0.354166666666667"`,
+/// the criterion `">="&A1` builds from it. Arithmetic keeps the full binary
+/// value. Only finite numbers are equal: `None` for a NaN and for two equal
+/// infinities, which Excel never holds.
+pub fn compare_to_15_digits(a: f64, b: f64) -> Option<std::cmp::Ordering> {
+    if same_to_15_digits(a, b) {
+        Some(std::cmp::Ordering::Equal)
+    } else if a == b {
+        None
+    } else {
+        a.partial_cmp(&b)
+    }
+}
+
+/// The least and the greatest double that [`compare_to_15_digits`] finds
+/// equal to the finite `n`. Rounding is monotonic, so the doubles between
+/// them are exactly those equal to `n`, and one comparison with each bound
+/// orders any number against `n`: an Arrow lane needs no rounding per cell.
+pub fn same_to_15_digits_bounds(n: f64) -> (f64, f64) {
+    let (mut low, mut high) = (n, n);
+    // A few dozen steps: a unit of the 15th digit spans at most 90 doubles.
+    while same_to_15_digits(low.next_down(), n) {
+        low = low.next_down();
+    }
+    while same_to_15_digits(high.next_up(), n) {
+        high = high.next_up();
+    }
+    (low, high)
+}
+
+/// Whether two finite numbers agree when rounded to 15 significant digits.
+/// The digits round like [`number_to_text`]'s, half away from zero, so a
+/// number always equals the number its own text reads as: a criterion built
+/// with `"="&A1` matches A1.
+pub fn same_to_15_digits(a: f64, b: f64) -> bool {
+    if a == b {
+        return a.is_finite();
+    }
+    if !a.is_finite() || !b.is_finite() {
+        return false;
+    }
+    // Numbers with the same 15 digits lie within one unit of the 15th digit
+    // of each other; this also rules out zero and opposite signs. (A
+    // subnormal left over is never an exact tie, so its rounding is right.)
+    let scale = a.abs().max(b.abs());
+    if (a - b).abs() > scale * 1e-14 {
+        return false;
+    }
+    significant_digits(a.abs(), 15) == significant_digits(b.abs(), 15)
+}
+
 /// The positive normal `a` rounded half up to `sig` significant digits: the
 /// digits, and the decimal exponent of the first one.
 fn significant_digits(a: f64, sig: usize) -> (String, i32) {
@@ -710,6 +765,145 @@ mod tests {
                     "{a:e} to {sig} digits"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn numbers_compare_to_15_significant_digits() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        for (a, b, order) in [
+            (0.1 + 0.2, 0.3, Equal),
+            // 8:30 is 0.35416666666666669; its text, 0.354166666666667, reads
+            // back as 0.35416666666666702.
+            (8.5 / 24.0, 0.354166666666667, Equal),
+            (-(8.5 / 24.0), -0.354166666666667, Equal),
+            (45000.354166666664, 45000.3541666667, Equal),
+            (45000.354166666664, 45000.3541666666, Greater),
+            (123456789012345.67, 123456789012346.0, Equal),
+            // The 15th digit decides.
+            (1.00000000000001, 1.0, Greater),
+            (0.99999999999999, 1.0, Less),
+            (1.000000000000004, 1.0, Equal),
+            (1.000000000000006, 1.0, Greater),
+            (0.9999999999999996, 1.0, Equal),
+            (0.9999999999999994, 1.0, Less),
+            // An exact tie at the 16th digit rounds half away from zero, as in
+            // the number's text: 1000000000000005 reads 1.00000000000001E+15.
+            (1_000_000_000_000_005.0, 1_000_000_000_000_010.0, Equal),
+            (1_000_000_000_000_005.0, 1_000_000_000_000_006.0, Equal),
+            (1_000_000_000_000_005.0, 1_000_000_000_000_004.0, Greater),
+            (-1_000_000_000_000_005.0, -1_000_000_000_000_010.0, Equal),
+            // Nothing but zero is 0.
+            (0.0, -0.0, Equal),
+            (2.5e-16, 0.0, Greater),
+            (1e-300, 0.0, Greater),
+            (-1e-300, 1e-300, Less),
+        ] {
+            assert_eq!(compare_to_15_digits(a, b), Some(order), "{a:e} vs {b:e}");
+            assert_eq!(
+                compare_to_15_digits(b, a),
+                Some(order.reverse()),
+                "{b:e} vs {a:e}"
+            );
+        }
+        assert_eq!(compare_to_15_digits(f64::NAN, 1.0), None);
+        assert_eq!(compare_to_15_digits(f64::INFINITY, f64::INFINITY), None);
+        assert_eq!(compare_to_15_digits(f64::INFINITY, f64::MAX), Some(Greater));
+        assert!(!same_to_15_digits(f64::INFINITY, f64::INFINITY));
+    }
+
+    #[test]
+    fn numbers_are_the_same_when_their_15_rounded_digits_are() {
+        // Every double within 100 steps of a random one: the same 15 digits,
+        // rounded half up from the exact value, make the same number.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut same = 0;
+        for _ in 0..200 {
+            let a = f64::from_bits(next() >> 1);
+            if !a.is_normal() || a > 1e300 {
+                continue;
+            }
+            let digits = half_up_from_exact_digits(a, 15);
+            let mut b = a;
+            for _ in 0..100 {
+                b = b.next_down();
+            }
+            for _ in 0..200 {
+                let expected = half_up_from_exact_digits(b, 15) == digits;
+                assert_eq!(same_to_15_digits(a, b), expected, "{a:e} vs {b:e}");
+                assert_eq!(same_to_15_digits(-a, -b), expected, "-{a:e} vs -{b:e}");
+                same += usize::from(expected);
+                b = b.next_up();
+            }
+        }
+        assert!(same > 1000, "{same} equal pairs");
+    }
+
+    #[test]
+    fn bounds_hold_exactly_the_numbers_equal_to_15_digits() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        for n in [
+            8.5 / 24.0,
+            -0.354166666666667,
+            0.3,
+            1.0,
+            0.9999999999999996,
+            123.456,
+            45000.354166666664,
+            999_999_999_999_999.0,
+            1_000_000_000_000_005.0,
+            1e-300,
+            1e300,
+            0.0,
+        ] {
+            let (low, high) = same_to_15_digits_bounds(n);
+            assert!(low <= n && n <= high, "{n:e}");
+            assert_eq!(compare_to_15_digits(low, n), Some(Equal), "{n:e}");
+            assert_eq!(compare_to_15_digits(high, n), Some(Equal), "{n:e}");
+            assert_eq!(
+                compare_to_15_digits(low.next_down(), n),
+                Some(Less),
+                "{n:e}"
+            );
+            assert_eq!(
+                compare_to_15_digits(high.next_up(), n),
+                Some(Greater),
+                "{n:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_number_equals_its_own_text() {
+        // A criterion built with "="&A1 reads A1's text, so it matches A1.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..20_000 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let a = f64::from_bits(state >> 1);
+            if !a.is_normal() || !(1e-98..1e99).contains(&a) {
+                continue;
+            }
+            let text: f64 = number_to_text(a).parse().unwrap();
+            assert_eq!(
+                compare_to_15_digits(a, text),
+                Some(std::cmp::Ordering::Equal)
+            );
+        }
+        for i in [
+            1_000_000_000_000_005_i64,
+            9_007_199_254_740_993,
+            123_456_789_012_345_675,
+        ] {
+            let text: f64 = number_to_text(i as f64).parse().unwrap();
+            assert!(same_to_15_digits(i as f64, text), "{i}");
         }
     }
 

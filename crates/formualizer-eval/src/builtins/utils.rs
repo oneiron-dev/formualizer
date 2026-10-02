@@ -1,4 +1,5 @@
 use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
+use crate::coercion::compare_to_15_digits;
 use formualizer_common::{ExcelError, LiteralValue};
 use std::sync::LazyLock;
 
@@ -306,10 +307,10 @@ pub fn criteria_match(pred: &crate::args::CriteriaPredicate, v: &LiteralValue) -
     match pred {
         P::Eq(t) => values_equal_invariant(t, v),
         P::Ne(t) => !values_equal_invariant(t, v),
-        P::Gt(n) => criteria_ordered_number(v).is_some_and(|x| x > *n),
-        P::Ge(n) => criteria_ordered_number(v).is_some_and(|x| x >= *n),
-        P::Lt(n) => criteria_ordered_number(v).is_some_and(|x| x < *n),
-        P::Le(n) => criteria_ordered_number(v).is_some_and(|x| x <= *n),
+        P::Gt(_) | P::Ge(_) | P::Lt(_) | P::Le(_) => {
+            let (n, holds) = numeric_criterion(pred).expect("an ordered criterion is numeric");
+            criteria_ordered_number(v).is_some_and(|x| holds(compare_to_15_digits(x, n)))
+        }
         P::TextLike {
             pattern,
             case_insensitive,
@@ -325,6 +326,63 @@ fn value_to_number(v: &LiteralValue) -> Result<f64, ExcelError> {
     crate::coercion::to_number_lenient(v)
 }
 
+/// Whether a cell's number equals a criterion's: to 15 significant digits,
+/// like every numeric criterion (see [`numeric_criterion`]).
+fn numbers_equal(a: f64, b: f64) -> bool {
+    compare_to_15_digits(a, b) == Some(std::cmp::Ordering::Equal)
+}
+
+/// A criterion's number, and whether the order of a cell's number to it
+/// meets the criterion.
+type NumericCriterion = (f64, fn(Option<std::cmp::Ordering>) -> bool);
+
+/// A criterion that compares numbers (`">5"`, `"<=0.3"`, `"=7"`, `"<>0"`, `7`).
+/// Excel orders the two numbers as the comparison operators do, equal when
+/// they agree to 15 significant digits, for every operator: 8:30
+/// (0.35416666666666669) meets `">="&A1` with A1 8:30, whose text makes the
+/// criterion `">=0.354166666666667"`, and `"<"&A1` skips it.
+fn numeric_criterion(pred: &crate::args::CriteriaPredicate) -> Option<NumericCriterion> {
+    use crate::args::CriteriaPredicate as P;
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    Some(match pred {
+        P::Gt(n) => (*n, |o| o == Some(Greater)),
+        P::Ge(n) => (*n, |o| matches!(o, Some(Greater | Equal))),
+        P::Lt(n) => (*n, |o| o == Some(Less)),
+        P::Le(n) => (*n, |o| matches!(o, Some(Less | Equal))),
+        P::Eq(LiteralValue::Number(n)) => (*n, |o| o == Some(Equal)),
+        P::Eq(LiteralValue::Int(i)) => (*i as f64, |o| o == Some(Equal)),
+        P::Ne(LiteralValue::Number(n)) => (*n, |o| o != Some(Equal)),
+        P::Ne(LiteralValue::Int(i)) => (*i as f64, |o| o != Some(Equal)),
+        _ => return None,
+    })
+}
+
+/// `criteria_match` of a numeric criterion (see [`numeric_criterion`]) for
+/// each number of a numbers lane, null where the lane holds no number. The
+/// cached and vectorized criteria masks use it, so they compare numbers like
+/// the scalar matcher does. `None` for any other criterion.
+pub(crate) fn numeric_criteria_mask(
+    numbers: &arrow_array::Float64Array,
+    pred: &crate::args::CriteriaPredicate,
+) -> Option<arrow_array::BooleanArray> {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    let (n, holds) = numeric_criterion(pred)?;
+    // The doubles equal to n to 15 digits form one run, so a finite cell is
+    // ordered by two plain comparisons.
+    let (low, high) = crate::coercion::same_to_15_digits_bounds(n);
+    Some(arrow_array::BooleanArray::from_unary(numbers, |x| {
+        holds(if !x.is_finite() || !n.is_finite() {
+            compare_to_15_digits(x, n)
+        } else if x < low {
+            Some(Less)
+        } else if x > high {
+            Some(Greater)
+        } else {
+            Some(Equal)
+        })
+    }))
+}
+
 /// The number a cell offers to an ordered numeric criterion (`">5"`, `"<=0"`).
 /// Criteria compare like types only: a blank cell or a logical is not a
 /// number, so `COUNTIF(r,"<5")` skips blanks and FALSE, and `">0"` skips TRUE.
@@ -337,8 +395,8 @@ fn criteria_ordered_number(v: &LiteralValue) -> Option<f64> {
 
 fn values_equal_invariant(a: &LiteralValue, b: &LiteralValue) -> bool {
     match (a, b) {
-        (LiteralValue::Number(x), LiteralValue::Number(y)) => (x - y).abs() < 1e-12,
-        (LiteralValue::Int(x), LiteralValue::Int(y)) => x == y,
+        (LiteralValue::Number(x), LiteralValue::Number(y)) => numbers_equal(*x, *y),
+        (LiteralValue::Int(x), LiteralValue::Int(y)) => numbers_equal(*x as f64, *y as f64),
         (LiteralValue::Boolean(x), LiteralValue::Boolean(y)) => x == y,
         // A logical never equals a number (or a date) for criteria: TRUE=1 is
         // FALSE, so COUNTIF(r,1) skips TRUE and COUNTIF(r,"<>0") counts FALSE.
@@ -360,11 +418,8 @@ fn values_equal_invariant(a: &LiteralValue, b: &LiteralValue) -> bool {
         (x, y) if x.as_serial_number().is_some() && y.as_serial_number().is_some() => x
             .as_serial_number()
             .zip(y.as_serial_number())
-            .map(|(sx, sy)| (sx - sy).abs() < 1e-12)
-            .unwrap_or(false),
-        (LiteralValue::Number(x), _) => value_to_number(b)
-            .map(|y| (x - y).abs() < 1e-12)
-            .unwrap_or(false),
+            .is_some_and(|(sx, sy)| numbers_equal(sx, sy)),
+        (LiteralValue::Number(x), _) => value_to_number(b).is_ok_and(|y| numbers_equal(*x, y)),
         (_, LiteralValue::Number(_)) => values_equal_invariant(b, a),
         _ => false,
     }
@@ -475,3 +530,97 @@ pub static ARG_RANGE_NUM_LENIENT_ONE: LazyLock<Vec<ArgSchema>> = LazyLock::new(|
         s
     }]
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::args::CriteriaPredicate as P;
+
+    #[test]
+    fn numeric_lane_masks_match_the_scalar_matcher() {
+        // The cached and vectorized masks and the scalar matcher compare a
+        // cell's number with the criterion's to 15 significant digits alike,
+        // for every operator, near the criterion and away from it.
+        let mut state = 0x853c_49e6_748f_ea9bu64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 11
+        };
+        for _ in 0..200 {
+            let n =
+                (next() as f64 / (1u64 << 53) as f64 - 0.5) * 10f64.powi((next() % 40) as i32 - 20);
+            let mut cells = vec![
+                n,
+                -n,
+                0.0,
+                n * 2.0,
+                n * (1.0 + 4e-15),
+                n * (1.0 - 4e-15),
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NAN,
+            ];
+            let mut x = n;
+            for _ in 0..60 {
+                x = x.next_down();
+            }
+            for _ in 0..120 {
+                cells.push(x);
+                x = x.next_up();
+            }
+            let lane = arrow_array::Float64Array::from(cells.clone());
+            for pred in [
+                P::Gt(n),
+                P::Ge(n),
+                P::Lt(n),
+                P::Le(n),
+                P::Eq(LiteralValue::Number(n)),
+                P::Ne(LiteralValue::Number(n)),
+            ] {
+                let mask = numeric_criteria_mask(&lane, &pred).unwrap();
+                for (i, cell) in cells.iter().enumerate() {
+                    assert_eq!(
+                        mask.value(i),
+                        criteria_match(&pred, &LiteralValue::Number(*cell)),
+                        "{pred:?} on {cell:e}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_criteria_compare_to_15_digits() {
+        // 8:30 is 0.35416666666666669; the criterion ">=0.354166666666667"
+        // (from ">="&A1 with A1 8:30) is 0.35416666666666702.
+        let cell = LiteralValue::Number(8.5 / 24.0);
+        let n = 0.354166666666667;
+        assert!(criteria_match(&P::Ge(n), &cell));
+        assert!(criteria_match(&P::Le(n), &cell));
+        assert!(!criteria_match(&P::Lt(n), &cell));
+        assert!(!criteria_match(&P::Gt(n), &cell));
+        assert!(criteria_match(&P::Eq(LiteralValue::Number(n)), &cell));
+        assert!(!criteria_match(&P::Ne(LiteralValue::Number(n)), &cell));
+        // Numeric text and the integer lane compare the same way.
+        assert!(criteria_match(
+            &P::Eq(LiteralValue::Number(0.3)),
+            &LiteralValue::Text("0.30000000000000004".into())
+        ));
+        assert!(criteria_match(
+            &P::Eq(LiteralValue::Int(1_000_000_000_000_006)),
+            &LiteralValue::Int(1_000_000_000_000_005)
+        ));
+        // The 15th digit still counts, near zero too.
+        assert!(!criteria_match(
+            &P::Eq(LiteralValue::Number(1.0)),
+            &LiteralValue::Number(1.00000000000001)
+        ));
+        assert!(!criteria_match(
+            &P::Eq(LiteralValue::Number(0.0)),
+            &LiteralValue::Number(1e-13)
+        ));
+        assert!(criteria_match(&P::Gt(0.0), &LiteralValue::Number(1e-13)));
+    }
+}

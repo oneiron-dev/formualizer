@@ -2753,51 +2753,9 @@ fn compute_criteria_mask(
     col_in_view: usize,
     pred: &crate::args::CriteriaPredicate,
 ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
-    use crate::compute_prelude::{boolean, cmp, concat_arrays};
+    use crate::compute_prelude::{boolean, concat_arrays};
     use arrow::compute::kernels::comparison::{ilike, nilike};
-    use arrow_array::{
-        Array as _, ArrayRef, BooleanArray, Float64Array, StringArray, builder::BooleanBuilder,
-    };
-
-    // Helper: apply a numeric predicate to a single Float64Array chunk
-    fn apply_numeric_pred(
-        chunk: &Float64Array,
-        pred: &crate::args::CriteriaPredicate,
-    ) -> Option<BooleanArray> {
-        match pred {
-            crate::args::CriteriaPredicate::Gt(n) => {
-                cmp::gt(chunk, &Float64Array::new_scalar(*n)).ok()
-            }
-            crate::args::CriteriaPredicate::Ge(n) => {
-                cmp::gt_eq(chunk, &Float64Array::new_scalar(*n)).ok()
-            }
-            crate::args::CriteriaPredicate::Lt(n) => {
-                cmp::lt(chunk, &Float64Array::new_scalar(*n)).ok()
-            }
-            crate::args::CriteriaPredicate::Le(n) => {
-                cmp::lt_eq(chunk, &Float64Array::new_scalar(*n)).ok()
-            }
-            crate::args::CriteriaPredicate::Eq(v) => match v {
-                formualizer_common::LiteralValue::Number(x) => {
-                    cmp::eq(chunk, &Float64Array::new_scalar(*x)).ok()
-                }
-                formualizer_common::LiteralValue::Int(i) => {
-                    cmp::eq(chunk, &Float64Array::new_scalar(*i as f64)).ok()
-                }
-                _ => None,
-            },
-            crate::args::CriteriaPredicate::Ne(v) => match v {
-                formualizer_common::LiteralValue::Number(x) => {
-                    cmp::neq(chunk, &Float64Array::new_scalar(*x)).ok()
-                }
-                formualizer_common::LiteralValue::Int(i) => {
-                    cmp::neq(chunk, &Float64Array::new_scalar(*i as f64)).ok()
-                }
-                _ => None,
-            },
-            _ => None,
-        }
-    }
+    use arrow_array::{Array as _, ArrayRef, BooleanArray, StringArray, builder::BooleanBuilder};
 
     // Check if this is a numeric predicate that can be applied per-chunk
     let is_numeric_pred = matches!(
@@ -2860,7 +2818,8 @@ fn compute_criteria_mask(
             let (rs, _rl, cols_seg) = res.ok()?;
             if col_in_view < cols_seg.len() {
                 let chunk = cols_seg[col_in_view].as_ref();
-                let mut mask = apply_numeric_pred(chunk, pred)?;
+                // Numbers compare to 15 significant digits, as in the scalar matcher.
+                let mut mask = crate::builtins::numeric_criteria_mask(chunk, pred)?;
                 if fill_nulls && mask.null_count() > 0 {
                     mask = (0..mask.len())
                         .map(|i| {
