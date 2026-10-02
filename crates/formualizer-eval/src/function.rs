@@ -237,15 +237,6 @@ pub trait Function: Send + Sync + 'static {
         args: &'c [crate::traits::ArgumentHandle<'a, 'b>],
         ctx: &dyn crate::traits::FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        // Date text in a number argument reads in this call's date system and
-        // clock year (`crate::coercion::to_number_argument`).
-        let _argument_dates = {
-            use chrono::Datelike;
-            crate::coercion::enter_argument_date_context(
-                ctx.date_system(),
-                Some(ctx.clock().today().year()),
-            )
-        };
         // Short-circuit functions (IF/IFS/CHOOSE/SWITCH/AND/OR, ...) evaluate
         // their arguments lazily inside `eval`; eagerly materializing every
         // argument here would execute reads in untaken branches (defeating the

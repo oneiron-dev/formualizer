@@ -606,3 +606,279 @@ fn date_text_in_references_and_non_number_text_are_unchanged() {
         }
     }
 }
+
+/// Evaluate `formula` at J10 of an engine in `system` whose clock reads noon
+/// UTC on `today`, with A1:A4 = b a b a and C1:C4 = 1 2 3 4; return the
+/// `rows` x `cols` block from J10.
+fn spill_at_clock(
+    system: DateSystem,
+    today: (i32, u32, u32),
+    formula: &str,
+    rows: u32,
+    cols: u32,
+) -> Vec<Vec<LiteralValue>> {
+    use chrono::TimeZone;
+    let timestamp_utc = chrono::Utc
+        .with_ymd_and_hms(today.0, today.1, today.2, 12, 0, 0)
+        .single()
+        .unwrap();
+    let config = EvalConfig {
+        deterministic_mode: crate::engine::DeterministicMode::Enabled {
+            timestamp_utc,
+            timezone: crate::timezone::TimeZoneSpec::Utc,
+        },
+        ..Default::default()
+    }
+    .with_date_system(system);
+    let mut engine = Engine::new(TestWorkbook::new(), config);
+    for (row, (key, value)) in [("b", 1.0), ("a", 2.0), ("b", 3.0), ("a", 4.0)]
+        .into_iter()
+        .enumerate()
+    {
+        let row = row as u32 + 1;
+        engine
+            .set_cell_value("Sheet1", row, 1, LiteralValue::Text(key.into()))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", row, 3, LiteralValue::Number(value))
+            .unwrap();
+    }
+    engine
+        .set_cell_formula("Sheet1", 10, 10, parse(formula).unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    (0..rows)
+        .map(|r| {
+            (0..cols)
+                .map(|c| {
+                    engine
+                        .get_cell_value("Sheet1", 10 + r, 10 + c)
+                        .unwrap_or(LiteralValue::Empty)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn functions_with_their_own_dispatch_read_date_text_in_the_workbook_context() {
+    let n = LiteralValue::Number;
+    let empty = LiteralValue::Empty;
+    // MAKEARRAY and GROUPBY dispatch themselves. Their number arguments read
+    // date text in the workbook's date system and the clock's year at the
+    // top of a formula as well as nested: "1/2/1904" is serial 1 in the 1904
+    // system, so MAKEARRAY spills one row.
+    assert_eq!(
+        spill_at_clock(
+            DateSystem::Excel1904,
+            (2026, 10, 2),
+            "=MAKEARRAY(\"1/2/1904\",1,LAMBDA(r,c,r))",
+            2,
+            1
+        ),
+        vec![vec![n(1.0)], vec![empty.clone()]]
+    );
+    assert_eq!(
+        spill_at_clock(
+            DateSystem::Excel1904,
+            (2026, 10, 2),
+            "=ROWS(MAKEARRAY(\"1/2/1904\",1,LAMBDA(r,c,r)))",
+            1,
+            1
+        ),
+        vec![vec![n(1.0)]]
+    );
+    // Year-less date text reads in the clock's year: Jan 3 of 1900 is serial
+    // 3 in the 1900 system, Jan 3 of 1904 serial 2 in the 1904 system.
+    for (system, year, rows) in [
+        (DateSystem::Excel1900, 1900, 3),
+        (DateSystem::Excel1904, 1904, 2),
+    ] {
+        let mut expected: Vec<Vec<LiteralValue>> = (1..=rows).map(|r| vec![n(r as f64)]).collect();
+        expected.push(vec![empty.clone()]);
+        assert_eq!(
+            spill_at_clock(
+                system,
+                (year, 6, 1),
+                "=MAKEARRAY(\"Jan 3\",1,LAMBDA(r,c,r))",
+                rows + 1,
+                1
+            ),
+            expected,
+            "{system:?}"
+        );
+    }
+    // GROUPBY's total_depth "1/1/1904" is 0 in the 1904 system: no total row.
+    let text = |s: &str| LiteralValue::Text(s.into());
+    assert_eq!(
+        spill_at_clock(
+            DateSystem::Excel1904,
+            (2026, 10, 2),
+            "=GROUPBY(A1:A4,C1:C4,SUM,,\"1/1/1904\")",
+            3,
+            2
+        ),
+        vec![
+            vec![text("a"), n(6.0)],
+            vec![text("b"), n(4.0)],
+            vec![empty.clone(), empty.clone()],
+        ]
+    );
+}
+
+fn assert_value_error(system: DateSystem, formula: &str) {
+    match eval_with_text_a1(system, "1/9/2020", formula) {
+        LiteralValue::Error(error) => {
+            assert_eq!(error.kind, ExcelErrorKind::Value, "{formula} ({system:?})")
+        }
+        other => panic!("{formula} ({system:?}): expected #VALUE!, got {other:?}"),
+    }
+}
+
+#[test]
+fn date_text_outside_the_date_systems_range_is_no_number() {
+    // Microsoft documents date text as January 1, 1900 (1904 in the 1904
+    // system) through December 31, 9999; text outside the range is no date.
+    for formula in [
+        "=INT(\"1/1/1899\")",
+        "=ABS(\"1/1/1899\")",
+        "=SUM(\"12/31/1899 12:00\")",
+        "=\"1/1/1899\"+0",
+        "=VALUE(\"1/1/1899\")",
+        "=DATEVALUE(\"1/1/1899\")",
+        "=YEAR(\"1/1/1899\")",
+    ] {
+        for system in [DateSystem::Excel1900, DateSystem::Excel1904] {
+            assert_value_error(system, formula);
+        }
+    }
+    for formula in [
+        "=INT(\"12/31/1903\")",
+        "=\"1/1/1900\"+0",
+        "=DATEVALUE(\"1/1/1903\")",
+    ] {
+        assert_value_error(DateSystem::Excel1904, formula);
+    }
+    for (system, formula, expected) in [
+        (DateSystem::Excel1900, "=INT(\"1/1/1900\")", 1.0),
+        (DateSystem::Excel1900, "=INT(\"12/31/1903\")", 1461.0),
+        (
+            DateSystem::Excel1900,
+            "=INT(\"12/31/9999 18:00\")",
+            2_958_465.0,
+        ),
+        (DateSystem::Excel1904, "=INT(\"1/1/1904\")", 0.0),
+        (DateSystem::Excel1904, "=DATEVALUE(\"1/2/1904\")", 1.0),
+        (DateSystem::Excel1904, "=INT(\"12/31/9999\")", 2_957_003.0),
+    ] {
+        // DATEVALUE's result carries a date format; compare its serial.
+        let actual = match eval_with_text_a1(system, "", formula) {
+            LiteralValue::Number(n) => n,
+            other => other
+                .as_serial_number_for(system)
+                .unwrap_or_else(|| panic!("{formula} ({system:?}): {other:?}")),
+        };
+        assert_eq!(actual, expected, "{formula} ({system:?})");
+    }
+}
+
+#[test]
+fn direct_arguments_of_list_functions_convert_date_text() {
+    for (system, offset) in [
+        (DateSystem::Excel1900, 0.0),
+        (DateSystem::Excel1904, 1462.0),
+    ] {
+        // MULTINOMIAL: a value typed into the list is a number argument.
+        for (formula, expected) in [
+            ("=MULTINOMIAL(\"12:00\",1)", 1.0),
+            ("=MULTINOMIAL(\"2\",1)", 3.0),
+            ("=MULTINOMIAL({1,2},1)", 12.0),
+        ] {
+            assert_eq!(
+                eval_with_text_a1(system, "1/9/2020", formula),
+                LiteralValue::Number(expected),
+                "{formula} ({system:?})"
+            );
+        }
+        // "1/2/1900" is serial 2 in the 1900 system ("1/2/1904" in the 1904).
+        let two = if offset == 0.0 {
+            "=MULTINOMIAL(\"1/2/1900\",1)"
+        } else {
+            "=MULTINOMIAL(\"1/3/1904\",1)"
+        };
+        assert_eq!(
+            eval_with_text_a1(system, "1/9/2020", two),
+            LiteralValue::Number(3.0),
+            "{two} ({system:?})"
+        );
+        assert_value_error(system, "=MULTINOMIAL(\"abc\",1)");
+
+        // AVERAGE: text typed into the list that is no number is #VALUE!;
+        // text in a reference is skipped.
+        assert_value_error(system, "=AVERAGE(\"13/13/2020\",1)");
+        assert_value_error(system, "=AVERAGE(\"abc\")");
+        for (formula, expected) in [
+            ("=AVERAGE(A1,1)", 1.0),
+            ("=AVERAGE(A1:A2)", 2.0),
+            ("=AVERAGE(\"12:00\",1.5)", 1.0),
+            ("=AVERAGE(\"1/9/2020\",\"1/11/2020\")", 43840.0 - offset),
+        ] {
+            assert_eq!(
+                eval_with_text_a1(system, "1/9/2020", formula),
+                LiteralValue::Number(expected),
+                "{formula} ({system:?})"
+            );
+        }
+    }
+}
+
+#[test]
+fn financial_number_arguments_convert_date_and_time_text() {
+    for (system, offset) in [
+        (DateSystem::Excel1900, 0.0),
+        (DateSystem::Excel1904, 1462.0),
+    ] {
+        for (formula, expected) in [
+            ("=SLN(\"12:00\",0,1)", 0.5),
+            ("=SLN(\"5\",0,1)", 5.0),
+            ("=SLN(\"1/9/2020\",0,1)", 43839.0 - offset),
+            ("=SYD(\"12:00\",0,1,1)", 0.5),
+            ("=PMT(0,1,\"12:00\")", -0.5),
+            ("=FV(0,\"2\",-1)", 2.0),
+        ] {
+            assert_eq!(
+                eval_with_text_a1(system, "1/9/2020", formula),
+                LiteralValue::Number(expected),
+                "{formula} ({system:?})"
+            );
+        }
+        assert_value_error(system, "=SLN(\"abc\",0,1)");
+        assert_value_error(system, "=PMT(0,1,\"13/13/2020\")");
+    }
+}
+
+#[test]
+fn lcm_of_2_to_the_53_or_more_is_num() {
+    // Microsoft: "If lcm(a,b) >= 2^53, LCM returns the #NUM! error value."
+    for formula in [
+        "=LCM(9999999989,9999999988)",
+        "=LCM(\"1/1/9999\",9999999989)",
+    ] {
+        match eval_with_text_a1(DateSystem::Excel1900, "", formula) {
+            LiteralValue::Error(error) => assert_eq!(error.kind, ExcelErrorKind::Num, "{formula}"),
+            other => panic!("{formula}: expected #NUM!, got {other:?}"),
+        }
+    }
+    // 6361 * 69431 * 20394401 = 2^53 - 1, the largest LCM Excel returns.
+    for (formula, expected) in [
+        ("=LCM(441650591,20394401)", 9_007_199_254_740_991.0),
+        ("=LCM(6,\"1/10/1900\")", 30.0),
+        ("=LCM(0,9999999989)", 0.0),
+    ] {
+        assert_eq!(
+            eval_with_text_a1(DateSystem::Excel1900, "", formula),
+            LiteralValue::Number(expected),
+            "{formula}"
+        );
+    }
+}

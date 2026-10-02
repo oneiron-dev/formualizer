@@ -123,6 +123,9 @@ impl Function for DateValueFn {
             Some(args[0].current_year()),
         )
         .or_else(|| parse_legacy_datevalue_text(&date_text))
+        // Date text names a day of the date system's range (January 1, 1900
+        // or 1904 through December 31, 9999); other text is #VALUE!.
+        .filter(|date| formualizer_common::is_excel_date_text_in_range(system, date))
         {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
                 date_to_serial_for(system, &date),

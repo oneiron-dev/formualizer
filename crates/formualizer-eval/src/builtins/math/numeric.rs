@@ -1976,15 +1976,37 @@ impl Function for MultinomialFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         let mut values: Vec<i64> = Vec::new();
         for arg in args {
-            for value in arg.lazy_values_owned()? {
+            // A value typed into the list is a number argument: its text
+            // converts as VALUE() converts it, date and time text included
+            // (`MULTINOMIAL("12:00",1)` is 1). Cells of a range and elements
+            // of an array keep the element rule (numeric text only).
+            let (items, direct) = match resolve_aggregate_argument(arg, ctx)? {
+                AggregateArgument::Range(view) => {
+                    let mut cells = Vec::new();
+                    view.for_each_cell(&mut |cell| {
+                        cells.push(cell.clone());
+                        Ok(())
+                    })?;
+                    (cells, false)
+                }
+                AggregateArgument::ReferenceError(e) => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+                }
+                AggregateArgument::Scalar(LiteralValue::Array(rows)) => {
+                    (rows.into_iter().flatten().collect(), false)
+                }
+                AggregateArgument::Scalar(value) => (vec![value], true),
+            };
+            for value in items {
                 let n = match value {
                     LiteralValue::Error(e) => {
                         return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
                     }
+                    other if direct => coerce_num(&other)?.trunc() as i64,
                     other => crate::coercion::to_number_lenient(&other)?.trunc() as i64,
                 };
                 if n < 0 {

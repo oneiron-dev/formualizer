@@ -15,9 +15,20 @@ use formualizer_macros::func_caps;
 /// copy of the value -> number policy had no date arm, so `PRICE(A1,B1,...)`
 /// over date cells returned `#VALUE!` (see #328). Delegates to the central
 /// [`crate::coercion::to_serial_strict`].
+///
+/// These are number parameters, so text converts as VALUE() converts it:
+/// numeric text, and date or time text in the workbook's date system
+/// (`"12:00"` is 0.5), as the argument validation already reads it.
 fn coerce_num(arg: &ArgumentHandle) -> Result<f64, ExcelError> {
     let v = arg.value()?.into_literal();
-    to_serial_strict(&v, arg.date_system())
+    match v {
+        LiteralValue::Text(_) => crate::coercion::to_serial_lenient_in_year(
+            &v,
+            arg.date_system(),
+            Some(arg.current_year()),
+        ),
+        other => to_serial_strict(&other, arg.date_system()),
+    }
 }
 
 /// Day count basis calculation

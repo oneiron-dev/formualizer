@@ -378,10 +378,12 @@ impl Function for AverageFn {
                     if let LiteralValue::Error(e) = v {
                         return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
                     }
-                    if let Ok(n) = crate::coercion::to_number_argument(&v) {
-                        sum += n;
-                        cnt += 1;
-                    }
+                    // A value typed into the list counts; text that is no
+                    // number is #VALUE! (Microsoft: "Arguments that are error
+                    // values or text that cannot be translated into numbers
+                    // cause errors"). Text in a range is skipped above.
+                    sum += coerce_num(&v)?;
+                    cnt += 1;
                 }
             }
         }

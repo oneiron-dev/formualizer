@@ -16,9 +16,20 @@ use formualizer_macros::func_caps;
 /// rather than re-implementing the value -> number policy locally; the old
 /// private `coerce_literal_num`/`coerce_literal_date_serial` pair silently
 /// dropped `Date`/`DateTime`/`Time`/`Duration` cells (see #328).
+///
+/// These are number parameters, so text converts as VALUE() converts it:
+/// numeric text, and date or time text in the workbook's date system
+/// (`"12:00"` is 0.5), as the argument validation already reads it.
 fn coerce_num(arg: &ArgumentHandle) -> Result<f64, ExcelError> {
     let v = arg.value()?.into_literal();
-    to_serial_strict(&v, arg.date_system())
+    match v {
+        LiteralValue::Text(_) => crate::coercion::to_serial_lenient_in_year(
+            &v,
+            arg.date_system(),
+            Some(arg.current_year()),
+        ),
+        other => to_serial_strict(&other, arg.date_system()),
+    }
 }
 
 /// Excel truncates date serials to whole days inside XNPV/XIRR: a cell holding

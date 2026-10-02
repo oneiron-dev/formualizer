@@ -418,6 +418,7 @@ impl<'a> Interpreter<'a> {
                         self.current_cell,
                         self.current_sheet,
                     );
+                    let _call_dates = self.enter_function_call();
                     if let Some(res) = fun.eval_reference(&handles, &fctx) {
                         res
                     } else {
@@ -473,6 +474,7 @@ impl<'a> Interpreter<'a> {
             self.current_cell,
             self.current_sheet,
         );
+        let _call_dates = self.enter_function_call();
         fun.eval_reference(&handles, &fctx)
     }
 
@@ -508,6 +510,7 @@ impl<'a> Interpreter<'a> {
                     self.current_cell,
                     self.current_sheet,
                 );
+                let _call_dates = self.enter_function_call();
 
                 self.with_arena_call_handles(
                     fun.as_ref(),
@@ -585,6 +588,7 @@ impl<'a> Interpreter<'a> {
             self.current_cell,
             self.current_sheet,
         );
+        let _call_dates = self.enter_function_call();
         self.with_arena_call_handles(fun.as_ref(), args, data_store, sheet_registry, |handles| {
             fun.eval_reference(handles, &fctx)
         })
@@ -1202,6 +1206,7 @@ impl<'a> Interpreter<'a> {
                         self.current_cell,
                         self.current_sheet,
                     );
+                    let _call_dates = self.enter_function_call();
 
                     return error_as_value(self.with_arena_call_handles(
                         fun.as_ref(),
@@ -1686,6 +1691,20 @@ impl<'a> Interpreter<'a> {
         Some(self.context.clock().today().year())
     }
 
+    /// Enter the date context of a builtin call made by this interpreter:
+    /// until the guard drops, date text in the call's number arguments reads
+    /// in this workbook's date system and the clock's year
+    /// ([`crate::coercion::to_number_argument`]). Every builtin call the
+    /// interpreter makes (value, reference or lifted) enters it here, before
+    /// the function runs, so a function that overrides `dispatch` reads date
+    /// text in the same context as any other.
+    pub(crate) fn enter_function_call(&self) -> crate::coercion::ArgumentDateContextGuard {
+        crate::coercion::enter_argument_date_context(
+            self.context.date_system(),
+            self.current_year(),
+        )
+    }
+
     /* ===================  binary ops  =================== */
     fn eval_binary(
         &self,
@@ -1819,6 +1838,7 @@ impl<'a> Interpreter<'a> {
                 self.current_cell,
                 self.current_sheet,
             );
+            let _call_dates = self.enter_function_call();
             return error_as_value(fun.dispatch(&handles, &fctx));
         }
 

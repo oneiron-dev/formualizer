@@ -54,8 +54,10 @@ impl Drop for ArgumentDateContextGuard {
 }
 
 /// Make [`to_number_argument`] read date text in `system`, with year-less
-/// dates in `current_year`, until the returned guard drops. Function dispatch
-/// enters it for every call.
+/// dates in `current_year`, until the returned guard drops. The interpreter
+/// enters it for every builtin call it makes
+/// (`Interpreter::enter_function_call`), before the function runs, so no
+/// function's own `dispatch` can bypass it.
 pub(crate) fn enter_argument_date_context(
     system: DateSystem,
     current_year: Option<i32>,
@@ -69,10 +71,12 @@ pub(crate) fn enter_argument_date_context(
 /// Text converts as VALUE() and the arithmetic operators convert it: numeric
 /// text as [`to_number_lenient`], then date and time text in en-US order
 /// (`"01/09/2020 15:02:40"` is 9 January 2020, 15:02:40), so `INT(A2)` with
-/// that text in A2 is the date's serial rather than `#VALUE!`. The date system
-/// and the year of year-less dates are those of the function call being
-/// evaluated ([`enter_argument_date_context`]); outside a call they are the
-/// 1900 system and no year-less dates.
+/// that text in A2 is the date's serial rather than `#VALUE!`. Date text must
+/// name a day of the date system's range (January 1, 1900 or 1904 through
+/// December 31, 9999); other text is `#VALUE!`. The date system and the year
+/// of year-less dates are those of the function call being evaluated
+/// ([`enter_argument_date_context`]); outside a call they are the 1900 system
+/// and no year-less dates.
 ///
 /// Only a single value converts this way. Cells of a range and elements of an
 /// array argument that Excel skips or zeroes when they hold text keep
@@ -330,6 +334,14 @@ mod tests {
         assert!(to_number_argument(&text("Jan 3")).is_err());
         assert!(to_number_argument(&text("abc")).is_err());
         assert!(to_number_lenient(&text("1/1/03")).is_err());
+        // Date text names a day of the date system's range.
+        assert_eq!(to_number_argument(&text("1/1/1900")).unwrap(), 1.0);
+        assert!(to_number_argument(&text("12/31/1899")).is_err());
+        {
+            let _system = enter_argument_date_context(DateSystem::Excel1904, None);
+            assert_eq!(to_number_argument(&text("1/1/1904")).unwrap(), 0.0);
+            assert!(to_number_argument(&text("12/31/1903")).is_err());
+        }
         {
             let _outer = enter_argument_date_context(DateSystem::Excel1904, Some(2024));
             assert_eq!(to_number_argument(&text("1/1/03")).unwrap(), 36_160.0);

@@ -437,12 +437,27 @@ pub fn parse_excel_datetime_text_in_year(
         })
 }
 
+/// Whether Excel reads `date` as a date in `system`: date text must name a
+/// day from the system's first date (January 1, 1900 in the 1900 system,
+/// January 1, 1904 in the 1904 system) through December 31, 9999. Microsoft
+/// documents this range for DATEVALUE's date text; text naming a day outside
+/// it is no date, so converting it is `#VALUE!`.
+pub fn is_excel_date_text_in_range(system: DateSystem, date: &NaiveDate) -> bool {
+    let first = match system {
+        DateSystem::Excel1900 => EXCEL_1900_EPOCH + ChronoDuration::days(1),
+        DateSystem::Excel1904 => EXCEL_1904_EPOCH,
+    };
+    (first..=EXCEL_MAX_DATE).contains(date)
+}
+
 /// Parse spreadsheet date, time, or datetime text and return its serial.
 ///
 /// This is the canonical entry point for text operands that need a temporal
 /// serial. Dates use deterministic en-US month/day/year ordering, with no
 /// locale parameter. Date-bearing results honor the selected workbook date
-/// system; time-only results are fractional days in either system.
+/// system; time-only results are fractional days in either system. Text
+/// naming a day outside the system's date range
+/// ([`is_excel_date_text_in_range`]) is no date and returns `None`.
 pub fn parse_excel_datetime_text_to_serial_for(system: DateSystem, input: &str) -> Option<f64> {
     parse_excel_datetime_text_to_serial_in_year_for(system, input, None)
 }
@@ -455,10 +470,12 @@ pub fn parse_excel_datetime_text_to_serial_in_year_for(
     current_year: Option<i32>,
 ) -> Option<f64> {
     if let Some(datetime) = parse_excel_datetime_text_in_year(input, current_year) {
-        return Some(datetime_to_serial_for(system, &datetime));
+        return is_excel_date_text_in_range(system, &datetime.date())
+            .then(|| datetime_to_serial_for(system, &datetime));
     }
     if let Some(date) = parse_excel_date_text_in_year(input, current_year) {
-        return Some(date_to_serial_for(system, &date));
+        return is_excel_date_text_in_range(system, &date)
+            .then(|| date_to_serial_for(system, &date));
     }
     parse_excel_time_text(input).map(|time| time_to_fraction(&time))
 }
@@ -821,6 +838,55 @@ mod tests {
             parse_excel_datetime_text_to_serial_for(DateSystem::Excel1900, "12:00"),
             Some(0.5)
         );
+    }
+
+    #[test]
+    fn temporal_text_serial_is_limited_to_the_date_systems_range() {
+        // Microsoft (DATEVALUE): date text must name a day from January 1,
+        // 1900 (1904 in the 1904 system) through December 31, 9999; text
+        // outside that range is no date.
+        let serial = |system, text: &str| parse_excel_datetime_text_to_serial_for(system, text);
+        for (system, first, before) in [
+            (DateSystem::Excel1900, "1/1/1900", "12/31/1899"),
+            (DateSystem::Excel1904, "1/1/1904", "12/31/1903"),
+        ] {
+            let first_serial = if system == DateSystem::Excel1900 {
+                1.0
+            } else {
+                0.0
+            };
+            assert_eq!(serial(system, first), Some(first_serial), "{system:?}");
+            assert_eq!(
+                serial(system, &format!("{first} 12:00")),
+                Some(first_serial + 0.5),
+                "{system:?}"
+            );
+            for text in [before, "1/1/1899", "1/1/0100", "1899-06-01", "Jan 1 1899"] {
+                assert_eq!(serial(system, text), None, "{text} ({system:?})");
+                assert_eq!(
+                    serial(system, &format!("{text} 12:00")),
+                    None,
+                    "{text} 12:00 ({system:?})"
+                );
+            }
+            assert_eq!(
+                serial(system, "12/31/9999"),
+                Some(max_excel_serial_for(system)),
+                "{system:?}"
+            );
+            // Time-only text is a fraction of a day in either system.
+            assert_eq!(serial(system, "12:00"), Some(0.5));
+        }
+        // The 1904 system reads 1900-1903 dates as no date.
+        assert_eq!(serial(DateSystem::Excel1904, "1/1/1900"), None);
+        assert!(!is_excel_date_text_in_range(
+            DateSystem::Excel1904,
+            &date(1903, 12, 31)
+        ));
+        assert!(is_excel_date_text_in_range(
+            DateSystem::Excel1900,
+            &date(1900, 1, 1)
+        ));
     }
 
     #[test]

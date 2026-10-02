@@ -10,9 +10,20 @@ use formualizer_macros::func_caps;
 /// Numeric coercion for depreciation arguments. Shares the crate-central
 /// value -> number policy with the rest of the financial builtins so a date
 /// cell resolves to its serial instead of `#VALUE!`.
+///
+/// These are number parameters, so text converts as VALUE() converts it:
+/// numeric text, and date or time text in the workbook's date system
+/// (`"12:00"` is 0.5), as the argument validation already reads it.
 fn coerce_num(arg: &ArgumentHandle) -> Result<f64, ExcelError> {
     let v = arg.value()?.into_literal();
-    to_serial_strict(&v, arg.date_system())
+    match v {
+        LiteralValue::Text(_) => crate::coercion::to_serial_lenient_in_year(
+            &v,
+            arg.date_system(),
+            Some(arg.current_year()),
+        ),
+        other => to_serial_strict(&other, arg.date_system()),
+    }
 }
 
 /// Returns straight-line depreciation for a single period.

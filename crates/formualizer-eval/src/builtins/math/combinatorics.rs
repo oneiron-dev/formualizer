@@ -220,6 +220,7 @@ pub struct LcmFn;
 /// # Remarks
 /// - Inputs must be non-negative and within the supported Excel-compatible range.
 /// - If any input is `0`, the resulting least common multiple is `0`.
+/// - A least common multiple of 2^53 or more returns `#NUM!`.
 /// - Any argument error propagates immediately.
 ///
 /// # Examples
@@ -286,11 +287,17 @@ impl Function for LcmFn {
         fn gcd(a: u64, b: u64) -> u64 {
             if b == 0 { a } else { gcd(b, a % b) }
         }
-        fn lcm(a: u64, b: u64) -> u64 {
+        /// Microsoft: "If lcm(a,b) >= 2^53, LCM returns the #NUM! error
+        /// value." Checked at every step of the reduction, so the product
+        /// never overflows.
+        const LCM_LIMIT: u64 = 1 << 53;
+        fn lcm(a: u64, b: u64) -> Option<u64> {
             if a == 0 || b == 0 {
-                0
+                Some(0)
             } else {
-                (a / gcd(a, b)) * b
+                (a / gcd(a, b))
+                    .checked_mul(b)
+                    .filter(|&multiple| multiple < LCM_LIMIT)
             }
         }
 
@@ -313,7 +320,14 @@ impl Function for LcmFn {
 
             result = Some(match result {
                 None => n,
-                Some(r) => lcm(r, n),
+                Some(r) => match lcm(r, n) {
+                    Some(multiple) => multiple,
+                    None => {
+                        return Ok(CalcValue::Scalar(
+                            LiteralValue::Error(ExcelError::new_num()),
+                        ));
+                    }
+                },
             });
         }
 

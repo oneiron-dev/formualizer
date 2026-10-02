@@ -823,6 +823,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                     self.interp.current_cell(),
                     self.interp.current_sheet(),
                 );
+                let _call_dates = self.interp.enter_function_call();
                 Some(fun.resolve_reference_or_value(&handles, &ctx, &|| self.value()))
             }
             ArgumentExpr::Arena {
@@ -869,6 +870,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                     self.interp.current_cell(),
                     self.interp.current_sheet(),
                 );
+                let _call_dates = self.interp.enter_function_call();
                 Some(self.interp.with_arena_call_handles(
                     fun.as_ref(),
                     args,
@@ -1035,6 +1037,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
             self.interp.current_cell(),
             self.interp.current_sheet(),
         );
+        let _call_dates = self.interp.enter_function_call();
         self.with_call_handles(fun.as_ref(), |handles| match spec {
             Some(spec) => {
                 crate::lift::lift_reference(spec, handles, |call| fun.eval_reference(call, &ctx))
