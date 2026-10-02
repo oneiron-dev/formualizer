@@ -471,3 +471,62 @@ fn lookup_blank_targets_stay_empty_until_published() {
         );
     }
 }
+
+#[test]
+fn value_and_numbervalue_read_a_blank_as_zero() {
+    // Excel's VALUE of an empty cell is 0, and so is VALUE of the empty target
+    // a VLOOKUP returns, while VALUE("") is #VALUE!. Microsoft documents
+    // NUMBERVALUE("") as 0 (spaces are ignored); a blank is 0 there too.
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    let text = |s: &str| LiteralValue::Text(s.to_string());
+    engine.set_cell_value("Sheet1", 1, 4, text("A")).unwrap();
+    engine
+        .set_cell_value("Sheet1", 1, 5, LiteralValue::Number(2.5))
+        .unwrap();
+    engine.set_cell_value("Sheet1", 2, 4, text("C")).unwrap();
+    let value_error = LiteralValue::Error(formualizer_common::ExcelError::new_value());
+    let cases = [
+        ("=VALUE(C1)", LiteralValue::Number(0.0)),
+        (
+            "=VALUE(VLOOKUP(\"C\",D1:E2,2,FALSE))",
+            LiteralValue::Number(0.0),
+        ),
+        (
+            "=VALUE(HLOOKUP(\"C\",D2:E3,2,FALSE))",
+            LiteralValue::Number(0.0),
+        ),
+        ("=VALUE(\"\")", value_error.clone()),
+        ("=VALUE(C1&\"\")", value_error.clone()),
+        (
+            "=VALUE(VLOOKUP(\"A\",D1:E2,2,FALSE))",
+            LiteralValue::Number(2.5),
+        ),
+        ("=NUMBERVALUE(C1)", LiteralValue::Number(0.0)),
+        (
+            "=NUMBERVALUE(VLOOKUP(\"C\",D1:E2,2,FALSE))",
+            LiteralValue::Number(0.0),
+        ),
+        ("=NUMBERVALUE(\"\")", LiteralValue::Number(0.0)),
+        ("=NUMBERVALUE(\"  \")", LiteralValue::Number(0.0)),
+        ("=NUMBERVALUE(\"%\")", value_error.clone()),
+        (
+            "=ISBLANK(VLOOKUP(\"C\",D1:E2,2,FALSE))",
+            LiteralValue::Boolean(true),
+        ),
+    ];
+    for (i, (formula, _)) in cases.iter().enumerate() {
+        engine
+            .set_cell_formula("Sheet1", 10 + i as u32, 1, parse(formula).unwrap())
+            .unwrap();
+    }
+    engine.evaluate_all().unwrap();
+    for (i, (formula, expected)) in cases.iter().enumerate() {
+        let got = engine.get_cell_value("Sheet1", 10 + i as u32, 1);
+        match (expected, &got) {
+            (LiteralValue::Error(e), Some(LiteralValue::Error(g))) => {
+                assert_eq!(e.kind, g.kind, "{formula}")
+            }
+            _ => assert_eq!(got.as_ref(), Some(expected), "{formula}"),
+        }
+    }
+}

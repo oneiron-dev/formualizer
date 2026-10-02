@@ -20,14 +20,25 @@ fn scalar_like_value(arg: &ArgumentHandle<'_, '_>) -> Result<LiteralValue, Excel
 /// documents for IF (`VALUE(IF(FALSE,1,))` is 0): the "" that `&` and the other
 /// text functions read for it is not a number for VALUE to parse.
 fn to_text<'a, 'b>(a: &ArgumentHandle<'a, 'b>) -> Result<String, ExcelError> {
+    Ok(text_or_blank(a)?.unwrap_or_default())
+}
+
+/// [`to_text`], or `None` for a blank value: an empty cell, or the empty target
+/// a VLOOKUP or HLOOKUP returns. VALUE reads a blank as 0 (Excel's
+/// `VALUE(A1)` of an empty A1 is 0), while empty text `""` is not a number.
+fn text_or_blank<'a, 'b>(a: &ArgumentHandle<'a, 'b>) -> Result<Option<String>, ExcelError> {
     let v = if a.is_omitted() {
-        scalar_text_value(a)?
+        // An empty slot written in the call is empty text, not a blank.
+        match scalar_text_value(a)? {
+            LiteralValue::Empty => return Ok(Some(String::new())),
+            v => v,
+        }
     } else {
         scalar_like_value(a)?
     };
-    Ok(match v {
+    Ok(Some(match v {
         LiteralValue::Text(s) => s,
-        LiteralValue::Empty => String::new(),
+        LiteralValue::Empty => return Ok(None),
         LiteralValue::Boolean(b) => {
             if b {
                 "TRUE".into()
@@ -39,7 +50,7 @@ fn to_text<'a, 'b>(a: &ArgumentHandle<'a, 'b>) -> Result<String, ExcelError> {
         LiteralValue::Number(f) => crate::coercion::number_to_text(f),
         LiteralValue::Error(e) => return Err(e),
         other => other.to_string(),
-    })
+    }))
 }
 
 // VALUE(text) - parse number
@@ -52,7 +63,8 @@ pub struct ValueFn;
 /// - Text in a number format Excel recognizes in the en-US region converts:
 ///   `,` group separators, a leading `$`, parentheses for a negative number and
 ///   a trailing `%` (`"$1,000"` -> 1000, `"($5)"` -> -5, `"90%"` -> 0.9).
-/// - Non-numeric text returns `#VALUE!`.
+/// - Non-numeric text returns `#VALUE!`, and so does empty text `""`.
+/// - A blank value (an empty cell, or the empty target a lookup returns) is `0`.
 /// - Booleans and numbers are first coerced to text, then parsed.
 /// - Errors are propagated unchanged.
 ///
@@ -111,7 +123,10 @@ impl Function for ValueFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let s = to_text(&args[0])?;
+        // A blank (an empty cell, a lookup's empty target) is 0; "" is #VALUE!.
+        let Some(s) = text_or_blank(&args[0])? else {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(0.0)));
+        };
         // Numeric text, then date/time text (VALUE("1/2/2023") is a serial).
         let Ok(n) = crate::coercion::to_arithmetic_number_with_locale(
             &LiteralValue::Text(s),
@@ -136,11 +151,12 @@ impl Function for ValueFn {
 /// - The decimal separator defaults to `.`.
 /// - The group separator defaults to `,`.
 /// - Only the first character of each separator is used.
-/// - Spaces are ignored, even in the middle (`" 3 000 "` is 3000), and empty
-///   text is 0.
+/// - Spaces are ignored, even in the middle (`" 3 000 "` is 3000).
 /// - Group separators before the decimal separator are ignored; one after it,
 ///   or a second decimal separator, is `#VALUE!`.
 /// - Percent suffixes are supported and scale the result by 100 per suffix.
+/// - Empty text `""` (or only spaces) returns `0`, as does a blank value (an empty cell,
+///   or the empty target a lookup returns).
 ///
 /// ```yaml,sandbox
 /// title: "Parse with explicit separators"

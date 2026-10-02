@@ -11,7 +11,8 @@ Converts text that represents a number into a numeric value.
 
 ## Remarks
  - Parsing uses locale-aware invariant number parsing from the function context.
- - Non-numeric text returns `#VALUE!`.
+ - Non-numeric text returns `#VALUE!`, and so does empty text `""`.
+ - A blank value (an empty cell, or the empty target a lookup returns) is `0`.
  - Booleans and numbers are first coerced to text, then parsed.
  - Errors are propagated unchanged.
 

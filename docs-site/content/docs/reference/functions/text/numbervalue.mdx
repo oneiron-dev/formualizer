@@ -14,6 +14,8 @@ Parses text using explicit decimal and group separators, independent of the
  - The decimal separator defaults to `.`.
  - The group separator defaults to `,`.
  - Percent suffixes are supported and scale the result by 100 per suffix.
+ - Empty text `""` (or only spaces) returns `0`, as does a blank value (an empty cell,
+   or the empty target a lookup returns).
 
 ## Examples
 
