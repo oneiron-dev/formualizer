@@ -238,11 +238,16 @@ impl Function for NumberValueFn {
         if body.is_empty() {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(0.0)));
         }
+        // Each trailing percent sign divides by 100; spaces around them are
+        // ignored like any other space, even when space is a separator
+        // ("9% %" with group " " is 0.0009).
         let mut pct_count = 0;
-        while body.ends_with('%') {
-            body.pop();
+        let mut number_len = body.len();
+        while let Some(rest) = body[..number_len].strip_suffix('%') {
+            number_len = rest.trim_end_matches(' ').len();
             pct_count += 1;
         }
+        body.truncate(number_len);
         let (integer, fraction) = match body.split_once(decimal) {
             Some((integer, fraction)) => (integer, Some(fraction)),
             None => (body.as_str(), None),
@@ -608,6 +613,41 @@ mod tests {
             &["1.2\u{a0}3", ".", "\u{a0}"][..],
             &["1\t2"][..],
         ] {
+            assert!(
+                matches!(run(args), LiteralValue::Error(e) if e.kind == ExcelErrorKind::Value),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn numbervalue_ignores_spaces_between_trailing_percent_signs() {
+        let wb = TestWorkbook::new().with_function(std::sync::Arc::new(NumberValueFn));
+        let ctx = wb.interpreter();
+        let f = ctx.context.get_function("", "NUMBERVALUE").unwrap();
+        let run = |args: &[&str]| {
+            let nodes: Vec<ASTNode> = args
+                .iter()
+                .map(|a| lit(LiteralValue::Text((*a).into())))
+                .collect();
+            let handles: Vec<ArgumentHandle> =
+                nodes.iter().map(|n| ArgumentHandle::new(n, &ctx)).collect();
+            f.dispatch(&handles, &ctx.function_context(None))
+                .unwrap()
+                .into_literal()
+        };
+        // Spaces are ignored and every trailing % divides by 100, also when
+        // the group separator is a space.
+        for (args, expected) in [
+            (&["9% %"][..], 0.0009),
+            (&["9% %", ".", " "][..], 0.0009),
+            (&["9 % %", ".", " "][..], 0.0009),
+            (&["1 234 % ", ".", " "][..], 12.34),
+            (&["9 %", ",", " "][..], 0.09),
+        ] {
+            assert_eq!(run(args), LiteralValue::Number(expected), "{args:?}");
+        }
+        for args in [&["% %", ".", " "][..], &["9% 5", ".", " "][..]] {
             assert!(
                 matches!(run(args), LiteralValue::Error(e) if e.kind == ExcelErrorKind::Value),
                 "{args:?}"
