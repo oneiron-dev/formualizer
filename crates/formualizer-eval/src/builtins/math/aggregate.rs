@@ -2120,7 +2120,7 @@ fn aggregate_order_statistic(
     k: Option<f64>,
 ) -> Result<f64, ExcelError> {
     use crate::builtins::stats::{
-        nth_smallest, order_statistic_rank, percentile_exc, percentile_inc,
+        largest_rank, nth_smallest, order_statistic_rank, percentile_exc, percentile_inc,
     };
     let k = k.unwrap_or(0.0);
     match function_num {
@@ -2153,11 +2153,11 @@ fn aggregate_order_statistic(
         14 | 15 => {
             // LARGE's and SMALL's bounds, on k as given: 3.1 over three
             // numbers is #NUM!, and a NaN k (no Excel number) fails them too.
-            let k = order_statistic_rank(k, nums.len())?;
+            // Within them LARGE takes the ceiling of k and SMALL truncates it.
             let index = if function_num == 14 {
-                nums.len() - k
+                nums.len() - largest_rank(k, nums.len())?
             } else {
-                k - 1
+                order_statistic_rank(k, nums.len())? - 1
             };
             Ok(nth_smallest(&mut nums, index))
         }
@@ -2591,8 +2591,11 @@ mod tests_subtotal_aggregate {
         }
         assert_eq!(rank(14, 3.0), Ok(1.0));
         assert_eq!(rank(15, 3.0), Ok(3.0));
-        // A fraction within the count is still dropped.
-        assert_eq!(rank(14, 2.5), Ok(2.0));
+        // Within the count LARGE takes the ceiling of a fraction and SMALL
+        // drops it.
+        assert_eq!(rank(14, 2.5), Ok(1.0));
+        assert_eq!(rank(14, 2.1), Ok(1.0));
+        assert_eq!(rank(14, 1.0000001), Ok(2.0));
         assert_eq!(rank(15, 1.9), Ok(1.0));
     }
 }

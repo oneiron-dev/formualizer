@@ -522,25 +522,35 @@ pub fn snap_cancellation(sum: f64, a: f64, b: f64) -> f64 {
     }
 }
 
-/// Excel's reading of a whole number in the functions that take positions:
-/// INDEX's row_num, column_num and area_num, VLOOKUP's and HLOOKUP's index,
-/// ADDRESS's row, column and abs_num, and DATE's year, month and day. A value
-/// within 2^-22 below a whole number is that number and any other fraction
-/// truncates, `floor(n + 2^-22)`. The window is absolute,
-/// the same at 2, 1999 and 100000 (Excel for Windows 16.0.20430:
+/// The window below a whole number within which Excel reads a fraction as
+/// that number: 2^-22, absolute, the same at 2, 1999 and 100000.
+const WHOLE_NUMBER_WINDOW: f64 = 1.0 / (1u64 << 22) as f64;
+
+/// Excel's reading of a whole number in the functions that take positions or
+/// counts: INDEX's row_num, column_num and area_num, VLOOKUP's and HLOOKUP's
+/// index, ADDRESS's row, column and abs_num, DATE's year, month and day,
+/// SEQUENCE's rows and columns and LEFT's and RIGHT's num_chars. A value within
+/// 2^-22 below a whole number is that number and any other fraction rounds
+/// down, negatives included: `floor(n + 2^-22)` (Excel for Windows 16.0.20430:
 /// `INDEX({10;20;30},2-2.38E-7)` is 20 and `2-2.39E-7` is 10;
-/// `INDEX(SEQUENCE(200000),100000-2.2E-7)` is 100000 and `-2.6E-7` is 99999),
-/// so `10^6*MOD(2/10^6+2,1)`, which is 1.9999999998354667, is row 2; VLOOKUP's
-/// index, ADDRESS's row and DATE's month read the same way. A negative value
-/// truncates toward zero. OFFSET, CHOOSE, SMALL, MID, REPT, TIME and INT
-/// truncate without the window; LARGE rounds.
+/// `INDEX(SEQUENCE(200000),100000-2.2E-7)` is 100000 and `-2.6E-7` is 99999;
+/// `INDEX({10;20;30},-0.5)` is #VALUE!, row -1, while `-1E-9` is row 0, the
+/// whole column; `DATE(2026,-0.5,1)` is November 1 2025, month -1). So
+/// `10^6*MOD(2/10^6+2,1)`, which is 1.9999999998354667, is row 2. ROUND's
+/// digits snap toward zero ([`snapped_toward_zero`]); OFFSET, CHOOSE, SMALL,
+/// MID, REPT, ROUNDUP, ROUNDDOWN, TIME and INT truncate without the window;
+/// LARGE takes the ceiling of k.
 pub fn snapped_whole_number(n: f64) -> f64 {
-    const WINDOW: f64 = 1.0 / (1u64 << 22) as f64;
-    if n > 0.0 {
-        (n + WINDOW).floor()
-    } else {
-        n.trunc()
-    }
+    (n + WHOLE_NUMBER_WINDOW).floor()
+}
+
+/// ROUND's num_digits: a value within 2^-22 below a whole number is that
+/// number and any other fraction goes toward zero (`ROUND(1.23456,2-1E-7)` is
+/// 1.23, `ROUND(1234.5,-0.5)` is 1235, digits 0). A whole number stays itself:
+/// digits -2 are -2, not the -1 that `trunc(-2 + 2^-22)` would give.
+pub fn snapped_toward_zero(n: f64) -> f64 {
+    let snapped = snapped_whole_number(n);
+    if snapped > n { snapped } else { n.trunc() }
 }
 
 #[cfg(test)]
@@ -568,7 +578,22 @@ mod tests {
         assert_eq!(snapped_whole_number(2.0), 2.0);
         assert_eq!(snapped_whole_number(2.0 + 1e-7), 2.0);
         assert_eq!(snapped_whole_number(0.0), 0.0);
-        assert_eq!(snapped_whole_number(-1.5), -1.0);
+        // Negatives round down too: -0.5 is -1, -1E-9 is 0.
+        assert_eq!(snapped_whole_number(-0.5), -1.0);
+        assert_eq!(snapped_whole_number(-0.9999999), -1.0);
+        assert_eq!(snapped_whole_number(-1.5), -2.0);
+        assert_eq!(snapped_whole_number(-1e-9), 0.0);
+        assert_eq!(snapped_whole_number(-1.0 - 1e-7), -1.0);
+        // ROUND's digits go toward zero after the same window.
+        assert_eq!(snapped_toward_zero(2.0 - 1e-7), 2.0);
+        assert_eq!(snapped_toward_zero(2.0 - 3e-7), 1.0);
+        assert_eq!(snapped_toward_zero(2.6), 2.0);
+        assert_eq!(snapped_toward_zero(-0.5), 0.0);
+        assert_eq!(snapped_toward_zero(-1.5), -1.0);
+        assert_eq!(snapped_toward_zero(-2.0), -2.0);
+        assert_eq!(snapped_toward_zero(-2.0 - 1e-7), -2.0);
+        assert_eq!(snapped_toward_zero(-2.0 + 1e-7), -1.0);
+        assert_eq!(snapped_toward_zero(-1e-9), 0.0);
     }
 
     #[test]

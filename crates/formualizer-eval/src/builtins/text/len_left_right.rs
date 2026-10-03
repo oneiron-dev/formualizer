@@ -282,11 +282,14 @@ impl Function for RightFn {
     }
 }
 
+/// LEFT's and RIGHT's num_chars: a number within 2^-22 below a whole number is
+/// that number and other fractions round down (`LEFT("abcd",2-1E-7)` is "ab",
+/// `LEFT("abcd",-0.5)` is #VALUE!), as Excel reads them.
 fn number_like<'a, 'b>(arg: &ArgumentHandle<'a, 'b>) -> Result<i64, ExcelError> {
     let v = scalar_like_value(arg)?;
     Ok(match v {
         LiteralValue::Int(i) => i,
-        LiteralValue::Number(f) => f as i64,
+        LiteralValue::Number(f) => crate::coercion::snapped_whole_number(f) as i64,
         LiteralValue::Empty => 0,
         LiteralValue::Text(t) => t.parse::<i64>().unwrap_or(0),
         LiteralValue::Boolean(b) => {

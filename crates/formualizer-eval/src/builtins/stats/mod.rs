@@ -216,6 +216,14 @@ pub(crate) fn order_statistic_rank(k: f64, count: usize) -> Result<usize, ExcelE
     Ok(k.trunc() as usize)
 }
 
+/// LARGE's k (also AGGREGATE's function 14): the bounds are on k as given, as
+/// for SMALL (`order_statistic_rank`), and within them k is its ceiling, so
+/// `LARGE({10,20,30},2.1)` is the third largest and `1.0000001` the second
+/// (Excel for Windows 16.0.20430).
+pub(crate) fn largest_rank(k: f64, count: usize) -> Result<usize, ExcelError> {
+    order_statistic_rank(k, count).map(|_| k.ceil() as usize)
+}
+
 /// k-th order statistic (0-based, ascending). Reorders `nums` in place.
 pub(crate) fn nth_smallest(nums: &mut [f64], k: usize) -> f64 {
     let (_, kth, _) = nums.select_nth_unstable_by(k, |a, b| a.partial_cmp(b).unwrap());
@@ -548,8 +556,8 @@ impl Function for RankAvgFn {
 /// # Remarks
 /// - `k` must be at least `1`.
 /// - Returns `#NUM!` if `k` is greater than the count of numeric values.
-/// - Within those bounds `k` rounds to the nearest whole number, as in Excel
-///   (`LARGE({10,20,30},2.6)` is 10, the third largest), where `SMALL` truncates its `k`.
+/// - Within those bounds `k` is its ceiling, as in Excel (`LARGE({10,20,30},2.1)` is 10, the
+///   third largest), where `SMALL` truncates its `k`.
 /// - Non-numeric values in referenced ranges are ignored.
 ///
 /// # Examples
@@ -638,10 +646,9 @@ impl Function for LARGE {
         }
         let mut nums = collect_numeric_stats(&args[..args.len() - 1])?;
         // The bounds are on k as given (3.1 over three numbers is #NUM!);
-        // within them LARGE rounds k to the nearest whole number, where SMALL
-        // truncates it.
-        let k = match order_statistic_rank(k, nums.len()) {
-            Ok(_) => k.round() as usize,
+        // within them LARGE takes the ceiling of k, where SMALL truncates it.
+        let k = match largest_rank(k, nums.len()) {
+            Ok(k) => k,
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
         // k-th largest == (n-k)-th smallest: quickselect instead of full sort.
@@ -11615,9 +11622,11 @@ mod tests_basic_stats {
         assert_close("=LARGE({1,2,3},3)", 1.0);
         assert_close("=SMALL({1,2,3},3)", 3.0);
         assert_close("=LARGE(A1:A4,3)", 1.0);
-        // Within the count LARGE rounds a fraction and SMALL drops it.
+        // Within the count LARGE takes the ceiling of a fraction and SMALL
+        // drops it.
         assert_close("=LARGE({1,2,3},2.5)", 1.0);
-        assert_close("=LARGE({1,2,3},2.4)", 2.0);
+        assert_close("=LARGE({1,2,3},2.1)", 1.0);
+        assert_close("=LARGE({1,2,3},1.0000001)", 2.0);
         assert_close("=SMALL({1,2,3},1.5)", 1.0);
         assert_close("=SMALL({1,2,3},2.9999)", 2.0);
         assert_eq!(

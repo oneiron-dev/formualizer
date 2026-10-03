@@ -4,7 +4,8 @@
 //! whole number as that number (`floor(n + 2^-22)`), so
 //! `INDEX(range,10^6*MOD(row/10^6+col,1))` lands on `row` when MOD leaves
 //! 1.9999999998354667. OFFSET, CHOOSE, SMALL, MID, REPT, TIME and INT truncate
-//! without that window, and LARGE rounds its k.
+//! without that window, and LARGE takes the ceiling of its k
+//! (`whole_number_probes` holds the later probes).
 
 use crate::engine::{Engine, EvalConfig};
 use crate::test_workbook::TestWorkbook;
@@ -206,14 +207,14 @@ fn truncating_arguments_keep_truncating() {
 }
 
 #[test]
-fn large_rounds_k_within_its_bounds() {
+fn large_takes_the_ceiling_of_k_within_its_bounds() {
     let num =
         |e: &LiteralValue| matches!(e, LiteralValue::Error(e) if e.kind == ExcelErrorKind::Num);
     assert_cases(&[
         ("=LARGE({10,20,30},2-1E-7)", n(20.0)),
         ("=LARGE({10,20,30},2.6)", n(10.0)),
         ("=LARGE({10,20,30},2.9999)", n(10.0)),
-        ("=LARGE({10,20,30},2.4)", n(20.0)),
+        ("=LARGE({10,20,30},2.4)", n(10.0)),
         ("=LARGE({10,20,30},1)", n(30.0)),
     ]);
     let mut engine = engine();

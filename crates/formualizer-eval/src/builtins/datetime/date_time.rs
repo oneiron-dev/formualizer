@@ -62,8 +62,8 @@ fn num_error<'b>() -> Result<crate::traits::CalcValue<'b>, ExcelError> {
 /// # Remarks
 /// - Years in the range `0..=1899` are interpreted as `1900..=3799` for Excel compatibility.
 /// - A year, month or day within 2^-22 below a whole number is that number, as in Excel
-///   (`DATE(2026,2-1E-7,1)` is February 1); other fractions truncate (`DATE(2026,2.9999,1)`
-///   is February 1).
+///   (`DATE(2026,2-1E-7,1)` is February 1); other fractions round down (`DATE(2026,2.9999,1)`
+///   is February 1, `DATE(2026,-0.5,1)` is month -1, November 1 2025).
 /// - The returned serial is date-system aware and depends on the active workbook system (`1900` vs `1904`).
 /// - In the `1900` system, serial mapping preserves Excel's historical phantom `1900-02-29` behavior.
 ///

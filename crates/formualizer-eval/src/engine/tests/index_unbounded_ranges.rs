@@ -143,7 +143,7 @@ fn index_whole_column_past_the_data_is_a_blank_cell() {
     engine
         .set_cell_formula("Sheet1", 1, 4, parse("=INDEX(B:B,5,1)&\"\"").unwrap())
         .unwrap();
-    // Beyond the grid and negative indexes are #REF!.
+    // A negative index is #VALUE!; one beyond the grid is #REF!.
     engine
         .set_cell_formula("Sheet1", 2, 4, parse("=INDEX(B:B,-1,1)").unwrap())
         .unwrap();
@@ -155,10 +155,10 @@ fn index_whole_column_past_the_data_is_a_blank_cell() {
         engine.get_cell_value("Sheet1", 1, 4),
         Some(LiteralValue::Text(String::new()))
     );
-    for row in [2u32, 3u32] {
+    for (row, kind) in [(2u32, ExcelErrorKind::Value), (3u32, ExcelErrorKind::Ref)] {
         match engine.get_cell_value("Sheet1", row, 4) {
-            Some(LiteralValue::Error(e)) => assert_eq!(e.kind, ExcelErrorKind::Ref),
-            other => panic!("Sheet1!R{row}C4: expected #REF!, got {other:?}"),
+            Some(LiteralValue::Error(e)) => assert_eq!(e.kind, kind),
+            other => panic!("Sheet1!R{row}C4: expected {kind:?}, got {other:?}"),
         }
     }
 }
@@ -245,7 +245,7 @@ fn static_index_self_loop_classification_matches_index_reference_semantics() {
         for (row, kind) in [
             (2, ExcelErrorKind::Circ),
             (3, ExcelErrorKind::Circ),
-            (4, ExcelErrorKind::Ref),
+            (4, ExcelErrorKind::Value),
             (5, ExcelErrorKind::Circ),
         ] {
             let col = if row == 2 { 2 } else { 1 };

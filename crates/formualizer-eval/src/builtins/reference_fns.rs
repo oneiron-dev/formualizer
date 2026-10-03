@@ -302,8 +302,10 @@ impl IndexFn {
             None if sr == er => (1, position),
             None => (position, 0),
         };
+        // A negative position is no position at all (#VALUE!, like an
+        // area_num below 1); one past the area is #REF!.
         if row < 0 || col < 0 {
-            return Some(Err(ExcelError::new(ExcelErrorKind::Ref)));
+            return Some(Err(ExcelError::new(ExcelErrorKind::Value)));
         }
         // Whole columns and rows stay open-ended (A:A, not A1:A1048576).
         let full_rows = sr == 1 && er == EXCEL_MAX_ROW;
@@ -444,15 +446,16 @@ impl IndexFn {
 ///   selects the entire row, like `column_num` = `0` (Excel behavior).
 /// - A `row_num` or `column_num` of `0` selects the entire column or row respectively
 ///   (both `0` selects the whole range), matching Excel.
-/// - Negative or out-of-bounds indexes return `#REF!`, however large.
+/// - A negative index returns `#VALUE!` (`INDEX({10;20;30},-0.5)`: -0.5 reads as -1); an index
+///   past the end returns `#REF!`, however large.
 /// - A structured reference is the cells it selects: `INDEX(Table1[Qty],2)` is the second
 ///   data cell of that column.
 /// - `row_num`, `column_num` and `area_num` are numbers: a blank cell is 0, TRUE and FALSE
 ///   are 1 and 0, and numeric text converts. Other text returns `#VALUE!`, and an error
 ///   index returns that error.
 /// - A `row_num`, `column_num` or `area_num` within 2^-22 below a whole number is that
-///   number, as in Excel: `INDEX({10;20;30},1.9999999985)` is 20. Other fractions truncate
-///   (2.9999 is row 2).
+///   number, as in Excel: `INDEX({10;20;30},1.9999999985)` is 20. Other fractions round down
+///   (2.9999 is row 2, -0.5 is -1, -1E-9 is 0).
 /// - An array `row_num`, `column_num` or `area_num` returns an array of the selected values,
 ///   paired and broadcast element by element like any single-value parameter.
 /// - In a workbook formula entered without the array flag, a range `row_num`, `column_num` or
@@ -499,7 +502,7 @@ impl IndexFn {
 ///   - q: "How does INDEX behave when column_num is omitted?"
 ///     a: "For single-row or single-column inputs, row_num selects the position along that vector; for 2D inputs, an omitted column_num returns the entire row, like column_num 0."
 ///   - q: "Which errors indicate bad indexes?"
-///     a: "A blank index is 0, TRUE and FALSE are 1 and 0, and numeric text converts; other text returns #VALUE! and an error index returns that error. A 0 row_num/column_num selects an entire column/row (Excel behavior); negative or out-of-bounds indexes return #REF!."
+///     a: "A blank index is 0, TRUE and FALSE are 1 and 0, and numeric text converts; other text returns #VALUE! and an error index returns that error. A 0 row_num/column_num selects an entire column/row (Excel behavior); a negative index returns #VALUE! and an out-of-bounds index #REF!."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: INDEX
@@ -667,8 +670,11 @@ impl Function for IndexFn {
                     )));
                 }
             }
+            // A negative position is #VALUE!; one past the array is #REF!.
             if row < 0 || col < 0 {
-                return Ok(ref_err());
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                    ExcelError::new(ExcelErrorKind::Value),
+                )));
             }
             // A position beyond the address space is past the array's end.
             let (Ok(row), Ok(col)) = (usize::try_from(row), usize::try_from(col)) else {
@@ -1693,15 +1699,15 @@ mod tests {
     }
 
     #[test]
-    fn index_negative_index_is_ref() {
+    fn index_negative_index_is_value_error() {
         let wb = TestWorkbook::new()
             .with_cell_a1("Sheet1", "A1", LiteralValue::Int(10))
             .with_function(std::sync::Arc::new(IndexFn));
 
         let value = evaluate_formula("=INDEX(A1:C3,-1,2)", &wb).unwrap();
         match value {
-            LiteralValue::Error(err) => assert_eq!(err.kind, ExcelErrorKind::Ref),
-            other => panic!("expected #REF!, got {other:?}"),
+            LiteralValue::Error(err) => assert_eq!(err.kind, ExcelErrorKind::Value),
+            other => panic!("expected #VALUE!, got {other:?}"),
         }
     }
 
@@ -1805,13 +1811,13 @@ mod tests {
     }
 
     #[test]
-    fn index_array_constant_negative_is_ref() {
+    fn index_array_constant_negative_is_value_error() {
         let wb = TestWorkbook::new().with_function(std::sync::Arc::new(IndexFn));
 
         let value = evaluate_formula("=INDEX({1,2,3},-1)", &wb).unwrap();
         match value {
-            LiteralValue::Error(err) => assert_eq!(err.kind, ExcelErrorKind::Ref),
-            other => panic!("expected #REF!, got {other:?}"),
+            LiteralValue::Error(err) => assert_eq!(err.kind, ExcelErrorKind::Value),
+            other => panic!("expected #VALUE!, got {other:?}"),
         }
     }
 

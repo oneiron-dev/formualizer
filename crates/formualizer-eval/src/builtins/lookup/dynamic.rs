@@ -2228,6 +2228,8 @@ pub struct SequenceFn;
 /// # Remarks
 /// - Defaults: `columns=1`, `start=1`, `step=1`.
 /// - `rows` and `columns` must be positive; otherwise returns `#VALUE!`.
+/// - A `rows` or `columns` within 2^-22 below a whole number is that number, as in Excel
+///   (`SEQUENCE(2-1E-7)` has 2 rows); other fractions round down (`SEQUENCE(-0.5)` is `#VALUE!`).
 /// - Values are emitted as integers when integral, otherwise as floating-point numbers.
 /// - Result spills to the requested dimensions.
 ///
@@ -2347,8 +2349,10 @@ impl Function for SequenceFn {
                     .map_err(|_| ExcelError::new(ExcelErrorKind::Value)),
             }
         };
-        let rows = num(0)? as i64;
-        let cols = num(1)? as i64;
+        // rows and columns are whole numbers read like INDEX's positions:
+        // 2-1E-7 is 2, 2.6 is 2, -0.5 is -1 (#VALUE!).
+        let rows = crate::coercion::snapped_whole_number(num(0)?) as i64;
+        let cols = crate::coercion::snapped_whole_number(num(1)?) as i64;
         let start = num(2)?;
         let step = num(3)?;
         if rows <= 0 || cols <= 0 {
