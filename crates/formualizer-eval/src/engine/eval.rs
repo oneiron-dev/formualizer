@@ -1262,6 +1262,20 @@ fn arena_single_value(data_store: &crate::engine::arena::DataStore, node: AstNod
             ) && arena_single_value(data_store, *left_id)
                 && arena_single_value(data_store, *right_id)
         }
+        // A builtin whose parameters are all single values gives one value
+        // for single-value arguments (`ABS(1)`, `DATE(2026,1,1)`), except
+        // FILTERXML, which returns every matching node.
+        Some(AstNodeData::Function { name_id, .. }) => {
+            let name = data_store.resolve_ast_string(*name_id);
+            let name = crate::formula_plane::template_canonical::normalize_function_name(name);
+            name != "FILTERXML"
+                && matches!(crate::lift::lift_spec(&name), Some(crate::lift::Lift::All))
+                && data_store
+                    .get_args(node)
+                    .unwrap_or(&[])
+                    .iter()
+                    .all(|&arg| arena_single_value(data_store, arg))
+        }
         _ => false,
     }
 }
@@ -1365,15 +1379,14 @@ fn function_result_extent(
             let fits = |s: Option<f64>, high: u64| {
                 s.is_some_and(|n| (0.0..=high as f64).contains(&position(n)))
             };
-            // An array row_num or column_num is lifted: each element is one
-            // value. So is an area_num that is an array or a multi-cell range;
-            // a scalar expression (`ABS(1)`) is one area, read like the other
-            // selectors (area 1 is the source itself).
-            let area_scalar = extent(3, false) == (1, 1);
+            // An index that may hold several values is lifted: each element is
+            // one value (`{1,1}`, `SEQUENCE(1,2)`). A single value (`ABS(1)`)
+            // is one area, read like the other selectors (area 1 is the source
+            // itself).
             let area_one = !given(3) || selector(3).is_some_and(|n| position(n) == 1.0);
             let selects = single(1)
                 && single(2)
-                && area_scalar
+                && single(3)
                 && (succeeded || (fits(row, array.0) && fits(col, array.1) && area_one));
             let whole = |s: Option<f64>| s.is_some_and(|n| position(n) == 0.0);
             let selected = if selects {

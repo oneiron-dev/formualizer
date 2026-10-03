@@ -304,14 +304,32 @@ fn index_result_extent_matches_what_index_selects() {
             "{formula}"
         );
     }
-    // An array area_num is lifted: one value per element, not a column each.
-    let engine = on_result_sheet("=INDEX(Sheet1!A:A,0,1,{1,1})");
-    assert_eq!(engine.get_cell_value("Result", 2, 10), Some(n(11.0)));
-    assert_eq!(engine.get_cell_value("Result", 2, 11), Some(n(11.0)));
-    assert!(matches!(
-        engine.get_cell_value("Result", 3, 10),
-        None | Some(LiteralValue::Empty)
-    ));
+    // An array area_num is lifted: one value per element, not a column each,
+    // however the array is written.
+    for formula in [
+        "=INDEX(Sheet1!A:A,0,1,{1,1})",
+        "=INDEX(Sheet1!A:A,0,1,SEQUENCE(1,2,1,0))+0",
+        "=INDEX(Sheet1!A:A,0,1,FILTER({1,1},{TRUE,TRUE}))+0",
+    ] {
+        let engine = on_result_sheet(formula);
+        assert_eq!(
+            engine.get_cell_value("Result", 2, 10),
+            Some(n(11.0)),
+            "{formula}"
+        );
+        assert_eq!(
+            engine.get_cell_value("Result", 2, 11),
+            Some(n(11.0)),
+            "{formula}"
+        );
+        assert!(
+            matches!(
+                engine.get_cell_value("Result", 3, 10),
+                None | Some(LiteralValue::Empty)
+            ),
+            "{formula}"
+        );
+    }
 }
 
 #[test]
