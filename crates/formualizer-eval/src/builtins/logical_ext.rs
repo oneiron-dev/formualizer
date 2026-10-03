@@ -253,12 +253,21 @@ impl Function for IfErrorFn {
             )));
         }
         match args[0].value() {
-            Ok(cv) if matches!(cv.as_scalar(), Some(LiteralValue::Error(_))) => args[1].value(),
+            Ok(cv) if matches!(cv.as_scalar(), Some(LiteralValue::Error(_))) => {
+                crate::traits::record_selection("IFERROR", args, Some(1));
+                args[1].value()
+            }
             Ok(cv) => match crate::lift::array_rows(&cv) {
                 Some(rows) => Ok(replace_errors(args, rows, |_| true)),
-                None => Ok(cv),
+                None => {
+                    crate::traits::record_selection("IFERROR", args, Some(0));
+                    Ok(cv)
+                }
             },
-            Err(_) => args[1].value(),
+            Err(_) => {
+                crate::traits::record_selection("IFERROR", args, Some(1));
+                args[1].value()
+            }
         }
     }
 }
@@ -382,13 +391,17 @@ impl Function for IfNaFn {
         let value = args[0].value()?;
         match value.as_scalar() {
             Some(LiteralValue::Error(e)) if e.kind == formualizer_common::ExcelErrorKind::Na => {
+                crate::traits::record_selection("IFNA", args, Some(1));
                 args[1].value()
             }
             _ => match crate::lift::array_rows(&value) {
                 Some(rows) => Ok(replace_errors(args, rows, |e| {
                     e.kind == formualizer_common::ExcelErrorKind::Na
                 })),
-                None => Ok(value),
+                None => {
+                    crate::traits::record_selection("IFNA", args, Some(0));
+                    Ok(value)
+                }
             },
         }
     }
@@ -465,7 +478,8 @@ impl Function for IfsFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Option<Result<formualizer_parse::parser::ReferenceType, ExcelError>> {
-        resolution_to_reference(resolve_ifs_reference_or_value(args, ctx))
+        let _probe = crate::traits::probe_references();
+        resolution_to_reference(resolve_ifs_reference_or_value(args, ctx, false))
     }
     fn resolve_reference_or_value<'a, 'b, 'c>(
         &self,
@@ -473,7 +487,7 @@ impl Function for IfsFn {
         ctx: &dyn FunctionContext<'b>,
         _value_fallback: &dyn Fn() -> Result<crate::traits::CalcValue<'b>, ExcelError>,
     ) -> Result<FunctionResolution<'b>, ExcelError> {
-        resolve_ifs_reference_or_value(args, ctx)
+        resolve_ifs_reference_or_value(args, ctx, true)
     }
     fn eval<'a, 'b, 'c>(
         &self,
@@ -485,7 +499,7 @@ impl Function for IfsFn {
                 ExcelError::new_value(),
             )));
         }
-        for pair in args.chunks(2) {
+        for (index, pair) in args.chunks(2).enumerate() {
             let cond = pair[0].value()?.into_literal();
             let is_true = match cond {
                 LiteralValue::Boolean(b) => b,
@@ -493,18 +507,22 @@ impl Function for IfsFn {
                 LiteralValue::Int(i) => i != 0,
                 LiteralValue::Empty => false,
                 LiteralValue::Error(e) => {
+                    crate::traits::record_selection("IFS", args, None);
                     return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
                 }
                 _ => {
+                    crate::traits::record_selection("IFS", args, None);
                     return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                         ExcelError::from_error_string("#VALUE!"),
                     )));
                 }
             };
             if is_true {
+                crate::traits::record_selection("IFS", args, Some(2 * index + 1));
                 return pair[1].value();
             }
         }
+        crate::traits::record_selection("IFS", args, None);
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
             ExcelError::new_na(),
         )))
@@ -527,11 +545,12 @@ fn value_error_resolution<'b>() -> FunctionResolution<'b> {
 fn resolve_ifs_reference_or_value<'b>(
     args: &[ArgumentHandle<'_, 'b>],
     ctx: &dyn FunctionContext<'b>,
+    record: bool,
 ) -> Result<FunctionResolution<'b>, ExcelError> {
     if args.len() < 2 || !args.len().is_multiple_of(2) {
         return Ok(value_error_resolution());
     }
-    for pair in args.chunks(2) {
+    for (index, pair) in args.chunks(2).enumerate() {
         let condition = pair[0].value()?.into_literal();
         let selected = match condition {
             LiteralValue::Boolean(value) => value,
@@ -539,15 +558,29 @@ fn resolve_ifs_reference_or_value<'b>(
             LiteralValue::Int(value) => value != 0,
             LiteralValue::Empty => false,
             LiteralValue::Error(error) => {
+                if record {
+                    crate::traits::record_selection("IFS", args, None);
+                }
                 return Ok(FunctionResolution::Value(crate::traits::CalcValue::Scalar(
                     LiteralValue::Error(error),
                 )));
             }
-            _ => return Ok(value_error_resolution()),
+            _ => {
+                if record {
+                    crate::traits::record_selection("IFS", args, None);
+                }
+                return Ok(value_error_resolution());
+            }
         };
         if selected {
+            if record {
+                crate::traits::record_selection("IFS", args, Some(2 * index + 1));
+            }
             return resolve_selected_non_if(&pair[1], ctx);
         }
+    }
+    if record {
+        crate::traits::record_selection("IFS", args, None);
     }
     Ok(FunctionResolution::Value(crate::traits::CalcValue::Scalar(
         LiteralValue::Error(ExcelError::new_na()),
@@ -650,6 +683,7 @@ impl Function for SwitchFn {
         }
         let expr = args[0].value()?.into_literal();
         if let LiteralValue::Error(e) = &expr {
+            crate::traits::record_selection("SWITCH", args, None);
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 e.clone(),
             )));
@@ -662,15 +696,18 @@ impl Function for SwitchFn {
         } else {
             rest.len()
         };
-        for chunk in rest[..pairs].chunks(2) {
+        for (index, chunk) in rest[..pairs].chunks(2).enumerate() {
             let candidate = chunk[0].value()?.into_literal();
             if switch_values_equal(&expr, &candidate) {
+                crate::traits::record_selection("SWITCH", args, Some(2 * index + 2));
                 return chunk[1].value();
             }
         }
         if has_default {
+            crate::traits::record_selection("SWITCH", args, Some(args.len() - 1));
             return rest.last().unwrap().value();
         }
+        crate::traits::record_selection("SWITCH", args, None);
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
             ExcelError::new_na(),
         )))

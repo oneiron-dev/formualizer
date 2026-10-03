@@ -5,6 +5,8 @@ mod common;
 #[cfg(feature = "calamine")]
 mod calcpr;
 #[cfg(feature = "calamine")]
+mod circular_array_caches;
+#[cfg(feature = "calamine")]
 mod criteria_ingest_blank;
 #[cfg(feature = "calamine")]
 mod criteria_wildcard_parity;

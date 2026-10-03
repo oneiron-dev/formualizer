@@ -449,7 +449,8 @@ impl Function for IfFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Option<Result<formualizer_parse::parser::ReferenceType, ExcelError>> {
-        match try_resolve_if_reference_or_value(args) {
+        let _probe = crate::traits::probe_references();
+        match try_resolve_if_reference_or_value(args, false) {
             Ok(Some(result)) => resolution_to_reference(Ok(result)),
             Ok(None) => None,
             Err(error) => Some(Err(error)),
@@ -462,7 +463,7 @@ impl Function for IfFn {
         _ctx: &dyn FunctionContext<'b>,
         value_fallback: &dyn Fn() -> Result<crate::traits::CalcValue<'b>, ExcelError>,
     ) -> Result<FunctionResolution<'b>, ExcelError> {
-        match try_resolve_if_reference_or_value(args)? {
+        match try_resolve_if_reference_or_value(args, true)? {
             Some(result) => Ok(result),
             None => value_fallback().map(FunctionResolution::Value),
         }
@@ -486,8 +487,12 @@ impl Function for IfFn {
         }
         let b = match if_condition(condition.into_literal()) {
             Ok(b) => b,
-            Err(error) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error))),
+            Err(error) => {
+                crate::traits::record_selection("IF", args, None);
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
+            }
         };
+        crate::traits::record_selection("IF", args, Some(if b { 1 } else { 2 }));
 
         if b {
             args[1].value()
@@ -502,9 +507,9 @@ impl Function for IfFn {
 }
 
 /// The argument (1 or 2) whose value IF returns for a single-value condition,
-/// as `IfFn::eval` selects it. `None` when IF returns no argument's value: a
-/// wrong argument count, an array or error condition, or a FALSE condition
-/// with no value_if_false.
+/// as `IfFn::eval` selects it, recorded as `IfFn::eval` records it. `None`
+/// when IF returns no argument's value: a wrong argument count, an array or
+/// error condition, or a FALSE condition with no value_if_false.
 pub(crate) fn if_selected_argument(args: &[ArgumentHandle<'_, '_>]) -> Option<usize> {
     if !(2..=3).contains(&args.len()) {
         return None;
@@ -513,7 +518,12 @@ pub(crate) fn if_selected_argument(args: &[ArgumentHandle<'_, '_>]) -> Option<us
     if crate::lift::array_rows(&condition).is_some() {
         return None;
     }
-    if if_condition(condition.into_literal()).ok()? {
+    let Ok(selected) = if_condition(condition.into_literal()) else {
+        crate::traits::record_selection("IF", args, None);
+        return None;
+    };
+    crate::traits::record_selection("IF", args, Some(if selected { 1 } else { 2 }));
+    if selected {
         Some(1)
     } else {
         (args.len() == 3).then_some(2)
@@ -569,8 +579,12 @@ fn if_over_array<'b>(
     crate::lift::array_result(rows, args[0].date_system())
 }
 
+/// `record`: whether the argument selected is recorded (see
+/// [`crate::traits::record_selection`]); not when only a reference is wanted
+/// and a value found is discarded.
 fn try_resolve_if_reference_or_value<'b>(
     args: &[ArgumentHandle<'_, 'b>],
+    record: bool,
 ) -> Result<Option<FunctionResolution<'b>>, ExcelError> {
     if args.len() < 2 || args.len() > 3 {
         return Ok(Some(FunctionResolution::Value(
@@ -587,11 +601,17 @@ fn try_resolve_if_reference_or_value<'b>(
     let selected = match if_condition(condition) {
         Ok(selected) => selected,
         Err(error) => {
+            if record {
+                crate::traits::record_selection("IF", args, None);
+            }
             return Ok(Some(FunctionResolution::Value(
                 crate::traits::CalcValue::Scalar(LiteralValue::Error(error)),
             )));
         }
     };
+    if record {
+        crate::traits::record_selection("IF", args, Some(if selected { 1 } else { 2 }));
+    }
     if selected {
         args[1].resolve_reference_or_value().map(Some)
     } else if let Some(arg) = args.get(2) {

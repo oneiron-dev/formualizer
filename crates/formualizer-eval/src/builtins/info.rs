@@ -1937,10 +1937,35 @@ impl Function for CellFn {
         // `contents` and `type` read a value, so they also accept a literal in
         // the reference position (`=CELL("type","")` is "l" in Excel). The
         // metadata info types (`address`, `col`, `row`) derive purely from
-        // reference metadata and must not force the referenced value.
+        // reference metadata and must not force the referenced value. Of a
+        // reference only the upper-left cell is read ("the value of the
+        // upper-left cell in reference"), so CELL("contents",A1:A5) in A5
+        // does not read its own cell.
         if matches!(info_type.as_str(), "contents" | "type") {
             let value = match &reference {
                 Some(area) if structured => first_cell_value(ctx, area)?,
+                Some(formualizer_parse::parser::ReferenceType::Range {
+                    sheet,
+                    start_row,
+                    start_col,
+                    ..
+                }) => {
+                    // The upper-left cell, read as the formula reads a cell
+                    // (a whole column or row starts at row or column 1).
+                    let first = formualizer_parse::parser::ReferenceType::cell(
+                        sheet.clone(),
+                        start_row.unwrap_or(1),
+                        start_col.unwrap_or(1),
+                    );
+                    let node = formualizer_parse::parser::ASTNode::new(
+                        formualizer_parse::parser::ASTNodeType::Reference {
+                            original: first.to_string(),
+                            reference: first,
+                        },
+                        None,
+                    );
+                    cell_top_left(&args[1].literal(&node))?
+                }
                 _ => cell_top_left(&args[1])?,
             };
             if info_type == "contents" {

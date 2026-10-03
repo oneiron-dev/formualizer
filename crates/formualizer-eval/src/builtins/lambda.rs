@@ -227,6 +227,7 @@ impl Function for LetFn {
             };
 
             let (binding, shape) = args[pair_idx + 1].with_env(env.clone(), |value| {
+                let _tracking = crate::traits::track_selections();
                 let binding = let_binding(value)?;
                 let shape = bound_shape(value, &binding);
                 Ok::<_, ExcelError>((binding, shape))
@@ -243,6 +244,9 @@ struct LambdaClosure {
     params: Vec<String>,
     body: ASTNode,
     captured_env: LocalEnv,
+    /// The body node the LAMBDA was written with (see
+    /// [`CustomCallable::written_body`]).
+    written_body: u64,
 }
 
 impl CustomCallable for LambdaClosure {
@@ -267,6 +271,17 @@ impl CustomCallable for LambdaClosure {
         interp: &crate::interpreter::Interpreter<'ctx>,
         args: Vec<LocalBinding>,
     ) -> Result<CalcValue<'ctx>, ExcelError> {
+        self.invoke_shaped_bindings(interp, args.into_iter().map(|arg| (arg, None)).collect())
+    }
+
+    /// Each parameter keeps the shape of its argument's value: one bound to
+    /// a single value is not searched as an array (`LAMBDA(x,MATCH(1,x,0))(1)`
+    /// is #N/A), one bound to a one-element array is.
+    fn invoke_shaped_bindings<'ctx>(
+        &self,
+        interp: &crate::interpreter::Interpreter<'ctx>,
+        args: Vec<(LocalBinding, Option<crate::traits::ResultShape>)>,
+    ) -> Result<CalcValue<'ctx>, ExcelError> {
         if args.len() != self.arity() {
             return Ok(CalcValue::Scalar(LiteralValue::Error(value_error(
                 format!(
@@ -277,17 +292,31 @@ impl CustomCallable for LambdaClosure {
             ))));
         }
 
+        let report = crate::traits::lambda_result_wanted();
         let mut env = self.captured_env.clone();
-        for (name, binding) in self.params.iter().zip(args) {
-            env = env.with_binding(name, binding);
+        for (name, (binding, shape)) in self.params.iter().zip(args) {
+            env = env.with_shaped_binding(name, binding, shape);
         }
 
         let scoped = interp.with_local_env(env);
-        scoped.evaluate_ast(&self.body)
+        // The body is this closure's copy: what its calls record is read
+        // here only, and may not outlive a temporary closure.
+        let _own = crate::traits::track_own_selections();
+        let result = scoped.evaluate_ast(&self.body);
+        // The shape of the result, read from this body as it just ran (the
+        // call site's formula holds the body this one was copied from).
+        if report {
+            crate::traits::report_lambda_result(&ArgumentHandle::new(&self.body, &scoped));
+        }
+        result
     }
 
     fn lambda_parts(&self) -> Option<(&[String], &ASTNode, &LocalEnv)> {
         Some((&self.params, &self.body, &self.captured_env))
+    }
+
+    fn written_body(&self) -> Option<u64> {
+        Some(self.written_body)
     }
 }
 
@@ -419,6 +448,7 @@ impl Function for LambdaFn {
             params,
             body: args[args.len() - 1].ast().clone(),
             captured_env: args[0].current_env(),
+            written_body: crate::traits::written_body_key(&args[args.len() - 1]),
         };
 
         Ok(CalcValue::Callable(Arc::new(closure)))
@@ -501,6 +531,8 @@ impl CustomCallable for EtaCallable {
             },
             None,
         );
+        // What this temporary call records goes with it.
+        let _own = crate::traits::track_own_selections();
         interp.with_local_env(env).evaluate_ast(&body)
     }
 }

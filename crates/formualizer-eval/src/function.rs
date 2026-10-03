@@ -281,22 +281,15 @@ pub trait Function: Send + Sync + 'static {
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         // Central argument validation (includes min-arity check). Arguments
         // the function reads only as a reference (ROWS's, CELL("row",...)'s)
-        // are not read to validate them, as they are not dependencies.
+        // are not read to validate them, as they are not dependencies. CELL
+        // reads at most the upper-left cell of its reference ("contents",
+        // "type"), and reads it itself: validating the reference would read
+        // every cell of a range.
         {
             use crate::args::{ValidationOptions, validate_and_prepare_reading};
             let schema = self.arg_schema();
             let name = self.name();
-            let cell_info = if name.eq_ignore_ascii_case("CELL") {
-                args.first().and_then(|info| match info.value() {
-                    Ok(value) => match value.into_literal() {
-                        LiteralValue::Text(text) => Some(text),
-                        _ => None,
-                    },
-                    Err(_) => None,
-                })
-            } else {
-                None
-            };
+            let cell = name.eq_ignore_ascii_case("CELL");
             if let Err(e) = validate_and_prepare_reading(
                 args,
                 schema,
@@ -305,7 +298,11 @@ pub trait Function: Send + Sync + 'static {
                     min_args: self.min_args(),
                 },
                 |index| {
-                    !crate::engine::refs::reference_only_argument(name, index, cell_info.as_deref())
+                    if cell {
+                        index != 1
+                    } else {
+                        !crate::engine::refs::reference_only_argument(name, index, None)
+                    }
                 },
             ) {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));

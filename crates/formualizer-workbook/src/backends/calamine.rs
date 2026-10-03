@@ -427,9 +427,16 @@ impl ArrayMembers {
     }
 
     /// Whether the 0-based cell lies in an array formula's extent.
+    #[cfg(test)]
     fn covers(&mut self, row: u32, col: u32) -> bool {
+        self.covering(row, col).is_some()
+    }
+
+    /// The 0-based first cell (the formula's) of the array formula extent
+    /// the 0-based cell lies in.
+    fn covering(&mut self, row: u32, col: u32) -> Option<(u32, u32)> {
         if self.extents.is_empty() {
-            return false;
+            return None;
         }
         if self.row != Some(row) {
             if self.row.is_some_and(|last| row < last) {
@@ -451,7 +458,8 @@ impl ArrayMembers {
         }
         self.active
             .iter()
-            .any(|&(_, first, _, last)| (first..=last).contains(&col))
+            .find(|&&(_, first, _, last)| (first..=last).contains(&col))
+            .map(|&(first_row, first_col, _, _)| (first_row, first_col))
     }
 }
 
@@ -988,10 +996,17 @@ impl CalamineAdapter {
             }
 
             // Preserve existing KeepCachedValue behavior: a formula's cached
-            // value is not handed to the value plane. With iteration off it
-            // is the formula's last calculated value, which a formula left
-            // uncalculated on a circular reference keeps.
-            if has_formula {
+            // value is not handed to the value plane, nor is an array formula
+            // member's (it is the anchor's result). With iteration off each
+            // is the last calculated value of its cell, which a formula left
+            // uncalculated on a circular reference keeps, an array formula in
+            // every cell of its area.
+            let array_formula = if has_formula {
+                None
+            } else {
+                array_members.covering(row0, col0)
+            };
+            if has_formula || array_formula.is_some() {
                 if engine.config.cycle.policy
                     == formualizer_eval::engine::CyclePolicy::RetainLastValue
                 {
@@ -1001,13 +1016,36 @@ impl CalamineAdapter {
                         value => data_ref_to_literal(value, engine.config.date_system),
                     };
                     if let Some(value) = value {
-                        engine.set_last_calculated_value(sheet, row0 + 1, col0 + 1, value);
+                        // A member's cache kept is a populated cell like a value.
+                        if !has_formula {
+                            value_cells_observed += 1;
+                            if u64::try_from(value_cells_observed)
+                                .unwrap_or(u64::MAX)
+                                .saturating_add(u64::try_from(formula_count).unwrap_or(u64::MAX))
+                                > engine.workbook_load_limits().max_sheet_logical_cells
+                            {
+                                return Err(calamine::Error::Io(std::io::Error::other(format!(
+                                    "Workbook load budget exceeded in calamine for sheet {sheet}: observed populated cell count exceeds configured logical-cell budget of {}",
+                                    engine.workbook_load_limits().max_sheet_logical_cells
+                                ))));
+                            }
+                        }
+                        match array_formula {
+                            Some((anchor_row0, anchor_col0)) => engine
+                                .set_last_calculated_array_member_value(
+                                    sheet,
+                                    anchor_row0 + 1,
+                                    anchor_col0 + 1,
+                                    row0 + 1,
+                                    col0 + 1,
+                                    value,
+                                ),
+                            None => {
+                                engine.set_last_calculated_value(sheet, row0 + 1, col0 + 1, value)
+                            }
+                        }
                     }
                 }
-                continue;
-            }
-            // Nor is an array formula member's: it is the anchor's result.
-            if array_members.covers(row0, col0) {
                 continue;
             }
             let Some(literal) = data_ref_to_literal(&record.value, engine.config.date_system)

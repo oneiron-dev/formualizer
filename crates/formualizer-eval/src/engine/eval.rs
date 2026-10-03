@@ -1643,9 +1643,17 @@ pub struct Engine<R> {
     /// zero cost otherwise.
     last_calculated_seed: FxHashMap<(SheetId, u32, u32), LiteralValue>,
 
+    /// For a value in [`Self::last_calculated_seed`] supplied for a cell of
+    /// an array formula other than its own, that formula's cell (0-based
+    /// row, column on the same sheet): the value applies while the array
+    /// formula is not calculated (see
+    /// [`Self::set_last_calculated_array_member_value`]).
+    last_calculated_owner: FxHashMap<(SheetId, u32, u32), (u32, u32)>,
+
     /// Last calculated values of formulas whose computed value a row/column
     /// edit cleared while moving them (`clear_computed_overlay_after_row/
-    /// _col`), keyed by vertex so they follow the cell. Under
+    /// _col`), keyed by vertex so they follow the cell; an array formula's
+    /// is its whole result (the values of all its cells). Under
     /// `CyclePolicy::RetainLastValue` only: the last calculated value of a
     /// formula is its latest result, whichever calculation produced it, and
     /// moving the cell neither erases it nor brings back an older one.
@@ -1654,8 +1662,9 @@ pub struct Engine<R> {
     last_calculated_carry: FxHashMap<VertexId, LiteralValue>,
 
     /// The values formulas held when the current evaluation request first
-    /// scheduled them, kept under `CyclePolicy::RetainLastValue` (runtime
-    /// detection) while the request schedules dynamic references. A circular
+    /// scheduled them (an array formula's whole result), kept under
+    /// `CyclePolicy::RetainLastValue` (runtime detection) while the request
+    /// schedules dynamic references. A circular
     /// reference made through `INDIRECT`/`OFFSET` is only found once the
     /// reference has been calculated, after the formulas on it have already
     /// calculated once without knowing they are circular; that one-pass
@@ -3534,6 +3543,7 @@ where
             retained_scc_dirty_at_begin: Vec::new(),
             iterative_state_values: FxHashMap::default(),
             last_calculated_seed: FxHashMap::default(),
+            last_calculated_owner: FxHashMap::default(),
             last_calculated_carry: FxHashMap::default(),
             request_prior_values: FxHashMap::default(),
             kept_last_values: FxHashSet::default(),
@@ -3710,6 +3720,7 @@ where
             retained_scc_dirty_at_begin: Vec::new(),
             iterative_state_values: FxHashMap::default(),
             last_calculated_seed: FxHashMap::default(),
+            last_calculated_owner: FxHashMap::default(),
             last_calculated_carry: FxHashMap::default(),
             request_prior_values: FxHashMap::default(),
             kept_last_values: FxHashSet::default(),
@@ -5777,6 +5788,35 @@ where
         if let Some(sheet_id) = self.graph.sheet_id(sheet) {
             self.last_calculated_seed
                 .insert((sheet_id, row - 1, col - 1), value);
+            self.last_calculated_owner
+                .remove(&(sheet_id, row - 1, col - 1));
+        }
+    }
+
+    /// [`Self::set_last_calculated_value`] for the cell `sheet`!`row`,`col`
+    /// (1-based) of the array formula at `anchor_row`,`anchor_col` other than
+    /// its own (a file's cached value of that cell of the array's result).
+    /// The value applies while that array formula is not calculated; then it
+    /// goes, so a formula entered in the cell later does not inherit it.
+    pub fn set_last_calculated_array_member_value(
+        &mut self,
+        sheet: &str,
+        anchor_row: u32,
+        anchor_col: u32,
+        row: u32,
+        col: u32,
+        value: LiteralValue,
+    ) {
+        if row == 0 || col == 0 || anchor_row == 0 || anchor_col == 0 {
+            return;
+        }
+        if let Some(sheet_id) = self.graph.sheet_id(sheet) {
+            self.last_calculated_seed
+                .insert((sheet_id, row - 1, col - 1), value);
+            self.last_calculated_owner.insert(
+                (sheet_id, row - 1, col - 1),
+                (anchor_row - 1, anchor_col - 1),
+            );
         }
     }
 
@@ -5786,17 +5826,35 @@ where
     /// cells that no longer hold a formula. Formulas the request did not
     /// reach — a targeted calculation of an unrelated cell — keep theirs.
     /// A supplied value for a cell with no vertex yet (a formula still
-    /// staged) is kept.
+    /// staged) is kept; one for a cell of an array formula other than its
+    /// own goes with that formula's.
     fn consume_last_calculated_values(&mut self) {
         let graph = &self.graph;
+        let owners = &self.last_calculated_owner;
         if !self.last_calculated_seed.is_empty() {
+            // Whether the formula at the cell is not calculated yet.
+            let uncalculated = |sheet_id: SheetId, row0: u32, col0: u32| {
+                let cell = graph.make_cell_ref_internal(sheet_id, row0, col0);
+                graph
+                    .get_vertex_id_for_address(&cell)
+                    .is_none_or(|&v| graph.is_live_formula_vertex(v) && graph.is_dirty(v))
+            };
             self.last_calculated_seed
                 .retain(|&(sheet_id, row0, col0), _| {
-                    let cell = graph.make_cell_ref_internal(sheet_id, row0, col0);
-                    graph
-                        .get_vertex_id_for_address(&cell)
-                        .is_none_or(|&v| graph.is_live_formula_vertex(v) && graph.is_dirty(v))
+                    match owners.get(&(sheet_id, row0, col0)) {
+                        // A cell of an array formula: while that formula is
+                        // not calculated.
+                        Some(&(anchor_row0, anchor_col0)) => {
+                            uncalculated(sheet_id, anchor_row0, anchor_col0)
+                        }
+                        None => uncalculated(sheet_id, row0, col0),
+                    }
                 });
+        }
+        if !self.last_calculated_owner.is_empty() {
+            let seeds = &self.last_calculated_seed;
+            self.last_calculated_owner
+                .retain(|cell, _| seeds.contains_key(cell));
         }
         if !self.last_calculated_carry.is_empty() {
             self.last_calculated_carry
@@ -5826,6 +5884,12 @@ where
             let value = match self.graph.get_vertex_kind(vertex) {
                 VertexKind::FormulaScalar | VertexKind::FormulaArray => {
                     self.graph.get_cell_ref(vertex).and_then(|cell| {
+                        // An array formula's value is its whole result: the
+                        // request may take its spill down or overwrite its
+                        // cells before the cycle is found.
+                        if let Some(block) = self.array_formula_block(vertex, cell) {
+                            return Some(LiteralValue::Array(block));
+                        }
                         let sheet_name = self.graph.sheet_name(cell.sheet_id);
                         self.get_cell_value(sheet_name, cell.coord.row() + 1, cell.coord.col() + 1)
                     })
@@ -5875,15 +5939,38 @@ where
             if cell.sheet_id != sheet_id || !shifted(row0, col0) {
                 continue;
             }
-            let seed = self.last_calculated_seed.remove(&(sheet_id, row0, col0));
+            // The value supplied for this formula's own cell (not one
+            // supplied for another array formula's cell here).
+            let seed = match self
+                .last_calculated_owner
+                .contains_key(&(sheet_id, row0, col0))
+            {
+                true => None,
+                false => self.last_calculated_seed.remove(&(sheet_id, row0, col0)),
+            };
             if index(row0, col0) - start0 < deleted {
                 self.last_calculated_carry.remove(&vertex);
                 continue;
             }
-            let value = seed.or_else(|| {
-                self.get_cell_value(&sheet_name, row0 + 1, col0 + 1)
-                    .filter(|value| !matches!(value, LiteralValue::Empty))
-            });
+            // An array formula carries its whole result: every cell of its
+            // area (or spill) with the value supplied for it, else the value
+            // it holds.
+            let block = self.array_formula_block(vertex, cell);
+            let value = match (seed, block) {
+                (Some(seed), Some(block)) => Some(self.last_calculated_array(cell, &block, seed)),
+                (Some(seed), None) => Some(seed),
+                (None, block) => {
+                    let held = self
+                        .get_cell_value(&sheet_name, row0 + 1, col0 + 1)
+                        .filter(|value| !matches!(value, LiteralValue::Empty));
+                    match (held, block) {
+                        (Some(anchor), Some(block)) => {
+                            Some(self.last_calculated_array(cell, &block, anchor))
+                        }
+                        (held, _) => held,
+                    }
+                }
+            };
             // A formula whose value an earlier edit already cleared, and that
             // has not calculated since, keeps the value carried then.
             if let Some(value) = value {
@@ -5893,6 +5980,11 @@ where
         if !self.last_calculated_seed.is_empty() {
             self.last_calculated_seed
                 .retain(|&(sheet, row0, col0), _| sheet != sheet_id || !shifted(row0, col0));
+        }
+        if !self.last_calculated_owner.is_empty() {
+            let seeds = &self.last_calculated_seed;
+            self.last_calculated_owner
+                .retain(|cell, _| seeds.contains_key(cell));
         }
     }
 
@@ -28996,33 +29088,83 @@ where
         self.mirror_vertex_value_to_overlay(vertex_id, circ_error);
     }
 
+    /// The value supplied for the cell `key` as the last calculated value of
+    /// the formula there (not of another array formula's cell).
+    fn supplied_own_value(&self, key: &(SheetId, u32, u32)) -> Option<&LiteralValue> {
+        if self.last_calculated_owner.contains_key(key) {
+            return None;
+        }
+        self.last_calculated_seed.get(key)
+    }
+
+    /// The value supplied for the cell `key` of the array formula whose own
+    /// cell is `anchor` (0-based row and column).
+    fn supplied_member_value(
+        &self,
+        key: &(SheetId, u32, u32),
+        anchor: (u32, u32),
+    ) -> Option<&LiteralValue> {
+        match self.last_calculated_owner.get(key) {
+            Some(owner) if *owner != anchor => None,
+            _ => self.last_calculated_seed.get(key),
+        }
+    }
+
     /// The value a live-cycle member keeps under
     /// [`CyclePolicy::RetainLastValue`]: its last calculated value — the
     /// host-supplied value of a formula the engine has not calculated yet
     /// (see [`Self::set_last_calculated_value`]), else the result a
     /// row/column edit carried for it ([`Self::last_calculated_carry`]),
-    /// else `before`, the value it held before this calculation — or `0`, the
-    /// value of a circular formula that never calculated.
+    /// else the value it held before this request first calculated it
+    /// ([`Self::request_prior_values`]) or before this calculation (`held`,
+    /// with `held_block`, the cells of an array formula) — or `0`, the value
+    /// of a circular formula that never calculated. An array formula keeps
+    /// its whole result: the value of each cell of its area or spill.
     fn last_calculated_value(
         &self,
         vertex: VertexId,
-        cell: &Option<CellRef>,
-        before: &LiteralValue,
+        cell: Option<CellRef>,
+        held: &LiteralValue,
+        held_block: Option<&[Vec<LiteralValue>]>,
     ) -> LiteralValue {
+        // What the formula held before the request calculated it: one pass
+        // of this request already calculated it when a dynamic reference
+        // made it circular, and that pass is not a successful calculation.
+        let (before, block) = match self.request_prior_values.get(&vertex) {
+            Some(LiteralValue::Array(rows)) => (
+                rows.first()
+                    .and_then(|row| row.first())
+                    .unwrap_or(&LiteralValue::Empty),
+                Some(rows.as_slice()),
+            ),
+            Some(prior) => (prior, None),
+            None => (held, held_block),
+        };
+        let as_array =
+            |anchor: LiteralValue, block: Option<&[Vec<LiteralValue>]>| match (block, cell) {
+                (Some(block), Some(cell)) => self.last_calculated_array(cell, block, anchor),
+                _ => anchor,
+            };
         if let Some(cell) = cell
             && let Some(value) =
-                self.last_calculated_seed
-                    .get(&(cell.sheet_id, cell.coord.row(), cell.coord.col()))
+                self.supplied_own_value(&(cell.sheet_id, cell.coord.row(), cell.coord.col()))
         {
-            return value.clone();
+            // A supplied value is a result the engine never calculated: its
+            // array covers the cells the formula covered when the request
+            // began, else those it covers now.
+            return as_array(value.clone(), block.or(held_block));
         }
         if let Some(value) = self.last_calculated_carry.get(&vertex) {
+            // The whole result the edit carried.
             return value.clone();
         }
-        match before {
-            LiteralValue::Empty | LiteralValue::Pending => LiteralValue::Number(0.0),
-            value => value.clone(),
-        }
+        as_array(
+            match before {
+                LiteralValue::Empty | LiteralValue::Pending => LiteralValue::Number(0.0),
+                value => value.clone(),
+            },
+            block,
+        )
     }
 
     /// The cells an array formula at `cell` covers, with the values they hold
@@ -29085,6 +29227,11 @@ where
         block: &[Vec<LiteralValue>],
         anchor: LiteralValue,
     ) -> LiteralValue {
+        // A whole array supplied for its own cell is the whole result.
+        if matches!(anchor, LiteralValue::Array(_)) {
+            return anchor;
+        }
+        let owner = (cell.coord.row(), cell.coord.col());
         let mut anchor = Some(anchor);
         let rows = block
             .iter()
@@ -29101,7 +29248,7 @@ where
                             cell.coord.row() + r as u32,
                             cell.coord.col() + c as u32,
                         );
-                        match self.last_calculated_seed.get(&key) {
+                        match self.supplied_member_value(&key, owner) {
                             Some(value) => value.clone(),
                             None => match held {
                                 LiteralValue::Empty | LiteralValue::Pending => {
@@ -29342,6 +29489,12 @@ where
         let mut pos: Vec<i64> = vec![-1; n];
         // Whether each member's committed value changed in the most recent pass.
         let mut changed = vec![false; n];
+        // Members that read a value which changed afterwards in an earlier
+        // pass and have not run since (see the live-cycle recheck below),
+        // and those of them whose changed value was not a live-cycle
+        // member's.
+        let mut stale_pending = vec![false; n];
+        let mut stale_pending_outside = vec![false; n];
 
         // Evaluate-and-commit one member; returns Ok(true) when the member was
         // stamped `#CIRC!` (array result — would-be spill anchor, spec §7.9).
@@ -29349,6 +29502,8 @@ where
             ($i:expr) => {{
                 let i: usize = $i;
                 let m = &members[i];
+                stale_pending[i] = false;
+                stale_pending_outside[i] = false;
                 if i < recordable {
                     collector.set_current(i as u32);
                 }
@@ -29422,6 +29577,36 @@ where
             }};
         }
 
+        // Commit `value` as member `i`'s value without calculating it: an
+        // array spills as an array result, a former spill is taken down.
+        macro_rules! commit_value {
+            ($i:expr, $value:expr) => {{
+                let i: usize = $i;
+                let value: LiteralValue = $value;
+                let vertex = members[i].vertex;
+                if matches!(value, LiteralValue::Array(_)) {
+                    self.apply_parallel_vertex_result(
+                        vertex,
+                        value.clone(),
+                        delta.as_deref_mut(),
+                        None,
+                    )?;
+                } else if self.graph.spill_registry_has_anchor(vertex) {
+                    // An array this calculation spilled is not a last
+                    // calculated value: take it down.
+                    self.apply_non_array_result_from_parallel(
+                        vertex,
+                        value.clone(),
+                        delta.as_deref_mut(),
+                    );
+                } else {
+                    self.graph.update_vertex_value(vertex, value.clone());
+                    self.mirror_vertex_value_to_overlay(vertex, &value);
+                }
+                last_value[i] = value;
+            }};
+        }
+
         let check_cancel = |flag: Option<&AtomicBool>| -> Result<(), ExcelError> {
             if let Some(flag) = flag
                 && flag.load(Ordering::Relaxed)
@@ -29482,6 +29667,10 @@ where
         // Error flow `1 + settle_passes == passes`, preserving Stage-2
         // behavior exactly).
         let mut settle_passes = 0usize;
+        // Rounds that calculated again stale members a live cycle reads (see
+        // below), bounded defensively.
+        let mut recheck_rounds = 0usize;
+        let recheck_cap = 2 * n + 2;
         loop {
             // Drain this pass's recordings; members that ran replace their
             // out-edge set, members that didn't keep last-known edges.
@@ -29512,6 +29701,109 @@ where
 
             let analysis = analyze_live_graph(n, &edges);
 
+            // A live cycle is only one when its members' reads are current. A
+            // member that read another before that one's value changed in the
+            // pass that just ran calculated from a stale value, and its reads
+            // may not be the ones it makes: `IF(B1=0,A1,5)` in A1 reads its
+            // own cell only while B1 is not yet calculated. Before the policy
+            // decides (not under `Iterate`, whose passes are the iteration),
+            // calculate again, dependencies first, the members the live
+            // cycles read, directly or not, that read a value from outside
+            // the cycles before it changed, with the cycles' members holding
+            // their last values. Values of the cycles' own members are no
+            // calculated results (the policy keeps their last ones), so
+            // reading them is no reason to calculate again. The other stale
+            // readers stay stale until they run.
+            if analysis.cycle_count > 0
+                && !matches!(policy, CyclePolicy::Iterate { .. })
+                && recheck_rounds < recheck_cap
+            {
+                let read_stale = |i: usize, outside: bool| {
+                    out_edges[i].iter().any(|&t| {
+                        let t = t as usize;
+                        analysis.in_cycle[t] != outside
+                            && changed[t]
+                            && (pos[i] < 0 || (pos[t] >= 0 && pos[i] < pos[t]))
+                    })
+                };
+                let stale_outside: Vec<bool> = (0..n)
+                    .map(|i| !excluded[i] && (stale_pending_outside[i] || read_stale(i, true)))
+                    .collect();
+                let stale_now: Vec<bool> = (0..n)
+                    .map(|i| {
+                        !excluded[i]
+                            && (stale_outside[i] || stale_pending[i] || read_stale(i, false))
+                    })
+                    .collect();
+                // The members the live cycles read, directly or not.
+                let mut upstream = analysis.in_cycle.clone();
+                let mut frontier: Vec<usize> = (0..n).filter(|&i| upstream[i]).collect();
+                while let Some(i) = frontier.pop() {
+                    for &t in &out_edges[i] {
+                        let t = t as usize;
+                        if !excluded[t] && !upstream[t] {
+                            upstream[t] = true;
+                            frontier.push(t);
+                        }
+                    }
+                }
+                let rerun: Vec<usize> = analysis
+                    .topo
+                    .iter()
+                    .map(|&i| i as usize)
+                    .filter(|&i| upstream[i] && stale_outside[i])
+                    .collect();
+                if !rerun.is_empty() {
+                    for i in 0..n {
+                        stale_pending[i] |= stale_now[i];
+                        stale_pending_outside[i] |= stale_outside[i];
+                    }
+                    // What the cycles' members hold now is no calculated
+                    // result: while the others calculate again they hold
+                    // their last values (the policy's own), and they are
+                    // calculated again if the cycle goes.
+                    let mut restored = vec![false; n];
+                    for i in 0..n {
+                        if analysis.in_cycle[i] && !excluded[i] {
+                            let value = match policy {
+                                CyclePolicy::RetainLastValue => self.last_calculated_value(
+                                    members[i].vertex,
+                                    members[i].cell,
+                                    &snapshot[i],
+                                    array_before[i].as_deref(),
+                                ),
+                                _ => snapshot[i].clone(),
+                            };
+                            restored[i] = last_value[i] != value;
+                            commit_value!(i, value);
+                            stale_pending[i] = true;
+                        }
+                    }
+                    // Whatever read a value restored now read one that went,
+                    // a spilled cell of it included (not a member's own
+                    // cell, so not among the live edges): every member
+                    // calculates again unless the cycle stays.
+                    if restored.iter().any(|&restored| restored) {
+                        for (pending, excluded) in stale_pending.iter_mut().zip(&excluded) {
+                            *pending |= !*excluded;
+                        }
+                    }
+                    recheck_rounds += 1;
+                    check_cancel(cancel_flag)?;
+                    prev_pass = None;
+                    for x in pos.iter_mut() {
+                        *x = -1;
+                    }
+                    changed.fill(false);
+                    passes += 1;
+                    for (p, i) in rerun.into_iter().enumerate() {
+                        run_member!(i);
+                        pos[i] = p as i64;
+                    }
+                    continue;
+                }
+            }
+
             if analysis.cycle_count > 0 {
                 // Classification repeats every iteration pass under
                 // `Iterate`; record the widest single witness instead of
@@ -29529,44 +29821,15 @@ where
                         // Each round retains at least one more member.
                         for i in 0..n {
                             if analysis.in_cycle[i] && !excluded[i] {
-                                let before = self
-                                    .request_prior_values
-                                    .get(&members[i].vertex)
-                                    .unwrap_or(&snapshot[i]);
                                 let value = self.last_calculated_value(
                                     members[i].vertex,
-                                    &members[i].cell,
-                                    before,
+                                    members[i].cell,
+                                    &snapshot[i],
+                                    array_before[i].as_deref(),
                                 );
-                                let value = match (&array_before[i], members[i].cell) {
-                                    (Some(block), Some(cell)) => {
-                                        self.last_calculated_array(cell, block, value)
-                                    }
-                                    _ => value,
-                                };
-                                let vertex = members[i].vertex;
-                                if matches!(value, LiteralValue::Array(_)) {
-                                    self.apply_parallel_vertex_result(
-                                        vertex,
-                                        value.clone(),
-                                        delta.as_deref_mut(),
-                                        None,
-                                    )?;
-                                } else if self.graph.spill_registry_has_anchor(vertex) {
-                                    // An array this calculation spilled is not
-                                    // a last calculated value: take it down.
-                                    self.apply_non_array_result_from_parallel(
-                                        vertex,
-                                        value.clone(),
-                                        delta.as_deref_mut(),
-                                    );
-                                } else {
-                                    self.graph.update_vertex_value(vertex, value.clone());
-                                    self.mirror_vertex_value_to_overlay(vertex, &value);
-                                }
-                                self.kept_last_values.insert(vertex);
+                                commit_value!(i, value);
+                                self.kept_last_values.insert(members[i].vertex);
                                 excluded[i] = true;
-                                last_value[i] = value;
                             }
                         }
                         check_cancel(cancel_flag)?;
@@ -29724,10 +29987,11 @@ where
                 if excluded[i] {
                     continue;
                 }
-                let is_stale = out_edges[i].iter().any(|&t| {
-                    let t = t as usize;
-                    changed[t] && (pos[i] < 0 || (pos[t] >= 0 && pos[i] < pos[t]))
-                });
+                let is_stale = stale_pending[i]
+                    || out_edges[i].iter().any(|&t| {
+                        let t = t as usize;
+                        changed[t] && (pos[i] < 0 || (pos[t] >= 0 && pos[i] < pos[t]))
+                    });
                 if is_stale {
                     stale.push(i);
                 }

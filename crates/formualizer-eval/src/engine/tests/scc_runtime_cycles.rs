@@ -1748,3 +1748,350 @@ fn retain_last_value_spilled_array_keeps_its_spill_when_it_becomes_circular() {
     assert_eq!(num(&engine, "Sheet1", 2, 2), 2.0);
     assert_eq!(num(&engine, "Sheet1", 3, 2), 3.0);
 }
+
+/// A circular reference found through a calculated reference keeps an array
+/// formula's whole last result: the request's first pass, which took the
+/// spill down (or filled a fixed area with its one value) before the cycle
+/// was known, is not a successful calculation.
+#[test]
+fn circular_array_found_through_a_calculated_reference_keeps_its_whole_result() {
+    let mut engine = retain_engine();
+    set_value(&mut engine, "Sheet1", 1, 3, LiteralValue::Number(3.0)); // C1
+    set_value(&mut engine, "Sheet1", 1, 5, LiteralValue::Text("C1".into())); // E1
+    set_formula(&mut engine, "Sheet1", 1, 4, "=E1"); // D1
+    set_formula(&mut engine, "Sheet1", 1, 2, "=SEQUENCE(INDIRECT(D1))"); // B1:B3
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 3, 2), 3.0);
+    set_value(&mut engine, "Sheet1", 1, 5, LiteralValue::Text("B1".into()));
+    engine.evaluate_all().unwrap();
+    assert!(engine.last_cycle_telemetry().live_cycles_witnessed >= 1);
+    for row in 1..=3u32 {
+        assert_eq!(num(&engine, "Sheet1", row, 2), row as f64, "B{row}");
+    }
+
+    // A legacy array formula over B1:B3.
+    let mut engine = retain_engine();
+    set_value(&mut engine, "Sheet1", 1, 3, LiteralValue::Number(3.0)); // C1
+    set_value(&mut engine, "Sheet1", 1, 4, LiteralValue::Text("C1".into())); // D1
+    set_formula(&mut engine, "Sheet1", 1, 2, "=SEQUENCE(INDIRECT(D1))");
+    engine.use_legacy_array_semantics();
+    engine.declare_array_formula("Sheet1", 1, 2, 3, 1, false);
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 3, 2), 3.0);
+    set_formula(&mut engine, "Sheet1", 1, 5, "=\"B1\""); // E1
+    set_formula(&mut engine, "Sheet1", 1, 4, "=E1"); // D1
+    engine.evaluate_all().unwrap();
+    assert!(engine.last_cycle_telemetry().live_cycles_witnessed >= 1);
+    for row in 1..=3u32 {
+        assert_eq!(num(&engine, "Sheet1", row, 2), row as f64, "B{row}");
+    }
+}
+
+/// A row insertion moves an array formula's whole last result with it, not
+/// only its own cell's value.
+#[test]
+fn retain_last_value_moved_array_formula_keeps_its_whole_result() {
+    let mut engine = retain_engine();
+    set_value(&mut engine, "Sheet1", 1, 4, LiteralValue::Boolean(false)); // D1
+    set_formula(&mut engine, "Sheet1", 1, 3, "=IF(D1,B1+2,3)"); // C1
+    set_formula(&mut engine, "Sheet1", 1, 2, "=SEQUENCE(C1)"); // B1:B3
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 3, 2), 3.0);
+
+    engine.insert_rows("Sheet1", 1, 1).unwrap();
+    set_value(&mut engine, "Sheet1", 2, 4, LiteralValue::Boolean(true)); // D2
+    engine.evaluate_all().unwrap();
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 1);
+    for row in 2..=4u32 {
+        assert_eq!(num(&engine, "Sheet1", row, 2), (row - 1) as f64, "B{row}");
+    }
+    assert_eq!(num(&engine, "Sheet1", 2, 3), 3.0);
+
+    // Supplied values of every cell of a legacy array formula move with it.
+    let formulas = [(1, 1, "={1;2}+SUM(A1:A100)"), (1, 2, "=A2*10")];
+    let mut engine = retain_engine();
+    load_with_arrays(&mut engine, &formulas, &[(1, 1, 2)]);
+    engine.set_last_calculated_value("Sheet1", 1, 1, LiteralValue::Number(5.0));
+    engine.set_last_calculated_value("Sheet1", 2, 1, LiteralValue::Number(6.0));
+    engine.insert_rows("Sheet1", 1, 1).unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 2, 1), 5.0);
+    assert_eq!(num(&engine, "Sheet1", 3, 1), 6.0);
+    assert_eq!(num(&engine, "Sheet1", 2, 2), 60.0);
+}
+
+/// CELL("contents") reads only the upper-left cell of its reference, so a
+/// range running down to the formula's own cell is no circular reference.
+#[test]
+fn cell_contents_of_a_range_reads_only_its_first_cell() {
+    let mut engine = retain_engine();
+    set_value(&mut engine, "Sheet1", 1, 1, LiteralValue::Number(7.0)); // A1
+    set_formula(
+        &mut engine,
+        "Sheet1",
+        5,
+        1,
+        "=CELL(\"contents\",A1:A5)+INDIRECT(\"A1\")",
+    );
+    set_formula(
+        &mut engine,
+        "Sheet1",
+        6,
+        1,
+        "=CELL(\"type\",A1:A6)&INDIRECT(\"A2\")",
+    );
+    engine.set_last_calculated_value("Sheet1", 5, 1, LiteralValue::Number(99.0));
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 5, 1), 14.0);
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 6, 1),
+        Some(LiteralValue::Text("v".into()))
+    );
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 0);
+}
+
+/// A guard that read another member before that member calculated (`B1=0`
+/// while B1 is still empty) is read again before a cycle through the
+/// untaken branch counts: A1 reads itself only while B1 is not calculated.
+#[test]
+fn a_stale_guard_read_does_not_make_a_cycle_live() {
+    let mut engine = retain_engine();
+    set_formula(&mut engine, "Sheet1", 1, 1, "=IF(B1=0,A1,5)"); // A1
+    set_formula(&mut engine, "Sheet1", 1, 2, "=IF(TRUE,6,A1)"); // B1
+    engine.set_last_calculated_value("Sheet1", 1, 1, LiteralValue::Number(99.0));
+    engine.set_last_calculated_value("Sheet1", 1, 2, LiteralValue::Number(6.0));
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 5.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 6.0);
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 0);
+
+    // Under the default policy the cycle through C1 is no #CIRC! either.
+    let mut engine = runtime_engine();
+    set_formula(&mut engine, "Sheet1", 1, 1, "=IF(B1=0,C1,5)"); // A1
+    set_formula(&mut engine, "Sheet1", 1, 2, "=IF(TRUE,6,A1)"); // B1
+    set_formula(&mut engine, "Sheet1", 1, 3, "=A1+0"); // C1
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 5.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 6.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 3), 5.0);
+
+    // Recalculating the stale cycle members leaves the other stale readers
+    // stale: D1 read E1 before E1 calculated, and calculates again.
+    for policy in [CyclePolicy::Error, CyclePolicy::RetainLastValue] {
+        let cycle = CycleConfig {
+            detection: CycleDetection::Runtime,
+            policy,
+        };
+        let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default().with_cycle(cycle));
+        set_formula(&mut engine, "Sheet1", 1, 1, "=IF(B1=0,C1,5)"); // A1
+        set_formula(&mut engine, "Sheet1", 1, 2, "=IF(TRUE,6,D1)"); // B1
+        set_formula(&mut engine, "Sheet1", 1, 3, "=A1+0"); // C1
+        set_formula(
+            &mut engine,
+            "Sheet1",
+            1,
+            4,
+            "=IF(E1=0,10,20)+IF(FALSE,A1,0)",
+        ); // D1
+        set_formula(&mut engine, "Sheet1", 1, 5, "=IF(TRUE,6,A1)"); // E1
+        engine.evaluate_all().unwrap();
+        let values: Vec<f64> = (1..=5).map(|col| num(&engine, "Sheet1", 1, col)).collect();
+        assert_eq!(values, [5.0, 6.0, 5.0, 20.0, 6.0], "{policy:?}");
+        assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 0);
+    }
+
+    // A stale cycle member calculates again after the stale members it reads:
+    // D1's test reads E1, which reads F1, all calculated after it.
+    for policy in [CyclePolicy::Error, CyclePolicy::RetainLastValue] {
+        let cycle = CycleConfig {
+            detection: CycleDetection::Runtime,
+            policy,
+        };
+        let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default().with_cycle(cycle));
+        set_formula(&mut engine, "Sheet1", 1, 1, "=IF(B1=0,C1,D1)"); // A1
+        set_formula(&mut engine, "Sheet1", 1, 2, "=IF(TRUE,6,A1)"); // B1
+        set_formula(&mut engine, "Sheet1", 1, 3, "=A1+0"); // C1
+        set_formula(&mut engine, "Sheet1", 1, 4, "=IF(E1=0,A1,5)"); // D1
+        set_formula(&mut engine, "Sheet1", 1, 5, "=IF(F1=0,0,6)+IF(FALSE,A1,0)"); // E1
+        set_formula(&mut engine, "Sheet1", 1, 6, "=IF(TRUE,1,A1)"); // F1
+        engine.evaluate_all().unwrap();
+        let values: Vec<f64> = (1..=6).map(|col| num(&engine, "Sheet1", 1, col)).collect();
+        assert_eq!(values, [5.0, 6.0, 5.0, 5.0, 6.0, 1.0], "{policy:?}");
+        assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 0);
+    }
+
+    // A cycle member that finds a stale member to read only as it calculates
+    // again calculates once more after that member settles (F1 reads D1).
+    for policy in [CyclePolicy::Error, CyclePolicy::RetainLastValue] {
+        let cycle = CycleConfig {
+            detection: CycleDetection::Runtime,
+            policy,
+        };
+        let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default().with_cycle(cycle));
+        set_formula(&mut engine, "Sheet1", 1, 1, "=IF(B1=0,C1,F1)"); // A1
+        set_formula(&mut engine, "Sheet1", 1, 2, "=IF(TRUE,6,A1)"); // B1
+        set_formula(&mut engine, "Sheet1", 1, 3, "=A1+0"); // C1
+        set_formula(&mut engine, "Sheet1", 1, 4, "=IF(E1=0,0,6)+IF(FALSE,A1,0)"); // D1
+        set_formula(&mut engine, "Sheet1", 1, 5, "=IF(TRUE,1,A1)"); // E1
+        set_formula(&mut engine, "Sheet1", 1, 6, "=IF(G1=0,A1,IF(D1=0,A1,5))"); // F1
+        set_formula(&mut engine, "Sheet1", 1, 7, "=IF(TRUE,6,A1)"); // G1
+        engine.evaluate_all().unwrap();
+        let values: Vec<f64> = (1..=7).map(|col| num(&engine, "Sheet1", 1, col)).collect();
+        assert_eq!(values, [5.0, 6.0, 5.0, 6.0, 1.0, 5.0, 6.0], "{policy:?}");
+        assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 0);
+    }
+
+    // The values of the cycle's own members are no reason to calculate a
+    // member again: with D1 TRUE, A1, B1 and C1 read each other and keep
+    // their last calculated values.
+    let mut engine = retain_engine();
+    set_value(&mut engine, "Sheet1", 1, 4, LiteralValue::Boolean(false)); // D1
+    set_formula(&mut engine, "Sheet1", 1, 1, "=IF(B1=0,C1,5)"); // A1
+    set_formula(&mut engine, "Sheet1", 1, 2, "=IF(D1,A1+1,0)"); // B1
+    set_formula(&mut engine, "Sheet1", 1, 3, "=IF(D1,A1+1,7)"); // C1
+    engine.evaluate_all().unwrap();
+    let values: Vec<f64> = (1..=3).map(|col| num(&engine, "Sheet1", 1, col)).collect();
+    assert_eq!(values, [7.0, 0.0, 7.0]);
+    set_value(&mut engine, "Sheet1", 1, 4, LiteralValue::Boolean(true));
+    engine.evaluate_all().unwrap();
+    let values: Vec<f64> = (1..=3).map(|col| num(&engine, "Sheet1", 1, col)).collect();
+    assert_eq!(values, [7.0, 0.0, 7.0]);
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 1);
+
+    // While a cycle member calculates again, the cycle's members hold their
+    // last values: A1 reads its own 0, not this pass's 7, and stays
+    // circular; C1 and B1 then read each other and keep theirs.
+    let mut engine = retain_engine();
+    set_value(&mut engine, "Sheet1", 1, 26, LiteralValue::Number(0.0)); // Z1
+    set_formula(&mut engine, "Sheet1", 1, 1, "=IF(Z1=0,0,IF(A1=0,D1,C1+1))"); // A1
+    set_formula(&mut engine, "Sheet1", 1, 2, "=IF(Z1=0,0,IF(C1=0,C1,1))"); // B1
+    set_formula(&mut engine, "Sheet1", 1, 3, "=IF(Z1=0,7,IF(A1=0,B1,A1))"); // C1
+    set_formula(&mut engine, "Sheet1", 1, 4, "=IF(Z1=0,7,3)+IF(FALSE,A1,0)"); // D1
+    engine.evaluate_all().unwrap();
+    let values: Vec<f64> = (1..=4).map(|col| num(&engine, "Sheet1", 1, col)).collect();
+    assert_eq!(values, [0.0, 0.0, 7.0, 7.0]);
+    set_value(&mut engine, "Sheet1", 1, 26, LiteralValue::Number(1.0));
+    engine.evaluate_all().unwrap();
+    let values: Vec<f64> = (1..=4).map(|col| num(&engine, "Sheet1", 1, col)).collect();
+    assert_eq!(values, [0.0, 0.0, 7.0, 3.0]);
+
+    // A formula that read a cycle member's value of this pass calculates
+    // again when that value goes back to the member's last one (D1 reads
+    // A1, also through its spill).
+    for (a1, b1, d1) in [
+        (
+            "=IF(Z1=0,0,IF(B1=0,C1+1,0))",
+            "=IF(Z1=0,0,6)+IF(FALSE,D1,0)",
+            "=A1",
+        ),
+        (
+            "=IF(Z1=0,{0;0},IF(B1=0,{1;1}+C1,{0;0}))",
+            "=IF(Z1=0,0,1)+IF(FALSE,D1,0)",
+            "=SUM(A1:A2)",
+        ),
+        (
+            "=IF(Z1=0,{0;0},IF(B1=0,{1;1}+C1,{0;0}))",
+            "=IF(Z1=0,0,1)+IF(FALSE,D1,0)",
+            "=A2+IF(FALSE,A1,0)",
+        ),
+    ] {
+        for policy in [CyclePolicy::Error, CyclePolicy::RetainLastValue] {
+            if policy == CyclePolicy::Error && a1.contains('{') {
+                continue;
+            }
+            let cycle = CycleConfig {
+                detection: CycleDetection::Runtime,
+                policy,
+            };
+            let mut engine =
+                Engine::new(TestWorkbook::new(), EvalConfig::default().with_cycle(cycle));
+            set_value(&mut engine, "Sheet1", 1, 26, LiteralValue::Number(0.0)); // Z1
+            set_formula(&mut engine, "Sheet1", 1, 1, a1);
+            set_formula(&mut engine, "Sheet1", 1, 2, b1);
+            set_formula(&mut engine, "Sheet1", 1, 3, "=A1"); // C1
+            set_formula(&mut engine, "Sheet1", 1, 4, d1);
+            engine.evaluate_all().unwrap();
+            set_value(&mut engine, "Sheet1", 1, 26, LiteralValue::Number(1.0));
+            engine.evaluate_all().unwrap();
+            assert_eq!(num(&engine, "Sheet1", 1, 1), 0.0, "{a1} {policy:?}");
+            assert_eq!(num(&engine, "Sheet1", 1, 3), 0.0, "{a1} {policy:?}");
+            assert_eq!(num(&engine, "Sheet1", 1, 4), 0.0, "{a1} {policy:?}");
+        }
+    }
+
+    // A value supplied for a cell of an array formula other than its own
+    // goes with that formula's: a formula entered there later has no last
+    // calculated value, whatever else is left to calculate.
+    for targeted in [false, true] {
+        let mut engine = retain_engine();
+        set_formula(&mut engine, "Sheet1", 1, 1, "=SEQUENCE(1)"); // A1
+        set_formula(&mut engine, "Sheet1", 1, 2, "=42"); // B1, unrelated
+        engine.set_last_calculated_value("Sheet1", 1, 1, LiteralValue::Number(5.0));
+        engine.set_last_calculated_array_member_value(
+            "Sheet1",
+            1,
+            1,
+            2,
+            1,
+            LiteralValue::Number(99.0),
+        );
+        if targeted {
+            engine.evaluate_cell("Sheet1", 1, 1).unwrap();
+        } else {
+            engine.evaluate_all().unwrap();
+        }
+        assert_eq!(num(&engine, "Sheet1", 1, 1), 1.0);
+        set_formula(&mut engine, "Sheet1", 2, 1, "=A2+1"); // A2
+        if targeted {
+            engine.evaluate_cell("Sheet1", 2, 1).unwrap();
+        } else {
+            engine.evaluate_all().unwrap();
+        }
+        assert_eq!(num(&engine, "Sheet1", 2, 1), 0.0, "targeted={targeted}");
+    }
+
+    // A value supplied for an array formula's cell belongs to that array: a
+    // formula entered in the cell after the array formula went has none.
+    let mut engine = retain_engine();
+    set_formula(&mut engine, "Sheet1", 1, 1, "=SEQUENCE(1)"); // A1
+    engine.set_last_calculated_value("Sheet1", 1, 1, LiteralValue::Number(5.0));
+    engine.set_last_calculated_array_member_value("Sheet1", 1, 1, 2, 1, LiteralValue::Number(99.0));
+    set_value(&mut engine, "Sheet1", 1, 1, LiteralValue::Number(0.0));
+    set_formula(&mut engine, "Sheet1", 2, 1, "=INDIRECT(\"A2\")+1"); // A2
+    engine.evaluate_cell("Sheet1", 2, 1).unwrap();
+    assert_eq!(num(&engine, "Sheet1", 2, 1), 0.0);
+
+    // A whole array supplied for an array formula moves with it as it is.
+    let mut engine = retain_engine();
+    load_with_arrays(
+        &mut engine,
+        &[(1, 1, "=B1+{1;2}"), (1, 2, "=A1+1")],
+        &[(1, 1, 2)],
+    );
+    engine.set_last_calculated_value(
+        "Sheet1",
+        1,
+        1,
+        LiteralValue::Array(vec![
+            vec![LiteralValue::Number(5.0)],
+            vec![LiteralValue::Number(6.0)],
+        ]),
+    );
+    engine.set_last_calculated_value("Sheet1", 1, 2, LiteralValue::Number(9.0));
+    engine.insert_rows("Sheet1", 1, 2).unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(num(&engine, "Sheet1", 3, 1), 5.0);
+    assert_eq!(num(&engine, "Sheet1", 4, 1), 6.0);
+    assert_eq!(num(&engine, "Sheet1", 3, 2), 9.0);
+
+    // A real cycle is still one, whichever member reads first.
+    let mut engine = retain_engine();
+    set_formula(&mut engine, "Sheet1", 1, 1, "=IF(B1=0,A1,B1+1)"); // A1
+    set_formula(&mut engine, "Sheet1", 1, 2, "=A1+1"); // B1
+    engine.set_last_calculated_value("Sheet1", 1, 1, LiteralValue::Number(3.0));
+    engine.set_last_calculated_value("Sheet1", 1, 2, LiteralValue::Number(4.0));
+    engine.evaluate_all().unwrap();
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 1);
+    assert_eq!(num(&engine, "Sheet1", 1, 1), 3.0);
+    assert_eq!(num(&engine, "Sheet1", 1, 2), 4.0);
+}

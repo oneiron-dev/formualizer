@@ -611,10 +611,24 @@ pub fn recalculate_xlsx_bytes(
     // formula, those of every cell of its extent.
     if retain_last_values {
         for (sheet, (_, scan)) in sheets.iter().zip(&plans) {
-            let members = scan.members.iter().map(|member| &member.cell);
-            for cell in scan.cells.iter().chain(members) {
+            for cell in &scan.cells {
                 if let Some(value) = last_calculated_value(cell, &tags) {
                     engine.set_last_calculated_value(&sheet.name, cell.row, cell.col, value);
+                }
+            }
+            for member in &scan.members {
+                let Some(anchor) = scan.cells.get(member.anchor) else {
+                    continue;
+                };
+                if let Some(value) = last_calculated_value(&member.cell, &tags) {
+                    engine.set_last_calculated_array_member_value(
+                        &sheet.name,
+                        anchor.row,
+                        anchor.col,
+                        member.cell.row,
+                        member.cell.col,
+                        value,
+                    );
                 }
             }
         }

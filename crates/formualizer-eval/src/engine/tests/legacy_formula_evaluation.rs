@@ -681,3 +681,423 @@ fn an_empty_if_slot_is_empty_text_to_ampersand_with_an_intersected_test() {
     assert_eq!(legacy(1, "=IF(A1:A3=0,1,)+5"), number(5.0));
     assert_eq!(legacy(1, "=COUNT(IF(A1:A3=0,1,))"), number(1.0));
 }
+
+#[test]
+fn match_reads_the_shape_of_what_returns_its_lookup_array() {
+    for legacy_file in [true, false] {
+        // Single values: the value IFERROR or IFNA returns, the branch IF
+        // selected with a test on a LET name, a LAMBDA parameter given a
+        // value, a value computed from INDEX's reference, XMATCH's position
+        // for one lookup value, N and T of a cell.
+        let results = evaluate(
+            legacy_file,
+            &[
+                (9, 4, "=MATCH(1,IFERROR(1,{2}),0)"),
+                (9, 5, "=MATCH(1,IFNA(1,{2}),0)"),
+                (9, 6, "=MATCH(1,LET(x,1,IF(x,1,{2})),0)"),
+                (9, 7, "=LAMBDA(x,MATCH(1,x,0))(1)"),
+                (9, 8, "=MATCH(1,INDEX(A1:A3,1)+0,0)"),
+                (9, 9, "=MATCH(1,XMATCH(7,{7},0),0)"),
+                (9, 10, "=MATCH(1,N(A1),0)"),
+                (9, 11, "=MATCH(1,CHOOSE(A1,1,{1}),0)"),
+                // Calls of equal arguments but another test are told apart.
+                (
+                    9,
+                    12,
+                    "=LET(x,{1}+0,y,1,MATCH(1,IF(A2,x,y)+0*SUM(IF(A1,x,y)),0))",
+                ),
+                // A LAMBDA's result as its body returned it.
+                (9, 13, "=MATCH(1,LAMBDA(z,IF(A2,{1}+0,1))(0),0)"),
+                (9, 14, "=MATCH(1,LET(f,LAMBDA(z,IF(A2,{1}+0,1)),f(0)),0)"),
+                // What one temporary LAMBDA's body recorded is not read for
+                // another's.
+                (
+                    9,
+                    18,
+                    "=MATCH(2,SUM(LAMBDA(_p,IF(FALSE,1,{1}+0))(0))+LAMBDA(_p,IF(1=1,1,{1}+0))(0),0)",
+                ),
+                // An empty slot IF selects, read as text.
+                (9, 19, "=MATCH(0,--(IF(1=1,,{1}+0)&\"0\"),0)"),
+                // The same call written under two LET bindings of f calls
+                // two LAMBDAs: each keeps its own result.
+                (
+                    9,
+                    20,
+                    "=LET(f,LAMBDA(z,IF(A1,1,{1}+0)),MATCH(1,f(A1)+0*SUM(LET(f,LAMBDA(z,{1}+0),f(A1))),0))",
+                ),
+                (
+                    9,
+                    21,
+                    "=MATCH(1,LET(f,LAMBDA(z,IF(A1,1,{1}+0)),f(A1))+0*SUM(LET(f,LAMBDA(z,{1}+0),f(A1))),0)",
+                ),
+                (
+                    9,
+                    15,
+                    "=LET(x,{1}+0,y,1,MATCH(1,IF(A2:A2,x,y)+0*SUM(IF(A1:A1,x,y)),0))",
+                ),
+                (
+                    9,
+                    16,
+                    "=LET(w,0,x,{1}+0,y,1,f,LAMBDA(a,b,d,z,z),MATCH(1,f(w,w,w,y)+0*SUM(f(w,w,w,x)),0))",
+                ),
+                (
+                    9,
+                    17,
+                    "=LET(x,{1}+0,f,LAMBDA(z,1),MATCH(1,f(x)+0*SUM(LET(f,LAMBDA(z,z),f(x))),0))",
+                ),
+            ],
+        );
+        let kinds: Vec<_> = results.into_iter().map(error_kind).collect();
+        assert_eq!(kinds, [ExcelErrorKind::Na; 18], "legacy={legacy_file}");
+        // One-element arrays: the replacement IFERROR returns, the branch IF
+        // selected, a LAMBDA parameter given one, XMATCH over an array of
+        // lookup values, N and T over an array.
+        let results = evaluate(
+            legacy_file,
+            &[
+                (10, 4, "=MATCH(2,IFERROR(1/0,{2}+0),0)"),
+                (10, 5, "=MATCH(1,LET(x,0,IF(x,1,{1}+0)),0)"),
+                (10, 6, "=LAMBDA(x,MATCH(1,x,0))(SEQUENCE(1))"),
+                (10, 7, "=MATCH(1,XMATCH({7}+0,{7},0),0)"),
+                (10, 8, "=MATCH(1,N({1}),0)"),
+                (10, 9, "=MATCH(\"a\",T({\"a\"}),0)"),
+                (10, 10, "=MATCH(1,CHOOSE(A1,{1}+0,1),0)"),
+                // IFS and SWITCH over a one-element array are element-wise.
+                (10, 17, "=MATCH(1,IFS({TRUE}+0,1),0)"),
+                (10, 18, "=MATCH(1,SWITCH({1}+0,1,1),0)"),
+                (
+                    10,
+                    11,
+                    "=LET(x,{1}+0,y,1,MATCH(1,IF(A1,x,y)+0*SUM(IF(A2,x,y)),0))",
+                ),
+                (10, 12, "=MATCH(1,LAMBDA(z,IF(A1,{1}+0,1))(0),0)"),
+                (10, 13, "=MATCH(1,LET(f,LAMBDA(z,IF(A1,{1}+0,1)),f(0)),0)"),
+                (
+                    10,
+                    14,
+                    "=LET(x,{1}+0,y,1,MATCH(1,IF(A1:A1,x,y)+0*SUM(IF(A2:A2,x,y)),0))",
+                ),
+                (
+                    10,
+                    15,
+                    "=LET(w,0,x,{1}+0,y,1,f,LAMBDA(a,b,d,z,z),MATCH(1,f(w,w,w,x)+0*SUM(f(w,w,w,y)),0))",
+                ),
+                (
+                    10,
+                    16,
+                    "=LET(x,{1}+0,f,LAMBDA(z,z),MATCH(1,f(x)+0*SUM(LET(f,LAMBDA(z,1),f(x))),0))",
+                ),
+            ],
+        );
+        assert!(
+            results.iter().all(|value| *value == number(1.0)),
+            "legacy={legacy_file}: {results:?}"
+        );
+    }
+}
+
+#[test]
+fn reading_the_shape_of_lookup_array_calculates_nothing_again() {
+    use crate::args::ArgSchema;
+    use crate::function::{FnCaps, Function};
+    use crate::traits::{ArgumentHandle, FunctionContext};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// TRUE, counting its calculations.
+    #[derive(Debug)]
+    struct Tick(Arc<AtomicUsize>);
+    impl Function for Tick {
+        fn caps(&self) -> FnCaps {
+            FnCaps::VOLATILE
+        }
+        fn name(&self) -> &'static str {
+            "TICK"
+        }
+        fn arg_schema(&self) -> &'static [ArgSchema] {
+            &[]
+        }
+        fn eval<'a, 'b, 'c>(
+            &self,
+            _args: &'c [ArgumentHandle<'a, 'b>],
+            _ctx: &dyn FunctionContext<'b>,
+        ) -> Result<crate::traits::CalcValue<'b>, formualizer_common::ExcelError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(crate::traits::CalcValue::Scalar(LiteralValue::Boolean(
+                true,
+            )))
+        }
+    }
+
+    // A LAMBDA argument's shape is read without calculating a defined name
+    // there again.
+    {
+        use crate::engine::named_range::{NameScope, NamedDefinition};
+        let mut counts = Vec::new();
+        for formula in ["=LAMBDA(x,1)(Thing)", "=LAMBDA(x,MATCH(1,x,0))(Thing)"] {
+            let count = Arc::new(AtomicUsize::new(0));
+            let workbook = TestWorkbook::new().with_function(Arc::new(Tick(count.clone())));
+            let mut engine = Engine::new(
+                workbook,
+                EvalConfig {
+                    enable_parallel: false,
+                    ..Default::default()
+                },
+            );
+            engine.add_sheet("Sheet1").ok();
+            engine
+                .define_name(
+                    "Thing",
+                    NamedDefinition::Formula {
+                        ast: parse("=IF(TICK(),{1}+0,1)").unwrap(),
+                        dependencies: Vec::new(),
+                        range_deps: Vec::new(),
+                    },
+                    NameScope::Workbook,
+                )
+                .unwrap();
+            engine
+                .set_cell_formula("Sheet1", 1, 1, parse(formula).unwrap())
+                .unwrap();
+            engine.evaluate_all().unwrap();
+            counts.push(count.load(Ordering::Relaxed));
+        }
+        assert_eq!(counts[0], counts[1], "{counts:?}");
+    }
+
+    // MATCH tries its lookup_array as a reference before reading its value,
+    // so an IF there runs twice whatever its branches are; reading the
+    // shape adds no third run.
+    for legacy_file in [true, false] {
+        for (formula, calls, expected) in [
+            ("=LET(x,IF(TICK(),1,{1}),x)", 1, number(1.0)),
+            ("=LET(x,IF(TRUE,1,IF(TICK(),1,{1})),x)", 0, number(1.0)),
+            ("=MATCH(1,IF(TICK(),1,2),0)", 2, None),
+            ("=MATCH(1,IF(TICK(),1,{1}),0)", 2, None),
+            ("=MATCH(1,IF(TRUE,1,IF(TICK(),1,{1})),0)", 0, None),
+            ("=MATCH(1,IF(TICK(),{1}+0,1),0)", 2, number(1.0)),
+            ("=LAMBDA(x,MATCH(1,x,0))(IF(TICK(),1,{1}))", 1, None),
+        ] {
+            let count = Arc::new(AtomicUsize::new(0));
+            let workbook = TestWorkbook::new().with_function(Arc::new(Tick(count.clone())));
+            let mut engine = Engine::new(
+                workbook,
+                EvalConfig {
+                    enable_parallel: false,
+                    ..Default::default()
+                },
+            );
+            engine
+                .set_cell_formula("Sheet1", 1, 1, parse(formula).unwrap())
+                .unwrap();
+            if legacy_file {
+                engine.use_legacy_array_semantics();
+            }
+            engine.evaluate_all().unwrap();
+            assert_eq!(
+                count.load(Ordering::Relaxed),
+                calls,
+                "{formula} legacy={legacy_file}"
+            );
+            let value = engine.get_cell_value("Sheet1", 1, 1);
+            match expected {
+                Some(_) => assert_eq!(value, expected, "{formula} legacy={legacy_file}"),
+                None => assert_eq!(
+                    error_kind(value),
+                    ExcelErrorKind::Na,
+                    "{formula} legacy={legacy_file}"
+                ),
+            }
+        }
+    }
+}
+
+#[test]
+fn reading_the_shape_of_a_lambda_call_types_only_what_ran() {
+    // Twenty LAMBDAs, each calling the one before twice in a branch never
+    // taken: their results are read without typing those branches.
+    let mut bindings = vec!["_f0,LAMBDA(z,1)".to_string()];
+    for i in 1..=20 {
+        bindings.push(format!(
+            "_f{i},LAMBDA(z,IF(TRUE,1,_f{p}(z)+_f{p}(z)))",
+            p = i - 1
+        ));
+    }
+    let formula = format!("=LET({},LAMBDA(z,z)(_f20(0)))", bindings.join(","));
+    for legacy_file in [true, false] {
+        assert_eq!(
+            evaluate(legacy_file, &[(5, 4, formula.as_str())])[0],
+            number(1.0),
+            "legacy={legacy_file}"
+        );
+        let formula = format!("=LET({},MATCH(1,_f20(0),0))", bindings.join(","));
+        assert_eq!(
+            error_kind(evaluate(legacy_file, &[(5, 4, formula.as_str())]).remove(0)),
+            ExcelErrorKind::Na,
+            "legacy={legacy_file}"
+        );
+    }
+    // Each LAMBDA calling the one before twice, both calls taken: each body
+    // is read once per distinct call, and the result is a single value.
+    let mut bindings = vec!["_f0,LAMBDA(z,1)".to_string()];
+    for i in 1..=12 {
+        bindings.push(format!("_f{i},LAMBDA(z,_f{p}(z)+_f{p}(z))", p = i - 1));
+    }
+    let formula = format!("=LET({},MATCH(4096,_f12(0),0))", bindings.join(","));
+    for legacy_file in [true, false] {
+        assert_eq!(
+            error_kind(evaluate(legacy_file, &[(5, 4, formula.as_str())]).remove(0)),
+            ExcelErrorKind::Na,
+            "legacy={legacy_file}"
+        );
+    }
+    // Twelve-parameter LAMBDAs called with every mix of shapes, in an IFS
+    // value never returned: not typed.
+    let names = ["a", "b", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m"];
+    let params = names.join(",");
+    let mut bindings = vec![format!("_f0,LAMBDA({params},1)")];
+    for i in 1..=12 {
+        let (mut left, mut right) = (names.to_vec(), names.to_vec());
+        left[i - 1] = "1";
+        right[i - 1] = "{1}";
+        bindings.push(format!(
+            "_f{i},LAMBDA({params},_f{p}({})+_f{p}({}))",
+            left.join(","),
+            right.join(","),
+            p = i - 1
+        ));
+    }
+    let formula = format!(
+        "=MATCH(1,LET({},IFS(TRUE,1,FALSE,_f12({}))),0)",
+        bindings.join(","),
+        ["1"; 12].join(",")
+    );
+    for legacy_file in [true, false] {
+        assert_eq!(
+            error_kind(evaluate(legacy_file, &[(5, 4, formula.as_str())]).remove(0)),
+            ExcelErrorKind::Na,
+            "legacy={legacy_file}"
+        );
+    }
+    // Two LAMBDAs of one body, `_x`, one returning its parameter (an
+    // array), the other a name it sees (a single value).
+    let formula = "=MATCH(2,LET(_arr,{1},LET(_x,1,_f,LAMBDA(_y,_x),_f(_arr))+LET(_x,1,_f,LAMBDA(_x,_x),_f(_arr))),0)";
+    for legacy_file in [true, false] {
+        assert_eq!(
+            evaluate(legacy_file, &[(5, 4, formula)])[0],
+            number(1.0),
+            "legacy={legacy_file}"
+        );
+    }
+}
+
+#[test]
+fn a_lambda_result_computed_from_a_defined_reference_is_a_single_value() {
+    use crate::engine::named_range::{NameScope, NamedDefinition};
+    use crate::reference::{CellRef, Coord};
+    for legacy_file in [true, false] {
+        let mut engine = Engine::new(
+            TestWorkbook::new(),
+            EvalConfig {
+                enable_parallel: false,
+                ..Default::default()
+            },
+        );
+        engine.add_sheet("Sheet1").ok();
+        let sheet = engine.sheet_id("Sheet1").unwrap();
+        engine
+            .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(1.0))
+            .unwrap();
+        engine
+            .define_name(
+                "Thing",
+                NamedDefinition::Cell(CellRef::new(sheet, Coord::from_excel(1, 1, true, true))),
+                NameScope::Workbook,
+            )
+            .unwrap();
+        engine
+            .set_cell_formula(
+                "Sheet1",
+                2,
+                2,
+                parse("=MATCH(1,LAMBDA(z,Thing+0)(0),0)").unwrap(),
+            )
+            .unwrap();
+        if legacy_file {
+            engine.use_legacy_array_semantics();
+        }
+        engine.evaluate_all().unwrap();
+        assert_eq!(
+            error_kind(engine.get_cell_value("Sheet1", 2, 2)),
+            ExcelErrorKind::Na,
+            "legacy={legacy_file}"
+        );
+    }
+}
+
+#[test]
+fn match_reads_the_selection_its_value_came_from() {
+    use crate::args::ArgSchema;
+    use crate::function::{FnCaps, Function};
+    use crate::traits::{ArgumentHandle, FunctionContext};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// TRUE, FALSE, TRUE, ... on successive calculations.
+    #[derive(Debug)]
+    struct Toggle(Arc<AtomicUsize>);
+    impl Function for Toggle {
+        fn caps(&self) -> FnCaps {
+            FnCaps::VOLATILE
+        }
+        fn name(&self) -> &'static str {
+            "TOGGLE"
+        }
+        fn arg_schema(&self) -> &'static [ArgSchema] {
+            &[]
+        }
+        fn eval<'a, 'b, 'c>(
+            &self,
+            _args: &'c [ArgumentHandle<'a, 'b>],
+            _ctx: &dyn FunctionContext<'b>,
+        ) -> Result<crate::traits::CalcValue<'b>, formualizer_common::ExcelError> {
+            let calls = self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(crate::traits::CalcValue::Scalar(LiteralValue::Boolean(
+                calls.is_multiple_of(2),
+            )))
+        }
+    }
+
+    // MATCH tries lookup_array as a reference first (IF and CHOOSE resolve
+    // their selected argument as one too): what that runs is discarded and
+    // records nothing.
+    for formula in [
+        "=MATCH(1,IF(TOGGLE(),1,{2}+0),0)",
+        "=MATCH(1,IF(TRUE,IF(TOGGLE(),1,{2}+0),0),0)",
+        "=MATCH(1,CHOOSE(1,IF(TOGGLE(),1,{2}+0)),0)",
+    ] {
+        for legacy_file in [true, false] {
+            let count = Arc::new(AtomicUsize::new(0));
+            let workbook = TestWorkbook::new().with_function(Arc::new(Toggle(count)));
+            let mut engine = Engine::new(
+                workbook,
+                EvalConfig {
+                    enable_parallel: false,
+                    ..Default::default()
+                },
+            );
+            engine
+                .set_cell_formula("Sheet1", 1, 1, parse(formula).unwrap())
+                .unwrap();
+            if legacy_file {
+                engine.use_legacy_array_semantics();
+            }
+            engine.evaluate_all().unwrap();
+            assert_eq!(
+                error_kind(engine.get_cell_value("Sheet1", 1, 1)),
+                ExcelErrorKind::Na,
+                "{formula} legacy={legacy_file}"
+            );
+        }
+    }
+}

@@ -156,6 +156,22 @@ impl Function for MatchFn {
         });
         &SCHEMA
     }
+    /// The default dispatch, with the selections of IF, CHOOSE, IFERROR and
+    /// IFNA tracked while lookup_array is evaluated, so that its shape (an
+    /// array or a single value) is read without evaluating it again.
+    fn dispatch<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+    ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        let _tracking = crate::traits::track_selections();
+        if let Some(lifted) =
+            crate::lift::lift_call(self.name(), args, |call| self.dispatch_scalar(call, ctx))?
+        {
+            return Ok(lifted);
+        }
+        self.dispatch_scalar(args, ctx)
+    }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
@@ -206,10 +222,13 @@ impl Function for MatchFn {
         } else {
             0
         };
-        // A LET name or LAMBDA parameter bound to a value is that value.
+        // A LET name or LAMBDA parameter bound to a value is that value. A
+        // value found trying it as a reference is discarded: what that runs
+        // records nothing for reading lookup_array's shape.
         let arr_ref = if args[1].is_local_value_name() {
             None
         } else {
+            let _probe = crate::traits::probe_references();
             args[1].as_reference_or_eval().ok()
         };
         if let Some(r) = arr_ref {

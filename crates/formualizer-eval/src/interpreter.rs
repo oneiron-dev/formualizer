@@ -1015,6 +1015,12 @@ impl<'a> Interpreter<'a> {
                 }
             })
             .collect();
+        // A call that records what it returned does so under the arguments
+        // written in the formula, not their intersections.
+        let _replaced =
+            crate::traits::note_replaced_arguments(positions.iter().zip(args).filter_map(
+                |((_, intersected, _), &id)| intersected.as_ref().map(|node| (node, id)),
+            ));
         f(&handles)
     }
 
@@ -1548,16 +1554,29 @@ impl<'a> Interpreter<'a> {
                     && let Some((callee_id, call_args)) = args.split_first()
                 {
                     let callee = self.evaluate_arena_ast(*callee_id, data_store, sheet_registry)?;
-                    let mut bindings = Vec::with_capacity(call_args.len());
-                    for arg_id in call_args {
-                        bindings.push(self.call_argument(&ArgumentHandle::new_arena(
-                            *arg_id,
-                            self,
-                            data_store,
-                            sheet_registry,
-                        ))?);
+                    let handles: Vec<ArgumentHandle> = call_args
+                        .iter()
+                        .map(|&id| ArgumentHandle::new_arena(id, self, data_store, sheet_registry))
+                        .collect();
+                    let mut bindings = Vec::with_capacity(handles.len());
+                    for handle in &handles {
+                        bindings.push(self.call_argument(handle)?);
                     }
-                    return self.invoke_call_bindings(callee, bindings);
+                    crate::traits::want_lambda_result();
+                    let callable = match &callee {
+                        crate::traits::CalcValue::Callable(callable) => Some(callable.clone()),
+                        _ => None,
+                    };
+                    let result = self.invoke_call_bindings(callee, bindings);
+                    let callee =
+                        ArgumentHandle::new_arena(*callee_id, self, data_store, sheet_registry);
+                    crate::traits::record_lambda_call(
+                        None,
+                        Some(&callee),
+                        callable.as_ref(),
+                        &handles,
+                    );
+                    return result;
                 }
 
                 if let Some(fun) = self.context.get_function("", name) {
@@ -1578,16 +1597,18 @@ impl<'a> Interpreter<'a> {
                 }
 
                 if let Some(callable) = self.resolve_local_callable(name) {
-                    let mut bindings = Vec::with_capacity(args.len());
-                    for arg_id in args {
-                        bindings.push(self.call_argument(&ArgumentHandle::new_arena(
-                            *arg_id,
-                            self,
-                            data_store,
-                            sheet_registry,
-                        ))?);
+                    let handles: Vec<ArgumentHandle> = args
+                        .iter()
+                        .map(|&id| ArgumentHandle::new_arena(id, self, data_store, sheet_registry))
+                        .collect();
+                    let mut bindings = Vec::with_capacity(handles.len());
+                    for handle in &handles {
+                        bindings.push(self.call_argument(handle)?);
                     }
-                    return callable.invoke_bindings(self, bindings);
+                    crate::traits::want_lambda_result();
+                    let result = callable.invoke_shaped_bindings(self, bindings);
+                    crate::traits::record_lambda_call(Some(name), None, Some(&callable), &handles);
+                    return result;
                 }
 
                 // An unknown function is a #NAME? value at the call site, as on the
@@ -2139,21 +2160,50 @@ impl<'a> Interpreter<'a> {
         callee: &ASTNode,
         args: &[ASTNode],
     ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
-        let callee = self.evaluate_ast(callee)?;
-        let mut bindings = Vec::with_capacity(args.len());
-        for arg in args {
-            bindings.push(self.call_argument(&ArgumentHandle::new(arg, self))?);
+        let callee_value = self.evaluate_ast(callee)?;
+        let handles: Vec<ArgumentHandle> = args
+            .iter()
+            .map(|arg| ArgumentHandle::new(arg, self))
+            .collect();
+        let mut bindings = Vec::with_capacity(handles.len());
+        for handle in &handles {
+            bindings.push(self.call_argument(handle)?);
         }
-        self.invoke_call_bindings(callee, bindings)
+        crate::traits::want_lambda_result();
+        let callable = match &callee_value {
+            crate::traits::CalcValue::Callable(callable) => Some(callable.clone()),
+            _ => None,
+        };
+        let result = self.invoke_call_bindings(callee_value, bindings);
+        crate::traits::record_lambda_call(
+            None,
+            Some(&ArgumentHandle::new(callee, self)),
+            callable.as_ref(),
+            &handles,
+        );
+        result
     }
 
     /// What a LAMBDA parameter receives for a call argument: a reference stays
     /// a reference (`LAMBDA(area,ROWS(area))(A:A)` is 1048576), anything else passes
-    /// its value.
-    fn call_argument(&self, arg: &ArgumentHandle<'_, 'a>) -> Result<LocalBinding, ExcelError> {
+    /// its value, with the shape that value has to Excel: a one-element array
+    /// held as its single value (`SEQUENCE(1)`) stays an array, a single value
+    /// stays one.
+    fn call_argument(
+        &self,
+        arg: &ArgumentHandle<'_, 'a>,
+    ) -> Result<(LocalBinding, Option<crate::traits::ResultShape>), ExcelError> {
+        let _tracking = crate::traits::track_selections();
         Ok(match arg.bindable_reference()? {
-            Some(reference) => LocalBinding::Reference(reference),
-            None => LocalBinding::Value(arg.value()?.into_literal()),
+            Some(reference) => (LocalBinding::Reference(reference), None),
+            None => {
+                let value = arg.value()?.into_literal();
+                let shape = match value {
+                    LiteralValue::Array(_) => None,
+                    _ => Some(arg.result_shape_without_names()),
+                };
+                (LocalBinding::Value(value), shape)
+            }
         })
     }
 
@@ -2162,10 +2212,12 @@ impl<'a> Interpreter<'a> {
     fn invoke_call_bindings(
         &self,
         callee: crate::traits::CalcValue<'a>,
-        args: Vec<LocalBinding>,
+        args: Vec<(LocalBinding, Option<crate::traits::ResultShape>)>,
     ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
         match callee {
-            crate::traits::CalcValue::Callable(callable) => callable.invoke_bindings(self, args),
+            crate::traits::CalcValue::Callable(callable) => {
+                callable.invoke_shaped_bindings(self, args)
+            }
             other => match other.into_literal() {
                 error @ LiteralValue::Error(_) => Ok(crate::traits::CalcValue::Scalar(error)),
                 _ => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -2195,11 +2247,18 @@ impl<'a> Interpreter<'a> {
         }
 
         if let Some(callable) = self.resolve_local_callable(name) {
-            let mut bindings = Vec::with_capacity(args.len());
-            for arg in args {
-                bindings.push(self.call_argument(&ArgumentHandle::new(arg, self))?);
+            let handles: Vec<ArgumentHandle> = args
+                .iter()
+                .map(|arg| ArgumentHandle::new(arg, self))
+                .collect();
+            let mut bindings = Vec::with_capacity(handles.len());
+            for handle in &handles {
+                bindings.push(self.call_argument(handle)?);
             }
-            return callable.invoke_bindings(self, bindings);
+            crate::traits::want_lambda_result();
+            let result = callable.invoke_shaped_bindings(self, bindings);
+            crate::traits::record_lambda_call(Some(name), None, Some(&callable), &handles);
+            return result;
         }
 
         // Include the function name in the error message for better debugging

@@ -18,7 +18,11 @@ use formualizer_parse::parser::{
 };
 
 mod result_shape;
-pub(crate) use result_shape::ResultShape;
+pub(crate) use result_shape::{
+    ResultShape, lambda_result_wanted, note_replaced_arguments, probe_references,
+    record_lambda_call, record_selection, report_lambda_result, track_own_selections,
+    track_selections, want_lambda_result, written_body_key,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReferenceInfo {
@@ -128,11 +132,35 @@ pub trait CustomCallable: Send + Sync {
         self.invoke(interp, &values)
     }
 
+    /// [`Self::invoke_bindings`] with the shape each argument value has to
+    /// Excel, when it is known ([`ResultShape`]): a LAMBDA parameter bound to
+    /// a one-element array held as its single value is an array, one bound
+    /// to a single value is not. The default ignores the shapes, and reports
+    /// no result shape to the call site (a LAMBDA it calls in turn does not
+    /// report one for it either).
+    #[doc(hidden)]
+    fn invoke_shaped_bindings<'ctx>(
+        &self,
+        interp: &Interpreter<'ctx>,
+        args: Vec<(crate::interpreter::LocalBinding, Option<ResultShape>)>,
+    ) -> Result<CalcValue<'ctx>, ExcelError> {
+        let _ = result_shape::lambda_result_wanted();
+        self.invoke_bindings(interp, args.into_iter().map(|(arg, _)| arg).collect())
+    }
+
     /// The parameters, body and captured local names of a callable written
     /// as a LAMBDA, so that the shape of its result (an array or a single
     /// value) can be read from its body. `None` for other callables.
     #[doc(hidden)]
     fn lambda_parts(&self) -> Option<(&[String], &ASTNode, &crate::interpreter::LocalEnv)> {
+        None
+    }
+
+    /// For a LAMBDA written in a formula, the node of the body it was
+    /// written with (hashed), which its copy of the body stands for when the
+    /// shape of a call's result is read. `None` for other callables.
+    #[doc(hidden)]
+    fn written_body(&self) -> Option<u64> {
         None
     }
 }
@@ -561,6 +589,13 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
     /// shape here.
     pub(crate) fn result_shape(&self) -> ResultShape {
         result_shape::of(self)
+    }
+
+    /// [`Self::result_shape`] without resolving defined names (a name not
+    /// bound by a LET or LAMBDA is of unknown shape), so that reading it
+    /// calculates nothing.
+    pub(crate) fn result_shape_without_names(&self) -> ResultShape {
+        result_shape::of_without_names(self)
     }
 
     pub fn value(&self) -> Result<crate::traits::CalcValue<'b>, ExcelError> {

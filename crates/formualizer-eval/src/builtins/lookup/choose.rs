@@ -125,7 +125,8 @@ impl Function for ChooseFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Option<Result<formualizer_parse::parser::ReferenceType, ExcelError>> {
-        resolution_to_reference(resolve_choose_reference_or_value(args, ctx))
+        let _probe = crate::traits::probe_references();
+        resolution_to_reference(resolve_choose_reference_or_value(args, ctx, false))
     }
 
     fn resolve_reference_or_value<'a, 'b, 'c>(
@@ -134,7 +135,7 @@ impl Function for ChooseFn {
         ctx: &dyn FunctionContext<'b>,
         _value_fallback: &dyn Fn() -> Result<crate::traits::CalcValue<'b>, ExcelError>,
     ) -> Result<FunctionResolution<'b>, ExcelError> {
-        resolve_choose_reference_or_value(args, ctx)
+        resolve_choose_reference_or_value(args, ctx, true)
     }
 
     fn eval<'a, 'b, 'c>(
@@ -157,6 +158,7 @@ impl Function for ChooseFn {
         }
         let index_val = index_value.into_literal();
         if let LiteralValue::Error(e) = index_val {
+            crate::traits::record_selection("CHOOSE", args, None);
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
         }
 
@@ -167,6 +169,7 @@ impl Function for ChooseFn {
             LiteralValue::Number(n) => n as i64,
             LiteralValue::Int(i) => i,
             _ => {
+                crate::traits::record_selection("CHOOSE", args, None);
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new(ExcelErrorKind::Value),
                 )));
@@ -175,12 +178,14 @@ impl Function for ChooseFn {
 
         // Check bounds
         if index < 1 || index as usize > args.len() - 1 {
+            crate::traits::record_selection("CHOOSE", args, None);
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new(ExcelErrorKind::Value),
             )));
         }
 
         // Return the selected value (1-based indexing for the choice)
+        crate::traits::record_selection("CHOOSE", args, Some(index as usize));
         let selected_arg = &args[index as usize];
         selected_arg.value()
     }
@@ -189,6 +194,7 @@ impl Function for ChooseFn {
 fn resolve_choose_reference_or_value<'b>(
     args: &[ArgumentHandle<'_, 'b>],
     _ctx: &dyn FunctionContext<'b>,
+    record: bool,
 ) -> Result<FunctionResolution<'b>, ExcelError> {
     let value_error = || {
         FunctionResolution::Value(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -206,14 +212,28 @@ fn resolve_choose_reference_or_value<'b>(
         LiteralValue::Number(value) => value as i64,
         LiteralValue::Int(value) => value,
         LiteralValue::Error(error) => {
+            if record {
+                crate::traits::record_selection("CHOOSE", args, None);
+            }
             return Ok(FunctionResolution::Value(crate::traits::CalcValue::Scalar(
                 LiteralValue::Error(error),
             )));
         }
-        _ => return Ok(value_error()),
+        _ => {
+            if record {
+                crate::traits::record_selection("CHOOSE", args, None);
+            }
+            return Ok(value_error());
+        }
     };
     if index < 1 || index as usize > args.len() - 1 {
+        if record {
+            crate::traits::record_selection("CHOOSE", args, None);
+        }
         return Ok(value_error());
+    }
+    if record {
+        crate::traits::record_selection("CHOOSE", args, Some(index as usize));
     }
     let selected = &args[index as usize];
     selected.resolve_reference_or_value()
