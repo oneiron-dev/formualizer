@@ -22,6 +22,20 @@ fn column_to_letters(col: u32) -> String {
 #[derive(Debug)]
 pub struct AddressFn;
 
+/// ADDRESS's row, column or abs_num as a whole number: a number, or text that
+/// reads as one, read like INDEX's positions (`coercion::snapped_whole_number`).
+/// `None` for anything else.
+fn whole_position(value: &LiteralValue) -> Option<i64> {
+    match value {
+        LiteralValue::Int(i) => Some(*i),
+        LiteralValue::Number(n) => Some(crate::coercion::snapped_whole_number(*n) as i64),
+        LiteralValue::Text(_) => crate::coercion::to_number_argument(value)
+            .ok()
+            .map(|n| crate::coercion::snapped_whole_number(n) as i64),
+        _ => None,
+    }
+}
+
 /// Returns a cell reference as text from row and column numbers.
 ///
 /// `ADDRESS` can emit either A1 or R1C1 notation and optionally prefix the address with a
@@ -34,6 +48,7 @@ pub struct AddressFn;
 /// - Out-of-range row/column values or invalid `abs_num` return `#VALUE!`.
 /// - A row, column or `abs_num` within 2^-22 below a whole number is that number, as in Excel
 ///   (`ADDRESS(2-1E-7,1)` is `$A$2`); other fractions truncate (`ADDRESS(2.9999,1)` is `$A$2`).
+///   Text that reads as a number converts first (`ADDRESS("2",1)` is `$A$2`).
 /// - If `sheet_text` contains spaces or special characters, it is quoted.
 ///
 /// # Examples
@@ -85,35 +100,35 @@ impl Function for AddressFn {
         use once_cell::sync::Lazy;
         static SCHEMA: Lazy<Vec<ArgSchema>> = Lazy::new(|| {
             vec![
-                // row_num (required, strict number)
+                // row_num (required, a number; numeric text converts)
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Number],
                     required: true,
                     by_ref: false,
                     shape: ShapeKind::Scalar,
-                    coercion: CoercionPolicy::NumberStrict,
+                    coercion: CoercionPolicy::NumberLenientText,
                     max: None,
                     repeating: None,
                     default: None,
                 },
-                // column_num (required, strict number)
+                // column_num (required, a number; numeric text converts)
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Number],
                     required: true,
                     by_ref: false,
                     shape: ShapeKind::Scalar,
-                    coercion: CoercionPolicy::NumberStrict,
+                    coercion: CoercionPolicy::NumberLenientText,
                     max: None,
                     repeating: None,
                     default: None,
                 },
-                // abs_num (optional, default 1)
+                // abs_num (optional, default 1; numeric text converts)
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Number],
                     required: false,
                     by_ref: false,
                     shape: ShapeKind::Scalar,
-                    coercion: CoercionPolicy::NumberStrict,
+                    coercion: CoercionPolicy::NumberLenientText,
                     max: None,
                     repeating: None,
                     default: Some(LiteralValue::Int(1)),
@@ -161,10 +176,9 @@ impl Function for AddressFn {
         if let LiteralValue::Error(e) = row_val {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
         }
-        let row = match row_val {
-            LiteralValue::Number(n) => crate::coercion::snapped_whole_number(n) as i64,
-            LiteralValue::Int(i) => i,
-            _ => {
+        let row = match whole_position(&row_val) {
+            Some(row) => row,
+            None => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new(ExcelErrorKind::Value),
                 )));
@@ -182,10 +196,9 @@ impl Function for AddressFn {
         if let LiteralValue::Error(e) = col_val {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
         }
-        let col = match col_val {
-            LiteralValue::Number(n) => crate::coercion::snapped_whole_number(n) as i64,
-            LiteralValue::Int(i) => i,
-            _ => {
+        let col = match whole_position(&col_val) {
+            Some(col) => col,
+            None => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new(ExcelErrorKind::Value),
                 )));
@@ -204,10 +217,11 @@ impl Function for AddressFn {
             if let LiteralValue::Error(e) = abs_val {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
             }
-            match abs_val {
-                LiteralValue::Number(n) => crate::coercion::snapped_whole_number(n) as i64,
-                LiteralValue::Int(i) => i,
-                _ => 1,
+            match whole_position(&abs_val) {
+                Some(abs_num) => abs_num,
+                // Text that is no number is #VALUE!; a blank is the default.
+                None if matches!(abs_val, LiteralValue::Text(_)) => 0,
+                None => 1,
             }
         } else {
             1

@@ -1365,13 +1365,16 @@ fn function_result_extent(
             let fits = |s: Option<f64>, high: u64| {
                 s.is_some_and(|n| (0.0..=high as f64).contains(&position(n)))
             };
-            // An array index of any kind, area_num included, is lifted: each
-            // element is one value.
+            // An array row_num or column_num is lifted: each element is one
+            // value. So is an area_num that is an array or a multi-cell range;
+            // a scalar expression (`ABS(1)`) is one area, read like the other
+            // selectors (area 1 is the source itself).
+            let area_scalar = extent(3, false) == (1, 1);
+            let area_one = !given(3) || selector(3).is_some_and(|n| position(n) == 1.0);
             let selects = single(1)
                 && single(2)
-                && single(3)
-                && (succeeded
-                    || (fits(row, array.0) && fits(col, array.1) && within(3, 1.0, 1, position)));
+                && area_scalar
+                && (succeeded || (fits(row, array.0) && fits(col, array.1) && area_one));
             let whole = |s: Option<f64>| s.is_some_and(|n| position(n) == 0.0);
             let selected = if selects {
                 (

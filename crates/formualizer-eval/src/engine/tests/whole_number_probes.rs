@@ -174,6 +174,18 @@ fn sequence_left_right_and_round_snap() {
         ("=ROUND(1.23456,2.4)", n(1.23)),
         ("=ROUND(1.23456,2.6)", n(1.23)),
         ("=ROUND(1234.5,-0.5)", n(1235.0)),
+        ("=ROUND(1234.5678,-2)", n(1200.0)),
+        ("=ROUND(1234.5678,-2-1E-7)", n(1200.0)),
+        ("=ROUND(1234.5678,-2+1E-7)", n(1230.0)),
+        // Numeric text converts before the whole-number reading.
+        ("=LEFT(\"abcd\",\"1.9999999\")", text("ab")),
+        ("=RIGHT(\"abcd\",\"2.6\")", text("cd")),
+        ("=LEFT(\"abcd\",\"bad\")", error(Value)),
+        ("=ADDRESS(\"1.9999999\",1)", text("$A$2")),
+        ("=ADDRESS(1,\"1.9999999\")", text("$B$1")),
+        ("=ADDRESS(1,1,\"1.9999999\")", text("A$1")),
+        ("=ADDRESS(\"x\",1)", error(Value)),
+        ("=ADDRESS(1,1,\"x\")", error(Value)),
     ]);
 }
 
@@ -270,6 +282,10 @@ fn index_result_extent_matches_what_index_selects() {
         "=INDEX(Sheet1!1:1,0.9)+0",
         "=INDEX(Sheet1!$1:$1048576,1.9999999)+0",
         "=INDEX(Sheet1!$1:$1048576,2,)+0",
+        // A scalar area_num is one area, however it is written.
+        "=INDEX(Sheet1!A:A,0,1,ABS(1))+0",
+        "=INDEX(Sheet1!A:A,0,1,--1)+0",
+        "=IFERROR(INDEX(Sheet1!A:A,0,1,\"1\"),99)",
     ] {
         let engine = on_result_sheet(formula);
         let value = engine.get_cell_value("Result", 2, 10);
