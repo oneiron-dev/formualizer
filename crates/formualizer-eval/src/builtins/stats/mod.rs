@@ -11615,9 +11615,11 @@ mod tests_basic_stats {
         assert_close("=LARGE({1,2,3},3)", 1.0);
         assert_close("=SMALL({1,2,3},3)", 3.0);
         assert_close("=LARGE(A1:A4,3)", 1.0);
-        // A fraction within the count is still dropped.
-        assert_close("=LARGE({1,2,3},2.5)", 2.0);
+        // Within the count LARGE rounds a fraction and SMALL drops it.
+        assert_close("=LARGE({1,2,3},2.5)", 1.0);
+        assert_close("=LARGE({1,2,3},2.4)", 2.0);
         assert_close("=SMALL({1,2,3},1.5)", 1.0);
+        assert_close("=SMALL({1,2,3},2.9999)", 2.0);
         assert_eq!(
             order_statistic_rank(f64::NAN, 3),
             Err(ExcelError::new_num())

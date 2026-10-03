@@ -1861,7 +1861,8 @@ mod tests {
 
     #[test]
     fn index_area_num_below_one_is_value_error() {
-        // An area_num below 1 after truncation is no area number at all
+        // An area_num that reads below 1 (a fraction truncates unless it lies
+        // within 2^-22 below a whole number) is no area number at all
         // (#VALUE!); only an area above the reference's one area is #REF!.
         // (TestWorkbook reads a cell it does not hold as #REF!, so the blank
         // C1 is set explicitly.)
@@ -1877,7 +1878,7 @@ mod tests {
         };
 
         // C1 is blank, which reads as area 0.
-        for area in ["0", "-1", "0.5", "0.9999999999", "-0.5", "C1", "FALSE"] {
+        for area in ["0", "-1", "0.5", "1-3E-7", "-0.5", "C1", "FALSE"] {
             for formula in [
                 format!("=INDEX(A1:B3,2,2,{area})"),
                 format!("=SUM(INDEX(A1:B3,2,2,{area}))"),
@@ -1907,6 +1908,11 @@ mod tests {
         assert_eq!(
             error_kind("=INDEX({1,2;3,4},-1,2,1/0)"),
             ExcelErrorKind::Div
+        );
+        // Within 2^-22 below 1 is area 1, like row_num and column_num.
+        assert_eq!(
+            evaluate_formula("=INDEX(A1:B3,2,2,0.9999999999)", &wb).unwrap(),
+            LiteralValue::Number(20.0)
         );
     }
 
