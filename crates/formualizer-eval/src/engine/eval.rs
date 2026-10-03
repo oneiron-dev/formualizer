@@ -1262,19 +1262,39 @@ fn arena_single_value(data_store: &crate::engine::arena::DataStore, node: AstNod
             ) && arena_single_value(data_store, *left_id)
                 && arena_single_value(data_store, *right_id)
         }
-        // A builtin whose parameters are all single values gives one value
-        // for single-value arguments (`ABS(1)`, `DATE(2026,1,1)`), except
-        // FILTERXML, which returns every matching node.
         Some(AstNodeData::Function { name_id, .. }) => {
+            use crate::function::FnCaps;
+            use crate::lift::{Lift, lift_spec};
             let name = data_store.resolve_ast_string(*name_id);
             let name = crate::formula_plane::template_canonical::normalize_function_name(name);
-            name != "FILTERXML"
-                && matches!(crate::lift::lift_spec(&name), Some(crate::lift::Lift::All))
-                && data_store
-                    .get_args(node)
-                    .unwrap_or(&[])
-                    .iter()
-                    .all(|&arg| arena_single_value(data_store, arg))
+            let args = data_store.get_args(node).unwrap_or(&[]);
+            let single = |i: usize| arena_single_value(data_store, args[i]);
+            match name.as_str() {
+                // The result is one of the arguments, or an error.
+                "IF" | "IFS" | "IFERROR" | "IFNA" | "CHOOSE" | "SWITCH" => {
+                    (0..args.len()).all(single)
+                }
+                // FILTERXML returns every matching node.
+                "FILTERXML" => false,
+                _ => match lift_spec(&name) {
+                    // A builtin whose parameters are all single values gives
+                    // one value for single-value arguments (`ABS(1)`).
+                    Some(Lift::All) => (0..args.len()).all(single),
+                    // A reduction (SUM, MAX, COUNTIF, LARGE, ...) gives one
+                    // value unless an argument it lifts over (COUNTIF's
+                    // criteria, LARGE's k, AGGREGATE's k) holds several.
+                    lift => crate::function_registry::get("", &name).is_some_and(|function| {
+                        let caps = function.caps();
+                        caps.contains(FnCaps::REDUCTION)
+                            && !caps.intersects(FnCaps::MAY_SPILL | FnCaps::RETURNS_REFERENCE)
+                            && (0..args.len()).all(|i| {
+                                let lifted = lift.is_some_and(|lift| lift.lifts(i))
+                                    || (name == "AGGREGATE" && i == 3);
+                                !lifted || single(i)
+                            })
+                    }),
+                },
+            }
         }
         _ => false,
     }

@@ -284,6 +284,13 @@ fn index_result_extent_matches_what_index_selects() {
         "=INDEX(Sheet1!$1:$1048576,2,)+0",
         // A scalar area_num is one area, however it is written.
         "=INDEX(Sheet1!A:A,0,1,ABS(1))+0",
+        "=INDEX(Sheet1!A:A,0,1,SUM(1))+0",
+        "=INDEX(Sheet1!A:A,0,1,MIN(1))+0",
+        "=INDEX(Sheet1!A:A,0,1,IF(TRUE,1,2))+0",
+        "=INDEX(Sheet1!A:A,0,1,CHOOSE(1,1,2))+0",
+        "=INDEX(Sheet1!A:A,0,1,COUNTIF(Sheet1!A:A,11))+0",
+        // A scalar operand keeps the selected column's extent.
+        "=INDEX(Sheet1!A:A,0,1)+SUM(0)",
         "=INDEX(Sheet1!A:A,0,1,--1)+0",
         "=IFERROR(INDEX(Sheet1!A:A,0,1,\"1\"),99)",
     ] {
