@@ -205,7 +205,97 @@ fn truncating_arguments_have_no_window() {
 #[test]
 fn index_of_its_own_column_selecting_another_row_is_no_cycle() {
     // F1 =INDEX(F:F,2-1E-7)+1 reads F2, not F1: 1, no circular reference.
+    // Under the default configuration (runtime cycle detection, #CIRC! for a
+    // live cycle) a formula is circular only when it reads its own cell.
     assert_spill("=INDEX(F:F,2-1E-7)+1", &[&[n(1.0)]]);
+
+    // F1 holds `formula`, G1 the selector `g1`, F2 the formula `f2`.
+    let run = |formula: &str, g1: Option<&str>, f2: Option<&str>| {
+        let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+        for (row, col, f) in [(1, 7, g1), (2, 6, f2)] {
+            if let Some(f) = f {
+                engine
+                    .set_cell_formula("Sheet1", row, col, parse(f).unwrap())
+                    .unwrap();
+            }
+        }
+        engine
+            .set_cell_formula("Sheet1", 1, 6, parse(formula).unwrap())
+            .unwrap();
+        engine.evaluate_all().unwrap();
+        engine.get_cell_value("Sheet1", 1, 6).unwrap()
+    };
+    let circ = error(ExcelErrorKind::Circ);
+    for (formula, g1, f2, expected) in [
+        ("=INDEX(F:F,2-1E-7)+1", None, Some("=41"), n(42.0)),
+        ("=INDEX(F:F,1)+1", None, None, circ.clone()),
+        ("=INDEX(F:F,1-1E-7)+1", None, None, circ.clone()),
+        ("=INDEX(F:F,G1)+1", Some("=2"), None, n(1.0)),
+        ("=INDEX(F:F,G1)+1", Some("=1"), None, circ.clone()),
+        ("=INDEX(F:F,G1)+SUM(F:F)", Some("=2"), None, circ),
+    ] {
+        let actual = run(formula, g1, f2);
+        assert!(
+            same(&actual, &expected),
+            "{formula} with G1 {g1:?}, F2 {f2:?}: {actual:?}, not {expected:?}"
+        );
+    }
+}
+
+/// `formula` in Result!J2 of a workbook whose Sheet1 holds A1 = 11.
+fn on_result_sheet(formula: &str) -> Engine<TestWorkbook> {
+    let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+    engine
+        .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(11.0))
+        .unwrap();
+    engine.add_sheet("Result").unwrap();
+    engine
+        .set_cell_formula("Result", 2, 10, parse(formula).unwrap())
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    engine
+}
+
+#[test]
+fn index_result_extent_matches_what_index_selects() {
+    // A whole column or row INDEX selects does not fit from J2: #SPILL!, the
+    // same for row 0 written as numeric text or under two signs, for a lone
+    // index into a one-row source (it selects columns) and for a lone row
+    // index into a two-dimensional source (the entire row).
+    for formula in [
+        "=INDEX(Sheet1!A:A,0,1)+0",
+        "=INDEX(Sheet1!A:A,\"0\",1)+0",
+        "=INDEX(Sheet1!A:A,--0,1)+0",
+        "=INDEX(Sheet1!A:A,,1)+0",
+        "=INDEX(Sheet1!1:1,0.9)+0",
+        "=INDEX(Sheet1!$1:$1048576,1.9999999)+0",
+        "=INDEX(Sheet1!$1:$1048576,2,)+0",
+    ] {
+        let engine = on_result_sheet(formula);
+        let value = engine.get_cell_value("Result", 2, 10);
+        assert!(
+            matches!(&value, Some(LiteralValue::Error(e)) if e.kind == ExcelErrorKind::Spill),
+            "{formula}: {value:?}"
+        );
+    }
+    // A lone index into a one-row source, or an explicit row and column, is
+    // one cell.
+    for formula in ["=INDEX(Sheet1!1:1,1)+0", "=INDEX(Sheet1!A:A,1,1)+0"] {
+        let engine = on_result_sheet(formula);
+        assert_eq!(
+            engine.get_cell_value("Result", 2, 10),
+            Some(n(11.0)),
+            "{formula}"
+        );
+    }
+    // An array area_num is lifted: one value per element, not a column each.
+    let engine = on_result_sheet("=INDEX(Sheet1!A:A,0,1,{1,1})");
+    assert_eq!(engine.get_cell_value("Result", 2, 10), Some(n(11.0)));
+    assert_eq!(engine.get_cell_value("Result", 2, 11), Some(n(11.0)));
+    assert!(matches!(
+        engine.get_cell_value("Result", 3, 10),
+        None | Some(LiteralValue::Empty)
+    ));
 }
 
 #[test]

@@ -203,7 +203,7 @@ fn static_number_tree(node: &ASTNode) -> Option<f64> {
     }
 }
 
-fn static_number_arena(store: &DataStore, id: AstNodeId) -> Option<f64> {
+pub(crate) fn static_number_arena(store: &DataStore, id: AstNodeId) -> Option<f64> {
     match store.get_node(id)? {
         AstNodeData::Literal(value) => static_number_value(&store.retrieve_value(*value)),
         AstNodeData::UnaryOp { op_id, expr_id } => match store.resolve_ast_string(*op_id) {

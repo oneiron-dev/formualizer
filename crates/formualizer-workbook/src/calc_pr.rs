@@ -22,8 +22,9 @@
 //! ## Detection-handling decision (spec §9 implication)
 //!
 //! Spec §9 says "Loading never changes `detection`". Taken literally that would
-//! produce `CyclePolicy::Iterate` with the *default* `CycleDetection::Static`,
-//! which is a config error that panics at engine construction
+//! produce `CyclePolicy::Iterate` with a caller's `CycleDetection::Static`
+//! (the default before runtime detection became the default), which is a
+//! config error that panics at engine construction
 //! ([`CycleConfig::validate`]). To keep `Workbook::from_reader` ergonomic and
 //! non-panicking we resolve the implication per the task's first option: when a
 //! file enables iteration we set `detection: Runtime` as well (iteration is

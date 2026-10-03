@@ -796,8 +796,10 @@ pub struct EvalConfig {
     pub spill: SpillConfig,
 
     /// Cycle handling configuration (detection mode + policy). Defaults to
-    /// `CycleDetection::Static` (today's stamp-every-static-SCC behavior);
-    /// `CycleDetection::Runtime` is opt-in (RFC #112).
+    /// `CycleDetection::Runtime` with `CyclePolicy::Error`: a formula that
+    /// actually reads its own cell is `#CIRC!`, one that only might (an
+    /// INDEX of its own column selecting another row) calculates;
+    /// `CycleDetection::Static` stamps every static SCC (RFC #112).
     pub cycle: CycleConfig,
 
     /// Use dynamic topological ordering (Pearce-Kelly algorithm)
@@ -1120,13 +1122,16 @@ impl CycleConfig {
 /// How statically-cyclic SCCs are treated at evaluation time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CycleDetection {
-    /// Today's behavior: every static SCC is stamped `#CIRC!`. Compat escape
-    /// hatch; no live-edge machinery runs.
-    #[default]
+    /// Every static SCC is stamped `#CIRC!` without evaluating it. Compat
+    /// escape hatch; no live-edge machinery runs.
     Static,
-    /// Static SCCs are candidates; members are evaluated with live-edge
-    /// recording and only *live* cycles get the policy verdict. Phantom
-    /// (live-acyclic) SCCs produce ordinary values (discussion #99).
+    /// The default. Static SCCs are candidates; members are evaluated with
+    /// live-edge recording and only *live* cycles get the policy verdict.
+    /// Phantom (live-acyclic) SCCs produce ordinary values (discussion #99).
+    /// This is Excel's rule: a formula is circular when it reads its own
+    /// cell, so `=INDEX(F:F,2-1E-7)+1` in F1 reads F2 and is 1, while
+    /// `=INDEX(F:F,1)+1` in F1 is circular (Excel for Windows 16.0.20430).
+    #[default]
     Runtime,
 }
 

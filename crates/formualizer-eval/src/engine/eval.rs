@@ -1341,25 +1341,52 @@ fn function_result_extent(
                 Some(&id) if given(i) => arena_single_value(data_store, id),
                 _ => true,
             };
+            // A selector as INDEX reads it: an omitted one is 0, a constant is
+            // read like the dependency plan reads it (numbers, logicals and
+            // numeric text, under any leading signs); `None` when absent or
+            // known only at run time.
+            let selector = |i: usize| match node(i) {
+                Some(AstNodeData::Omitted) => Some(0.0),
+                Some(_) => crate::engine::refs::static_number_arena(data_store, args[i]),
+                None => None,
+            };
+            // The (row, column) INDEX selects with: a lone index picks a column
+            // of a one-row source and otherwise a row, with column 0 (the
+            // entire row).
+            let (row, col) = if args.len() == 2 {
+                if array.0 == 1 {
+                    (Some(1.0), selector(1))
+                } else {
+                    (selector(1), Some(0.0))
+                }
+            } else {
+                (selector(1), selector(2))
+            };
+            let fits = |s: Option<f64>, high: u64| {
+                s.is_some_and(|n| (0.0..=high as f64).contains(&position(n)))
+            };
+            // An array index of any kind, area_num included, is lifted: each
+            // element is one value.
             let selects = single(1)
                 && single(2)
+                && single(3)
                 && (succeeded
-                    || (given(1)
-                        && within(1, 0.0, array.0, position)
-                        && within(2, 0.0, array.1, position)
-                        && within(3, 1.0, 1, position)));
-            let whole = |i: usize| constant(i).is_some_and(|n| position(n) == 0.0);
+                    || (fits(row, array.0) && fits(col, array.1) && within(3, 1.0, 1, position)));
+            let whole = |s: Option<f64>| s.is_some_and(|n| position(n) == 0.0);
             let selected = if selects {
                 (
-                    if whole(1) { array.0 } else { 1 },
-                    if whole(2) { array.1 } else { 1 },
+                    if whole(row) { array.0 } else { 1 },
+                    if whole(col) { array.1 } else { 1 },
                 )
             } else {
                 (1, 1)
             };
             broadcast_extent(
                 selected,
-                broadcast_extent(extent(1, false), extent(2, false)),
+                broadcast_extent(
+                    extent(1, false),
+                    broadcast_extent(extent(2, false), extent(3, false)),
+                ),
             )
         }
         // SORT by a column (row) of the array, either way: constants in range.

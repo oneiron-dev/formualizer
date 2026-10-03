@@ -3,8 +3,8 @@
 //! Test inventory from `formualizer-stage2-scc-evaluation-design.md` §5 and
 //! the spec's §7 Error-policy subset: phantom (guarded) cycles produce
 //! values, live cycles produce `#CIRC!` with live-cycle-only blast radius,
-//! and `CycleDetection::Static` (the default) stays byte-for-byte today's
-//! behavior.
+//! and `CycleDetection::Static` (now opt-in; Runtime is the default) stays
+//! byte-for-byte the stamp-every-static-SCC behavior.
 
 use crate::engine::graph::editor::undo_engine::UndoEngine;
 use crate::engine::named_range::{NameScope, NamedDefinition};
@@ -34,7 +34,13 @@ fn runtime_engine() -> Engine<TestWorkbook> {
 }
 
 fn static_engine() -> Engine<TestWorkbook> {
-    Engine::new(TestWorkbook::new(), EvalConfig::default())
+    Engine::new(
+        TestWorkbook::new(),
+        EvalConfig::default().with_cycle(CycleConfig {
+            detection: CycleDetection::Static,
+            policy: CyclePolicy::Error,
+        }),
+    )
 }
 
 fn set_formula(engine: &mut Engine<TestWorkbook>, sheet: &str, row: u32, col: u32, f: &str) {
@@ -983,7 +989,7 @@ fn recalc_plan_skips_clean_cycles_and_evaluates_dirty_ones_whole() {
 /* ──────────────────────── compat & determinism ───────────────────────── */
 
 #[test]
-fn static_default_keeps_stamping_the_99_pair() {
+fn static_detection_keeps_stamping_the_99_pair() {
     // Golden dual-mode pin: the only documented diff (spec §8) is values vs
     // #CIRC for the guarded phantom pair.
     let mut engine = static_engine();

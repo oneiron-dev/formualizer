@@ -492,10 +492,12 @@ fn guarded_self_reference_stays_legacy_via_internal_dependency() {
         Some(&u64::from(ROWS))
     );
     engine.evaluate_all().unwrap();
-    assert!(matches!(
+    // The guard is FALSE, so B60 never reads itself: under the default
+    // runtime cycle detection it is 0, as in Excel, not #CIRC!.
+    assert_eq!(
         engine.get_cell_value("Sheet1", 60, 2),
-        Some(LiteralValue::Error(error)) if error.kind == ExcelErrorKind::Circ
-    ));
+        Some(LiteralValue::Number(0.0))
+    );
 }
 
 #[test]
