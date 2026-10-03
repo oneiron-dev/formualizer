@@ -175,11 +175,11 @@ pub(crate) fn reference_only_argument(name: &str, index: usize, cell_info: Optio
         .any(|f| name.eq_ignore_ascii_case(f))
 }
 
-/// A constant INDEX selector (row_num, column_num or area_num) as the whole
-/// number INDEX reads it: a number, a logical or numeric text, truncated, with
-/// any leading signs. `None` for anything that is not such a constant (a cell,
-/// an array, date text, ...): its value is known only when the formula runs.
-pub(crate) fn static_index_value(value: &formualizer_common::LiteralValue) -> Option<i64> {
+/// A constant INDEX selector (row_num, column_num or area_num) as the number
+/// INDEX reads: a number, a logical or numeric text. `None` for anything that
+/// is not such a constant (a cell, an array, date text, ...): its value is
+/// known only when the formula runs.
+fn static_number_value(value: &formualizer_common::LiteralValue) -> Option<f64> {
     use formualizer_common::LiteralValue;
     match value {
         LiteralValue::Int(_)
@@ -187,32 +187,42 @@ pub(crate) fn static_index_value(value: &formualizer_common::LiteralValue) -> Op
         | LiteralValue::Boolean(_)
         | LiteralValue::Text(_) => crate::coercion::to_number_lenient(value)
             .ok()
-            .filter(|number| number.is_finite())
-            .map(|number| number.trunc() as i64),
+            .filter(|number| number.is_finite()),
         _ => None,
     }
 }
 
-/// [`static_index_value`] of a selector written in a formula.
-pub(crate) fn static_index_tree(node: &ASTNode) -> Option<i64> {
+/// [`static_number_value`] of a selector written in a formula, with any
+/// leading signs.
+fn static_number_tree(node: &ASTNode) -> Option<f64> {
     match &node.node_type {
-        ASTNodeType::Literal(value) => static_index_value(value),
-        ASTNodeType::UnaryOp { op, expr } if op == "+" => static_index_tree(expr),
-        ASTNodeType::UnaryOp { op, expr } if op == "-" => static_index_tree(expr)?.checked_neg(),
+        ASTNodeType::Literal(value) => static_number_value(value),
+        ASTNodeType::UnaryOp { op, expr } if op == "+" => static_number_tree(expr),
+        ASTNodeType::UnaryOp { op, expr } if op == "-" => static_number_tree(expr).map(|n| -n),
         _ => None,
     }
 }
 
-fn static_index_arena(store: &DataStore, id: AstNodeId) -> Option<i64> {
+fn static_number_arena(store: &DataStore, id: AstNodeId) -> Option<f64> {
     match store.get_node(id)? {
-        AstNodeData::Literal(value) => static_index_value(&store.retrieve_value(*value)),
+        AstNodeData::Literal(value) => static_number_value(&store.retrieve_value(*value)),
         AstNodeData::UnaryOp { op_id, expr_id } => match store.resolve_ast_string(*op_id) {
-            "+" => static_index_arena(store, *expr_id),
-            "-" => static_index_arena(store, *expr_id)?.checked_neg(),
+            "+" => static_number_arena(store, *expr_id),
+            "-" => static_number_arena(store, *expr_id).map(|n| -n),
             _ => None,
         },
         _ => None,
     }
+}
+
+/// A constant selector written in a formula, as the whole-number position
+/// INDEX reads it ([`crate::coercion::snapped_whole_number`]).
+pub(crate) fn static_index_tree(node: &ASTNode) -> Option<i64> {
+    static_number_tree(node).map(|n| crate::coercion::snapped_whole_number(n) as i64)
+}
+
+fn static_index_arena(store: &DataStore, id: AstNodeId) -> Option<i64> {
+    static_number_arena(store, id).map(|n| crate::coercion::snapped_whole_number(n) as i64)
 }
 
 /// The area INDEX selects when its area_num is constant: area 1 when absent

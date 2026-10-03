@@ -139,7 +139,8 @@ fn nth_within(start: u32, end: u32, n: i64) -> Option<u32> {
 pub struct IndexFn;
 
 impl IndexFn {
-    /// A row_num, column_num or area_num: `None` when it holds several values, which
+    /// A row_num, column_num or area_num, a whole-number position
+    /// (`position_parameter`): `None` when it holds several values, which
     /// dispatch lifts over. In a formula entered without the array flag a
     /// multi-cell reference here has already been intersected with the
     /// formula cell (`lift::legacy_arg`).
@@ -153,14 +154,14 @@ impl IndexFn {
             // A blank index is 0 (the whole row or column), TRUE/FALSE and
             // numeric text convert, and an error index is the result, as in
             // value context (MATCH's #N/A).
-            value => integer_parameter(value.into_literal(), arg).map(Some),
+            value => position_parameter(value.into_literal(), arg).map(Some),
         }
     }
 
     /// area_num, the area of the reference INDEX selects in: 1 when omitted.
-    /// It is a whole-number parameter read like row_num and column_num
-    /// (`index_argument`: truncated; a blank is 0, a logical and numeric text
-    /// convert, other text is `#VALUE!`, an error is itself), the same way in
+    /// It is a whole-number position read like row_num and column_num
+    /// (`index_argument`; a blank is 0, a logical and numeric text convert,
+    /// other text is `#VALUE!`, an error is itself), the same way in
     /// reference and value context. An area below 1 is no area number at all,
     /// so it is `#VALUE!`; an area past the reference's last area is the
     /// caller's `#REF!`. `None` for an array area_num, which dispatch lifts
@@ -449,6 +450,9 @@ impl IndexFn {
 /// - `row_num`, `column_num` and `area_num` are numbers: a blank cell is 0, TRUE and FALSE
 ///   are 1 and 0, and numeric text converts. Other text returns `#VALUE!`, and an error
 ///   index returns that error.
+/// - A `row_num`, `column_num` or `area_num` within 2^-22 below a whole number is that
+///   number, as in Excel: `INDEX({10;20;30},1.9999999985)` is 20. Other fractions truncate
+///   (2.9999 is row 2).
 /// - An array `row_num`, `column_num` or `area_num` returns an array of the selected values,
 ///   paired and broadcast element by element like any single-value parameter.
 /// - In a workbook formula entered without the array flag, a range `row_num`, `column_num` or
@@ -604,7 +608,7 @@ impl Function for IndexFn {
             let index = if args[1].is_omitted() {
                 0
             } else {
-                match integer_parameter(args[1].value()?.into_literal(), &args[1]) {
+                match position_parameter(args[1].value()?.into_literal(), &args[1]) {
                     Ok(index) => index,
                     Err(error) => {
                         return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
@@ -617,7 +621,7 @@ impl Function for IndexFn {
                 Some(if args[2].is_omitted() {
                     0
                 } else {
-                    match integer_parameter(args[2].value()?.into_literal(), &args[2]) {
+                    match position_parameter(args[2].value()?.into_literal(), &args[2]) {
                         Ok(column) => column,
                         Err(error) => {
                             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -912,11 +916,27 @@ fn offset_number(arg: &ArgumentHandle<'_, '_>) -> Result<i64, ExcelError> {
     integer_parameter(arg.value()?.into_literal(), arg)
 }
 
-/// A whole-number parameter (INDEX's row_num and column_num, OFFSET's offsets
-/// and sizes): a blank is 0, TRUE and FALSE are 1 and 0, and numeric or date
-/// text converts; other text is #VALUE!, an error is itself, and a fraction
-/// truncates.
+/// A whole-number parameter (OFFSET's offsets and sizes): a number parameter
+/// (`number_parameter`) whose fraction truncates.
 fn integer_parameter(value: LiteralValue, arg: &ArgumentHandle<'_, '_>) -> Result<i64, ExcelError> {
+    number_parameter(value, arg).map(|n| n.trunc() as i64)
+}
+
+/// INDEX's row_num, column_num and area_num: a number parameter
+/// (`number_parameter`) read as a whole-number position, so a value within
+/// 2^-22 below a whole number is that number and other fractions truncate
+/// (`coercion::snapped_whole_number`).
+fn position_parameter(
+    value: LiteralValue,
+    arg: &ArgumentHandle<'_, '_>,
+) -> Result<i64, ExcelError> {
+    number_parameter(value, arg).map(|n| crate::coercion::snapped_whole_number(n) as i64)
+}
+
+/// A number parameter of INDEX or OFFSET: a blank is 0, TRUE and FALSE are 1
+/// and 0, and numeric or date text converts; other text is #VALUE! and an
+/// error is itself.
+fn number_parameter(value: LiteralValue, arg: &ArgumentHandle<'_, '_>) -> Result<f64, ExcelError> {
     match value {
         LiteralValue::Error(e) => Err(e),
         LiteralValue::Array(_) => Err(ExcelError::new(ExcelErrorKind::Value)),
@@ -924,8 +944,7 @@ fn integer_parameter(value: LiteralValue, arg: &ArgumentHandle<'_, '_>) -> Resul
             &value,
             arg.date_system(),
             Some(arg.current_year()),
-        )
-        .map(|n| n.trunc() as i64),
+        ),
     }
 }
 

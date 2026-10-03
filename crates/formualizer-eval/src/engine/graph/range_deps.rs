@@ -419,7 +419,7 @@ impl DependencyGraph {
         };
 
         // A constant selector reads as INDEX reads it at run time (numbers,
-        // logicals and numeric text, truncated).
+        // logicals and numeric text, as whole-number positions).
         use crate::engine::refs::static_index_tree as static_index;
 
         fn matching_range(

@@ -548,6 +548,8 @@ impl Function for RankAvgFn {
 /// # Remarks
 /// - `k` must be at least `1`.
 /// - Returns `#NUM!` if `k` is greater than the count of numeric values.
+/// - Within those bounds `k` rounds to the nearest whole number, as in Excel
+///   (`LARGE({10,20,30},2.6)` is 10, the third largest), where `SMALL` truncates its `k`.
 /// - Non-numeric values in referenced ranges are ignored.
 ///
 /// # Examples
@@ -635,8 +637,11 @@ impl Function for LARGE {
             )));
         }
         let mut nums = collect_numeric_stats(&args[..args.len() - 1])?;
+        // The bounds are on k as given (3.1 over three numbers is #NUM!);
+        // within them LARGE rounds k to the nearest whole number, where SMALL
+        // truncates it.
         let k = match order_statistic_rank(k, nums.len()) {
-            Ok(k) => k,
+            Ok(_) => k.round() as usize,
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
         // k-th largest == (n-k)-th smallest: quickselect instead of full sort.

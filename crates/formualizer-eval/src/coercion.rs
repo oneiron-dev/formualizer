@@ -522,9 +522,54 @@ pub fn snap_cancellation(sum: f64, a: f64, b: f64) -> f64 {
     }
 }
 
+/// Excel's reading of a whole number in the functions that take positions:
+/// INDEX's row_num, column_num and area_num, VLOOKUP's and HLOOKUP's index,
+/// ADDRESS's row, column and abs_num, and DATE's year, month and day. A value
+/// within 2^-22 below a whole number is that number and any other fraction
+/// truncates, `floor(n + 2^-22)`. The window is absolute,
+/// the same at 2, 1999 and 100000 (Excel for Windows 16.0.20430:
+/// `INDEX({10;20;30},2-2.38E-7)` is 20 and `2-2.39E-7` is 10;
+/// `INDEX(SEQUENCE(200000),100000-2.2E-7)` is 100000 and `-2.6E-7` is 99999),
+/// so `10^6*MOD(2/10^6+2,1)`, which is 1.9999999998354667, is row 2; VLOOKUP's
+/// index, ADDRESS's row and DATE's month read the same way. A negative value
+/// truncates toward zero. OFFSET, CHOOSE, SMALL, MID, REPT, TIME and INT
+/// truncate without the window; LARGE rounds.
+pub fn snapped_whole_number(n: f64) -> f64 {
+    const WINDOW: f64 = 1.0 / (1u64 << 22) as f64;
+    if n > 0.0 {
+        (n + WINDOW).floor()
+    } else {
+        n.trunc()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whole_number_positions_snap_within_two_to_the_minus_22() {
+        assert_eq!(snapped_whole_number(2.0 - 1e-7), 2.0);
+        assert_eq!(snapped_whole_number(2.0 - 2.38e-7), 2.0);
+        assert_eq!(snapped_whole_number(2.0 - 2.39e-7), 1.0);
+        assert_eq!(snapped_whole_number(2.0 - 1e-6), 1.0);
+        assert_eq!(snapped_whole_number(1.9999999985), 2.0);
+        assert_eq!(snapped_whole_number(1e6 * ((2.0 / 1e6 + 2.0) % 1.0)), 2.0);
+        // The window is absolute, not relative to the size of the number.
+        assert_eq!(snapped_whole_number(1999.0 - 2.2e-7), 1999.0);
+        assert_eq!(snapped_whole_number(1999.0 - 2.4e-7), 1998.0);
+        assert_eq!(snapped_whole_number(100000.0 - 2.2e-7), 100000.0);
+        assert_eq!(snapped_whole_number(100000.0 - 2.6e-7), 99999.0);
+        assert_eq!(snapped_whole_number(1000000.0 - 1e-6), 999999.0);
+        // Other fractions truncate; whole numbers and values above them stay.
+        assert_eq!(snapped_whole_number(1.5), 1.0);
+        assert_eq!(snapped_whole_number(2.9999), 2.0);
+        assert_eq!(snapped_whole_number(0.9), 0.0);
+        assert_eq!(snapped_whole_number(2.0), 2.0);
+        assert_eq!(snapped_whole_number(2.0 + 1e-7), 2.0);
+        assert_eq!(snapped_whole_number(0.0), 0.0);
+        assert_eq!(snapped_whole_number(-1.5), -1.0);
+    }
 
     #[test]
     fn cancellation_snaps_only_within_binary_noise() {

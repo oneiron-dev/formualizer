@@ -193,6 +193,7 @@ mod text_number_criteria_rules;
 mod used_bounds_cache;
 mod used_extent_resolver;
 mod whole_column_sumifs;
+mod whole_number_arguments;
 mod wildcard_star_semantics;
 mod xnpv_xirr_dates;
 

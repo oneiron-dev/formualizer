@@ -32,6 +32,8 @@ pub struct AddressFn;
 /// - `a1` defaults to `TRUE`; `FALSE` returns R1C1-style text.
 /// - Valid row range is `1..1048576`; valid column range is `1..16384`.
 /// - Out-of-range row/column values or invalid `abs_num` return `#VALUE!`.
+/// - A row, column or `abs_num` within 2^-22 below a whole number is that number, as in Excel
+///   (`ADDRESS(2-1E-7,1)` is `$A$2`); other fractions truncate (`ADDRESS(2.9999,1)` is `$A$2`).
 /// - If `sheet_text` contains spaces or special characters, it is quoted.
 ///
 /// # Examples
@@ -160,7 +162,7 @@ impl Function for AddressFn {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
         }
         let row = match row_val {
-            LiteralValue::Number(n) => n as i64,
+            LiteralValue::Number(n) => crate::coercion::snapped_whole_number(n) as i64,
             LiteralValue::Int(i) => i,
             _ => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -181,7 +183,7 @@ impl Function for AddressFn {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
         }
         let col = match col_val {
-            LiteralValue::Number(n) => n as i64,
+            LiteralValue::Number(n) => crate::coercion::snapped_whole_number(n) as i64,
             LiteralValue::Int(i) => i,
             _ => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -203,7 +205,7 @@ impl Function for AddressFn {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
             }
             match abs_val {
-                LiteralValue::Number(n) => n as i64,
+                LiteralValue::Number(n) => crate::coercion::snapped_whole_number(n) as i64,
                 LiteralValue::Int(i) => i,
                 _ => 1,
             }

@@ -454,6 +454,8 @@ pub struct VLookupFn;
 ///
 /// # Remarks
 /// - `col_index_num` is 1-based and must be within the table width as written (whole rows span 16,384 columns).
+///   A value within 2^-22 below a whole number is that number, as in Excel (`1.9999999985` is
+///   2); other fractions truncate (`2.9999` is 2).
 /// - `range_lookup` defaults to `TRUE`, matching Excel and LibreOffice.
 /// - When `range_lookup=TRUE`, approximate match logic is used against the first column.
 /// - In exact mode, a blank candidate never matches. A blank lookup value matches a real numeric zero, but not blank, text, or boolean candidates.
@@ -595,7 +597,7 @@ impl Function for VLookupFn {
         // error is the result.
         let col_index = match crate::coercion::to_number_argument(&args[2].value()?.into_literal())
         {
-            Ok(n) => n as i64,
+            Ok(n) => crate::coercion::snapped_whole_number(n) as i64,
             Err(error) => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                     if error.kind == ExcelErrorKind::Value {
@@ -727,6 +729,8 @@ pub struct HLookupFn;
 ///
 /// # Remarks
 /// - `row_index_num` is 1-based and must be within the table height as written (whole columns span 1,048,576 rows).
+///   A value within 2^-22 below a whole number is that number, as in Excel (`1.9999999985` is
+///   2); other fractions truncate (`2.9999` is 2).
 /// - `range_lookup` defaults to `TRUE`, matching Excel and LibreOffice.
 /// - When `range_lookup=TRUE`, approximate match logic is used against the first row.
 /// - In exact mode, a blank candidate never matches. A blank lookup value matches a real numeric zero, but not blank, text, or boolean candidates.
@@ -868,7 +872,7 @@ impl Function for HLookupFn {
         // error is the result.
         let row_index = match crate::coercion::to_number_argument(&args[2].value()?.into_literal())
         {
-            Ok(n) => n as i64,
+            Ok(n) => crate::coercion::snapped_whole_number(n) as i64,
             Err(error) => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                     if error.kind == ExcelErrorKind::Value {

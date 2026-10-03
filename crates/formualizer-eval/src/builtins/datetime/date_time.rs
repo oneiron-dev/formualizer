@@ -8,13 +8,17 @@ use chrono::NaiveTime;
 use formualizer_common::{ExcelError, LiteralValue, date_to_serial_for, time_to_fraction};
 use formualizer_macros::func_caps;
 
-fn coerce_to_int(arg: &ArgumentHandle) -> Result<i32, ExcelError> {
+/// A DATE or TIME argument as the whole number `whole` makes of it: DATE's
+/// year, month and day snap within 2^-22 below a whole number
+/// (`coercion::snapped_whole_number`, so `DATE(2026,2-1E-7,1)` is February),
+/// TIME's parts truncate.
+fn coerce_to_int(arg: &ArgumentHandle, whole: fn(f64) -> f64) -> Result<i32, ExcelError> {
     let v = arg.value()?.into_literal();
     match v {
         // Saturate rather than wrap, so a value outside i32 stays out of the
         // 16-bit argument ranges below instead of wrapping back into them.
         LiteralValue::Int(i) => Ok(i.clamp(i32::MIN.into(), i32::MAX.into()) as i32),
-        LiteralValue::Number(f) => Ok(f.trunc() as i32),
+        LiteralValue::Number(f) => Ok(whole(f) as i32),
         // Text coerces as VALUE() does: numeric text, or date/time text such as
         // "Oct 21" read as its serial (year-less dates fall in the clock's year).
         LiteralValue::Text(_) => crate::coercion::to_serial_lenient_in_year(
@@ -22,7 +26,7 @@ fn coerce_to_int(arg: &ArgumentHandle) -> Result<i32, ExcelError> {
             arg.date_system(),
             Some(arg.current_year()),
         )
-        .map(|f| f.trunc() as i32)
+        .map(|f| whole(f) as i32)
         .map_err(|_| {
             ExcelError::new_value().with_message("DATE/TIME argument is not a valid number")
         }),
@@ -57,6 +61,9 @@ fn num_error<'b>() -> Result<crate::traits::CalcValue<'b>, ExcelError> {
 ///
 /// # Remarks
 /// - Years in the range `0..=1899` are interpreted as `1900..=3799` for Excel compatibility.
+/// - A year, month or day within 2^-22 below a whole number is that number, as in Excel
+///   (`DATE(2026,2-1E-7,1)` is February 1); other fractions truncate (`DATE(2026,2.9999,1)`
+///   is February 1).
 /// - The returned serial is date-system aware and depends on the active workbook system (`1900` vs `1904`).
 /// - In the `1900` system, serial mapping preserves Excel's historical phantom `1900-02-29` behavior.
 ///
@@ -131,9 +138,10 @@ impl Function for DateFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let year = coerce_to_int(&args[0])?;
-        let month = coerce_to_int(&args[1])?;
-        let day = coerce_to_int(&args[2])?;
+        let whole = crate::coercion::snapped_whole_number;
+        let year = coerce_to_int(&args[0], whole)?;
+        let month = coerce_to_int(&args[1], whole)?;
+        let day = coerce_to_int(&args[2], whole)?;
 
         // A month outside Excel's 16-bit range is #NUM!, even when the rolled-over
         // date would be valid. Date text used as the month (a serial such as
@@ -249,9 +257,9 @@ impl Function for TimeFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let hour = coerce_to_int(&args[0])?;
-        let minute = coerce_to_int(&args[1])?;
-        let second = coerce_to_int(&args[2])?;
+        let hour = coerce_to_int(&args[0], f64::trunc)?;
+        let minute = coerce_to_int(&args[1], f64::trunc)?;
+        let second = coerce_to_int(&args[2], f64::trunc)?;
 
         // An argument outside the 16-bit range is #NUM! (date text such as
         // "1/15/2021" is a serial far above 32767). The bound also keeps the

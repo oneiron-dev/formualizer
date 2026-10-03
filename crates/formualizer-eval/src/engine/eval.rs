@@ -1306,10 +1306,12 @@ fn function_result_extent(
         }
         other => literal(other),
     };
-    // An omitted argument, or a constant from `low` to `high`.
-    let at_most = |i: usize, low: f64, high: u64| {
-        !given(i) || constant(i).is_some_and(|n| (low..=high as f64).contains(&n.trunc()))
+    // An omitted argument, or a constant from `low` to `high` as `whole`
+    // reads it (truncated, or as INDEX reads a row or column position).
+    let within = |i: usize, low: f64, high: u64, whole: fn(f64) -> f64| {
+        !given(i) || constant(i).is_some_and(|n| (low..=high as f64).contains(&whole(n)))
     };
+    let at_most = |i: usize, low: f64, high: u64| within(i, low, high, f64::trunc);
     match name {
         // A constant test selects one branch whole; otherwise the result is
         // at least as large as the test lifted over (an error test is IF's
@@ -1333,6 +1335,7 @@ fn function_result_extent(
         // array, the first area) and is not lifted over an array of indexes
         // (each element is then one value).
         "INDEX" => {
+            let position = crate::coercion::snapped_whole_number;
             let array = extent(0, succeeded);
             let single = |i: usize| match args.get(i) {
                 Some(&id) if given(i) => arena_single_value(data_store, id),
@@ -1342,10 +1345,10 @@ fn function_result_extent(
                 && single(2)
                 && (succeeded
                     || (given(1)
-                        && at_most(1, 0.0, array.0)
-                        && at_most(2, 0.0, array.1)
-                        && at_most(3, 1.0, 1)));
-            let whole = |i: usize| constant(i).is_some_and(|n| n.trunc() == 0.0);
+                        && within(1, 0.0, array.0, position)
+                        && within(2, 0.0, array.1, position)
+                        && within(3, 1.0, 1, position)));
+            let whole = |i: usize| constant(i).is_some_and(|n| position(n) == 0.0);
             let selected = if selects {
                 (
                     if whole(1) { array.0 } else { 1 },
