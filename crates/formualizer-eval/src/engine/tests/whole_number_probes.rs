@@ -254,12 +254,18 @@ fn index_of_its_own_column_selecting_another_row_is_no_cycle() {
     }
 }
 
-/// `formula` in Result!J2 of a workbook whose Sheet1 holds A1 = 11.
+/// `formula` in Result!J2 of a workbook whose Sheet1 holds A1 = 11 and
+/// B1 = B2 = 1.
 fn on_result_sheet(formula: &str) -> Engine<TestWorkbook> {
     let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
     engine
         .set_cell_value("Sheet1", 1, 1, LiteralValue::Number(11.0))
         .unwrap();
+    for row in [1, 2] {
+        engine
+            .set_cell_value("Sheet1", row, 2, LiteralValue::Number(1.0))
+            .unwrap();
+    }
     engine.add_sheet("Result").unwrap();
     engine
         .set_cell_formula("Result", 2, 10, parse(formula).unwrap())
@@ -284,13 +290,10 @@ fn index_result_extent_matches_what_index_selects() {
         "=INDEX(Sheet1!$1:$1048576,2,)+0",
         // A scalar area_num is one area, however it is written.
         "=INDEX(Sheet1!A:A,0,1,ABS(1))+0",
-        "=INDEX(Sheet1!A:A,0,1,SUM(1))+0",
-        "=INDEX(Sheet1!A:A,0,1,MIN(1))+0",
         "=INDEX(Sheet1!A:A,0,1,IF(TRUE,1,2))+0",
         "=INDEX(Sheet1!A:A,0,1,CHOOSE(1,1,2))+0",
-        "=INDEX(Sheet1!A:A,0,1,COUNTIF(Sheet1!A:A,11))+0",
-        // A scalar operand keeps the selected column's extent.
-        "=INDEX(Sheet1!A:A,0,1)+SUM(0)",
+        // A single-value operand keeps the selected column's extent.
+        "=INDEX(Sheet1!A:A,0,1)+ABS(0)",
         "=INDEX(Sheet1!A:A,0,1,--1)+0",
         "=IFERROR(INDEX(Sheet1!A:A,0,1,\"1\"),99)",
     ] {
@@ -317,6 +320,8 @@ fn index_result_extent_matches_what_index_selects() {
         "=INDEX(Sheet1!A:A,0,1,{1,1})",
         "=INDEX(Sheet1!A:A,0,1,SEQUENCE(1,2,1,0))+0",
         "=INDEX(Sheet1!A:A,0,1,FILTER({1,1},{TRUE,TRUE}))+0",
+        // A reduction over an array of references is one value per reference.
+        "=INDEX(Sheet1!A:A,0,1,SUBTOTAL(9,OFFSET(Sheet1!B1,{0,1},0)))+0",
     ] {
         let engine = on_result_sheet(formula);
         assert_eq!(

@@ -1263,7 +1263,6 @@ fn arena_single_value(data_store: &crate::engine::arena::DataStore, node: AstNod
                 && arena_single_value(data_store, *right_id)
         }
         Some(AstNodeData::Function { name_id, .. }) => {
-            use crate::function::FnCaps;
             use crate::lift::{Lift, lift_spec};
             let name = data_store.resolve_ast_string(*name_id);
             let name = crate::formula_plane::template_canonical::normalize_function_name(name);
@@ -1276,24 +1275,11 @@ fn arena_single_value(data_store: &crate::engine::arena::DataStore, node: AstNod
                 }
                 // FILTERXML returns every matching node.
                 "FILTERXML" => false,
-                _ => match lift_spec(&name) {
-                    // A builtin whose parameters are all single values gives
-                    // one value for single-value arguments (`ABS(1)`).
-                    Some(Lift::All) => (0..args.len()).all(single),
-                    // A reduction (SUM, MAX, COUNTIF, LARGE, ...) gives one
-                    // value unless an argument it lifts over (COUNTIF's
-                    // criteria, LARGE's k, AGGREGATE's k) holds several.
-                    lift => crate::function_registry::get("", &name).is_some_and(|function| {
-                        let caps = function.caps();
-                        caps.contains(FnCaps::REDUCTION)
-                            && !caps.intersects(FnCaps::MAY_SPILL | FnCaps::RETURNS_REFERENCE)
-                            && (0..args.len()).all(|i| {
-                                let lifted = lift.is_some_and(|lift| lift.lifts(i))
-                                    || (name == "AGGREGATE" && i == 3);
-                                !lifted || single(i)
-                            })
-                    }),
-                },
+                // A builtin whose parameters are all single values gives one
+                // value for single-value arguments (`ABS(1)`). Reductions are
+                // not proved single here: they also lift over arrays of
+                // references (`SUBTOTAL(9,OFFSET(B1,{0,1},0))` is two values).
+                _ => matches!(lift_spec(&name), Some(Lift::All)) && (0..args.len()).all(single),
             }
         }
         _ => false,
