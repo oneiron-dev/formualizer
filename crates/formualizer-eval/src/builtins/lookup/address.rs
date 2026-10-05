@@ -10,7 +10,7 @@ use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, FunctionContext};
 use formualizer_common::{
-    ArgKind, ExcelError, ExcelErrorKind, LiteralValue, col_letters_from_1based,
+    ArgKind, DateSystem, ExcelError, ExcelErrorKind, LiteralValue, col_letters_from_1based,
 };
 use formualizer_macros::func_caps;
 
@@ -24,12 +24,13 @@ pub struct AddressFn;
 
 /// ADDRESS's row, column or abs_num as a whole number, read like INDEX's
 /// positions (`coercion::snapped_whole_number`) from what a number argument
-/// takes: a number, a logical (`ADDRESS(TRUE,TRUE)` is `$A$1`), a blank cell
-/// (0) or text that reads as a number (`ADDRESS(1,1,"1")` is `$A$1`). `None`
-/// for anything else.
-fn whole_position(value: &LiteralValue) -> Option<i64> {
-    crate::coercion::to_number_argument(value)
-        .ok()
+/// takes: a number, a logical (`ADDRESS(TRUE,TRUE)` is `$A$1`), a date (its
+/// serial in the workbook's date `system`), a blank cell (0) or text that
+/// reads as a number (`ADDRESS(1,1,"1")` is `$A$1`). `None` for anything else.
+fn whole_position(value: &LiteralValue, system: DateSystem) -> Option<i64> {
+    value
+        .as_serial_number_for(system)
+        .or_else(|| crate::coercion::to_number_argument(value).ok())
         .map(|n| crate::coercion::snapped_whole_number(n) as i64)
 }
 
@@ -165,8 +166,9 @@ impl Function for AddressFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        let system = ctx.date_system();
         if args.len() < 2 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new(ExcelErrorKind::Value),
@@ -178,7 +180,7 @@ impl Function for AddressFn {
         if let LiteralValue::Error(e) = row_val {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
         }
-        let row = match whole_position(&row_val) {
+        let row = match whole_position(&row_val, system) {
             Some(row) => row,
             None => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -198,7 +200,7 @@ impl Function for AddressFn {
         if let LiteralValue::Error(e) = col_val {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
         }
-        let col = match whole_position(&col_val) {
+        let col = match whole_position(&col_val, system) {
             Some(col) => col,
             None => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -220,7 +222,7 @@ impl Function for AddressFn {
             if let LiteralValue::Error(e) = abs_val {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
             }
-            whole_position(&abs_val).unwrap_or(0)
+            whole_position(&abs_val, system).unwrap_or(0)
         } else {
             1
         };
@@ -240,9 +242,12 @@ impl Function for AddressFn {
             if let LiteralValue::Error(e) = a1_val {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
             }
-            // A date or time is its serial number.
-            let a1 = crate::coercion::to_logical(&a1_val)
-                .or_else(|error| a1_val.as_serial_number().map(|n| n != 0.0).ok_or(error));
+            // A number, logical or date (its serial in the workbook's date
+            // system) is TRUE unless 0; blank and text read as a logical.
+            let a1 = match a1_val.as_serial_number_for(system) {
+                Some(n) => Ok(n != 0.0),
+                None => crate::coercion::to_logical(&a1_val),
+            };
             match a1 {
                 Ok(a1) => a1,
                 Err(_) => {

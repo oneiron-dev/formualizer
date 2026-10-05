@@ -277,6 +277,38 @@ fn address_reads_numbers_and_logicals_like_excel() {
 }
 
 #[test]
+fn address_reads_a_date_as_its_serial_in_the_workbook_date_system() {
+    // In a 1904 workbook January 1, 1904 is serial 0 and January 2 is 1.
+    use ExcelErrorKind::Value;
+    use chrono::NaiveDate;
+    let date = |day| LiteralValue::Date(NaiveDate::from_ymd_opt(1904, 1, day).unwrap());
+    for config in [EvalConfig::default(), super::common::arrow_eval_config()] {
+        let config = config.with_date_system(crate::engine::DateSystem::Excel1904);
+        let mut engine = Engine::new(TestWorkbook::new(), config);
+        engine.set_cell_value("Sheet1", 1, 1, date(1)).unwrap();
+        engine.set_cell_value("Sheet1", 1, 2, date(2)).unwrap();
+        let cases = [
+            ("=ADDRESS(1,1,B1)", text("$A$1")),
+            ("=ADDRESS(B1,B1)", text("$A$1")),
+            ("=ADDRESS(A1,1)", error(Value)),
+            ("=ADDRESS(1,A1)", error(Value)),
+            ("=ADDRESS(1,1,1,A1)", text("R1C1")),
+            ("=ADDRESS(1,1,1,B1)", text("$A$1")),
+        ];
+        for (i, (formula, _)) in cases.iter().enumerate() {
+            engine
+                .set_cell_formula("Sheet1", i as u32 + 1, 20, parse(formula).unwrap())
+                .unwrap();
+        }
+        engine.evaluate_all().unwrap();
+        for (i, (formula, expected)) in cases.iter().enumerate() {
+            let actual = engine.get_cell_value("Sheet1", i as u32 + 1, 20).unwrap();
+            assert!(same(&actual, expected), "{formula}: {actual:?}");
+        }
+    }
+}
+
+#[test]
 fn truncating_arguments_have_no_window() {
     assert_cases(&[
         ("=COLUMN(OFFSET(A1,0,2-1E-7))", n(2.0)),
