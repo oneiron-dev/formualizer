@@ -260,14 +260,17 @@ impl Function for AddressFn {
             true
         };
 
-        // Get sheet name (optional)
-        let sheet_name = if args.len() > 4 {
+        // Get sheet name (optional). An empty argument, ADDRESS(1,1,1,TRUE,), is
+        // no sheet; a blank cell is the empty name, so ADDRESS(1,1,1,TRUE,A1)
+        // with A1 blank is "!$A$1", as `""` is.
+        let sheet_name = if args.len() > 4 && !args[4].is_omitted() {
             let sheet_val = args[4].value()?.into_literal();
             if let LiteralValue::Error(e) = sheet_val {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
             }
             match sheet_val {
                 LiteralValue::Text(s) => Some(s),
+                LiteralValue::Empty => Some(String::new()),
                 _ => None,
             }
         } else {

@@ -1,5 +1,5 @@
 //! The whole-number readings settled by Excel for Windows 16.0.20430 (probes
-//! 4-8 of ops/excel-int-coercion-probe-20261003.md), with the shapes INDEX
+//! 4-9 of ops/excel-int-coercion-probe-20261003.md), with the shapes INDEX
 //! returns. One reader, `floor(x + 2^-22)` with negatives floored, serves
 //! INDEX, VLOOKUP/HLOOKUP, ADDRESS, DATE, SEQUENCE and LEFT/RIGHT; ROUND's
 //! digits snap on their magnitude and go toward zero,
@@ -273,6 +273,37 @@ fn address_reads_numbers_and_logicals_like_excel() {
         ("=ADDRESS(1,1,\"1\")", text("$A$1")),
         // A date is a number, so TRUE.
         ("=ADDRESS(1,1,1,DATE(2026,1,1))", text("$A$1")),
+    ]);
+}
+
+#[test]
+fn address_and_lookup_rows_of_probe_9() {
+    // A1 is blank.
+    use ExcelErrorKind::Value;
+    assert_cases(&[
+        ("=ADDRESS(FALSE,1)", error(Value)),
+        ("=ADDRESS(1,FALSE)", error(Value)),
+        ("=ADDRESS(1,1,FALSE)", error(Value)),
+        ("=ADDRESS(1,1,1,\"FALSE\")", text("R1C1")),
+        ("=ADDRESS(1,1,1,\"1\")", error(Value)),
+        ("=ADDRESS(\"1\",1)", text("$A$1")),
+        ("=ADDRESS(1,1,\"TRUE\")", error(Value)),
+        // sheet_text: the empty name is "!", an empty argument is no sheet, a
+        // blank cell is the empty name.
+        ("=ADDRESS(1,1,1,TRUE,\"\")", text("!$A$1")),
+        ("=ADDRESS(1,1,1,FALSE,\"\")", text("!R1C1")),
+        ("=ADDRESS(1,1,1,TRUE,)", text("$A$1")),
+        ("=ADDRESS(1,1,1,TRUE,A1)", text("!$A$1")),
+        ("=ADDRESS(1,1,1,TRUE,\"Sheet 1\")", text("'Sheet 1'!$A$1")),
+        // A text index fails before the lookup; TRUE is index 1.
+        ("=VLOOKUP(1,{1,2;3,4},\"a\",FALSE)", error(Value)),
+        ("=VLOOKUP(5,{1,2;3,4},\"a\",FALSE)", error(Value)),
+        ("=HLOOKUP(5,{1,3;2,4},\"a\",FALSE)", error(Value)),
+        (
+            "=VLOOKUP(5,{1,2;3,4},TRUE,FALSE)",
+            error(ExcelErrorKind::Na),
+        ),
+        ("=VLOOKUP(1,{1,2;3,4},TRUE,FALSE)", n(1.0)),
     ]);
 }
 
