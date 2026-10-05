@@ -1,10 +1,13 @@
 //! The whole-number readings settled by Excel for Windows 16.0.20430 (probes
-//! 4-6 of ops/excel-int-coercion-probe-20261003.md), with the shapes INDEX
+//! 4-8 of ops/excel-int-coercion-probe-20261003.md), with the shapes INDEX
 //! returns. One reader, `floor(x + 2^-22)` with negatives floored, serves
 //! INDEX, VLOOKUP/HLOOKUP, ADDRESS, DATE, SEQUENCE and LEFT/RIGHT; ROUND's
-//! digits snap toward zero, `trunc(x + 2^-22)`; LARGE (and AGGREGATE 14) take
-//! the ceiling of k after its bounds; OFFSET, CHOOSE, SMALL, AGGREGATE 15, MID,
-//! REPT, ROUNDUP and ROUNDDOWN truncate without a window.
+//! digits snap on their magnitude and go toward zero,
+//! `sign(x) * trunc(abs(x) + 2^-22)`; LARGE (and AGGREGATE 14) take the ceiling
+//! of k after its bounds; OFFSET, CHOOSE, SMALL, AGGREGATE 15, MID, REPT,
+//! ROUNDUP and ROUNDDOWN truncate without a window. VLOOKUP and HLOOKUP check
+//! their index only after a match, and ADDRESS reads its arguments like
+//! number and logical parameters.
 
 use crate::engine::{Engine, EvalConfig};
 use crate::test_workbook::TestWorkbook;
@@ -152,7 +155,7 @@ fn snapped_negatives_are_floored() {
 }
 
 #[test]
-fn sequence_left_right_and_round_snap() {
+fn sequence_left_and_right_snap() {
     use ExcelErrorKind::Value;
     assert_cases(&[
         ("=ROWS(SEQUENCE(2-1E-7))", n(2.0)),
@@ -169,14 +172,6 @@ fn sequence_left_right_and_round_snap() {
         ("=LEFT(\"abcd\",-0.5)", error(Value)),
         ("=RIGHT(\"abcd\",2-1E-7)", text("cd")),
         ("=RIGHT(\"abcd\",2.6)", text("cd")),
-        ("=ROUND(1.23456,2-1E-7)", n(1.23)),
-        ("=ROUND(1.23456,2-3E-7)", n(1.2)),
-        ("=ROUND(1.23456,2.4)", n(1.23)),
-        ("=ROUND(1.23456,2.6)", n(1.23)),
-        ("=ROUND(1234.5,-0.5)", n(1235.0)),
-        ("=ROUND(1234.5678,-2)", n(1200.0)),
-        ("=ROUND(1234.5678,-2-1E-7)", n(1200.0)),
-        ("=ROUND(1234.5678,-2+1E-7)", n(1230.0)),
         // Numeric text converts before the whole-number reading.
         ("=LEFT(\"abcd\",\"1.9999999\")", text("ab")),
         ("=RIGHT(\"abcd\",\"2.6\")", text("cd")),
@@ -186,6 +181,98 @@ fn sequence_left_right_and_round_snap() {
         ("=ADDRESS(1,1,\"1.9999999\")", text("A$1")),
         ("=ADDRESS(\"x\",1)", error(Value)),
         ("=ADDRESS(1,1,\"x\")", error(Value)),
+    ]);
+}
+
+#[test]
+fn round_digits_snap_on_the_magnitude_then_go_toward_zero() {
+    // The twelve ROUND points of probes 4-7, which all fit
+    // digits = sign(x) * trunc(abs(x) + 2^-22).
+    assert_cases(&[
+        ("=ROUND(1.23456,2-1E-7)", n(1.23)),
+        ("=ROUND(1.23456,2-3E-7)", n(1.2)),
+        ("=ROUND(1.23456,2.4)", n(1.23)),
+        ("=ROUND(1.23456,2.6)", n(1.23)),
+        ("=ROUND(1234.5,-0.5)", n(1235.0)),
+        ("=ROUND(1234.5678,-1.9999999)", n(1200.0)),
+        ("=ROUND(1234.5678,-1.99999999)", n(1200.0)),
+        ("=ROUND(1234.5678,-2.0000001)", n(1200.0)),
+        ("=ROUND(1234.5678,-1.9999997)", n(1230.0)),
+        ("=ROUND(1234.5678,-2)", n(1200.0)),
+        ("=ROUND(1234.5678,-2.5)", n(1200.0)),
+        ("=ROUND(1234.5678,1.9999999)", n(1234.57)),
+    ]);
+}
+
+#[test]
+fn index_reference_form_negative_position_is_value_error() {
+    // A1:C3 are blank. A negative position is #VALUE! in every reference
+    // shape; past the end stays #REF!.
+    use ExcelErrorKind::{Ref, Value};
+    assert_cases(&[
+        ("=INDEX(A1:A3,-1)", error(Value)),
+        ("=INDEX(A1:A3,-0.5)", error(Value)),
+        ("=ROW(INDEX(A1:A3,-1))", error(Value)),
+        ("=ROW(INDEX(A1:A3,2-1E-7))", n(2.0)),
+        ("=INDEX(A1:C3,1,-1)", error(Value)),
+        ("=INDEX(A1:C3,-1,1)", error(Value)),
+        ("=INDEX((A1:A3,B1:B3),1,1,-1)", error(Value)),
+        ("=INDEX(A:A,-1)", error(Value)),
+        ("=INDEX(A1:A3,4)", error(Ref)),
+    ]);
+    // -1E-9 floors to row 0, the whole column.
+    assert_spill(
+        "=ROW(INDEX(A1:A3,-1E-9))",
+        &[&[n(1.0)], &[n(2.0)], &[n(3.0)]],
+    );
+}
+
+#[test]
+fn vlookup_and_hlookup_look_up_before_checking_the_index() {
+    // A1:C3 are blank. A miss is #N/A whatever the index; on a match an
+    // index below 1 is #VALUE! and one past the table is #REF!.
+    use ExcelErrorKind::{Na, Ref, Value};
+    assert_cases(&[
+        ("=VLOOKUP(1,{1,2;3,4},-1)", error(Value)),
+        ("=VLOOKUP(1,{1,2;3,4},0)", error(Value)),
+        ("=VLOOKUP(1,{1,2;3,4},-0.5)", error(Value)),
+        ("=VLOOKUP(1,{1,2;3,4},3)", error(Ref)),
+        ("=VLOOKUP(5,{1,2;3,4},-1,FALSE)", error(Na)),
+        ("=VLOOKUP(5,{1,2;3,4},0,FALSE)", error(Na)),
+        ("=VLOOKUP(5,{1,2;3,4},3,FALSE)", error(Na)),
+        ("=VLOOKUP(0,{1,2;3,4},-1)", error(Na)),
+        ("=VLOOKUP(0,A1:B3,-1)", error(Na)),
+        ("=VLOOKUP(0,A1:B3,-1,FALSE)", error(Na)),
+        ("=VLOOKUP(0,A1:B3,5)", error(Na)),
+        ("=HLOOKUP(1,{1,3;2,4},-1,FALSE)", error(Value)),
+        ("=HLOOKUP(5,{1,3;2,4},-1,FALSE)", error(Na)),
+        ("=HLOOKUP(5,{1,3;2,4},3,FALSE)", error(Na)),
+        // The same through a reference table.
+        ("=HLOOKUP(0,A1:C2,-1)", error(Na)),
+        ("=HLOOKUP(0,A1:C2,5,FALSE)", error(Na)),
+        // Non-numeric text is still #VALUE! before the lookup.
+        ("=VLOOKUP(5,{1,2;3,4},\"x\",FALSE)", error(Value)),
+    ]);
+}
+
+#[test]
+fn address_reads_numbers_and_logicals_like_excel() {
+    // A1 is blank.
+    use ExcelErrorKind::Value;
+    assert_cases(&[
+        ("=ADDRESS(1,1,TRUE)", text("$A$1")),
+        ("=ADDRESS(TRUE,TRUE)", text("$A$1")),
+        ("=ADDRESS(1,1,)", text("$A$1")),
+        ("=ADDRESS(1,1,,)", text("$A$1")),
+        ("=ADDRESS(1,1,A1)", error(Value)),
+        ("=ADDRESS(1,1,1,A1)", text("R1C1")),
+        ("=ADDRESS(1,1,1,0)", text("R1C1")),
+        ("=ADDRESS(1,1,1,0.5)", text("$A$1")),
+        ("=ADDRESS(1,1,1,\"0\")", error(Value)),
+        ("=ADDRESS(1,1,1,\"TRUE\")", text("$A$1")),
+        ("=ADDRESS(1,1,\"1\")", text("$A$1")),
+        // A date is a number, so TRUE.
+        ("=ADDRESS(1,1,1,DATE(2026,1,1))", text("$A$1")),
     ]);
 }
 

@@ -544,13 +544,13 @@ pub fn snapped_whole_number(n: f64) -> f64 {
     (n + WHOLE_NUMBER_WINDOW).floor()
 }
 
-/// ROUND's num_digits: a value within 2^-22 below a whole number is that
-/// number and any other fraction goes toward zero (`ROUND(1.23456,2-1E-7)` is
-/// 1.23, `ROUND(1234.5,-0.5)` is 1235, digits 0). A whole number stays itself:
-/// digits -2 are -2, not the -1 that `trunc(-2 + 2^-22)` would give.
+/// ROUND's num_digits: the window applies to the magnitude and the result
+/// goes toward zero, `sign(n) * trunc(abs(n) + 2^-22)` (Excel for Windows
+/// 16.0.20430: `ROUND(1.23456,2-1E-7)` is 1.23 and `2-3E-7` is 1.2;
+/// `ROUND(1234.5678,-1.9999999)` is 1200 and `-1.9999997` is 1230;
+/// `ROUND(1234.5,-0.5)` is 1235, digits 0; `-2.5` is digits -2).
 pub fn snapped_toward_zero(n: f64) -> f64 {
-    let snapped = snapped_whole_number(n);
-    if snapped > n { snapped } else { n.trunc() }
+    (n.abs() + WHOLE_NUMBER_WINDOW).trunc().copysign(n)
 }
 
 #[cfg(test)]
@@ -584,15 +584,18 @@ mod tests {
         assert_eq!(snapped_whole_number(-1.5), -2.0);
         assert_eq!(snapped_whole_number(-1e-9), 0.0);
         assert_eq!(snapped_whole_number(-1.0 - 1e-7), -1.0);
-        // ROUND's digits go toward zero after the same window.
+        // ROUND's digits: the same window on the magnitude, then toward zero.
         assert_eq!(snapped_toward_zero(2.0 - 1e-7), 2.0);
         assert_eq!(snapped_toward_zero(2.0 - 3e-7), 1.0);
         assert_eq!(snapped_toward_zero(2.6), 2.0);
         assert_eq!(snapped_toward_zero(-0.5), 0.0);
         assert_eq!(snapped_toward_zero(-1.5), -1.0);
         assert_eq!(snapped_toward_zero(-2.0), -2.0);
+        assert_eq!(snapped_toward_zero(-2.5), -2.0);
         assert_eq!(snapped_toward_zero(-2.0 - 1e-7), -2.0);
-        assert_eq!(snapped_toward_zero(-2.0 + 1e-7), -1.0);
+        assert_eq!(snapped_toward_zero(-1.9999999), -2.0);
+        assert_eq!(snapped_toward_zero(-1.99999999), -2.0);
+        assert_eq!(snapped_toward_zero(-1.9999997), -1.0);
         assert_eq!(snapped_toward_zero(-1e-9), 0.0);
     }
 

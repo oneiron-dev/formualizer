@@ -22,18 +22,15 @@ fn column_to_letters(col: u32) -> String {
 #[derive(Debug)]
 pub struct AddressFn;
 
-/// ADDRESS's row, column or abs_num as a whole number: a number, or text that
-/// reads as one, read like INDEX's positions (`coercion::snapped_whole_number`).
-/// `None` for anything else.
+/// ADDRESS's row, column or abs_num as a whole number, read like INDEX's
+/// positions (`coercion::snapped_whole_number`) from what a number argument
+/// takes: a number, a logical (`ADDRESS(TRUE,TRUE)` is `$A$1`), a blank cell
+/// (0) or text that reads as a number (`ADDRESS(1,1,"1")` is `$A$1`). `None`
+/// for anything else.
 fn whole_position(value: &LiteralValue) -> Option<i64> {
-    match value {
-        LiteralValue::Int(i) => Some(*i),
-        LiteralValue::Number(n) => Some(crate::coercion::snapped_whole_number(*n) as i64),
-        LiteralValue::Text(_) => crate::coercion::to_number_argument(value)
-            .ok()
-            .map(|n| crate::coercion::snapped_whole_number(n) as i64),
-        _ => None,
-    }
+    crate::coercion::to_number_argument(value)
+        .ok()
+        .map(|n| crate::coercion::snapped_whole_number(n) as i64)
 }
 
 /// Returns a cell reference as text from row and column numbers.
@@ -48,7 +45,11 @@ fn whole_position(value: &LiteralValue) -> Option<i64> {
 /// - Out-of-range row/column values or invalid `abs_num` return `#VALUE!`.
 /// - A row, column or `abs_num` within 2^-22 below a whole number is that number, as in Excel
 ///   (`ADDRESS(2-1E-7,1)` is `$A$2`); other fractions truncate (`ADDRESS(2.9999,1)` is `$A$2`).
-///   Text that reads as a number converts first (`ADDRESS("2",1)` is `$A$2`).
+///   Text that reads as a number converts first (`ADDRESS("2",1)` is `$A$2`), a logical is 1 or
+///   0 (`ADDRESS(TRUE,TRUE)` is `$A$1`) and a blank cell is 0 (as `abs_num`, `#VALUE!`).
+/// - `a1` is read as a logical: a blank cell is `FALSE`, any number but 0 is `TRUE`, text
+///   `"TRUE"` or `"FALSE"` is that logical and other text (numeric text too) is `#VALUE!`.
+/// - An empty `abs_num` or `a1` argument (`ADDRESS(1,1,)`, `ADDRESS(1,1,,)`) is the default.
 /// - If `sheet_text` contains spaces or special characters, it is quoted.
 ///
 /// # Examples
@@ -133,13 +134,14 @@ impl Function for AddressFn {
                     repeating: None,
                     default: Some(LiteralValue::Int(1)),
                 },
-                // a1 (optional, default TRUE)
+                // a1 (optional, default TRUE; read in eval, where a date is a
+                // number and so TRUE)
                 ArgSchema {
                     kinds: smallvec::smallvec![ArgKind::Logical],
                     required: false,
                     by_ref: false,
                     shape: ShapeKind::Scalar,
-                    coercion: CoercionPolicy::Logical,
+                    coercion: CoercionPolicy::None,
                     max: None,
                     repeating: None,
                     default: Some(LiteralValue::Boolean(true)),
@@ -211,18 +213,14 @@ impl Function for AddressFn {
             )));
         }
 
-        // Get abs_num (default 1 = absolute)
-        let abs_num = if args.len() > 2 {
+        // Get abs_num (default 1 = absolute). An empty argument, ADDRESS(1,1,),
+        // is the default; a blank cell is 0, #VALUE!.
+        let abs_num = if args.len() > 2 && !args[2].is_omitted() {
             let abs_val = args[2].value()?.into_literal();
             if let LiteralValue::Error(e) = abs_val {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
             }
-            match whole_position(&abs_val) {
-                Some(abs_num) => abs_num,
-                // Text that is no number is #VALUE!; a blank is the default.
-                None if matches!(abs_val, LiteralValue::Text(_)) => 0,
-                None => 1,
-            }
+            whole_position(&abs_val).unwrap_or(0)
         } else {
             1
         };
@@ -233,15 +231,25 @@ impl Function for AddressFn {
             )));
         }
 
-        // Get a1 (default TRUE = A1 notation)
-        let a1_style = if args.len() > 3 {
+        // Get a1 (default TRUE = A1 notation). An empty argument, ADDRESS(1,1,,),
+        // is the default; otherwise a logical: a blank cell is FALSE, a number is
+        // TRUE unless 0, text "TRUE" or "FALSE" is that logical and other text,
+        // numeric text included, is #VALUE!.
+        let a1_style = if args.len() > 3 && !args[3].is_omitted() {
             let a1_val = args[3].value()?.into_literal();
             if let LiteralValue::Error(e) = a1_val {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
             }
-            match a1_val {
-                LiteralValue::Boolean(b) => b,
-                _ => true,
+            // A date or time is its serial number.
+            let a1 = crate::coercion::to_logical(&a1_val)
+                .or_else(|error| a1_val.as_serial_number().map(|n| n != 0.0).ok_or(error));
+            match a1 {
+                Ok(a1) => a1,
+                Err(_) => {
+                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                        ExcelError::new(ExcelErrorKind::Value),
+                    )));
+                }
             }
         } else {
             true

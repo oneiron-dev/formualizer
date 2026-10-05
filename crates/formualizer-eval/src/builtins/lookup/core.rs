@@ -446,6 +446,21 @@ fn lookup_table(arg: &ArgumentHandle<'_, '_>) -> Result<LookupTable, ExcelError>
     }
 }
 
+/// VLOOKUP's column or HLOOKUP's row `index` into a table `size` wide or tall,
+/// checked once the lookup has found its row or column: below 1 is #VALUE!
+/// and past the table is #REF!, as in Excel, where a miss is #N/A whatever
+/// the index (`VLOOKUP(5,{1,2;3,4},-1,FALSE)` is #N/A,
+/// `VLOOKUP(1,{1,2;3,4},-1)` is #VALUE!). The 0-based offset otherwise.
+fn found_index(index: i64, size: usize) -> Result<usize, ExcelError> {
+    if index < 1 {
+        Err(ExcelError::new(ExcelErrorKind::Value))
+    } else if index as usize > size {
+        Err(ExcelError::new(ExcelErrorKind::Ref))
+    } else {
+        Ok(index as usize - 1)
+    }
+}
+
 #[derive(Debug)]
 pub struct VLookupFn;
 /// Looks up a value in the first column of a table and returns a value from another column.
@@ -462,7 +477,9 @@ pub struct VLookupFn;
 /// - Approximate matching expects the first column sorted ascending but, like Excel, does not check it: it bisects the column as written (a whole column is 1,048,576 rows), so unsorted data gives whichever row the search reaches, or `#N/A`.
 /// - Numeric `range_lookup` values use logical coercion: zero is exact and nonzero is approximate.
 /// - If the lookup value is not found, returns `#N/A`; an error lookup value is returned as is.
-/// - If `col_index_num` is invalid, returns `#REF!` (or `#VALUE!` if non-numeric).
+/// - The lookup runs before `col_index_num` is checked: a miss is `#N/A` whatever the index; on a
+///   match, an index below 1 is `#VALUE!` and one past the table is `#REF!`. Non-numeric text
+///   is `#VALUE!`.
 /// - A matched empty target cell returns an empty value, not `0`: the formula cell shows `0`, but
 ///   `&""` gives `""` and an array index leaves it out of `MEDIAN`, `COUNT` or `AVERAGE`.
 ///
@@ -500,7 +517,7 @@ pub struct VLookupFn;
 ///   - q: "What is the default behavior when range_lookup is omitted?"
 ///     a: "VLOOKUP defaults range_lookup to TRUE, so it performs approximate matching; pass FALSE or 0 for exact matching."
 ///   - q: "What happens if col_index_num points outside the table?"
-///     a: "A numeric out-of-range column index returns #REF!, while a non-numeric col_index_num returns #VALUE!."
+///     a: "When the lookup value is found, a column index past the table returns #REF! and one below 1 returns #VALUE!; when it is not found, the result is #N/A. A non-numeric col_index_num returns #VALUE!."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: VLOOKUP
@@ -608,11 +625,6 @@ impl Function for VLookupFn {
                 )));
             }
         };
-        if col_index < 1 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new(ExcelErrorKind::Value),
-            )));
-        }
         let approximate = range_lookup_is_approximate(args, true)?;
         // Handle both cell references and array literals
         match table {
@@ -624,12 +636,6 @@ impl Function for VLookupFn {
                 // (1:2) stops at the last used column, and a column past it
                 // is blank, not outside the table.
                 let width = reference_extent(&table_ref).map_or(cols, |(_, cols)| cols);
-                if col_index as usize > width {
-                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                        ExcelError::new(ExcelErrorKind::Ref),
-                    )));
-                }
-
                 let first_col_view = rv.sub_view(0, 0, rows, 1);
                 let row_idx_opt = if !approximate {
                     let wildcard_mode = matches!(lookup_value, LiteralValue::Text(ref s) if s.contains('*') || s.contains('?') || s.contains('~'));
@@ -659,15 +665,15 @@ impl Function for VLookupFn {
                 };
 
                 match row_idx_opt {
-                    Some(i) => {
-                        // An empty target cell stays empty, as in Excel: VLOOKUP(..)&"" is ""
-                        // and an array col_index_num leaves it out of MEDIAN or COUNT. A
-                        // formula cell still shows it as 0 (formula result finalization).
-                        let target_col_idx = (col_index - 1) as usize;
-                        Ok(crate::traits::CalcValue::Scalar(
-                            rv.get_cell(i, target_col_idx),
-                        ))
-                    }
+                    // An empty target cell stays empty, as in Excel: VLOOKUP(..)&"" is ""
+                    // and an array col_index_num leaves it out of MEDIAN or COUNT. A
+                    // formula cell still shows it as 0 (formula result finalization).
+                    Some(i) => Ok(crate::traits::CalcValue::Scalar(
+                        match found_index(col_index, width) {
+                            Ok(col) => rv.get_cell(i, col),
+                            Err(error) => LiteralValue::Error(error),
+                        },
+                    )),
                     None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                         ExcelError::new(ExcelErrorKind::Na),
                     ))),
@@ -680,12 +686,6 @@ impl Function for VLookupFn {
                     )));
                 }
                 let width = table.first().map(|r| r.len()).unwrap_or(0);
-                if col_index as usize > width {
-                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                        ExcelError::new(ExcelErrorKind::Ref),
-                    )));
-                }
-
                 // First column values for lookup
                 let first_col: Vec<LiteralValue> =
                     table.iter().filter_map(|r| r.first().cloned()).collect();
@@ -703,15 +703,16 @@ impl Function for VLookupFn {
                 };
 
                 match row_idx_opt {
-                    Some(i) => {
-                        let target_col_idx = (col_index - 1) as usize;
-                        let val = table
-                            .get(i)
-                            .and_then(|r| r.get(target_col_idx))
-                            .cloned()
-                            .unwrap_or(LiteralValue::Empty);
-                        Ok(crate::traits::CalcValue::Scalar(val))
-                    }
+                    Some(i) => Ok(crate::traits::CalcValue::Scalar(
+                        match found_index(col_index, width) {
+                            Ok(col) => table
+                                .get(i)
+                                .and_then(|r| r.get(col))
+                                .cloned()
+                                .unwrap_or(LiteralValue::Empty),
+                            Err(error) => LiteralValue::Error(error),
+                        },
+                    )),
                     None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                         ExcelError::new(ExcelErrorKind::Na),
                     ))),
@@ -737,7 +738,9 @@ pub struct HLookupFn;
 /// - Approximate matching expects the first row sorted ascending but, like Excel, does not check it: it bisects the row as written, so unsorted data gives whichever column the search reaches, or `#N/A`.
 /// - Numeric `range_lookup` values use logical coercion: zero is exact and nonzero is approximate.
 /// - If the lookup value is not found, returns `#N/A`; an error lookup value is returned as is.
-/// - If `row_index_num` is invalid, returns `#REF!` (or `#VALUE!` if non-numeric).
+/// - The lookup runs before `row_index_num` is checked: a miss is `#N/A` whatever the index; on a
+///   match, an index below 1 is `#VALUE!` and one past the table is `#REF!`. Non-numeric text
+///   is `#VALUE!`.
 /// - A matched empty target cell returns an empty value, not `0`: the formula cell shows `0`, but
 ///   `&""` gives `""` and an array index leaves it out of `MEDIAN`, `COUNT` or `AVERAGE`.
 ///
@@ -775,7 +778,7 @@ pub struct HLookupFn;
 ///   - q: "Does HLOOKUP default to exact or approximate matching?"
 ///     a: "It defaults to approximate matching because range_lookup defaults to TRUE; pass FALSE or 0 for exact matching."
 ///   - q: "How are invalid row_index_num values reported?"
-///     a: "If row_index_num is outside table height HLOOKUP returns #REF!; if it is non-numeric it returns #VALUE!."
+///     a: "When the lookup value is found, a row_index_num past the table height returns #REF! and one below 1 returns #VALUE!; when it is not found, the result is #N/A. A non-numeric row_index_num returns #VALUE!."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: HLOOKUP
@@ -883,11 +886,6 @@ impl Function for HLookupFn {
                 )));
             }
         };
-        if row_index < 1 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new(ExcelErrorKind::Value),
-            )));
-        }
         let approximate = range_lookup_is_approximate(args, true)?;
         // Handle both cell references and array literals
         match table {
@@ -899,11 +897,6 @@ impl Function for HLookupFn {
                 // (A:B) stops at the last used row, and a row past it is
                 // blank, not outside the table.
                 let height = reference_extent(&table_ref).map_or(rows, |(rows, _)| rows);
-                if row_index as usize > height {
-                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                        ExcelError::new(ExcelErrorKind::Ref),
-                    )));
-                }
                 let first_row_view = rv.sub_view(0, 0, 1, cols);
                 let col_idx_opt = if approximate {
                     let mut first_row: Vec<LiteralValue> = Vec::with_capacity(cols);
@@ -932,13 +925,13 @@ impl Function for HLookupFn {
                 };
 
                 match col_idx_opt {
-                    Some(i) => {
-                        // An empty target cell stays empty, as in VLOOKUP.
-                        let target_row_idx = (row_index - 1) as usize;
-                        Ok(crate::traits::CalcValue::Scalar(
-                            rv.get_cell(target_row_idx, i),
-                        ))
-                    }
+                    // An empty target cell stays empty, as in VLOOKUP.
+                    Some(i) => Ok(crate::traits::CalcValue::Scalar(
+                        match found_index(row_index, height) {
+                            Ok(row) => rv.get_cell(row, i),
+                            Err(error) => LiteralValue::Error(error),
+                        },
+                    )),
                     None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                         ExcelError::new(ExcelErrorKind::Na),
                     ))),
@@ -951,12 +944,6 @@ impl Function for HLookupFn {
                     )));
                 }
                 let height = table.len();
-                if row_index as usize > height {
-                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                        ExcelError::new(ExcelErrorKind::Ref),
-                    )));
-                }
-
                 // First row values for lookup
                 let first_row: Vec<LiteralValue> = table.first().cloned().unwrap_or_default();
                 let col_idx_opt = if approximate {
@@ -973,15 +960,16 @@ impl Function for HLookupFn {
                 };
 
                 match col_idx_opt {
-                    Some(i) => {
-                        let target_row_idx = (row_index - 1) as usize;
-                        let val = table
-                            .get(target_row_idx)
-                            .and_then(|r| r.get(i))
-                            .cloned()
-                            .unwrap_or(LiteralValue::Empty);
-                        Ok(crate::traits::CalcValue::Scalar(val))
-                    }
+                    Some(i) => Ok(crate::traits::CalcValue::Scalar(
+                        match found_index(row_index, height) {
+                            Ok(row) => table
+                                .get(row)
+                                .and_then(|r| r.get(i))
+                                .cloned()
+                                .unwrap_or(LiteralValue::Empty),
+                            Err(error) => LiteralValue::Error(error),
+                        },
+                    )),
                     None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                         ExcelError::new(ExcelErrorKind::Na),
                     ))),

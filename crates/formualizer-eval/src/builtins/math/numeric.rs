@@ -326,6 +326,9 @@ pub struct RoundFn; // ROUND(number, digits)
 /// - Positive `digits` rounds to the right of the decimal point.
 /// - Negative `digits` rounds to the left of the decimal point.
 /// - Uses standard half-up style rounding from Rust's `round` behavior.
+/// - A fractional `digits` within 2^-22 of a whole number in magnitude is that number, and any
+///   other fraction goes toward zero, as in Excel (`ROUND(1234.5678,-1.9999999)` is 1200,
+///   `ROUND(1234.5,-0.5)` is 1235).
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -385,9 +388,9 @@ impl Function for RoundFn {
             LiteralValue::Error(e) => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
             }
-            // num_digits within 2^-22 below a whole number is that number and
-            // other fractions go toward zero: ROUND(1.23456,2-1E-7) is 1.23,
-            // ROUND(1234.5,-0.5) is 1235 (ROUNDUP and ROUNDDOWN truncate).
+            // num_digits snaps on its magnitude, then goes toward zero:
+            // ROUND(1.23456,2-1E-7) is 1.23, ROUND(1234.5678,-1.9999999) is
+            // 1200, ROUND(1234.5,-0.5) is 1235 (ROUNDUP and ROUNDDOWN truncate).
             other => crate::coercion::snapped_toward_zero(coerce_num(&other)?) as i32,
         };
         let out = round_decimal(n, digits, RoundMode::Nearest);
