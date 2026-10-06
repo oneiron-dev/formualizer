@@ -51,6 +51,7 @@ mod bulk_ingest;
 mod column_operations;
 mod debug_vertex_lifecycle;
 mod dynamic_topo;
+mod named_formula_caller;
 mod named_ranges;
 mod range_operations;
 mod row_operations;

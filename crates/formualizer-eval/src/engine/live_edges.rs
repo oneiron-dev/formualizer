@@ -500,6 +500,9 @@ impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
     fn workbook_file_name(&self) -> Option<String> {
         self.engine.workbook_file_name()
     }
+    fn note_workbook_text_reference(&self) {
+        self.engine.note_workbook_text_reference()
+    }
     fn sheet_index_by_name(&self, sheet: &str) -> Option<usize> {
         self.engine.sheet_index_by_name(sheet)
     }

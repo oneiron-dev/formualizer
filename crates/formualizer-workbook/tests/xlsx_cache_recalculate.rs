@@ -626,6 +626,33 @@ fn r1c1_indirect_reads_relative_to_the_formula_cell() {
     assert_eq!(data(&out.bytes, 0), Data::Float(1.0));
 }
 #[test]
+fn indirect_text_naming_a_workbook_is_unsupported() {
+    // Excel reads '[Book.xlsx]Sheet1'!A1 from the workbook of that name when
+    // it is open, this one under the name it was saved with (42 in
+    // self-bookref.xlsx). The package records neither, so the closed
+    // workbook's #REF!, literal, computed or behind IFERROR, is refused.
+    for formula in [
+        "INDIRECT(&quot;'[self-bookref.xlsx]Sheet1'!A1&quot;)",
+        "IFERROR(INDIRECT(&quot;[self-bookref.xlsx]Sheet1!&quot;&amp;&quot;A1&quot;),0)",
+    ] {
+        let p = parts(&format!(
+            "<row r=\"1\"><c r=\"A1\"><v>42</v></c></row><row r=\"2\"><c r=\"A2\"><f>{formula}</f><v>42</v></c></row>"
+        ));
+        let error = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap_err();
+        assert!(
+            matches!(&error, formualizer_workbook::IoError::Unsupported { feature, .. }
+                if feature == "INDIRECT text that names a workbook"),
+            "{formula}: {error:?}"
+        );
+    }
+    // The same reference without the workbook reads the cell.
+    let p = parts(
+        "<row r=\"1\"><c r=\"A1\"><v>42</v></c></row><row r=\"2\"><c r=\"A2\"><f>INDIRECT(&quot;Sheet1!A1&quot;)</f><v>0</v></c></row>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    assert_eq!(data(&out.bytes, 1), Data::Float(42.0));
+}
+#[test]
 fn arbitrary_stale_error_cache_is_not_evaluator_authority() {
     let mut p = single("1+1", "<v>#FUTURE_ERROR!</v>");
     let s = p.get_mut(SHEET).unwrap();

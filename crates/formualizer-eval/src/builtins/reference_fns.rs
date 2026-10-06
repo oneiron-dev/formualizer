@@ -1258,6 +1258,19 @@ fn indirect_text_reference(
         return Err(ExcelError::new(ExcelErrorKind::Ref));
     };
 
+    // Text that names a workbook is read from that workbook when it is open:
+    // this one under the name it was saved with, or another one Excel has
+    // open. Neither is known here, so the result is a closed workbook's
+    // #REF!, and the context records the read for a host that cannot vouch
+    // for it.
+    let context = args[0].interpreter().context;
+    if names_workbook(&ref_text, |sheet| {
+        context.sheet_index_by_name(sheet).is_some()
+    }) {
+        context.note_workbook_text_reference();
+        return Err(ExcelError::new(ExcelErrorKind::Ref));
+    }
+
     if !a1_style {
         // The A1/R1C1 flag does not apply to defined names or tables (they are
         // neither A1 nor R1C1 syntax): Excel resolves `INDIRECT(name, FALSE)`
@@ -1314,6 +1327,54 @@ fn indirect_text_reference(
             _ => Err(ExcelError::new(ExcelErrorKind::Ref)),
         },
     }
+}
+
+/// Whether INDIRECT's text names a workbook: `[Book.xlsx]Sheet1!A1`,
+/// `'C:\Data\[Book.xlsx]Sheet 1'!R1C1`, or a workbook's own name before the
+/// `!` (`Book.xlsx!Total`, `'Book.xlsx'!Total`) where no sheet has that name
+/// (`is_sheet`). No sheet name holds `[`, `]`, `\` or `/`, so a quoted sheet
+/// part holding one names a workbook; an unquoted one names a workbook when it
+/// opens with `[`, or holds `\` or `/` (a `[` later on belongs to a table's
+/// column, as in `Table1[a!b]`).
+fn names_workbook(text: &str, is_sheet: impl Fn(&str) -> bool) -> bool {
+    const BOOK_EXTENSIONS: [&str; 10] = [
+        "xlsx", "xlsm", "xlsb", "xls", "xltx", "xltm", "xlt", "xlam", "xla", "csv",
+    ];
+    let book_name = |part: &str| {
+        part.rsplit_once('.').is_some_and(|(stem, extension)| {
+            !stem.is_empty()
+                && BOOK_EXTENSIONS
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(extension))
+        }) && !is_sheet(part)
+    };
+    if let Some(quoted) = text.strip_prefix('\'') {
+        // The quoted part ends at a quote that is not doubled.
+        let mut part = String::new();
+        let mut chars = quoted.chars();
+        loop {
+            match chars.next() {
+                Some('\'') if chars.as_str().starts_with('\'') => {
+                    chars.next();
+                    part.push('\'');
+                }
+                Some('\'') => break,
+                Some(c) => part.push(c),
+                None => return false,
+            }
+        }
+        if !chars.as_str().starts_with('!') {
+            return false;
+        }
+        return part.contains(['[', ']', '\\', '/']) || book_name(&part);
+    }
+    let Some((part, _)) = text.split_once('!') else {
+        return false;
+    };
+    if part.starts_with('[') {
+        return true;
+    }
+    !part.contains('[') && (part.contains(['\\', '/']) || book_name(part))
 }
 
 /// A1 text as Excel's INDIRECT reads it: spaces may trail the text, follow

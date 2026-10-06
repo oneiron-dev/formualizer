@@ -665,6 +665,15 @@ pub fn recalculate_xlsx_bytes(
     checkpoint(&options.cancel)?;
     let calc_always = calc_always::calc_always(&engine, &sheets, &plans, &defined_names)?;
     checkpoint(&options.cancel)?;
+    // INDIRECT text that names a workbook ('[Book.xlsx]Sheet1'!A1) reads this
+    // file under the name it was saved with, or another workbook Excel has
+    // open; the package records neither, so its #REF! is not Excel's value.
+    if engine.text_named_workbook() {
+        return Err(unsupported(
+            "INDIRECT text that names a workbook",
+            "workbook",
+        ));
+    }
     let coerced: HashSet<_> = engine
         .formula_parse_diagnostics()
         .iter()

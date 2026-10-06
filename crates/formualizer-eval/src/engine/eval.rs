@@ -70,7 +70,7 @@ use crate::formula_plane::span_eval::{SpanComputedWriteSink, SpanEvalTask, SpanE
 use crate::formula_plane::structural::relocate_ast_for_template_placement;
 use crate::formula_plane::structural_shift::{SpanShiftPlan, StructuralOp, classify_span_for_op};
 use crate::function::FnCaps;
-use crate::interpreter::Interpreter;
+use crate::interpreter::{EvaluationScope, Interpreter};
 use crate::reference::{CellRef, Coord, RangeRef};
 use crate::traits::FunctionProvider;
 use crate::traits::{EvaluationContext, ReferenceInfo, Resolver};
@@ -1466,8 +1466,14 @@ pub struct Engine<R> {
     /// every RAND, RANDBETWEEN or RANDARRAY call (two in one formula, or one
     /// inside a LAMBDA that MAKEARRAY calls per element) draws its own value,
     /// as Excel's do. A cell's count restarts when its formula starts
-    /// evaluating; all are cleared at the start of every request.
+    /// evaluating; all are cleared at the start of every request. A formula
+    /// evaluated through its interpreter's formula entry counts in its
+    /// [`EvaluationScope`] instead, with the names it uses.
     rng_draws: std::sync::Mutex<FxHashMap<crate::CellRef, u64>>,
+    /// Some formula read a reference from text naming a workbook
+    /// (`INDIRECT("'[Book.xlsx]Sheet1'!A1")`); see
+    /// [`Self::text_named_workbook`].
+    text_named_workbook: std::sync::atomic::AtomicBool,
     thread_pool: Option<Arc<rayon::ThreadPool>>,
     pub recalc_epoch: u64,
     snapshot_id: std::sync::atomic::AtomicU64,
@@ -3520,6 +3526,7 @@ where
             workbook_load_limits: crate::engine::WorkbookLoadLimits::default(),
             clock: crate::timezone::SnapshotClock::new(clock),
             rng_draws: std::sync::Mutex::new(FxHashMap::default()),
+            text_named_workbook: std::sync::atomic::AtomicBool::new(false),
             thread_pool,
             recalc_epoch: 0,
             snapshot_id: std::sync::atomic::AtomicU64::new(1),
@@ -3698,6 +3705,7 @@ where
             workbook_load_limits: crate::engine::WorkbookLoadLimits::default(),
             clock: crate::timezone::SnapshotClock::new(clock),
             rng_draws: std::sync::Mutex::new(FxHashMap::default()),
+            text_named_workbook: std::sync::atomic::AtomicBool::new(false),
             thread_pool: Some(thread_pool),
             recalc_epoch: 0,
             snapshot_id: std::sync::atomic::AtomicU64::new(1),
@@ -5733,6 +5741,23 @@ where
         f()
     }
 
+    /// The interpreter of a defined name's formula evaluated on `sheet`, inside
+    /// an [`EvaluationScope::name`]. Excel evaluates a name for the formula
+    /// that uses it: ROW(), INDIRECT's relative R1C1 text and `#This Row` in
+    /// the name read that formula's row and column (on `sheet`), and its
+    /// random calls continue that formula's draws. Resolved for no formula
+    /// (for the graph), the name sits at A1 of `sheet`.
+    fn named_formula_interpreter<'c>(&'c self, sheet: &'c str) -> Interpreter<'c> {
+        let cell = match EvaluationScope::cell() {
+            Some(caller) => {
+                self.graph
+                    .make_cell_ref(sheet, caller.coord.row() + 1, caller.coord.col() + 1)
+            }
+            None => self.graph.make_cell_ref(sheet, 0, 0),
+        };
+        Interpreter::new_for_name(self, sheet, cell)
+    }
+
     /// Evaluate a named formula in `sheet_id` as a range view: it may yield a
     /// reference (OFFSET(...)), an array constant ({0,1,2}) or a single value.
     fn evaluate_named_formula<'c>(
@@ -5742,8 +5767,8 @@ where
     ) -> Result<RangeView<'c>, ExcelError> {
         Self::in_named_formula(|| {
             let sheet = self.graph.sheet_name(sheet_id);
-            let cell_ref = self.graph.make_cell_ref(sheet, 0, 0);
-            let interpreter = Interpreter::new_with_cell(self, sheet, cell_ref);
+            let _scope = EvaluationScope::name();
+            let interpreter = self.named_formula_interpreter(sheet);
             match interpreter.evaluate_ast(ast)? {
                 crate::traits::CalcValue::Range(view) => Ok(view),
                 other => match other.into_literal() {
@@ -5757,6 +5782,17 @@ where
                 },
             }
         })
+    }
+
+    /// Whether a formula evaluated by this engine read a reference from text
+    /// that names a workbook (`INDIRECT("'[Book.xlsx]Sheet1'!A1")`,
+    /// `INDIRECT("Book.xlsx!Total")`). Excel reads that reference from the
+    /// workbook of that name when it is open, this one included under the
+    /// name it was saved with; the engine knows neither, and gives the closed
+    /// workbook's #REF!. A host that cannot vouch for that result refuses it.
+    pub fn text_named_workbook(&self) -> bool {
+        self.text_named_workbook
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether the formula at `address` is dirty only because it is volatile
@@ -21470,7 +21506,10 @@ where
                     .graph
                     .get_cell_ref(vertex_id)
                     .unwrap_or_else(|| self.graph.make_cell_ref(sheet_name, 0, 0));
-                let interpreter = Interpreter::new_with_cell(self, sheet_name, cell_ref);
+                // The name's own vertex evaluates for no formula: no cell's draws
+                // change (see `EvaluationScope`).
+                let _scope = EvaluationScope::detached();
+                let interpreter = Interpreter::new_for_name(self, sheet_name, cell_ref);
                 match interpreter.evaluate_ast(ast) {
                     Ok(cv) => {
                         let value = cv.into_literal();
@@ -21569,7 +21608,10 @@ where
                     .graph
                     .get_cell_ref(vertex_id)
                     .unwrap_or_else(|| self.graph.make_cell_ref(sheet_name, 0, 0));
-                let interpreter = Interpreter::new_with_cell(self, sheet_name, cell_ref);
+                // The name's own vertex evaluates for no formula: no cell's draws
+                // change (see `EvaluationScope`).
+                let _scope = EvaluationScope::detached();
+                let interpreter = Interpreter::new_for_name(self, sheet_name, cell_ref);
                 match interpreter.evaluate_ast(ast) {
                     Ok(cv) => {
                         let v = cv.into_literal();
@@ -27012,7 +27054,10 @@ where
                             .graph
                             .get_cell_ref(vertex_id)
                             .unwrap_or_else(|| self.graph.make_cell_ref(sheet_name, 0, 0));
-                        let interpreter = Interpreter::new_with_cell(self, sheet_name, cell_ref);
+                        // The name's own vertex evaluates for no formula: no cell's draws
+                        // change (see `EvaluationScope`).
+                        let _scope = EvaluationScope::detached();
+                        let interpreter = Interpreter::new_for_name(self, sheet_name, cell_ref);
                         interpreter.evaluate_ast(ast).map(|cv| cv.into_literal())
                     }
                     NamedDefinition::Range(_) => Err(ExcelError::new(ExcelErrorKind::Value)
@@ -27083,7 +27128,10 @@ where
                             .graph
                             .get_cell_ref(vertex_id)
                             .unwrap_or_else(|| self.graph.make_cell_ref(sheet_name, 0, 0));
-                        let interpreter = Interpreter::new_with_cell(self, sheet_name, cell_ref);
+                        // The name's own vertex evaluates for no formula: no cell's draws
+                        // change (see `EvaluationScope`).
+                        let _scope = EvaluationScope::detached();
+                        let interpreter = Interpreter::new_for_name(self, sheet_name, cell_ref);
                         match interpreter.evaluate_ast(ast) {
                             Ok(cv) => {
                                 let v = cv.into_literal();
@@ -27860,8 +27908,8 @@ where
             NameScope::Workbook => current_id,
         };
         let sheet = self.graph.sheet_name(sheet_id);
-        let cell_ref = self.graph.make_cell_ref(sheet, 0, 0);
-        let interpreter = Interpreter::new_with_cell(self, sheet, cell_ref);
+        let _scope = EvaluationScope::name();
+        let interpreter = self.named_formula_interpreter(sheet);
         let resolved = Self::in_named_formula(|| {
             Ok(match interpreter.try_evaluate_ast_as_reference(ast) {
                 // A name for another name (`=Konst`, `=INDIRECT("Amounts")`) is
@@ -27989,8 +28037,8 @@ where
             NameScope::Workbook => current_id,
         };
         let sheet = self.graph.sheet_name(sheet_id);
-        let cell_ref = self.graph.make_cell_ref(sheet, 0, 0);
-        let interpreter = Interpreter::new_with_cell(self, sheet, cell_ref);
+        let _scope = EvaluationScope::name();
+        let interpreter = self.named_formula_interpreter(sheet);
         let formula = crate::traits::ArgumentHandle::new(ast, &interpreter);
         Self::in_named_formula(|| formula.reference_array()).transpose()
     }
@@ -28012,8 +28060,8 @@ where
             NameScope::Workbook => current_id,
         };
         let sheet = self.graph.sheet_name(sheet_id);
-        let cell_ref = self.graph.make_cell_ref(sheet, 0, 0);
-        let interpreter = Interpreter::new_with_cell(self, sheet, cell_ref);
+        let _scope = EvaluationScope::name();
+        let interpreter = self.named_formula_interpreter(sheet);
         let areas = match Self::in_named_formula(|| Ok(interpreter.evaluate_ast_as_areas(ast))) {
             Ok(areas) => areas?,
             Err(err) => return Some(Err(err)),
@@ -28079,6 +28127,11 @@ where
     }
 
     fn next_rng_draw(&self, cell: Option<crate::CellRef>) -> u64 {
+        // A formula evaluating through its interpreter counts its draws in its
+        // evaluation, those of the names it uses included.
+        if let Some(draw) = EvaluationScope::next_draw() {
+            return draw;
+        }
         let Some(cell) = cell else { return 0 };
         let mut draws = self
             .rng_draws
@@ -28095,6 +28148,11 @@ where
 
     fn workbook_file_name(&self) -> Option<String> {
         self.config.workbook_file_name.clone()
+    }
+
+    fn note_workbook_text_reference(&self) {
+        self.text_named_workbook
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn sheet_index_by_name(&self, sheet: &str) -> Option<usize> {
@@ -30321,7 +30379,10 @@ where
                             .graph
                             .get_cell_ref(vertex_id)
                             .unwrap_or_else(|| self.graph.make_cell_ref(sheet_name, 0, 0));
-                        let interpreter = Interpreter::new_with_cell(ctx, sheet_name, cell_ref);
+                        // The name's own vertex evaluates for no formula: no cell's draws
+                        // change (see `EvaluationScope`).
+                        let _scope = EvaluationScope::detached();
+                        let interpreter = Interpreter::new_for_name(ctx, sheet_name, cell_ref);
                         if kind == VertexKind::NamedScalar {
                             interpreter.evaluate_ast(ast).map(|cv| cv.into_literal())
                         } else {

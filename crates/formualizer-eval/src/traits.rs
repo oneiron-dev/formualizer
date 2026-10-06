@@ -2394,6 +2394,13 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
         None
     }
 
+    /// A formula read a reference from text that names a workbook
+    /// (`INDIRECT("'[Book.xlsx]Sheet1'!A1")`). Excel reads it from that
+    /// workbook when it is open, this one included under the name it was
+    /// saved with; the formula gets the closed workbook's #REF!, and an
+    /// engine records the read for a host that cannot vouch for it.
+    fn note_workbook_text_reference(&self) {}
+
     /// Excel-style 1-based active-sheet index for a sheet name, if known.
     fn sheet_index_by_name(&self, _sheet: &str) -> Option<usize> {
         None

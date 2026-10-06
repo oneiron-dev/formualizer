@@ -247,6 +247,22 @@ impl<'a, R: EvaluationContext> EvaluationContext for DynamicRefCollector<'a, R> 
         self.engine.workbook_file_name()
     }
 
+    fn note_workbook_text_reference(&self) {
+        self.engine.note_workbook_text_reference()
+    }
+
+    fn workbook_sheet_count(&self) -> Option<usize> {
+        self.engine.workbook_sheet_count()
+    }
+
+    fn sheet_index_by_name(&self, sheet: &str) -> Option<usize> {
+        self.engine.sheet_index_by_name(sheet)
+    }
+
+    fn current_sheet_index(&self, current_sheet: &str) -> Option<usize> {
+        self.engine.current_sheet_index(current_sheet)
+    }
+
     fn structured_reference_area(
         &self,
         table: &TableReference,

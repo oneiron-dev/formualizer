@@ -169,6 +169,91 @@ impl LocalEnv {
     }
 }
 
+/// A formula evaluating on a thread: the cell it belongs to (none for a
+/// defined name evaluated for no formula) and the random draws it has made.
+#[derive(Clone, Copy)]
+struct Evaluation {
+    cell: Option<CellRef>,
+    draws: u64,
+}
+
+thread_local! {
+    /// The formula evaluating on this thread, while it does.
+    static EVALUATION: std::cell::Cell<Option<Evaluation>> = const { std::cell::Cell::new(None) };
+}
+
+/// The formula evaluating on this thread, for as long as the scope lives; the
+/// evaluation that ran before is restored when it drops.
+///
+/// Excel evaluates a defined name where it is used, for the formula that uses
+/// it: ROW(), INDIRECT's relative R1C1 text and `#This Row` in a name read the
+/// calling formula's cell (`Prev = INDIRECT("RC[-1]",FALSE)` in B2 reads A2),
+/// and a RAND in a name is one more draw of that formula
+/// (`RAND()+ROW(Anchor)-RAND()` draws twice, never the same value twice). The
+/// engine evaluates names apart from the formula's interpreter, so the formula
+/// is recorded here, and its draw count with it.
+pub(crate) struct EvaluationScope {
+    /// The evaluation to restore, when this scope started one.
+    previous: Option<Option<Evaluation>>,
+}
+
+impl EvaluationScope {
+    /// `cell`'s formula starts evaluating: its draws count from 0, so an
+    /// evaluation repeats its draws (every settle pass of a circular reference
+    /// observes the same sample). The formula of `cell` already evaluating on
+    /// this thread goes on with its draws.
+    pub(crate) fn formula(cell: CellRef) -> Self {
+        match EVALUATION.get() {
+            Some(running) if running.cell == Some(cell) => Self { previous: None },
+            _ => Self::start(Some(cell)),
+        }
+    }
+
+    /// A defined name evaluates for the formula evaluating on this thread and
+    /// continues its draws; with no formula evaluating, it draws on its own.
+    pub(crate) fn name() -> Self {
+        match EVALUATION.get() {
+            Some(_) => Self { previous: None },
+            None => Self::start(None),
+        }
+    }
+
+    /// A defined name evaluates as its own graph vertex, for no formula,
+    /// whatever else runs on this thread: no cell's draws change.
+    pub(crate) fn detached() -> Self {
+        Self::start(None)
+    }
+
+    fn start(cell: Option<CellRef>) -> Self {
+        Self {
+            previous: Some(EVALUATION.replace(Some(Evaluation { cell, draws: 0 }))),
+        }
+    }
+
+    /// The cell whose formula evaluates on this thread, if any.
+    pub(crate) fn cell() -> Option<CellRef> {
+        EVALUATION.get().and_then(|running| running.cell)
+    }
+
+    /// The index of the next random draw of the evaluation running on this
+    /// thread; `None` when none runs.
+    pub(crate) fn next_draw() -> Option<u64> {
+        let mut running = EVALUATION.get()?;
+        let draw = running.draws;
+        running.draws += 1;
+        EVALUATION.set(Some(running));
+        Some(draw)
+    }
+}
+
+impl Drop for EvaluationScope {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            EVALUATION.set(previous);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct InterpreterParameterBindings<'a> {
     pub(crate) literal_slots_by_node: &'a FxHashMap<AstNodeId, LiteralSlotId>,
@@ -252,6 +337,26 @@ impl<'a> Interpreter<'a> {
         cell: crate::CellRef,
     ) -> Self {
         context.begin_cell_draws(cell);
+        Self {
+            context,
+            current_sheet,
+            current_cell: Some(cell),
+            local_env: LocalEnv::default(),
+            reference_row_delta: 0,
+            reference_col_delta: 0,
+            disable_ast_planner: false,
+            parameter_bindings: None,
+            legacy: None,
+        }
+    }
+
+    /// The interpreter of a defined name's formula evaluated at `cell`: the
+    /// cell's draws go on rather than restart (see [`EvaluationScope`]).
+    pub(crate) fn new_for_name(
+        context: &'a dyn EvaluationContext,
+        current_sheet: &'a str,
+        cell: crate::CellRef,
+    ) -> Self {
         Self {
             context,
             current_sheet,
@@ -1173,6 +1278,7 @@ impl<'a> Interpreter<'a> {
         &self,
         node: &ASTNode,
     ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        let _formula = self.current_cell.map(EvaluationScope::formula);
         if self.legacy.is_some() {
             return self.with_legacy_context(None).evaluate_formula_ast(node);
         }
@@ -1357,6 +1463,7 @@ impl<'a> Interpreter<'a> {
         data_store: &DataStore,
         sheet_registry: &SheetRegistry,
     ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        let _formula = self.current_cell.map(EvaluationScope::formula);
         self.evaluate_arena_node(node_id, data_store, sheet_registry, true)
     }
 
