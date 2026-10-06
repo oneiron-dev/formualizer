@@ -1,10 +1,13 @@
 //! Excel's compatibility names for its distributions (NORMSDIST, CHIDIST,
 //! TDIST, ...) and the current names that share their numerics and rules,
-//! as Excel for Windows 16.0.20430 reads them: every row of
-//! ops/excel-legacy-functions-probe-20261006.md (probes 1-5, each formula in
+//! as Excel for Windows 16.0.20430 reads them: the rows of
+//! ops/excel-legacy-functions-probe-20261006.md (probes 1-7, each formula in
 //! F1 of a blank sheet), numbers to 1e-12 relative, errors by kind. The
-//! 6 formulas Excel refuses at entry (NORMSDIST(1,TRUE), ...) are not
-//! rows: no workbook holds them.
+//! 11 formulas Excel refuses at entry (NORMSDIST(1,TRUE), 1E308 literals,
+//! ...) are not rows: no workbook holds them. The probe 6-7 rows the fork
+//! does not follow are listed in the record: 18 BINOM.INV boundaries and
+//! BINOM.DIST(0,6,0.1,TRUE), where Excel's cumulative and the fork's differ in
+//! the last bit, and a typed number below the smallest compared with 0.
 
 use crate::engine::{Engine, EvalConfig};
 use crate::test_workbook::TestWorkbook;
@@ -1012,5 +1015,316 @@ fn inverses_keep_the_quantile_where_excel_loses_it() {
         ("=CHIINV(0.5,1E11)", n(99999999999.33333)),
         // Excel 100026582354.38625, 2.7E-4 off
         ("=CHISQ.INV.RT(0.5,1E11)", n(99999999999.33333)),
+    ]);
+}
+
+/// BINOM.INV and CRITBINOM at exact boundaries and at their own BINOM.DIST: the
+/// smallest k whose BINOM.DIST is at least alpha (BINOM.INV(5,0.5,0.5) is 3, as
+/// BINOM.DIST(2,5,0.5,TRUE) is 0.4999999999999999 in Excel).
+#[test]
+fn binom_inv_decides_on_its_cumulative() {
+    assert_cases(&[
+        ("=BINOM.INV(5,0.5,0.5)", n(3.0)),
+        ("=CRITBINOM(5,0.5,0.5)", n(3.0)),
+        ("=BINOM.INV(5,0.5,0.5+2^-53)", n(3.0)),
+        ("=BINOM.INV(5,0.5,0.5+1E-15)", n(3.0)),
+        ("=BINOM.INV(5,0.5,0.5+1E-14)", n(3.0)),
+        ("=BINOM.INV(5,0.5,0.5+1E-12)", n(3.0)),
+        ("=BINOM.INV(5,0.5,0.5+1E-10)", n(3.0)),
+        ("=BINOM.INV(5,0.5,0.5-1E-15)", n(2.0)),
+        ("=BINOM.INV(4,0.5,0.6875)", n(2.0)),
+        ("=BINOM.INV(7,0.5,0.5)", n(4.0)),
+        ("=BINOM.INV(2,0.25,0.5625)", n(1.0)),
+        ("=BINOM.INV(10,0.3,BINOM.DIST(3,10,0.3,TRUE))", n(3.0)),
+        ("=BINOM.INV(20,0.7,BINOM.DIST(14,20,0.7,TRUE))", n(14.0)),
+        ("=BINOM.INV(100,0.37,BINOM.DIST(40,100,0.37,TRUE))", n(40.0)),
+        ("=BINOM.INV(1000,0.5,0.5)", n(500.0)),
+        ("=BINOM.INV(10,0.5,BINOM.DIST(4,10,0.5,TRUE))", n(4.0)),
+        ("=CRITBINOM(10,0.5,0.376953125)", n(4.0)),
+        (
+            "=BINOM.INV(10,0.3,BINOM.DIST(3,10,0.3,TRUE)*(1+1E-14))",
+            n(4.0),
+        ),
+        (
+            "=BINOM.INV(10,0.3,BINOM.DIST(3,10,0.3,TRUE)*(1+1E-15))",
+            n(4.0),
+        ),
+        ("=BINOM.INV(3,0.5,0.5)", n(1.0)),
+        ("=BINOM.INV(1,0.5,0.5)", n(1.0)),
+        ("=BINOM.INV(100000,0.5,0.5)", n(50000.0)),
+        (
+            "=BINOM.INV(10,0.3,BINOM.DIST(3,10,0.3,TRUE)*(1-1E-15))",
+            n(3.0),
+        ),
+        ("=BINOM.INV(5,0.5,0.5+1E-13)", n(3.0)),
+        ("=BINOM.INV(5,0.5,0.5+1E-11)", n(3.0)),
+        ("=BINOM.INV(5,0.5,0.5+3E-16)", n(3.0)),
+        ("=BINOM.INV(6,0.5,0.015625)", n(0.0)),
+        ("=BINOM.INV(6,0.5,0.109375)", n(1.0)),
+        ("=BINOM.INV(6,0.5,0.34375)", n(2.0)),
+        ("=BINOM.INV(6,0.5,0.984375)", n(5.0)),
+        ("=BINOM.INV(7,0.5,0.0078125)", n(0.0)),
+        ("=BINOM.INV(7,0.5,0.0625)", n(1.0)),
+        ("=BINOM.INV(7,0.5,0.2265625)", n(2.0)),
+        ("=BINOM.INV(7,0.5,0.5)", n(4.0)),
+        ("=BINOM.INV(7,0.5,0.9921875)", n(6.0)),
+        ("=BINOM.INV(11,0.5,0.5)", n(5.0)),
+        ("=BINOM.INV(15,0.5,0.5)", n(7.0)),
+        ("=BINOM.INV(21,0.5,0.5)", n(10.0)),
+        ("=BINOM.INV(51,0.5,0.5)", n(25.0)),
+        ("=BINOM.INV(101,0.5,0.5)", n(50.0)),
+        ("=BINOM.INV(1,0.25,0.75)", n(1.0)),
+        ("=BINOM.INV(3,0.25,0.421875)", n(0.0)),
+        ("=BINOM.INV(8,0.0625,0.5967194738332182)", n(0.0)),
+        ("=BINOM.INV(3,0.25,0.421875)", n(0.0)),
+        ("=BINOM.INV(3,0.25,0.84375)", n(1.0)),
+        ("=BINOM.INV(3,0.25,0.984375)", n(2.0)),
+        ("=BINOM.INV(10,0.3,BINOM.DIST(1,10,0.3,TRUE))", n(1.0)),
+        ("=BINOM.INV(10,0.3,BINOM.DIST(2,10,0.3,TRUE))", n(2.0)),
+        ("=BINOM.INV(10,0.3,BINOM.DIST(3,10,0.3,TRUE))", n(3.0)),
+        ("=BINOM.INV(10,0.3,BINOM.DIST(4,10,0.3,TRUE))", n(4.0)),
+        ("=BINOM.INV(10,0.3,BINOM.DIST(5,10,0.3,TRUE))", n(5.0)),
+        ("=BINOM.INV(10,0.3,BINOM.DIST(6,10,0.3,TRUE))", n(6.0)),
+        ("=BINOM.INV(10,0.3,BINOM.DIST(7,10,0.3,TRUE))", n(7.0)),
+        ("=BINOM.INV(10,0.3,BINOM.DIST(8,10,0.3,TRUE))", n(8.0)),
+        ("=BINOM.INV(10,0.3,BINOM.DIST(9,10,0.3,TRUE))", n(9.0)),
+        ("=BINOM.INV(6,0.1,BINOM.DIST(1,6,0.1,TRUE))", n(1.0)),
+        ("=BINOM.INV(6,0.1,BINOM.DIST(2,6,0.1,TRUE))", n(2.0)),
+        ("=BINOM.INV(6,0.1,BINOM.DIST(3,6,0.1,TRUE))", n(3.0)),
+        ("=BINOM.INV(6,0.1,BINOM.DIST(4,6,0.1,TRUE))", n(4.0)),
+        ("=BINOM.INV(6,0.1,BINOM.DIST(5,6,0.1,TRUE))", n(5.0)),
+        ("=BINOM.DIST(2,5,0.5,TRUE)", n(0.4999999999999999)),
+        ("=BINOM.DIST(0,1,0.5,TRUE)", n(0.5)),
+        ("=BINOM.DIST(0,6,0.1,TRUE)", n(0.531441)),
+        ("=BINOM.INV(6,0.1,0.531441)", n(1.0)),
+        ("=BINOM.INV(10,0.5,0.0001)", n(0.0)),
+        ("=BINOM.INV(1,0.5,0.4999)", n(0.0)),
+    ]);
+}
+
+/// Every distribution, current names and aliases, evaluates once per element of
+/// an array given for a single value; an error element stays that element's.
+#[test]
+fn current_names_lift_over_arrays() {
+    assert_cases(&[
+        ("=SUM(T.DIST({0,1},10,TRUE))", n(1.32955343384897)),
+        ("=SUM(BETA.DIST({0.25,0.5},2,3,TRUE))", n(0.94921875)),
+        (
+            "=SUM(GAMMA.DIST({1,#N/A},2,1,TRUE))",
+            error(ExcelErrorKind::Na),
+        ),
+        ("=SUM(T.DIST.RT({0,1},10))", n(0.6704465661510299)),
+        ("=SUM(T.DIST.2T({0,1},10))", n(1.3408931323020599)),
+        ("=SUM(T.INV({0.25,0.9},10))", n(0.6723715797979046)),
+        ("=SUM(T.INV.2T({0.5,0.1},10))", n(2.5122731841241075)),
+        ("=SUM(CHISQ.DIST({1,2},3,TRUE))", n(0.6263413386279193)),
+        ("=SUM(CHISQ.DIST.RT({1,2},3))", n(1.3736586613720807)),
+        ("=SUM(CHISQ.INV({0.25,0.5},3))", n(3.5785067874210066)),
+        ("=SUM(CHISQ.INV.RT({0.25,0.5},3))", n(6.474318820007655)),
+        ("=SUM(F.DIST({1,2},3,4,TRUE))", n(1.2646636832393976)),
+        ("=SUM(F.DIST.RT({1,2},3,4))", n(0.7353363167606024)),
+        ("=SUM(F.INV({0.25,0.5},3,4))", n(1.358925071499304)),
+        ("=SUM(F.INV.RT({0.25,0.5},3,4))", n(2.9872015629831217)),
+        ("=SUM(BINOM.INV({10,20},0.5,0.5))", n(15.0)),
+        (
+            "=SUM(BINOM.DIST.RANGE({10,20},0.5,5))",
+            n(0.2608795166015626),
+        ),
+        ("=SUM(GAMMA.INV({0.25,0.5},2,1))", n(2.639625753131438)),
+        ("=SUM(BETA.INV({0.25,0.5},2,3))", n(0.6287496518884658)),
+        ("=SUM(LOGNORM.DIST({1,2},0,1,TRUE))", n(1.2558914042144174)),
+        ("=SUM(LOGNORM.INV({0.25,0.5},0,1))", n(1.5094162838632774)),
+        ("=SUM(WEIBULL.DIST({1,2},2,1,TRUE))", n(1.6138049199398234)),
+        ("=SUM(NEGBINOM.DIST({1,2},3,0.5,FALSE))", n(0.375)),
+        (
+            "=SUM(HYPGEOM.DIST({1,2},4,8,20,FALSE))",
+            n(0.7446852425180597),
+        ),
+        (
+            "=SUM(CONFIDENCE.NORM({0.05,0.1},2,50))",
+            n(1.0195963912105404),
+        ),
+        ("=SUM(CONFIDENCE.T({0.05,0.1},2,50))", n(1.042593913060954)),
+        ("=SUM(TINV({0.5,0.1},10))", n(2.5122731841241075)),
+        ("=SUM(CRITBINOM({10,20},0.5,0.5))", n(15.0)),
+        ("=SUM(GAMMAINV({0.25,0.5},2,1))", n(2.639625753131438)),
+        ("=SUM(CONFIDENCE({0.05,0.1},2,50))", n(1.0195963912105404)),
+        ("=SUM(CHISQ.DIST(3,{1,2,3},TRUE))", n(2.301980146916931)),
+        ("=SUM(T.DIST(1,10,{TRUE,FALSE}))", n(1.0599154230781087)),
+        ("=SUM(F.DIST({1;2},{3,4},5,TRUE))", n(2.5839814005813992)),
+        ("=SUM(T.INV({0.5,2},10))", error(ExcelErrorKind::Num)),
+        (
+            "=INDEX(GAMMA.DIST({1,2,3},2,1,TRUE),3)",
+            n(0.8008517265285442),
+        ),
+        ("=SUM(BETA.DIST(0.5,{2,3},{3;4},TRUE))", n(2.65625)),
+        ("=SUM(EXPON.DIST({1,2},1,TRUE))", n(1.4967852755919449)),
+        (
+            "=SUM(F.DIST.RT({1,2,3},{3,4},5))",
+            error(ExcelErrorKind::Na),
+        ),
+        ("=SUM(BINOM.INV({10,20},0.5,{0.5;0.25}))", n(27.0)),
+        ("=INDEX(T.DIST({0,1},10,TRUE),2)", n(0.8295534338489701)),
+    ]);
+}
+
+/// Far below the centre of a large shape the prefactor keeps x (it once lost
+/// it in x - a, to 0 or to 1E-9 relative).
+#[test]
+fn small_x_keeps_its_precision() {
+    assert_cases(&[
+        ("=GAMMA.DIST(1E-20,10,1,TRUE)", n(2.7557319223985218e-207)),
+        ("=BETA.DIST(1E-20,10,10,TRUE)", n(9.237799999999794e-196)),
+        ("=GAMMA.INV(1E-200,10,1)", n(4.5287286881167724e-20)),
+        ("=BETA.INV(1E-200,10,10)", n(3.1874482644428417e-21)),
+        ("=GAMMA.DIST(1E-20,10,1,FALSE)", n(2.7557319223985216e-186)),
+        ("=BETA.DIST(1E-20,10,10,FALSE)", n(9.237800000000535e-175)),
+        ("=GAMMA.DIST(1E-5,10,1,TRUE)", n(2.755706870405003e-57)),
+        ("=BETA.DIST(0.01,10,10,TRUE)", n(8.509104732905565e-16)),
+        ("=BETA.DIST(1E-10,10,20,TRUE)", n(2.003000996540256e-93)),
+        (
+            "=BETA.DIST(0.9999999999,20,10,FALSE)",
+            n(2.00300248775621e-82),
+        ),
+        ("=CHISQ.DIST(1E-20,20,TRUE)", n(2.6911444554672564e-210)),
+        ("=GAMMAINV(1E-200,10,1)", n(4.5287286881167724e-20)),
+        ("=BETAINV(1E-200,10,10)", n(3.1874482644428417e-21)),
+        ("=GAMMADIST(1E-20,10,1,TRUE)", n(2.7557319223985218e-207)),
+        ("=BETADIST(1E-20,10,10)", n(9.237799999999794e-196)),
+        ("=CHISQ.INV(1E-200,20)", n(9.057457376233545e-20)),
+        ("=POISSON.DIST(10,1E-20,FALSE)", n(2.7557319223985218e-207)),
+        ("=POISSON(10,1E-20,FALSE)", n(2.7557319223985218e-207)),
+        ("=BINOM.DIST(10,20,1E-20,FALSE)", n(1.8475600000000203e-195)),
+        ("=NEGBINOM.DIST(10,10,1E-5,FALSE)", n(9.236876261569179e-46)),
+        ("=BINOM.DIST(10,20,1E-5,FALSE)", n(1.8473752523138066e-45)),
+        ("=GAMMA.DIST(0.001,50,1,TRUE)", n(3.284727517041072e-215)),
+        ("=BETA.INV(1-1E-15,10,10)", n(0.9898366842455903)),
+        ("=GAMMA.DIST(1E-30,12,1,FALSE)", n(0.0)),
+    ]);
+}
+
+/// BETA.DIST divides before it underflows; Excel's gamma, chi-square and F
+/// densities form the prefactor first and are 0 there.
+#[test]
+fn densities_near_zero() {
+    assert_cases(&[
+        ("=GAMMA.DIST(1E-200,2,1,FALSE)", n(0.0)),
+        ("=BETA.DIST(1E-200,2,3,FALSE)", n(1.1999999999999492e-199)),
+        ("=CHISQ.DIST(1E-200,4,FALSE)", n(0.0)),
+        ("=F.DIST(1E-200,4,6,FALSE)", n(0.0)),
+        ("=GAMMADIST(1E-200,2,1,FALSE)", n(0.0)),
+        ("=BETA.DIST(1E-160,3,2,FALSE)", n(0.0)),
+        ("=GAMMA.DIST(1E-160,3,1,FALSE)", n(0.0)),
+        (
+            "=BETA.DIST(0.5,2,3,FALSE,0,1E-200)",
+            error(ExcelErrorKind::Num),
+        ),
+        ("=F.DIST(1E-200,4,40,FALSE)", n(0.0)),
+        ("=CHISQ.DIST(1E-200,6,FALSE)", n(0.0)),
+    ]);
+}
+
+/// NORM.S.INV refines on the unflushed tail; an argument below the smallest
+/// number is 0.
+#[test]
+fn inverse_normal_near_the_smallest_number() {
+    assert_cases(&[
+        ("=NORM.S.INV(2.225074E-308)", n(-37.519379345450844)),
+        ("=NORMSINV(2.225074E-308)", n(-37.519379345450844)),
+        (
+            "=NORM.S.DIST(NORM.S.INV(2.225074E-308),TRUE)",
+            n(2.225073999999466e-308),
+        ),
+        ("=NORM.INV(2.225074E-308,0,1)", n(-37.519379345450844)),
+        ("=NORM.S.INV(3E-308)", n(-37.511419674255876)),
+        ("=NORM.S.INV(1E-307)", n(-37.47933256432157)),
+        ("=NORM.S.INV(1E-300)", n(-37.0470962993612)),
+        (
+            "=NORM.S.INV(2.2250738585072E-308)",
+            error(ExcelErrorKind::Num),
+        ),
+        ("=LOGNORM.INV(2.225074E-308,0,1)", n(5.076221752927908e-17)),
+        ("=NORM.S.INV(5E-308)", n(-37.49780899620377)),
+        (
+            "=NORM.S.INV(2.2250738585072E-308*1)",
+            error(ExcelErrorKind::Num),
+        ),
+    ]);
+}
+
+/// The T and F tails as far as Excel computes them: #NUM! where t^2 overflows,
+/// #DIV/0! where d1 x does, 0 where df/(df+t^2) or d2/(d1 x+d2) underflows.
+#[test]
+fn t_and_f_far_tails() {
+    assert_cases(&[
+        ("=T.DIST.RT(1E200,1)", error(ExcelErrorKind::Num)),
+        ("=T.INV(1E-160,1)", n(-3.1830988618379068e+159)),
+        ("=T.DIST(-1E200,1,TRUE)", error(ExcelErrorKind::Num)),
+        ("=T.DIST.2T(1E200,1)", error(ExcelErrorKind::Num)),
+        ("=TDIST(1E200,1,1)", error(ExcelErrorKind::Num)),
+        ("=T.INV.2T(1E-160,1)", n(6.3661977236758136e+159)),
+        ("=TINV(1E-160,1)", n(6.3661977236758136e+159)),
+        ("=T.DIST.RT(1E100,3)", n(1.1026577908435748e-300)),
+        ("=T.INV(1E-300,1)", n(-3.183098861837907e+299)),
+        ("=F.INV.RT(1E-150,2,1)", n(4.999999999999881e+299)),
+        ("=FINV(1E-150,2,1)", n(4.999999999999881e+299)),
+        ("=F.DIST(1E200,1,1,FALSE)", n(3.1830988618378795e-301)),
+        ("=T.DIST(1E150,1,FALSE)", n(3.1830988618379073e-301)),
+        ("=T.INV(1E-200,2)", n(-7.07106781186554e+99)),
+        ("=F.INV.RT(1E-154,2,1)", n(5.000000000000069e+307)),
+        ("=T.DIST.RT(1E300,1)", error(ExcelErrorKind::Num)),
+        ("=F.DIST.RT(1E300,2,2)", n(1.0000000000000237e-300)),
+        ("=T.INV(1E-150,1)", n(-3.183098861837907e+149)),
+        ("=F.DIST.RT(9E307,2,1)", error(ExcelErrorKind::Div)),
+        (
+            "=F.DIST.RT(9.99999999999999E307,2,1)",
+            error(ExcelErrorKind::Div),
+        ),
+        ("=F.DIST.RT(5E307,4,1)", error(ExcelErrorKind::Div)),
+        ("=F.DIST(9E307,2,1,TRUE)", error(ExcelErrorKind::Div)),
+        ("=FDIST(9E307,2,1)", error(ExcelErrorKind::Div)),
+        ("=F.DIST(9E307,2,1,FALSE)", error(ExcelErrorKind::Num)),
+        ("=F.DIST.RT(8E307,2,1)", n(0.0)),
+        ("=F.DIST.RT(8E307,1,1)", n(0.0)),
+        ("=F.DIST.RT(1E300,1E10,1)", error(ExcelErrorKind::Div)),
+        ("=F.DIST.RT(1E307,10,1)", n(0.0)),
+        ("=F.DIST.RT(2E307,10,1)", error(ExcelErrorKind::Div)),
+        ("=F.INV.RT(1E-155,2,1)", error(ExcelErrorKind::Num)),
+        ("=F.INV.RT(1.4E-154,2,1)", n(2.551020408163341e+307)),
+        ("=F.DIST(1E307,10,1,FALSE)", n(0.0)),
+        ("=F.DIST.RT(1E306,2,1)", n(7.071067811865554e-154)),
+        ("=T.DIST.RT(1E154,1)", n(0.0)),
+        ("=T.DIST.RT(1.3E154,1)", n(0.0)),
+        ("=T.DIST.RT(1.34E154,1)", n(0.0)),
+        ("=T.DIST.RT(1.35E154,1)", error(ExcelErrorKind::Num)),
+        ("=T.DIST(1E200,1,FALSE)", error(ExcelErrorKind::Num)),
+        ("=T.DIST(1E200,1,TRUE)", error(ExcelErrorKind::Num)),
+        ("=T.DIST(1E200,5,TRUE)", error(ExcelErrorKind::Num)),
+        ("=T.DIST.RT(1E160,10)", error(ExcelErrorKind::Num)),
+        ("=T.DIST.2T(1.35E154,1)", error(ExcelErrorKind::Num)),
+        ("=T.DIST(1E160,1,FALSE)", error(ExcelErrorKind::Num)),
+        ("=T.DIST(-1.35E154,1,TRUE)", error(ExcelErrorKind::Num)),
+        ("=T.DIST(1E100,1,FALSE)", n(3.183098861837907e-201)),
+        ("=T.DIST.RT(1E150,1)", n(3.183098861837907e-151)),
+        ("=T.INV(1E-307,1)", n(-3.183098861837907e+306)),
+        ("=T.INV(2.3E-308,1)", n(-1.3839560268860467e+307)),
+        ("=T.INV.2T(1E-300,1)", n(6.366197723675814e+299)),
+        ("=TINV(1E-300,1)", n(6.366197723675814e+299)),
+        ("=T.INV(1-1E-16,1)", n(2867080569611329.5)),
+        ("=T.INV(1E-100,10)", n(-25645257189.481995)),
+        ("=T.INV(1E-300,3)", n(-1.0331108360446901e+100)),
+    ]);
+}
+
+/// Excel refuses a second argument to its one-argument distributions at
+/// entry, so no workbook holds one; the fork reads the call as #VALUE!.
+#[test]
+fn one_argument_distributions_take_one_argument() {
+    assert_cases(&[
+        ("=NORMSDIST(1,TRUE)", error(ExcelErrorKind::Value)),
+        ("=NORMSINV(0.5,2)", error(ExcelErrorKind::Value)),
+        ("=NORM.S.INV(0.5,2)", error(ExcelErrorKind::Value)),
+        ("=PHI(1,2)", error(ExcelErrorKind::Value)),
+        ("=GAUSS(1,2)", error(ExcelErrorKind::Value)),
     ]);
 }

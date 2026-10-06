@@ -21,7 +21,12 @@
 //!   BETA.INV take neither end, and T.INV.2T/TINV take 0 < p < 2
 //!   (TINV(1.1,10) is T.INV(0.45,10));
 //! - small probabilities are computed as themselves, never as 1 minus a value
-//!   near 1: CHIDIST(1000,2) is 7.1E-218 and NORMSDIST(-37.5) is 4.6E-308.
+//!   near 1: CHIDIST(1000,2) is 7.1E-218 and NORMSDIST(-37.5) is 4.6E-308;
+//! - Excel has no number below its smallest one: such an argument is 0, and a
+//!   T or F tail is 0 where `df / (df + t^2)` or `d2 / (d1 x + d2)` falls
+//!   below it (T.DIST.RT(1E154,1), F.DIST.RT(8E307,2,1)); where `t^2` or
+//!   `d1 x` is beyond the largest number the T functions are `#NUM!`, the F
+//!   cumulative and tail `#DIV/0!` and the F density `#NUM!`.
 //!
 //! - the T and F functions and the chi-square distribution refuse degrees of
 //!   freedom above 1E10; the chi-square inverses take them (CHIINV(0.5,1E11)
@@ -38,7 +43,7 @@ use crate::args::ArgSchema;
 use crate::builtins::utils::coerce_num;
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, CalcValue, FunctionContext};
-use formualizer_common::{ExcelError, LiteralValue};
+use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
 use std::f64::consts::PI;
 
@@ -82,6 +87,26 @@ fn log1pmx(d: f64) -> f64 {
     sum
 }
 
+/// `ln t - (t - 1)` for the ratio `t = 1 + d` of a point to the centre of a
+/// shape term: from `d` near the centre, where `d` is exact, and from the
+/// ratio below half the centre, where `d` rounds towards -1 and loses a
+/// small point (GAMMA.DIST(1E-20,10,1,TRUE) is 2.8E-207, not 0).
+fn log_ratio_m1(t: f64, d: f64) -> f64 {
+    if t < 0.5 {
+        t.ln() - (t - 1.0)
+    } else {
+        log1pmx(d)
+    }
+}
+
+/// `(ln x, ln y)` for `y = 1 - x`, each from the one of the two near 0.
+fn ln_pair(x: f64, y: f64) -> (f64, f64) {
+    (
+        if x <= 0.5 { x.ln() } else { (-y).ln_1p() },
+        if y <= 0.5 { y.ln() } else { (-x).ln_1p() },
+    )
+}
+
 /// `ln B(a, b)`. For a large argument the large lnΓ values cancel
 /// analytically (Stirling) instead of numerically, so `ln B(0.5, 5E9)` keeps
 /// its precision.
@@ -123,7 +148,7 @@ fn gamma_prefix(a: f64, x: f64) -> f64 {
     if a < 10.0 {
         (a * x.ln() - x - ln_gamma(a)).exp()
     } else {
-        (a * log1pmx((x - a) / a) - stirling_rest(a)).exp() * (a / (2.0 * PI)).sqrt()
+        (a * log_ratio_m1(x / a, (x - a) / a) - stirling_rest(a)).exp() * (a / (2.0 * PI)).sqrt()
     }
 }
 
@@ -195,18 +220,24 @@ fn beta_prefix(a: f64, b: f64, x: f64, y: f64) -> f64 {
     if x <= 0.0 || y <= 0.0 {
         return 0.0;
     }
+    let (exponent, factor) = beta_prefix_parts(a, b, x, y);
+    exponent.exp() * factor
+}
+
+/// `beta_prefix` as `exp(exponent) * factor`, for `0 < x < 1`.
+fn beta_prefix_parts(a: f64, b: f64, x: f64, y: f64) -> (f64, f64) {
     let c = a + b;
     if a.min(b) >= 10.0 {
         // Around the centre x0 = a / c: x = x0 (1 + u), y = y0 (1 + v).
-        let u = (x * c - a) / a;
-        let v = (y * c - b) / b;
-        (a * log1pmx(u) + b * log1pmx(v) - stirling_rest(a) - stirling_rest(b) + stirling_rest(c))
-            .exp()
-            * (a / (2.0 * PI) * (b / c)).sqrt()
+        let u = log_ratio_m1(x * c / a, (x * c - a) / a);
+        let v = log_ratio_m1(y * c / b, (y * c - b) / b);
+        (
+            a * u + b * v - stirling_rest(a) - stirling_rest(b) + stirling_rest(c),
+            (a / (2.0 * PI) * (b / c)).sqrt(),
+        )
     } else {
-        let ln_x = if x <= 0.5 { x.ln() } else { (-y).ln_1p() };
-        let ln_y = if y <= 0.5 { y.ln() } else { (-x).ln_1p() };
-        (a * ln_x + b * ln_y - ln_beta(a, b)).exp()
+        let (ln_x, ln_y) = ln_pair(x, y);
+        (a * ln_x + b * ln_y - ln_beta(a, b), 1.0)
     }
 }
 
@@ -280,13 +311,26 @@ pub(super) fn beta_inc(a: f64, b: f64, x: f64, y: f64) -> (f64, f64) {
 }
 
 /// The density of the standard beta distribution at `x` (`y = 1 - x`), inside (0, 1).
+/// Where the prefactor is below Excel's smallest number the division is taken
+/// in its exponent: BETA.DIST(1E-200,2,3,FALSE) is 1.2E-199 in Excel. (Excel's
+/// gamma, chi-square and F densities form the prefactor first, so
+/// GAMMA.DIST(1E-200,2,1,FALSE) is 0 in Excel and here.)
 fn beta_density(a: f64, b: f64, x: f64, y: f64) -> f64 {
-    beta_prefix(a, b, x, y) / (x * y)
+    let prefix = beta_prefix(a, b, x, y);
+    if prefix >= f64::MIN_POSITIVE {
+        return prefix / (x * y);
+    }
+    let (exponent, factor) = beta_prefix_parts(a, b, x, y);
+    let (ln_x, ln_y) = ln_pair(x, y);
+    (exponent - ln_x - ln_y).exp() * factor
 }
 
 /// `P(T > t)` for Student's t with `df` degrees of freedom. Like Excel, a
 /// `t` too small to change `df + t^2` is a tail of exactly 1/2
-/// (TDIST(1E-10,5,2) is 1).
+/// (TDIST(1E-10,5,2) is 1); a `t` whose square is beyond the largest number
+/// has no tail (NaN, `#NUM!`: T.DIST.RT(1.35E154,1)), and one that puts
+/// `df / (df + t^2)` below the smallest number a tail of 0
+/// (T.DIST.RT(1E154,1)), as Excel's arithmetic has no smaller numbers.
 pub(super) fn t_upper(t: f64, df: f64) -> f64 {
     if t.is_nan() {
         return f64::NAN;
@@ -294,9 +338,11 @@ pub(super) fn t_upper(t: f64, df: f64) -> f64 {
     let t2 = t * t;
     let s = df + t2;
     let tail = if t2.is_infinite() {
-        0.0
+        f64::NAN
     } else if s == df {
         0.5
+    } else if df / s < f64::MIN_POSITIVE {
+        0.0
     } else {
         0.5 * beta_inc(df / 2.0, 0.5, df / s, t2 / s).0
     };
@@ -312,24 +358,44 @@ pub(super) fn t_lower(t: f64, df: f64) -> f64 {
     }
 }
 
+/// The t density; NaN (`#NUM!`) where `t^2` is beyond the largest number, as
+/// in Excel (T.DIST(1E160,1,FALSE)).
 fn t_density(t: f64, df: f64) -> f64 {
-    (-(df + 1.0) / 2.0 * (t * t / df).ln_1p() - 0.5 * df.ln() - ln_beta(df / 2.0, 0.5)).exp()
+    let t2 = t * t;
+    if t2.is_infinite() {
+        return f64::NAN;
+    }
+    (-(df + 1.0) / 2.0 * (t2 / df).ln_1p() - 0.5 * df.ln() - ln_beta(df / 2.0, 0.5)).exp()
 }
 
-/// `(P(F <= f), P(F > f))` for the F distribution.
+/// `(P(F <= f), P(F > f))` for the F distribution, `d1 * f` finite. Like
+/// Excel, the right tail is 0 where `d2 / (d1 f + d2)` is below the smallest
+/// number (F.DIST.RT(8E307,2,1)).
 pub(super) fn f_tails(f: f64, d1: f64, d2: f64) -> (f64, f64) {
     if f <= 0.0 {
         return (0.0, 1.0);
     }
     let p = d1 * f;
-    if p.is_infinite() {
+    let s = p + d2;
+    let y = d2 / s;
+    if y < f64::MIN_POSITIVE {
         return (1.0, 0.0);
     }
-    let s = p + d2;
-    beta_inc(d1 / 2.0, d2 / 2.0, p / s, d2 / s)
+    beta_inc(d1 / 2.0, d2 / 2.0, p / s, y)
 }
 
-/// The F density at `f > 0`.
+/// Excel's F distribution has no value where `d1 * f` is beyond the largest
+/// number: `#DIV/0!` (F.DIST.RT(9E307,2,1), F.DIST(9E307,2,1,TRUE)), and
+/// `#NUM!` for the density.
+fn f_overflow(f: f64, d1: f64, error: ExcelErrorKind) -> Result<(), ExcelError> {
+    if (d1 * f).is_infinite() {
+        Err(ExcelError::new(error))
+    } else {
+        Ok(())
+    }
+}
+
+/// The F density at `f > 0`, `d1 * f` finite.
 fn f_density(f: f64, d1: f64, d2: f64) -> f64 {
     let p = d1 * f;
     let s = p + d2;
@@ -468,7 +534,15 @@ fn t_upper_quantile(upper: f64, df: f64) -> f64 {
         return 0.0;
     }
     // P(T > t) = I_x(df/2, 1/2) / 2 with x = df / (df + t^2).
-    let (x, y) = beta_quantile(df / 2.0, 0.5, 2.0 * upper, 1.0 - 2.0 * upper);
+    let a = df / 2.0;
+    // Far in the tail, I_x(a, 1/2) = x^a / (a B(a, 1/2)) to double precision
+    // and t = sqrt(df / x), though x itself is below the smallest number
+    // (T.INV(1E-160,1) is -3.2E159).
+    let base = 2.0 * upper * a * ln_beta(a, 0.5).exp();
+    if base.ln() / a < -640.0 {
+        return df.sqrt() * base.powf(-0.5 / a);
+    }
+    let (x, y) = beta_quantile(a, 0.5, 2.0 * upper, 1.0 - 2.0 * upper);
     (df * y / x).sqrt()
 }
 
@@ -649,17 +723,20 @@ pub(super) fn chisq_inv_rt(p: f64, df: f64) -> Result<f64, ExcelError> {
 pub(super) fn f_dist(x: f64, d1: f64, d2: f64, cumulative: bool) -> Result<f64, ExcelError> {
     domain(df_ok(d1) && df_ok(d2) && x >= 0.0)?;
     if cumulative {
+        f_overflow(x, d1, ExcelErrorKind::Div)?;
         return Ok(f_tails(x, d1, d2).0);
     }
     if x == 0.0 {
         domain(d1 >= 2.0)?;
         return Ok(if d1 == 2.0 { 1.0 } else { 0.0 });
     }
+    f_overflow(x, d1, ExcelErrorKind::Num)?;
     Ok(f_density(x, d1, d2))
 }
 
 pub(super) fn f_dist_rt(x: f64, d1: f64, d2: f64) -> Result<f64, ExcelError> {
     domain(df_ok(d1) && df_ok(d2) && x >= 0.0)?;
+    f_overflow(x, d1, ExcelErrorKind::Div)?;
     Ok(f_tails(x, d1, d2).1)
 }
 
@@ -683,20 +760,26 @@ pub(super) fn binom_dist(k: f64, n: f64, p: f64, cumulative: bool) -> Result<f64
     })
 }
 
-/// BINOM.INV and CRITBINOM: the smallest `k` with `P(X <= k) >= alpha`,
-/// `n` already truncated; `p` and `alpha` lie strictly between 0 and 1.
+/// BINOM.INV and CRITBINOM: the smallest `k` whose BINOM.DIST(k, n, p, TRUE)
+/// is at least `alpha`, `n` already truncated; `p` and `alpha` lie strictly
+/// between 0 and 1. The boundary is decided on the published cumulative, as
+/// in Excel, where `BINOM.INV(n,p,BINOM.DIST(k,n,p,TRUE))` is `k` for every
+/// probed `k >= 1` and BINOM.INV(5,0.5,0.5) is 3 because its
+/// BINOM.DIST(2,5,0.5,TRUE) is 0.4999999999999999 (probes 6 and 7 of
+/// ops/excel-legacy-functions-probe-20261006.md).
 pub(super) fn binom_inv(n: f64, p: f64, alpha: f64) -> Result<f64, ExcelError> {
     domain(n >= 0.0 && p > 0.0 && p < 1.0 && alpha > 0.0 && alpha < 1.0)?;
-    let mut cumulative = 0.0;
-    let mut k = 0.0;
-    while k < n {
-        cumulative += binom_pmf(k, n, p);
-        if cumulative >= alpha {
-            return Ok(k);
+    // The cumulative is increasing in k and 1 at n.
+    let (mut low, mut high) = (0.0, n);
+    while low < high {
+        let k = ((low + high) / 2.0).floor();
+        if binom_cdf(k, n, p) >= alpha {
+            high = k;
+        } else {
+            low = k + 1.0;
         }
-        k += 1.0;
     }
-    Ok(n)
+    Ok(low)
 }
 
 /// POISSON.DIST and POISSON, with `k` already truncated.
@@ -841,9 +924,23 @@ pub(super) fn hypgeom_dist(
 
 /* ─────────────────────────── arguments ──────────────────────────── */
 
-/// A number argument.
+/// A number argument. Excel has no number below its smallest one, so a
+/// smaller one is 0 (NORM.S.INV(2.2250738585072E-308) is `#NUM!`).
 pub(super) fn number_arg(args: &[ArgumentHandle<'_, '_>], i: usize) -> Result<f64, ExcelError> {
-    coerce_num(&scalar_like_value(&args[i])?)
+    Ok(crate::coercion::underflow_to_zero(coerce_num(
+        &scalar_like_value(&args[i])?,
+    )?))
+}
+
+/// The number argument of a one-argument function (NORMSDIST, NORMSINV,
+/// NORM.S.INV, PHI, GAUSS). Its one-entry schema would repeat for further
+/// arguments; Excel refuses `NORMSDIST(1,TRUE)` at entry, and any other call
+/// with too many arguments is `#VALUE!`.
+pub(super) fn only_number_arg(args: &[ArgumentHandle<'_, '_>]) -> Result<f64, ExcelError> {
+    if args.len() > 1 {
+        return Err(ExcelError::new(ExcelErrorKind::Value).with_message("Too many arguments"));
+    }
+    number_arg(args, 0)
 }
 
 /// A count or a number of degrees of freedom: Excel truncates it.
@@ -923,7 +1020,7 @@ impl Function for NormsDistLegacyFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
-        result(Ok(std_norm_cdf(number_arg(args, 0)?)))
+        result(Ok(std_norm_cdf(only_number_arg(args)?)))
     }
 }
 
@@ -962,7 +1059,7 @@ impl Function for NormsInvLegacyFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
-        result(norm_inv(number_arg(args, 0)?, 0.0, 1.0))
+        result(norm_inv(only_number_arg(args)?, 0.0, 1.0))
     }
 }
 

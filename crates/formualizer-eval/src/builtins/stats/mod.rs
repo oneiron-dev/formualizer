@@ -3035,9 +3035,14 @@ STATISTICAL DISTRIBUTION FUNCTIONS
 /// is 9.4795348222032E-18 in Excel); below Excel's smallest number (from about
 /// z = -37.52) the result is 0, as in Excel.
 fn std_norm_cdf(z: f64) -> f64 {
-    crate::coercion::underflow_to_zero(
-        0.5 * crate::builtins::engineering::erfc_direct(-z * std::f64::consts::FRAC_1_SQRT_2),
-    )
+    crate::coercion::underflow_to_zero(std_norm_cdf_unflushed(z))
+}
+
+/// Φ(z) with the tail below Excel's smallest number kept, for the inverse's
+/// refinement: a step starting just past -37.52 still sees its residual, so
+/// NORM.S.INV(2.225074E-308) is -37.519379345450844, as in Excel.
+fn std_norm_cdf_unflushed(z: f64) -> f64 {
+    0.5 * crate::builtins::engineering::erfc_direct(-z * std::f64::consts::FRAC_1_SQRT_2)
 }
 
 /// Helper: Standard normal PDF
@@ -3108,7 +3113,7 @@ fn std_norm_inv(p: f64) -> Option<f64> {
         q * num / den
     };
     for _ in 0..2 {
-        let e = std_norm_cdf(z) - p;
+        let e = std_norm_cdf_unflushed(z) - p;
         let u = e * (2.0 * std::f64::consts::PI).sqrt() * (z * z / 2.0).exp();
         z -= u / (1.0 + z * u / 2.0);
     }
@@ -3232,7 +3237,7 @@ impl Function for NormSInvFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        dist::result(dist::norm_inv(dist::number_arg(args, 0)?, 0.0, 1.0))
+        dist::result(dist::norm_inv(dist::only_number_arg(args)?, 0.0, 1.0))
     }
 }
 
@@ -3542,7 +3547,7 @@ impl Function for PhiFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let z = coerce_num(&scalar_like_value(&args[0])?)?;
+        let z = dist::only_number_arg(args)?;
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
             std_norm_pdf(z),
         )))
@@ -3603,7 +3608,7 @@ impl Function for GaussFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let z = coerce_num(&scalar_like_value(&args[0])?)?;
+        let z = dist::only_number_arg(args)?;
         // GAUSS(z) = Φ(z) - 0.5
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
             std_norm_cdf(z) - 0.5,

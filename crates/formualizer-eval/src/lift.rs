@@ -95,10 +95,16 @@ pub(crate) fn lift_spec(name: &str) -> Option<Lift> {
         // Financial
         "PMT" | "IPMT" | "PPMT" | "PV" | "FV" | "NPER" | "RATE" | "EFFECT" | "NOMINAL" | "DB"
         | "DDB" | "SLN" | "SYD" | "ISPMT" | "RRI" | "PDURATION" => Lift::All,
-        // Statistical distributions
+        // Statistical distributions, current and compatibility names alike,
+        // take single values only (SUM(T.DIST({0,1},10,TRUE)) is two values).
         "NORM.DIST" | "NORM.INV" | "NORM.S.DIST" | "NORM.S.INV" | "STANDARDIZE" | "FISHER"
-        | "FISHERINV" | "EXPON.DIST" | "POISSON.DIST" | "BINOM.DIST" | "PHI" | "GAUSS" => Lift::All,
-        // The compatibility names of the distributions take single values only.
+        | "FISHERINV" | "EXPON.DIST" | "POISSON.DIST" | "BINOM.DIST" | "PHI" | "GAUSS"
+        | "LOGNORM.DIST" | "LOGNORM.INV" | "T.DIST" | "T.DIST.RT" | "T.DIST.2T" | "T.INV"
+        | "T.INV.2T" | "TINV" | "CHISQ.DIST" | "CHISQ.DIST.RT" | "CHISQ.INV" | "CHISQ.INV.RT"
+        | "F.DIST" | "F.DIST.RT" | "F.INV" | "F.INV.RT" | "GAMMA.DIST" | "GAMMA.INV"
+        | "GAMMAINV" | "BETA.DIST" | "BETA.INV" | "WEIBULL.DIST" | "BINOM.INV" | "CRITBINOM"
+        | "BINOM.DIST.RANGE" | "NEGBINOM.DIST" | "HYPGEOM.DIST" | "CONFIDENCE.NORM"
+        | "CONFIDENCE" | "CONFIDENCE.T" => Lift::All,
         "NORMSDIST" | "NORMSINV" | "NORMDIST" | "NORMINV" | "LOGNORMDIST" | "LOGINV" | "TDIST"
         | "CHIDIST" | "CHIINV" | "FDIST" | "FINV" | "BINOMDIST" | "POISSON" | "EXPONDIST"
         | "GAMMADIST" | "WEIBULL" | "BETADIST" | "BETAINV" | "HYPGEOMDIST" | "NEGBINOMDIST" => {
