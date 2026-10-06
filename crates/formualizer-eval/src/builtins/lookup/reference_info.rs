@@ -741,7 +741,11 @@ fn linked_position(
             end_row,
             end_col,
             ..
-        } => ReferenceType::range(None, start_row, start_col, end_row, end_col),
+        } => {
+            let (start_row, end_row) = crate::engine::external_book::in_order(start_row, end_row);
+            let (start_col, end_col) = crate::engine::external_book::in_order(start_col, end_col);
+            ReferenceType::range(None, start_row, start_col, end_row, end_col)
+        }
     }))
 }
 

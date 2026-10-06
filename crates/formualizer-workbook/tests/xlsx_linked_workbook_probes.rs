@@ -1,6 +1,6 @@
 #![cfg(feature = "xlsx-recalc")]
 //! Workbooks whose formulas read closed linked workbooks, recalculated and
-//! compared cell by cell with Excel for Windows 16.0.20430: probes 1 to 3 of
+//! compared cell by cell with Excel for Windows 16.0.20430: probes 1 to 5 of
 //! ops/excel-extlinks-probe-20261006.md, each kept to the rows the fork
 //! computes as Excel did (`excel-values.tsv`). Excel saw the links closed
 //! (UpdateLinks=0, CalculateFullRebuild), so it read the values the
@@ -49,5 +49,5 @@ fn linked_workbook_probes_match_excel_for_windows() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 171);
+    assert_eq!(checked, 181);
 }

@@ -144,6 +144,15 @@ pub fn is_link_index(token: &str) -> bool {
         .is_some_and(|inner| !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// The bounds of one axis of a linked range in order: a reversed range
+/// (`[1]S!A5:A1`) spans the same cells as the range written forwards.
+pub(crate) fn in_order(start: Option<u32>, end: Option<u32>) -> (Option<u32>, Option<u32>) {
+    match (start, end) {
+        (Some(start), Some(end)) if start > end => (Some(end), Some(start)),
+        bounds => bounds,
+    }
+}
+
 /// Normalized key of a book token such as `[1]`.
 pub(crate) fn book_key(token: &str) -> String {
     token.trim().to_lowercase()

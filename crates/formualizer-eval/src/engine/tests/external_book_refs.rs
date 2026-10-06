@@ -520,3 +520,30 @@ fn a_closed_linked_workbook_has_no_formula_or_sheet_to_inspect() {
         Some(LiteralValue::Number(5.0))
     );
 }
+
+#[test]
+fn a_reversed_linked_range_spans_the_same_cells() {
+    // Excel stores `[1]Ok!A5:A1` as `[1]Ok!A1:A5` (probe 4 of
+    // ops/excel-extlinks-probe-20261006.md): INDEX, ROW and ROWS read it in
+    // order, and a large reversed range still reaches the unsaved #REF!.
+    let mut engine = engine_with_failed_sheet();
+    for (formula, expected) in [
+        (
+            "=INDEX([1]Rates!A4:A1,2)",
+            LiteralValue::Text("pear".into()),
+        ),
+        ("=ROWS([1]Rates!B4:B1)", LiteralValue::Number(4.0)),
+        ("=ROW([1]Rates!A4:A2)", LiteralValue::Number(2.0)),
+        ("=SUM([1]Rates!B4:B1)", LiteralValue::Number(15.0)),
+    ] {
+        assert_eq!(
+            number_like(eval(&mut engine, formula)),
+            Some(expected),
+            "{formula}"
+        );
+    }
+    assert_ref_error(
+        eval(&mut engine, "=SUM([2]Full!E1000000:A1)"),
+        "=SUM([2]Full!E1000000:A1)",
+    );
+}

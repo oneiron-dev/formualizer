@@ -32075,13 +32075,13 @@ fn external_book_rows(
     if sr == 0 || sc == 0 {
         return Err(ExcelError::new(ExcelErrorKind::Ref));
     }
-    // The written extent, where an open axis reaches the sheet's edge.
+    // The written extent, in order, where an open end reaches the sheet's edge.
     let (full_er, full_ec) = match ext.kind {
         ExternalRefKind::Range {
             end_row, end_col, ..
         } => (
-            end_row.unwrap_or(1_048_576).max(sr),
-            end_col.unwrap_or(16_384).max(sc),
+            if end_row.is_some() { er } else { 1_048_576 },
+            if end_col.is_some() { ec } else { 16_384 },
         ),
         ExternalRefKind::Cell { .. } => (er, ec),
     };

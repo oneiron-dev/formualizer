@@ -146,16 +146,20 @@ fn linked_bounds<'b>(
             end_row,
             end_col,
             ..
-        } => index_static_bounds(start_row, start_col, end_row, end_col).unwrap_or_else(|| {
-            let (rows, cols) = view.dims();
-            let (sr, sc) = (start_row.unwrap_or(1), start_col.unwrap_or(1));
-            (
-                sr,
-                sc,
-                end_row.unwrap_or(sr + (rows.max(1) as u32) - 1),
-                end_col.unwrap_or(sc + (cols.max(1) as u32) - 1),
-            )
-        }),
+        } => {
+            let (start_row, end_row) = crate::engine::external_book::in_order(start_row, end_row);
+            let (start_col, end_col) = crate::engine::external_book::in_order(start_col, end_col);
+            index_static_bounds(start_row, start_col, end_row, end_col).unwrap_or_else(|| {
+                let (rows, cols) = view.dims();
+                let (sr, sc) = (start_row.unwrap_or(1), start_col.unwrap_or(1));
+                (
+                    sr,
+                    sc,
+                    end_row.unwrap_or(sr + (rows.max(1) as u32) - 1),
+                    end_col.unwrap_or(sc + (cols.max(1) as u32) - 1),
+                )
+            })
+        }
     })
 }
 

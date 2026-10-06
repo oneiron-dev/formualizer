@@ -172,6 +172,11 @@ fn parse_external_book(part: &[u8]) -> Option<ExternalBook> {
                 let text = t.xml10_content().ok()?;
                 value.get_or_insert_with(String::new).push_str(&text);
             }
+            // Excel reads a CDATA section as the text it holds.
+            Event::CData(text) if in_value => {
+                let text = text.xml10_content().ok()?;
+                value.get_or_insert_with(String::new).push_str(&text);
+            }
             Event::GeneralRef(entity) if in_value => {
                 CalamineAdapter::append_xml_entity(&entity, value.get_or_insert_with(String::new))
                     .ok()?;
@@ -268,6 +273,16 @@ mod tests {
         assert!(is_ref(book.sheet("Failed").unwrap().get(2, 1)));
         assert_eq!(book.sheet("Empty").unwrap().get(1, 1), LiteralValue::Empty);
         assert!(is_ref(book.sheet("NotSaved").unwrap().get(1, 1)));
+    }
+
+    #[test]
+    fn a_cdata_section_is_the_text_it_holds() {
+        let part = br#"<externalLink xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><externalBook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"><sheetNames><sheetName val="S"/></sheetNames><sheetDataSet><sheetData sheetId="0"><row r="1"><cell r="A1" t="str"><v><![CDATA[pear & <b>]]></v></cell></row></sheetData></sheetDataSet></externalBook></externalLink>"#;
+        let book = parse_external_book(part).expect("workbook link");
+        assert_eq!(
+            book.sheet("S").unwrap().get(1, 1),
+            LiteralValue::Text("pear & <b>".into())
+        );
     }
 
     #[test]
