@@ -560,10 +560,8 @@ mod tests {
                 crate::lift::LegacyArg::Value
             );
         }
-        // Owner ruling: the web functions stay unknown (#NAME?).
-        for name in ["WEBSERVICE", "ENCODEURL"] {
-            assert!(crate::function_registry::get("", name).is_none(), "{name}");
-        }
+        // WEBSERVICE reads the network: it stays unknown (#NAME?).
+        assert!(crate::function_registry::get("", "WEBSERVICE").is_none());
     }
 
     /// FILTERXML of literal XML and XPath (neither may hold a double quote).

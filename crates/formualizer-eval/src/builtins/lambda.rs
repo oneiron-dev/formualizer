@@ -54,6 +54,42 @@ fn is_valid_local_name(name: &str, parameter: bool) -> bool {
         && formualizer_common::parse_a1_1based(name).is_err()
 }
 
+/// A LAMBDA parameter as written: the name it binds and whether it is
+/// optional. A file writes an optional parameter `_xlop.b` and refers to it as
+/// `_xlpm.b`, so it binds `_xlpm.b`; Excel's own entry form `[b]` (which
+/// parses as the bracketed table shorthand) binds `b`.
+fn lambda_parameter(node: &ASTNode) -> Result<(String, bool), ExcelError> {
+    use formualizer_parse::parser::{SpecialItem, TableReference, TableSpecifier};
+    match &node.node_type {
+        ASTNodeType::Reference {
+            reference: ReferenceType::NamedRange(name),
+            ..
+        } if name.len() > 6 && name[..6].eq_ignore_ascii_case("_xlop.") => {
+            let bound = format!("_xlpm.{}", &name[6..]);
+            if is_valid_local_name(&bound, true) {
+                Ok((bound, true))
+            } else {
+                Err(value_error(format!("{name} is not a valid name")))
+            }
+        }
+        ASTNodeType::Reference {
+            reference:
+                ReferenceType::Table(TableReference {
+                    name,
+                    specifier: Some(TableSpecifier::SpecialItem(SpecialItem::Data)),
+                }),
+            ..
+        } if is_valid_local_name(name, true) => Ok((name.clone(), true)),
+        _ => local_name_from_ast(node, true).map(|name| (name, false)),
+    }
+}
+
+/// The name a LAMBDA parameter written as `node` binds in the body, for the
+/// dependency collectors (`None` when it is no parameter name).
+pub(crate) fn lambda_parameter_name(node: &ASTNode) -> Option<String> {
+    lambda_parameter(node).ok().map(|(name, _)| name)
+}
+
 fn binding_from_calc_value(cv: CalcValue<'_>) -> LocalBinding {
     match cv {
         CalcValue::Scalar(v) | CalcValue::AnnotatedScalar(v, _) => LocalBinding::Value(v),
@@ -242,6 +278,9 @@ impl Function for LetFn {
 #[derive(Clone)]
 struct LambdaClosure {
     params: Vec<String>,
+    /// The parameters before the first optional one, which a call must
+    /// supply (an empty argument counts: it is omitted).
+    required: usize,
     body: ASTNode,
     captured_env: LocalEnv,
     /// The body node the LAMBDA was written with (see
@@ -252,6 +291,10 @@ struct LambdaClosure {
 impl CustomCallable for LambdaClosure {
     fn arity(&self) -> usize {
         self.params.len()
+    }
+
+    fn accepts(&self, count: usize) -> bool {
+        (self.required..=self.params.len()).contains(&count)
     }
 
     fn invoke<'ctx>(
@@ -282,7 +325,7 @@ impl CustomCallable for LambdaClosure {
         interp: &crate::interpreter::Interpreter<'ctx>,
         args: Vec<(LocalBinding, Option<crate::traits::ResultShape>)>,
     ) -> Result<CalcValue<'ctx>, ExcelError> {
-        if args.len() != self.arity() {
+        if !self.accepts(args.len()) {
             return Ok(CalcValue::Scalar(LiteralValue::Error(value_error(
                 format!(
                     "LAMBDA expected {} argument(s), got {}",
@@ -294,7 +337,11 @@ impl CustomCallable for LambdaClosure {
 
         let report = crate::traits::lambda_result_wanted();
         let mut env = self.captured_env.clone();
-        for (name, (binding, shape)) in self.params.iter().zip(args) {
+        // An optional parameter left out of the call is omitted, as is one
+        // given an empty argument (`f(1,)`).
+        let mut args = args.into_iter();
+        for name in &self.params {
+            let (binding, shape) = args.next().unwrap_or((LocalBinding::Omitted, None));
             env = env.with_shaped_binding(name, binding, shape);
         }
 
@@ -330,7 +377,12 @@ pub struct LambdaFn;
 /// # Remarks
 /// - All arguments except the last are parameter names; the last argument is the body expression.
 /// - Parameter names must be unique (case-insensitive), or `#VALUE!` is returned.
-/// - Invocation arity must exactly match the declared parameter count.
+/// - A parameter written `[name]` (`_xlop.name` in a file) is optional: a call
+///   may leave it and those after it out. A parameter left out, or given an
+///   empty argument (`f(1,)`), is omitted: `ISOMITTED` is TRUE for it and it
+///   reads as a blank value.
+/// - A call with fewer arguments than the required parameters, or more than
+///   all of them, returns `#VALUE!`.
 /// - Returning an uninvoked lambda as a final cell value yields a `#CALC!` in evaluation.
 ///
 /// # Examples
@@ -364,7 +416,7 @@ pub struct LambdaFn;
 ///   - q: "Does a LAMBDA read outer LET variables at call time or definition time?"
 ///     a: "Definition time. The closure captures its lexical environment when created."
 ///   - q: "Can I call a LAMBDA with fewer or extra arguments?"
-///     a: "No. Invocation arity must match the declared parameter count exactly, or #VALUE! is returned."
+///     a: "Fewer only when the parameters left out are optional ([name]); otherwise, or with extra arguments, #VALUE! is returned."
 /// ```
 ///
 /// [formualizer-docgen:schema:start]
@@ -429,10 +481,11 @@ impl Function for LambdaFn {
         }
 
         let mut params = Vec::new();
+        let mut required = 0;
         let mut seen = HashSet::new();
         for arg in &args[..args.len() - 1] {
-            let name = match local_name_from_ast(arg.ast(), true) {
-                Ok(name) => name,
+            let (name, optional) = match lambda_parameter(arg.ast()) {
+                Ok(parameter) => parameter,
                 Err(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
             };
             let key = name.to_ascii_uppercase();
@@ -441,11 +494,21 @@ impl Function for LambdaFn {
                     "LAMBDA parameter names must be unique",
                 ))));
             }
+            // Excel refuses a required parameter after an optional one at entry.
+            if !optional {
+                if required != params.len() {
+                    return Ok(CalcValue::Scalar(LiteralValue::Error(value_error(
+                        "A required LAMBDA parameter follows an optional one",
+                    ))));
+                }
+                required += 1;
+            }
             params.push(name);
         }
 
         let closure = LambdaClosure {
             params,
+            required,
             body: args[args.len() - 1].ast().clone(),
             captured_env: args[0].current_env(),
             written_body: crate::traits::written_body_key(&args[args.len() - 1]),
@@ -1048,7 +1111,86 @@ lambda_helper!(ByRowFn, "BYROW", 2, false, eval_byrow);
 lambda_helper!(ByColFn, "BYCOL", 2, false, eval_bycol);
 lambda_helper!(MakeArrayFn, "MAKEARRAY", 3, false, eval_makearray);
 
+#[derive(Debug)]
+pub struct IsOmittedFn;
+
+/// Returns TRUE when a LAMBDA parameter was left out of the call.
+///
+/// # Remarks
+/// - The argument is a LAMBDA parameter: TRUE when the call left it out
+///   (an optional `[name]` parameter) or gave it an empty argument (`f(1,)`).
+/// - Anything else, a parameter given a blank cell or empty text, a LET name,
+///   a reference or a value, is FALSE. The argument is not evaluated.
+///
+/// # Examples
+///
+/// ```yaml,sandbox
+/// title: "Default for an optional parameter"
+/// formula: '=LAMBDA(a,[b],IF(ISOMITTED(b),a,a+b))(1)'
+/// expected: 1
+/// ```
+///
+/// ```yaml,docs
+/// related:
+///   - LAMBDA
+///   - ISBLANK
+/// faq:
+///   - q: "Is a parameter given an empty cell omitted?"
+///     a: "No. ISOMITTED is TRUE only when the call leaves the argument out or empty."
+/// ```
+impl Function for IsOmittedFn {
+    fn caps(&self) -> FnCaps {
+        FnCaps::PURE
+    }
+
+    fn name(&self) -> &'static str {
+        "ISOMITTED"
+    }
+
+    fn min_args(&self) -> usize {
+        1
+    }
+
+    fn arg_schema(&self) -> &'static [crate::args::ArgSchema] {
+        static SCHEMA: std::sync::LazyLock<Vec<crate::args::ArgSchema>> =
+            std::sync::LazyLock::new(|| vec![crate::args::ArgSchema::any()]);
+        &SCHEMA
+    }
+
+    fn dispatch<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+    ) -> Result<CalcValue<'b>, ExcelError> {
+        self.eval(args, ctx)
+    }
+
+    fn eval<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        _ctx: &dyn FunctionContext<'b>,
+    ) -> Result<CalcValue<'b>, ExcelError> {
+        if args.len() != 1 {
+            return Ok(CalcValue::Scalar(LiteralValue::Error(value_error(
+                "ISOMITTED takes one argument",
+            ))));
+        }
+        let omitted = match &args[0].ast().node_type {
+            ASTNodeType::Reference {
+                reference: ReferenceType::NamedRange(name),
+                ..
+            } => matches!(
+                args[0].interpreter().local_binding(name),
+                Some(LocalBinding::Omitted)
+            ),
+            _ => false,
+        };
+        Ok(CalcValue::Scalar(LiteralValue::Boolean(omitted)))
+    }
+}
+
 pub fn register_builtins() {
+    crate::function_registry::register_builtin(Arc::new(IsOmittedFn));
     crate::function_registry::register_builtin(Arc::new(LetFn));
     crate::function_registry::register_builtin(Arc::new(LambdaFn));
     crate::function_registry::register_builtin(Arc::new(MapFn));

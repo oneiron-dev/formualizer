@@ -2144,10 +2144,8 @@ mod tests {
                             if let Some(body) = args.last() {
                                 let mut lambda_scope = FxHashSet::default();
                                 for param in &args[..args.len().saturating_sub(1)] {
-                                    if let ASTNodeType::Reference {
-                                        reference: ReferenceType::NamedRange(param_name),
-                                        ..
-                                    } = &param.node_type
+                                    if let Some(param_name) =
+                                        crate::builtins::lambda::lambda_parameter_name(param)
                                     {
                                         lambda_scope.insert(param_name.to_ascii_uppercase());
                                     }

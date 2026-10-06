@@ -63,7 +63,9 @@ pub(crate) fn lift_spec(name: &str) -> Option<Lift> {
         | "MIDB" | "NUMBERVALUE" | "PROPER" | "REPLACE" | "REPLACEB" | "REPT" | "RIGHT"
         | "RIGHTB" | "SEARCH" | "SEARCHB" | "SUBSTITUTE" | "T" | "TEXT" | "TRIM" | "UNICHAR"
         | "UNICODE" | "UPPER" | "VALUE" | "ROMAN" | "ARABIC" | "BASE" | "DECIMAL" | "DOLLARDE"
-        | "DOLLARFR" => Lift::All,
+        | "DOLLARFR" | "ENCODEURL" | "BAHTTEXT" | "REGEXTEST" | "REGEXEXTRACT" | "REGEXREPLACE" => {
+            Lift::All
+        }
         // The delimiter may be an array of alternative delimiters.
         "TEXTBEFORE" | "TEXTAFTER" => Lift::Only(&[0, 2, 3, 4, 5]),
         // The text is a single value; each element's split keeps its first
@@ -86,12 +88,14 @@ pub(crate) fn lift_spec(name: &str) -> Option<Lift> {
         | "COMBINA" | "COS" | "COSH" | "COT" | "COTH" | "CSC" | "CSCH" | "SEC" | "SECH"
         | "DEGREES" | "RADIANS" | "EVEN" | "ODD" | "EXP" | "FACT" | "FACTDOUBLE" | "FLOOR"
         | "FLOOR.MATH" | "FLOOR.PRECISE" | "INT" | "LN" | "LOG" | "LOG10" | "MOD" | "MROUND"
-        | "PERMUT" | "POWER" | "QUOTIENT" | "ROUND" | "ROUNDDOWN" | "ROUNDUP" | "SIGN" | "SIN"
-        | "SINH" | "SQRT" | "SQRTPI" | "TAN" | "TANH" | "TRUNC" | "BITAND" | "BITOR" | "BITXOR"
-        | "BITLSHIFT" | "BITRSHIFT" | "DELTA" | "GESTEP" | "DEC2BIN" | "DEC2HEX" | "DEC2OCT"
-        | "BIN2DEC" | "BIN2HEX" | "BIN2OCT" | "HEX2BIN" | "HEX2DEC" | "HEX2OCT" | "OCT2BIN"
-        | "OCT2DEC" | "OCT2HEX" | "CONVERT" | "ERF" | "ERFC" | "ERF.PRECISE" | "ERFC.PRECISE"
-        | "GAMMA" | "GAMMALN" | "GAMMALN.PRECISE" => Lift::All,
+        | "PERMUT" | "PERMUTATIONA" | "MUNIT" | "POWER" | "QUOTIENT" | "ROUND" | "ROUNDDOWN"
+        | "ROUNDUP" | "SIGN" | "SIN" | "SINH" | "SQRT" | "SQRTPI" | "TAN" | "TANH" | "TRUNC"
+        | "BITAND" | "BITOR" | "BITXOR" | "BITLSHIFT" | "BITRSHIFT" | "DELTA" | "GESTEP"
+        | "DEC2BIN" | "DEC2HEX" | "DEC2OCT" | "BIN2DEC" | "BIN2HEX" | "BIN2OCT" | "HEX2BIN"
+        | "HEX2DEC" | "HEX2OCT" | "OCT2BIN" | "OCT2DEC" | "OCT2HEX" | "CONVERT" | "ERF"
+        | "ERFC" | "ERF.PRECISE" | "ERFC.PRECISE" | "GAMMA" | "GAMMALN" | "GAMMALN.PRECISE" => {
+            Lift::All
+        }
         // Financial
         "PMT" | "IPMT" | "PPMT" | "PV" | "FV" | "NPER" | "RATE" | "EFFECT" | "NOMINAL" | "DB"
         | "DDB" | "SLN" | "SYD" | "ISPMT" | "RRI" | "PDURATION" | "VDB" | "AMORLINC"
@@ -135,6 +139,7 @@ pub(crate) fn lift_spec(name: &str) -> Option<Lift> {
         // for the k of its array form).
         "SUBTOTAL" => Lift::Only(&[0]),
         "AGGREGATE" => Lift::Only(&[0, 1]),
+        "PROB" => Lift::Only(&[2, 3]),
         "COUNTIFS" => Lift::Every { start: 1, step: 2 },
         "SUMIFS" | "AVERAGEIFS" | "MAXIFS" | "MINIFS" => Lift::Every { start: 2, step: 2 },
         _ => return None,
@@ -263,11 +268,16 @@ pub(crate) fn legacy_arg(fun: &dyn Function, index: usize) -> LegacyArg {
         "INDEX" => split(1, Array, ForcedValue),
         "VLOOKUP" | "HLOOKUP" if index == 0 => ForcedValue,
         "LOOKUP" | "FORECAST.LINEAR" => split(1, Value, Array),
-        "FORECAST.ETS" if matches!(index, 1 | 2) => Array,
+        "FORECAST.ETS" | "FORECAST.ETS.CONFINT" if matches!(index, 1 | 2) => Array,
+        "FORECAST.ETS.SEASONALITY" | "FORECAST.ETS.STAT" if matches!(index, 0 | 1) => Array,
         "SUMPRODUCT" | "MMULT" | "MDETERM" | "MINVERSE" | "FREQUENCY" | "SUMX2MY2" | "SUMX2PY2"
         | "SUMXMY2" | "CHISQ.TEST" | "CORREL" | "COVARIANCE.P" | "COVARIANCE.S" | "PEARSON"
         | "RSQ" | "SLOPE" | "INTERCEPT" | "STEYX" | "F.TEST" | "MODE.SNGL" | "MODE.MULT" => Array,
         "TREND" | "GROWTH" => split(3, Array, Value),
+        // The data PERCENTOF adds and the range TRIMRANGE and the trim
+        // operators trim are references (or arrays), never intersected.
+        "PERCENTOF" => Reference,
+        "TRIMRANGE" | "_TRO_ALL" | "_TRO_LEADING" | "_TRO_TRAILING" => split(1, Reference, Value),
         "LINEST" | "LOGEST" | "T.TEST" => split(2, Array, Value),
         "IRR" | "MIRR" => split(1, Array, Value),
         // Forms 14 to 19 compute over an array expression.

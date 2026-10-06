@@ -44,6 +44,9 @@ web-time = { workspace = true, optional = true }
 # FILTERXML: XML tokenizing (pure Rust); the document model is builtins/text/filterxml/xml.rs
 # and the XPath 1.0 evaluator builtins/text/filterxml/xpath.rs.
 quick-xml = { version = "0.39" }
+# REGEXTEST, REGEXEXTRACT, REGEXREPLACE: Unicode property tables and simple
+# case folding for the PCRE2-compatible matcher in builtins/text/regex.
+regex-syntax = "0.8"
 
 # Arrow (per-crate) — pinned to 58.x series
 arrow-array = "59.2.0"

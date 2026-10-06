@@ -2355,6 +2355,37 @@ impl From<TokenizerError> for ParserError {
 /// This is the canonical parser implementation. It owns the formula source and
 /// span tokens, avoiding per-token string allocation while preserving source
 /// locations for AST nodes.
+/// The function Excel stores a trim-reference operator as, and the plain
+/// range it trims: `A1:.D6` trims trailing empty rows and columns
+/// (`_xlfn._TRO_TRAILING(A1:D6)`), `A1.:D6` leading ones (`_TRO_LEADING`) and
+/// `A1.:.D6` both (`_TRO_ALL`). `None` for any other reference text.
+fn trim_operator_form(value: &str) -> Option<(&'static str, String)> {
+    let address_start = value.rfind('!').map_or(0, |bang| bang + 1);
+    let (sheet, address) = value.split_at(address_start);
+    if address.contains('[') {
+        return None;
+    }
+    let (left, right) = address.split_once(':')?;
+    let leading = left.ends_with('.');
+    let trailing = right.starts_with('.');
+    let left = left.strip_suffix('.').unwrap_or(left);
+    let right = right.strip_prefix('.').unwrap_or(right);
+    if !(leading || trailing)
+        || left.is_empty()
+        || right.is_empty()
+        || left.contains('.')
+        || right.contains('.')
+    {
+        return None;
+    }
+    let function = match (leading, trailing) {
+        (true, true) => "_xlfn._TRO_ALL",
+        (true, false) => "_xlfn._TRO_LEADING",
+        _ => "_xlfn._TRO_TRAILING",
+    };
+    Some((function, format!("{sheet}{left}:{right}")))
+}
+
 pub struct Parser {
     source: Arc<str>,
     tokens: Arc<[TokenSpan]>,
@@ -2799,18 +2830,66 @@ impl Parser {
                 ))
             }
             TokenSubType::Range => {
-                let reference = ReferenceType::from_string_with_dialect(value, self.dialect)
+                // A trim-reference operator (`A1:.D6`, `A1.:D6`, `A1.:.D6`) is
+                // the function a file stores it as around the plain range.
+                let trim = match self.dialect {
+                    FormulaDialect::Excel => trim_operator_form(value),
+                    _ => None,
+                };
+                let (function, text) = match &trim {
+                    Some((function, text)) => (Some(*function), text.as_str()),
+                    None => (None, value),
+                };
+                let mut reference = ReferenceType::from_string_with_dialect(text, self.dialect)
                     .map_err(|e| ParserError {
                         message: format!("Invalid reference '{value}': {e}"),
                         position: Some(self.position),
                     })?;
-                Ok(ASTNode::new(
+                // Excel stores a trimmed range with its corners in order:
+                // `A2:.A1` is `_TRO_TRAILING(A1:A2)`.
+                if function.is_some()
+                    && let ReferenceType::Range {
+                        start_row,
+                        start_col,
+                        end_row,
+                        end_col,
+                        start_row_abs,
+                        start_col_abs,
+                        end_row_abs,
+                        end_col_abs,
+                        ..
+                    } = &mut reference
+                {
+                    if let (Some(a), Some(b)) = (*start_row, *end_row)
+                        && a > b
+                    {
+                        std::mem::swap(start_row, end_row);
+                        std::mem::swap(start_row_abs, end_row_abs);
+                    }
+                    if let (Some(a), Some(b)) = (*start_col, *end_col)
+                        && a > b
+                    {
+                        std::mem::swap(start_col, end_col);
+                        std::mem::swap(start_col_abs, end_col_abs);
+                    }
+                }
+                let node = ASTNode::new(
                     ASTNodeType::Reference {
-                        original: value.to_string(),
+                        original: text.to_string(),
                         reference,
                     },
-                    Some(token),
-                ))
+                    Some(token.clone()),
+                );
+                Ok(match function {
+                    Some(name) => ASTNode::new(
+                        ASTNodeType::Function {
+                            name: name.to_string(),
+                            args: vec![node],
+                        },
+                        Some(token),
+                    ),
+                    None => node,
+                })
             }
             _ => Err(ParserError {
                 message: format!("Unexpected operand subtype: {:?}", span.subtype),

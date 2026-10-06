@@ -460,10 +460,8 @@ pub(crate) fn visit_tree_references<C>(
                         if let Some(body) = args.last() {
                             let mut scope = FxHashSet::default();
                             for parameter in &args[..args.len().saturating_sub(1)] {
-                                if let ASTNodeType::Reference {
-                                    reference: ReferenceType::NamedRange(name),
-                                    ..
-                                } = &parameter.node_type
+                                if let Some(name) =
+                                    crate::builtins::lambda::lambda_parameter_name(parameter)
                                 {
                                     scope.insert(name.to_ascii_uppercase());
                                 }

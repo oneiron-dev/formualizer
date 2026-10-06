@@ -9177,10 +9177,12 @@ impl Function for GammaLnPreciseFn {
 
 mod dist;
 mod ets;
+mod prob;
 
 pub fn register_builtins() {
     dist::register_builtins();
-    crate::function_registry::register_builtin(Arc::new(ets::ForecastEtsFn));
+    prob::register_builtins();
+    ets::register_builtins();
     use std::sync::Arc;
     crate::function_registry::register_builtin(Arc::new(ForecastLinearFn));
     crate::function_registry::register_builtin(Arc::new(LinestFn));

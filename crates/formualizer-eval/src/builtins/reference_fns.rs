@@ -90,7 +90,7 @@ pub(crate) fn index_static_bounds(
     }
 }
 
-fn resolve_reference_bounds<'b>(
+pub(crate) fn resolve_reference_bounds<'b>(
     ctx: &dyn FunctionContext<'b>,
     base: &ReferenceType,
 ) -> Result<(Option<String>, u32, u32, u32, u32), ExcelError> {

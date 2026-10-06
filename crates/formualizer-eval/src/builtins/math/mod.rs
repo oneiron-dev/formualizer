@@ -3,6 +3,7 @@ pub mod combinatorics;
 pub mod criteria_aggregates;
 pub mod matrix;
 pub mod numeric;
+pub mod percentof;
 pub mod reduction;
 pub mod trig;
 
@@ -40,5 +41,6 @@ pub fn register_builtins() {
     matrix::register_builtins();
     reduction::register_builtins();
     numeric::register_builtins();
+    percentof::register_builtins();
     trig::register_builtins();
 }

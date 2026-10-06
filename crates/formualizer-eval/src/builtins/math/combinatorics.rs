@@ -717,8 +717,92 @@ impl Function for CombinaFn {
     }
 }
 
+#[derive(Debug)]
+pub struct PermutationaFn;
+/// Returns the number of permutations, with repetition, of `k` items chosen from `n`.
+///
+/// `PERMUTATIONA` computes `n^k` after truncating both inputs toward zero.
+///
+/// # Remarks
+/// - Fractional inputs are truncated to integers.
+/// - A negative `n` (before truncation) or `k` (after it), either one from
+///   2^31 - 1 up, or a result beyond the number range returns `#NUM!`.
+/// - Argument errors propagate directly.
+///
+/// # Examples
+///
+/// ```yaml,sandbox
+/// title: "Three items, two chosen"
+/// formula: "=PERMUTATIONA(3, 2)"
+/// expected: 9
+/// ```
+///
+/// ```yaml,docs
+/// related:
+///   - PERMUT
+///   - COMBINA
+/// faq:
+///   - q: "What is PERMUTATIONA(0,0)?"
+///     a: "1, as in Excel."
+/// ```
+impl Function for PermutationaFn {
+    func_caps!(PURE);
+    fn name(&self) -> &'static str {
+        "PERMUTATIONA"
+    }
+    fn min_args(&self) -> usize {
+        2
+    }
+    fn arg_schema(&self) -> &'static [ArgSchema] {
+        &ARG_NUM_LENIENT_TWO[..]
+    }
+    fn eval<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        _: &dyn FunctionContext<'b>,
+    ) -> Result<CalcValue<'b>, ExcelError> {
+        let result = (|| -> Result<f64, ExcelError> {
+            if args.len() != 2 {
+                return Err(ExcelError::new_value());
+            }
+            let mut numbers = [0.0; 2];
+            for (slot, arg) in numbers.iter_mut().zip(args) {
+                *slot = match arg.value()?.into_literal() {
+                    LiteralValue::Error(e) => return Err(e),
+                    other => coerce_num(&other)?,
+                };
+            }
+            // Excel for Windows: a negative number is #NUM! before truncation
+            // (PERMUTATIONA(-0.5,2) is #NUM!, PERMUTATIONA(0.5,2) is 0), a
+            // negative number_chosen after it (PERMUTATIONA(1,-1E-7) is 1);
+            // both must stay below 2^31 - 1 (PERMUTATIONA(2147483647,1) and
+            // PERMUTATIONA(1,2147483648) are #NUM!, PERMUTATIONA(1E9,2) is 1E18).
+            const LIMIT: f64 = 2_147_483_647.0;
+            let [n, k] = numbers;
+            if n < 0.0 {
+                return Err(ExcelError::new_num());
+            }
+            let (n, k) = (n.trunc(), k.trunc());
+            if k < 0.0 || n >= LIMIT || k >= LIMIT {
+                return Err(ExcelError::new_num());
+            }
+            let result = n.powf(k);
+            if result.is_finite() {
+                Ok(result)
+            } else {
+                Err(ExcelError::new_num())
+            }
+        })();
+        Ok(CalcValue::Scalar(match result {
+            Ok(n) => LiteralValue::Number(n),
+            Err(e) => LiteralValue::Error(e),
+        }))
+    }
+}
+
 pub fn register_builtins() {
     use std::sync::Arc;
+    crate::function_registry::register_builtin(Arc::new(PermutationaFn));
     crate::function_registry::register_builtin(Arc::new(FactFn));
     crate::function_registry::register_builtin(Arc::new(FactDoubleFn));
     crate::function_registry::register_builtin(Arc::new(GcdFn));

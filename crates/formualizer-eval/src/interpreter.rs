@@ -75,6 +75,11 @@ pub enum LocalBinding {
     /// reference (see `ArgumentHandle::reference_array`).
     #[allow(clippy::type_complexity)]
     References(Arc<Vec<Vec<Result<ReferenceType, ExcelError>>>>),
+    /// A LAMBDA parameter its call left out or gave an empty argument
+    /// (`LAMBDA(a,[b],b)(1)`, `f(1,)`): `ISOMITTED` is TRUE for it, and it
+    /// reads as a blank value (Excel for Windows: `TYPE` 1, `ISBLANK` TRUE,
+    /// `ISNUMBER` FALSE, `b&"x"` is "x", `ROWS(b)` is #VALUE!).
+    Omitted,
 }
 
 #[derive(Clone, Default)]
@@ -156,7 +161,9 @@ impl LocalEnv {
         Some(match self.find(name)? {
             (LocalBinding::Value(LiteralValue::Array(_)), _) => ResultShape::Array,
             (LocalBinding::Value(_), shape) => shape.unwrap_or(ResultShape::Unknown),
-            (LocalBinding::Reference(_) | LocalBinding::Callable(_), _) => ResultShape::Single,
+            (LocalBinding::Reference(_) | LocalBinding::Callable(_) | LocalBinding::Omitted, _) => {
+                ResultShape::Single
+            }
             (LocalBinding::References(_), _) => ResultShape::Unknown,
         })
     }
@@ -423,6 +430,7 @@ impl<'a> Interpreter<'a> {
             LocalBinding::References(_) => Ok(crate::traits::CalcValue::Scalar(
                 LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)),
             )),
+            LocalBinding::Omitted => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Empty)),
         }
     }
 
@@ -432,9 +440,10 @@ impl<'a> Interpreter<'a> {
         }
         match self.local_env.lookup(name)? {
             LocalBinding::Callable(c) => Some(c),
-            LocalBinding::Value(_) | LocalBinding::Reference(_) | LocalBinding::References(_) => {
-                None
-            }
+            LocalBinding::Value(_)
+            | LocalBinding::Reference(_)
+            | LocalBinding::References(_)
+            | LocalBinding::Omitted => None,
         }
     }
 
@@ -2206,6 +2215,9 @@ impl<'a> Interpreter<'a> {
         &self,
         arg: &ArgumentHandle<'_, 'a>,
     ) -> Result<(LocalBinding, Option<crate::traits::ResultShape>), ExcelError> {
+        if arg.is_omitted() {
+            return Ok((LocalBinding::Omitted, None));
+        }
         let _tracking = crate::traits::track_selections();
         Ok(match arg.bindable_reference()? {
             Some(reference) => (LocalBinding::Reference(reference), None),

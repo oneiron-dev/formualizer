@@ -105,6 +105,24 @@ const BUILT_IN: &[&str] = &[
     "YEARFRAC", "YIELD", "YIELDDISC", "YIELDMAT", "ZTEST",
 ];
 
+/// Whether `name`, a function name as a file writes it, names one of Excel's
+/// functions: a bare name of the Excel 2007 file format's functions, or a
+/// name with the `_xlfn.` (or `_xlfn._xlws.`) prefix of those added since. A
+/// user-defined (`_xludf.`), add-in (`_xll.`) or other bare name is not:
+/// without the workbook, add-in or application that defines it Excel
+/// evaluates it to #NAME? (Excel for Windows 16.0.20430 on the
+/// SpreadsheetBench corpus: IMAGE written without its prefix, ClrCnt, EOM,
+/// arrayformula and __xludf.DUMMYFUNCTION are #NAME?, which IFERROR and the
+/// criteria of SUMIFS see).
+pub fn is_excel_function(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    if upper.starts_with("_XLUDF.") || upper.starts_with("_XLL.") {
+        return false;
+    }
+    ["_XLFN.", "_XLWS."].iter().any(|p| upper.starts_with(p))
+        || BUILT_IN.binary_search(&upper.as_str()).is_ok()
+}
+
 /// Calculated-always flags per sheet, for each formula cell of
 /// [`sheet::Scan::cells`] and each member of [`sheet::Scan::members`].
 pub(super) struct CalcAlways {
@@ -713,6 +731,28 @@ mod tests {
     #[test]
     fn built_in_functions_are_sorted_for_binary_search() {
         assert!(BUILT_IN.windows(2).all(|w| w[0] < w[1]));
+        for name in [
+            "SUM",
+            "sum",
+            "AREAS",
+            "_xlfn.XLOOKUP",
+            "_xlfn._xlws.FILTER",
+            "_xlfn.IMAGE",
+        ] {
+            assert!(is_excel_function(name), "{name}");
+        }
+        for name in [
+            "IMAGE",
+            "XLOOKUP",
+            "ClrCnt",
+            "EOM",
+            "arrayformula",
+            "__xludf.DUMMYFUNCTION",
+            "_xludf.F",
+            "_xll.F",
+        ] {
+            assert!(!is_excel_function(name), "{name}");
+        }
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Strict cache-only XLSX recalculation, without a rich document model.
 //! Unsupported package/formula cases fail before any output is published.
 mod calc_always;
+pub use calc_always::is_excel_function;
 mod package;
 mod rich;
 mod sheet;

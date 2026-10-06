@@ -19,14 +19,17 @@ fn scalar_text_value(arg: &ArgumentHandle<'_, '_>) -> Result<LiteralValue, Excel
 }
 
 mod array_text; // TEXTSPLIT, VALUETOTEXT, ARRAYTOTEXT
+mod bahttext; // BAHTTEXT
 mod byte; // FINDB, LEFTB, LENB, MIDB, REPLACEB, RIGHTB, SEARCHB
 mod char_code_rept; // CHAR, CODE, REPT
+mod encodeurl; // ENCODEURL
 mod extended; // CLEAN, UNICHAR, UNICODE, TEXTBEFORE, TEXTAFTER, DOLLAR, FIXED
 mod filterxml; // FILTERXML
 mod find_search_exact; // FIND, SEARCH, EXACT
 mod len_left_right; // LEN, LEFT, RIGHT
 mod mid_sub_replace; // MID, SUBSTITUTE, REPLACE
 pub(crate) mod number_format; // Excel format codes for TEXT
+mod regex; // REGEXTEST, REGEXEXTRACT, REGEXREPLACE
 mod trim_case_concat; // TRIM, UPPER, LOWER, PROPER, CONCAT, CONCATENATE, TEXTJOIN
 mod value_text; // VALUE, TEXT
 
@@ -43,12 +46,15 @@ pub use value_text::*;
 
 pub fn register_builtins() {
     array_text::register_builtins();
+    bahttext::register_builtins();
     byte::register_builtins();
     char_code_rept::register_builtins();
+    encodeurl::register_builtins();
     extended::register_builtins();
     filterxml::register_builtins();
     len_left_right::register_builtins();
     mid_sub_replace::register_builtins();
+    regex::register_builtins();
     trim_case_concat::register_builtins();
     find_search_exact::register_builtins();
     value_text::register_builtins();

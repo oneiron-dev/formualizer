@@ -1,4 +1,6 @@
-//! FORECAST.ETS: additive (AAA) exponential-smoothing forecast.
+//! FORECAST.ETS and its CONFINT, SEASONALITY and STAT companions: additive
+//! (AAA) exponential smoothing, computed where Excel's result does not depend
+//! on its optimizer.
 
 use crate::args::ArgSchema;
 use crate::function::Function;
@@ -104,15 +106,19 @@ fn build_series(
             _ => grouped.push((t, v.into_iter().collect())),
         }
     }
-    if grouped.len() < 3 {
-        return Err(num_error());
+    // Excel forecasts from two points (FORECAST.ETS(3,{10,20},{1,2}) is 30)
+    // and from a timeline whose steps are not one size
+    // (FORECAST.ETS(7,{10,...,60},{1,...,5,6.5}) is 62.52); neither, nor a
+    // single point, is computed here.
+    if grouped.len() < 2 {
+        return Err(not_computed());
     }
     let step = grouped
         .windows(2)
         .map(|w| w[1].0 - w[0].0)
         .fold(f64::INFINITY, f64::min);
     if step <= 0.0 || !step.is_finite() {
-        return Err(num_error());
+        return Err(not_computed());
     }
     let start = grouped[0].0;
     let mut slots: Vec<Option<f64>> = Vec::new();
@@ -120,18 +126,18 @@ fn build_series(
         let pos = (t - start) / step;
         let idx = pos.round();
         if (pos - idx).abs() > 1e-9 * idx.abs().max(1.0) {
-            return Err(num_error());
+            return Err(not_computed());
         }
         let idx = idx as usize;
         if idx >= 1_000_000 {
-            return Err(num_error());
+            return Err(not_computed());
         }
         slots.resize(idx + 1, None);
         slots[idx] = (!vs.is_empty()).then(|| aggregate(vs, aggregation));
     }
     let known: Vec<usize> = (0..slots.len()).filter(|&i| slots[i].is_some()).collect();
     if known.len() < 2 {
-        return Err(num_error());
+        return Err(not_computed());
     }
     let mut out = Vec::with_capacity(slots.len());
     for (i, slot) in slots.iter().enumerate() {
@@ -161,130 +167,118 @@ fn build_series(
     })
 }
 
-/// A fitted additive Holt-Winters state after the last observation.
-struct Fit {
-    sse: f64,
-    level: f64,
-    trend: f64,
-    /// Seasonal terms indexed by absolute period position modulo the season.
-    season: Vec<f64>,
+/// The exact additive structure of a series, when it has one: `y[t]` is a
+/// line plus a season of `period` steps (`period` 0: a line alone). Excel's
+/// AAA exponential smoothing fits such a series without error whatever
+/// smoothing parameters its optimizer picks, so its forecasts, a zero
+/// confidence interval and zero error statistics follow from the series
+/// alone. For any other series they depend on Excel's optimizer and initial
+/// state, which this engine does not reproduce: those calls are not computed
+/// here (`#N/IMPL!`) rather than given a value Excel would not give
+/// (Excel for Windows 16.0.20430: `FORECAST.ETS(25,...)` of the first 24
+/// AirPassengers values is 138.69607025814878, a grid-search Holt-Winters fit
+/// gives 142.9).
+struct Exact {
+    period: usize,
+    /// The trend per step.
+    slope: f64,
 }
 
-fn run(y: &[f64], m: usize, alpha: f64, beta: f64, gamma: f64) -> Fit {
-    let (mut level, mut trend, mut season, first) = if m >= 2 {
-        let mean = |r: std::ops::Range<usize>| y[r.clone()].iter().sum::<f64>() / r.len() as f64;
-        let l0 = mean(0..m);
-        let b0 = (mean(m..2 * m) - l0) / m as f64;
-        let s: Vec<f64> = (0..m)
-            .map(|i| y[i] - (l0 + (i as f64 - (m as f64 - 1.0) / 2.0) * b0))
-            .collect();
-        (l0 + (m as f64 - 1.0) / 2.0 * b0, b0, s, m)
-    } else {
-        (y[0], y[1] - y[0], Vec::new(), 1)
-    };
-    let mut sse = 0.0;
-    for (t, &obs) in y.iter().enumerate().skip(first) {
-        let s = if m >= 2 { season[t % m] } else { 0.0 };
-        let forecast = level + trend + s;
-        let e = obs - forecast;
-        sse += e * e;
-        let new_level = alpha * (obs - s) + (1.0 - alpha) * (level + trend);
-        trend = beta * (new_level - level) + (1.0 - beta) * trend;
-        if m >= 2 {
-            season[t % m] = gamma * (obs - new_level) + (1.0 - gamma) * s;
-        }
-        level = new_level;
+fn close(a: f64, b: f64, scale: f64) -> bool {
+    (a - b).abs() <= 1e-12 * scale
+}
+
+/// Whether `y` is a line plus a season of `period` steps (`period` 0: a line),
+/// to 1E-12 of its largest value; with `strict`, every step exactly the same
+/// in binary (Excel's own fit of 0.1, 0.2, ..., 0.6 leaves residues of
+/// 1E-16, which its error statistics and confidence interval show).
+fn exact_fit(y: &[f64], period: usize, strict: bool) -> Option<Exact> {
+    let scale = y.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+    let same = |a: f64, b: f64| if strict { a == b } else { close(a, b, scale) };
+    let lag = period.max(1);
+    if y.len() < lag + 1 || (period > 0 && y.len() < 2 * period) {
+        return None;
     }
-    Fit {
-        sse,
-        level,
-        trend,
-        season,
+    let cycle = y[lag] - y[0];
+    let exact = (0..y.len() - lag).all(|t| same(y[t + lag] - y[t], cycle))
+        && (strict || period > 0 || (0..y.len()).all(|t| same(y[t], y[0] + cycle * t as f64)));
+    exact.then(|| Exact {
+        period,
+        slope: cycle / lag as f64,
+    })
+}
+
+/// The season Excel detects (seasonality 1, the default), known only for an
+/// exact line: none. For a series with a season Excel's choice is not
+/// reproduced (a 4-step season plus a trend is detected as 2).
+fn detect_exact(y: &[f64], strict: bool) -> Option<Exact> {
+    exact_fit(y, 0, strict)
+}
+
+fn not_computed() -> ExcelError {
+    ExcelError::new(ExcelErrorKind::NImpl).with_message(
+        "FORECAST.ETS of a series that is not exactly a line plus a season depends on \
+         Excel's optimizer, which is not reproduced",
+    )
+}
+
+/// The arguments the ETS functions share after the target (or before the
+/// statistic): values, timeline, seasonality, data completion, aggregation.
+struct EtsInput {
+    series: Series,
+    exact: Exact,
+}
+
+fn ets_input(args: &[ArgumentHandle<'_, '_>], first: usize) -> Result<EtsInput, ExcelError> {
+    ets_input_with(args, first, first + 2, false)
+}
+
+impl EtsInput {
+    /// The forecast `steps` steps after the last point: along the line, or
+    /// from the same season of the last full cycle (whole steps only:
+    /// Excel's value between the points of a season is not reproduced).
+    fn forecast(&self, steps: f64) -> Result<f64, ExcelError> {
+        let y = &self.series.values;
+        let n = y.len();
+        if self.exact.period == 0 {
+            return Ok(y[n - 1] + self.exact.slope * steps);
+        }
+        if (steps - steps.round()).abs() > 1e-9 {
+            return Err(not_computed());
+        }
+        let m = self.exact.period;
+        let target = n - 1 + steps.round() as usize;
+        let base = n - m + (target - (n - m)) % m;
+        Ok(y[base] + self.exact.slope * (target - base) as f64)
+    }
+
+    /// Steps from the end of the timeline to `target` (Excel: 7.5 on a
+    /// timeline 1 to 6 is 1.5 steps); `#NUM!` before the end.
+    fn steps_to(&self, target: f64) -> Result<f64, ExcelError> {
+        let y = &self.series.values;
+        let last = self.series.start + self.series.step * (y.len() - 1) as f64;
+        if target < last {
+            return Err(num_error());
+        }
+        let h = (target - last) / self.series.step;
+        if h > 1e7 {
+            return Err(not_computed());
+        }
+        Ok(h)
     }
 }
 
-/// Smoothing parameters minimising the one-step squared error: a coarse
-/// grid, then a finer grid around the best point.
-fn fit(y: &[f64], m: usize) -> Fit {
-    let grid = |centre: (f64, f64, f64), half: f64, steps: usize| {
-        let axis = |c: f64| -> Vec<f64> {
-            (0..=steps)
-                .map(|i| (c - half + 2.0 * half * i as f64 / steps as f64).clamp(0.0, 1.0))
-                .collect()
-        };
-        let gammas = if m >= 2 { axis(centre.2) } else { vec![0.0] };
-        let mut best = (f64::INFINITY, centre);
-        for &a in &axis(centre.0) {
-            for &b in &axis(centre.1) {
-                for &g in &gammas {
-                    let sse = run(y, m, a, b, g).sse;
-                    if sse < best.0 - 1e-12 {
-                        best = (sse, (a, b, g));
-                    }
-                }
-            }
-        }
-        best.1
-    };
-    let coarse = grid((0.5, 0.5, 0.5), 0.5, 10);
-    let fine = grid(coarse, 0.05, 10);
-    run(y, m, fine.0, fine.1, fine.2)
+fn ets_schema() -> &'static [ArgSchema] {
+    static SCHEMA: std::sync::LazyLock<Vec<ArgSchema>> =
+        std::sync::LazyLock::new(|| vec![ArgSchema::any()]);
+    &SCHEMA
 }
 
-/// Seasonality detection: candidate periods are the autocorrelation peaks
-/// of the detrended series; the model with the best information criterion
-/// (non-seasonal included) wins.
-fn detect_seasonality(y: &[f64]) -> usize {
-    let n = y.len();
-    let xs: Vec<f64> = (0..n).map(|i| i as f64).collect();
-    let mx = xs.iter().sum::<f64>() / n as f64;
-    let my = y.iter().sum::<f64>() / n as f64;
-    let sxx: f64 = xs.iter().map(|x| (x - mx).powi(2)).sum();
-    let slope = xs
-        .iter()
-        .zip(y)
-        .map(|(x, v)| (x - mx) * (v - my))
-        .sum::<f64>()
-        / sxx;
-    let r: Vec<f64> = (0..n)
-        .map(|i| y[i] - (my + slope * (i as f64 - mx)))
-        .collect();
-    let var: f64 = r.iter().map(|v| v * v).sum();
-    if var <= 1e-12 * y.iter().map(|v| v * v).sum::<f64>().max(1e-300) {
-        return 0;
-    }
-    let acf = |k: usize| (0..n - k).map(|i| r[i] * r[i + k]).sum::<f64>() / var;
-    let max_lag = (n / 2).min(MAX_SEASONALITY);
-    let values: Vec<f64> = (0..=max_lag)
-        .map(|k| if k < n { acf(k) } else { 0.0 })
-        .collect();
-    let mut peaks: Vec<(usize, f64)> = (2..=max_lag)
-        .filter(|&k| {
-            values[k] > 0.0
-                && values[k] >= values[k - 1]
-                && (k + 1 > max_lag || values[k] >= values[k + 1])
-        })
-        .map(|k| (k, values[k]))
-        .collect();
-    peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    peaks.truncate(3);
-    let score = |m: usize| {
-        let f = fit(y, m);
-        let first = if m >= 2 { m } else { 1 };
-        let count = (n - first) as f64;
-        let params = if m >= 2 { 3.0 + m as f64 } else { 2.0 };
-        count * (f.sse / count).max(1e-300).ln() + 2.0 * params
-    };
-    let mut best = (score(0), 0);
-    for (m, _) in peaks {
-        if n >= 2 * m + 1 {
-            let s = score(m);
-            if s < best.0 {
-                best = (s, m);
-            }
-        }
-    }
-    best.1
+fn number_result<'b>(result: Result<f64, ExcelError>) -> Result<CalcValue<'b>, ExcelError> {
+    Ok(CalcValue::Scalar(match result {
+        Ok(v) => LiteralValue::Number(v),
+        Err(e) => LiteralValue::Error(e),
+    }))
 }
 
 /// Predicts a future value with additive (AAA) exponential smoothing.
@@ -296,6 +290,10 @@ fn detect_seasonality(y: &[f64]) -> usize {
 ///   `aggregation` (default average) and missing points are interpolated
 ///   (`data_completion` 1, the default) or zero (0).
 /// - A target before the end of the timeline is `#NUM!`.
+/// - Computed only where Excel's result does not depend on its optimizer: a
+///   series that is exactly a line (any seasonality setting but 2 and up), or
+///   a line plus a season of the length given (at least two cycles), on an
+///   evenly stepped timeline of two points or more. Elsewhere `#N/IMPL!`.
 ///
 /// ```yaml,sandbox
 /// title: "Continue a linear trend"
@@ -317,9 +315,7 @@ impl Function for ForecastEtsFn {
         true
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        static SCHEMA: std::sync::LazyLock<Vec<ArgSchema>> =
-            std::sync::LazyLock::new(|| vec![ArgSchema::any()]);
-        &SCHEMA
+        ets_schema()
     }
     fn dispatch<'a, 'b, 'c>(
         &self,
@@ -333,51 +329,252 @@ impl Function for ForecastEtsFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
-        let result = (|| -> Result<f64, ExcelError> {
-            if args.len() < 3 || args.len() > 6 {
+        number_result((|| {
+            if !(3..=6).contains(&args.len()) {
                 return Err(ExcelError::new(ExcelErrorKind::Value));
             }
             let target = number(&args[0].value()?.into_literal())?;
-            let seasonality = optional_int(args, 3, 1)?;
-            let completion = optional_int(args, 4, 1)?;
-            let aggregation = optional_int(args, 5, 1)?;
-            if !(0..=MAX_SEASONALITY as i64).contains(&seasonality)
-                || !(0..=1).contains(&completion)
-                || !(1..=7).contains(&aggregation)
-            {
+            let input = ets_input(args, 1)?;
+            input.forecast(input.steps_to(target)?)
+        })())
+    }
+}
+
+/// Returns the confidence interval of a FORECAST.ETS forecast.
+///
+/// `FORECAST.ETS.CONFINT(target_date, values, timeline, [confidence_level],
+/// [seasonality], [data_completion], [aggregation])`; confidence_level is
+/// 0.95 by default and must lie strictly between 0 and 1.
+///
+/// # Remarks
+/// - Computed only for a series whose every step is exactly the same (with
+///   the season given), which Excel fits without error: the interval is 0.
+///   Elsewhere `#N/IMPL!`.
+///
+/// ```yaml,sandbox
+/// title: "An exact trend has no uncertainty"
+/// formula: "=FORECAST.ETS.CONFINT(7,{10,20,30,40,50,60},{1,2,3,4,5,6})"
+/// expected: 0
+/// ```
+#[derive(Debug)]
+pub struct ForecastEtsConfintFn;
+
+impl Function for ForecastEtsConfintFn {
+    func_caps!(PURE);
+    fn name(&self) -> &'static str {
+        "FORECAST.ETS.CONFINT"
+    }
+    fn min_args(&self) -> usize {
+        3
+    }
+    fn variadic(&self) -> bool {
+        true
+    }
+    fn arg_schema(&self) -> &'static [ArgSchema] {
+        ets_schema()
+    }
+    fn dispatch<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+    ) -> Result<CalcValue<'b>, ExcelError> {
+        self.eval(args, ctx)
+    }
+    fn eval<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        _ctx: &dyn FunctionContext<'b>,
+    ) -> Result<CalcValue<'b>, ExcelError> {
+        number_result((|| {
+            if !(3..=7).contains(&args.len()) {
+                return Err(ExcelError::new(ExcelErrorKind::Value));
+            }
+            let target = number(&args[0].value()?.into_literal())?;
+            let level = match args.get(3) {
+                Some(arg) if !arg.is_omitted() => number(&arg.value()?.into_literal())?,
+                _ => 0.95,
+            };
+            if !(level > 0.0 && level < 1.0) {
+                return Err(num_error());
+            }
+            // The values and timeline follow the target; the options follow
+            // the confidence level.
+            let input = ets_input_with(args, 1, 4, true)?;
+            input.steps_to(target)?;
+            Ok(0.0)
+        })())
+    }
+}
+
+/// [`ets_input`] when the options start at `options` rather than right after
+/// the timeline.
+fn ets_input_with(
+    args: &[ArgumentHandle<'_, '_>],
+    first: usize,
+    options: usize,
+    strict: bool,
+) -> Result<EtsInput, ExcelError> {
+    let seasonality = optional_int(args, options, 1)?;
+    let completion = optional_int(args, options + 1, 1)?;
+    let aggregation = optional_int(args, options + 2, 1)?;
+    if !(0..=MAX_SEASONALITY as i64).contains(&seasonality)
+        || !(0..=1).contains(&completion)
+        || !(1..=7).contains(&aggregation)
+    {
+        return Err(num_error());
+    }
+    let series = build_series(
+        &cells(&args[first])?,
+        &cells(&args[first + 1])?,
+        completion,
+        aggregation,
+    )?;
+    let exact = match seasonality {
+        1 => detect_exact(&series.values, strict),
+        m => exact_fit(&series.values, m as usize, strict),
+    }
+    .ok_or_else(not_computed)?;
+    Ok(EtsInput { series, exact })
+}
+
+/// Returns the season length FORECAST.ETS detects for a series.
+///
+/// `FORECAST.ETS.SEASONALITY(values, timeline, [data_completion],
+/// [aggregation])`.
+///
+/// # Remarks
+/// - Computed only for a series that is exactly a line (0); Excel's season
+///   detection is not reproduced, so any other series is `#N/IMPL!`.
+///
+/// ```yaml,sandbox
+/// title: "A line has no season"
+/// formula: "=FORECAST.ETS.SEASONALITY({10,20,30,40,50,60},{1,2,3,4,5,6})"
+/// expected: 0
+/// ```
+#[derive(Debug)]
+pub struct ForecastEtsSeasonalityFn;
+
+impl Function for ForecastEtsSeasonalityFn {
+    func_caps!(PURE);
+    fn name(&self) -> &'static str {
+        "FORECAST.ETS.SEASONALITY"
+    }
+    fn min_args(&self) -> usize {
+        2
+    }
+    fn variadic(&self) -> bool {
+        true
+    }
+    fn arg_schema(&self) -> &'static [ArgSchema] {
+        ets_schema()
+    }
+    fn dispatch<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+    ) -> Result<CalcValue<'b>, ExcelError> {
+        self.eval(args, ctx)
+    }
+    fn eval<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        _ctx: &dyn FunctionContext<'b>,
+    ) -> Result<CalcValue<'b>, ExcelError> {
+        number_result((|| {
+            if !(2..=4).contains(&args.len()) {
+                return Err(ExcelError::new(ExcelErrorKind::Value));
+            }
+            let completion = optional_int(args, 2, 1)?;
+            let aggregation = optional_int(args, 3, 1)?;
+            if !(0..=1).contains(&completion) || !(1..=7).contains(&aggregation) {
                 return Err(num_error());
             }
             let series = build_series(
+                &cells(&args[0])?,
                 &cells(&args[1])?,
-                &cells(&args[2])?,
                 completion,
                 aggregation,
             )?;
-            let y = &series.values;
-            let last = series.start + series.step * (y.len() - 1) as f64;
-            if target < last {
+            let exact = detect_exact(&series.values, false).ok_or_else(not_computed)?;
+            Ok(exact.period as f64)
+        })())
+    }
+}
+
+/// Returns a statistic of the FORECAST.ETS model of a series.
+///
+/// `FORECAST.ETS.STAT(values, timeline, statistic_type, [seasonality],
+/// [data_completion], [aggregation])`: 1 alpha, 2 beta, 3 gamma, 4 MASE,
+/// 5 SMAPE, 6 MAE, 7 RMSE, 8 the step of the timeline.
+///
+/// # Remarks
+/// - A statistic_type outside 1 to 8 is `#NUM!`.
+/// - The error statistics (4 to 7) are 0 for a series whose every step is
+///   exactly the same, and the step (8) is the timeline's for a series that
+///   is a line (or a line plus the season given); the smoothing parameters
+///   (1 to 3) are those Excel's optimizer picks, and every statistic of any
+///   other series depends on it: `#N/IMPL!`.
+///
+/// ```yaml,sandbox
+/// title: "Step of the timeline"
+/// formula: "=FORECAST.ETS.STAT({10,20,30,40,50,60},{1,2,3,4,5,6},8)"
+/// expected: 1
+/// ```
+#[derive(Debug)]
+pub struct ForecastEtsStatFn;
+
+impl Function for ForecastEtsStatFn {
+    func_caps!(PURE);
+    fn name(&self) -> &'static str {
+        "FORECAST.ETS.STAT"
+    }
+    fn min_args(&self) -> usize {
+        3
+    }
+    fn variadic(&self) -> bool {
+        true
+    }
+    fn arg_schema(&self) -> &'static [ArgSchema] {
+        ets_schema()
+    }
+    fn dispatch<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+    ) -> Result<CalcValue<'b>, ExcelError> {
+        self.eval(args, ctx)
+    }
+    fn eval<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        _ctx: &dyn FunctionContext<'b>,
+    ) -> Result<CalcValue<'b>, ExcelError> {
+        number_result((|| {
+            if !(3..=6).contains(&args.len()) {
+                return Err(ExcelError::new(ExcelErrorKind::Value));
+            }
+            let statistic = number(&args[2].value()?.into_literal())?.trunc();
+            if !(1.0..=8.0).contains(&statistic) {
                 return Err(num_error());
             }
-            let m = match seasonality {
-                1 => detect_seasonality(y),
-                m => m as usize,
-            };
-            let m = if m >= 2 && y.len() >= 2 * m { m } else { 0 };
-            let state = fit(y, m);
-            let h = (target - last) / series.step;
-            let season = if m >= 2 {
-                let at = (y.len() - 1) as f64 + h.round();
-                state.season[(at as usize) % m]
-            } else {
-                0.0
-            };
-            Ok(state.level + h * state.trend + season)
-        })();
-        Ok(CalcValue::Scalar(match result {
-            Ok(v) => LiteralValue::Number(v),
-            Err(e) => LiteralValue::Error(e),
-        }))
+            // The error statistics need the strict fit; the step does not.
+            let strict = (4.0..=7.0).contains(&statistic);
+            let input = ets_input_with(args, 0, 3, strict)?;
+            match statistic as u8 {
+                4..=7 => Ok(0.0),
+                8 => Ok(input.series.step),
+                _ => Err(not_computed()),
+            }
+        })())
     }
+}
+
+pub(crate) fn register_builtins() {
+    use std::sync::Arc;
+    crate::function_registry::register_builtin(Arc::new(ForecastEtsFn));
+    crate::function_registry::register_builtin(Arc::new(ForecastEtsConfintFn));
+    crate::function_registry::register_builtin(Arc::new(ForecastEtsSeasonalityFn));
+    crate::function_registry::register_builtin(Arc::new(ForecastEtsStatFn));
 }
 
 #[cfg(test)]
@@ -431,10 +628,15 @@ mod tests {
         let values = "{1,5,9,1,5,9,1,5,9,1,5,9}";
         let timeline = "{1,2,3,4,5,6,7,8,9,10,11,12}";
         close(
-            eval(&format!("=FORECAST.ETS(13,{values},{timeline})")),
+            eval(&format!("=FORECAST.ETS(13,{values},{timeline},3)")),
             1.0,
             1e-6,
         );
+        // Excel's season detection is not reproduced for a seasonal series.
+        match eval(&format!("=FORECAST.ETS(13,{values},{timeline})")) {
+            LiteralValue::Error(e) => assert_eq!(e.kind, ExcelErrorKind::NImpl),
+            other => panic!("expected #N/IMPL!, got {other:?}"),
+        }
         close(
             eval(&format!("=FORECAST.ETS(14,{values},{timeline},3)")),
             5.0,
@@ -447,12 +649,17 @@ mod tests {
         for f in [
             "=FORECAST.ETS(2,{10,20,30},{1,2,3})",
             "=FORECAST.ETS(7,{10,20,30},{1,2,3},-1)",
-            "=FORECAST.ETS(7,{10,20,30},{1,2,3.5})",
         ] {
             match eval(f) {
                 LiteralValue::Error(e) => assert_eq!(e.kind, ExcelErrorKind::Num, "{f}"),
                 other => panic!("{f}: expected #NUM!, got {other:?}"),
             }
+        }
+        // Excel forecasts from an unevenly stepped timeline; that is not
+        // reproduced.
+        match eval("=FORECAST.ETS(7,{10,20,30},{1,2,3.5})") {
+            LiteralValue::Error(e) => assert_eq!(e.kind, ExcelErrorKind::NImpl),
+            other => panic!("expected #N/IMPL!, got {other:?}"),
         }
     }
 }

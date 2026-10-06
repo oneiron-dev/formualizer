@@ -16,6 +16,7 @@ pub(crate) mod lookup_utils; // shared helper utilities for lookup family
 mod reference_info; // modern lookup & dynamic array subset (XLOOKUP, FILTER, UNIQUE)
 mod sort_collation; // Excel's text sort order for SORT and SORTBY
 mod stack; // stacking & concatenation functions (HSTACK, VSTACK)
+mod trimrange; // TRIMRANGE and the trim-reference operators
 
 #[cfg(test)]
 pub use choose::ChooseFn;
@@ -45,6 +46,8 @@ pub fn register_builtins() {
     register_builtin(Arc::new(reference_info::RowsFn));
     register_builtin(Arc::new(reference_info::ColumnFn));
     register_builtin(Arc::new(reference_info::ColumnsFn));
+    register_builtin(Arc::new(reference_info::AreasFn));
+    trimrange::register_builtins();
 
     // Address function
     register_builtin(Arc::new(address::AddressFn));

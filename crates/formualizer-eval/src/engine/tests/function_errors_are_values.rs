@@ -156,11 +156,9 @@ fn unknown_function_still_yields_name_error() {
         "=IF(TRUE,FOOBARFN(1),\"x\")",
         "=IFERROR(FOOBARFN(1),FOOBARFN(2))",
         "=_xludf.FOOBARFN(1)",
-        // WEBSERVICE and ENCODEURL are not implemented (no corpus use).
+        // WEBSERVICE reads the network: it is not implemented.
         "=_xlfn.WEBSERVICE(\"http://example.com\")",
         "=WEBSERVICE(\"http://example.com\")",
-        "=_xlfn.ENCODEURL(\"a b\")",
-        "=ENCODEURL(\"a b\")",
     ] {
         assert_name_error(formula);
     }

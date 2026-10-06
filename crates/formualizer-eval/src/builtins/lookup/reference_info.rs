@@ -1,10 +1,11 @@
-//! Reference information functions: ROW, ROWS, COLUMN, COLUMNS
+//! Reference information functions: ROW, ROWS, COLUMN, COLUMNS, AREAS
 //!
 //! Excel semantics:
 //! - ROW([reference]) - Returns the row number of a reference
 //! - ROWS(array) - Returns the number of rows in a reference
 //! - COLUMN([reference]) - Returns the column number of a reference
 //! - COLUMNS(array) - Returns the number of columns in a reference
+//! - AREAS(reference) - Returns the number of areas in a reference
 //!
 //! Without arguments, ROW and COLUMN return the current cell's position
 
@@ -15,6 +16,89 @@ use crate::traits::{ArgumentHandle, FunctionContext};
 use formualizer_common::{ArgKind, ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
 use formualizer_parse::parser::{ExternalRefKind, ReferenceType};
+
+#[derive(Debug)]
+pub struct AreasFn;
+
+/// Returns the number of areas in a reference.
+///
+/// # Remarks
+/// - A union written with the `,` reference operator, `(A1:B2,C3,D4:E5)`,
+///   has one area per operand in the order written (a repeated area counts
+///   each time); an intersection with one has an area per overlap.
+/// - Any other reference, a whole column or a function's reference included,
+///   is one area.
+/// - An argument that is no reference returns its error, or `#VALUE!`
+///   (Excel refuses a constant such as `AREAS(1)` at entry).
+///
+/// # Examples
+/// ```yaml,sandbox
+/// title: "Three areas"
+/// formula: '=AREAS((A1:B2,C3,D4:E5))'
+/// expected: 3
+/// ```
+///
+/// ```yaml,docs
+/// related:
+///   - INDEX
+///   - ROWS
+///   - COLUMNS
+/// faq:
+///   - q: "How many areas does an intersection have?"
+///     a: "One per overlap: AREAS(A1:B2 B1:C3) is 1."
+/// ```
+impl Function for AreasFn {
+    fn name(&self) -> &'static str {
+        "AREAS"
+    }
+
+    fn min_args(&self) -> usize {
+        1
+    }
+
+    func_caps!(PURE);
+
+    fn arg_schema(&self) -> &'static [ArgSchema] {
+        use once_cell::sync::Lazy;
+        static SCHEMA: Lazy<Vec<ArgSchema>> = Lazy::new(|| {
+            vec![ArgSchema {
+                kinds: smallvec::smallvec![ArgKind::Range],
+                required: true,
+                by_ref: true,
+                shape: ShapeKind::Range,
+                coercion: CoercionPolicy::None,
+                max: None,
+                repeating: None,
+                default: None,
+            }]
+        });
+        &SCHEMA
+    }
+
+    fn eval<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        _ctx: &dyn FunctionContext<'b>,
+    ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        let count = if args.len() != 1 {
+            Err(ExcelError::new(ExcelErrorKind::Value))
+        } else if let Some(areas) = args[0].reference_areas() {
+            areas.map(|areas| areas.len())
+        } else {
+            args[0].as_reference_or_eval().map(|_| 1).map_err(|error| {
+                if error.kind == ExcelErrorKind::Ref {
+                    ExcelError::new(ExcelErrorKind::Value)
+                } else {
+                    error
+                }
+            })
+        };
+        Ok(crate::traits::CalcValue::Scalar(match count {
+            Ok(count) => LiteralValue::Number(count as f64),
+            Err(error) => LiteralValue::Error(error),
+        }))
+    }
+}
 
 #[derive(Debug)]
 pub struct RowFn;
