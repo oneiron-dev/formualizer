@@ -2122,13 +2122,14 @@ fn erfc_large(x: f64) -> f64 {
     let q_val = q_val * inv_x2 + Q[1];
     let q_val = q_val * inv_x2 + Q[0];
 
-    // 1/sqrt(pi) = 0.5641895835477563
+    // Cody: erfc(x) = exp(-x^2) / x * (1/sqrt(pi) - R(1/x^2) / x^2); the
+    // correction lowers the leading term (erfc(4) = 1.541725790028E-08).
     const FRAC_1_SQRT_PI: f64 = 0.5641895835477563;
-    (-x2).exp() / x * (FRAC_1_SQRT_PI + inv_x2 * p_val / q_val)
+    (-x2).exp() / x * (FRAC_1_SQRT_PI - inv_x2 * p_val / q_val)
 }
 
 /// Direct erfc computation for ERFC function
-fn erfc_direct(x: f64) -> f64 {
+pub(crate) fn erfc_direct(x: f64) -> f64 {
     if x < 0.0 {
         return 2.0 - erfc_direct(-x);
     }

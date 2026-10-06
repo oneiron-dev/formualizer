@@ -173,6 +173,7 @@ mod info_reference_context;
 mod inspect;
 mod intersection_and_error_values;
 mod lambda_helpers;
+mod legacy_distribution_probes;
 mod let_lambda;
 mod negative_zero;
 mod nested_subtotals;

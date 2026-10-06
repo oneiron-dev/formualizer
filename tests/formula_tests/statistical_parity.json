@@ -114,15 +114,15 @@
     },
     {
       "formula": "=BETA.INV(0,2,3)",
-      "result": 0,
-      "result_type": "float",
-      "description": "BETA.INV at p=0"
+      "result": "#NUM!",
+      "result_type": "error",
+      "description": "BETA.INV at p=0 is #NUM! (Excel for Windows 16.0.20430)"
     },
     {
       "formula": "=BETA.INV(1,2,3)",
-      "result": 1,
-      "result_type": "float",
-      "description": "BETA.INV at p=1"
+      "result": "#NUM!",
+      "result_type": "error",
+      "description": "BETA.INV at p=1 is #NUM! (Excel for Windows 16.0.20430)"
     },
     {
       "formula": "=BINOM.DIST.RANGE(10,0.5,3)",

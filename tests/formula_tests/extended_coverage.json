@@ -1686,13 +1686,13 @@
     },
     {
       "formula": "=Z.TEST({3,6,7,8,6,5,4,2,1,9}, 4)",
-      "result": 0.07933459630405937,
+      "result": 0.09057419685136381,
       "result_type": "float",
       "description": "Z.TEST one-tailed p-value"
     },
     {
       "formula": "=Z.TEST({3,6,7,8,6,5,4,2,1,9}, 6)",
-      "result": 0.8756017728117506,
+      "result": 0.86304338912953,
       "result_type": "float",
       "description": "Z.TEST with x close to mean"
     },
@@ -1704,7 +1704,7 @@
     },
     {
       "formula": "=ZTEST({3,6,7,8,6,5,4,2,1,9}, 4)",
-      "result": 0.07933459630405937,
+      "result": 0.09057419685136381,
       "result_type": "float",
       "description": "ZTEST alias for Z.TEST"
     },

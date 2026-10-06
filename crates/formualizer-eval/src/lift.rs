@@ -98,6 +98,12 @@ pub(crate) fn lift_spec(name: &str) -> Option<Lift> {
         // Statistical distributions
         "NORM.DIST" | "NORM.INV" | "NORM.S.DIST" | "NORM.S.INV" | "STANDARDIZE" | "FISHER"
         | "FISHERINV" | "EXPON.DIST" | "POISSON.DIST" | "BINOM.DIST" | "PHI" | "GAUSS" => Lift::All,
+        // The compatibility names of the distributions take single values only.
+        "NORMSDIST" | "NORMSINV" | "NORMDIST" | "NORMINV" | "LOGNORMDIST" | "LOGINV" | "TDIST"
+        | "CHIDIST" | "CHIINV" | "FDIST" | "FINV" | "BINOMDIST" | "POISSON" | "EXPONDIST"
+        | "GAMMADIST" | "WEIBULL" | "BETADIST" | "BETAINV" | "HYPGEOMDIST" | "NEGBINOMDIST" => {
+            Lift::All
+        }
         // Lookup: the looked-up value, index and mode are single values.
         "VLOOKUP" | "HLOOKUP" => Lift::Only(&[0, 2, 3]),
         "MATCH" => Lift::Only(&[0, 2]),

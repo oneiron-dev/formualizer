@@ -31,6 +31,34 @@ use formualizer_common::{ExcelError, LiteralValue};
 // use std::collections::BTreeMap; // removed unused import
 use formualizer_macros::func_caps;
 
+/// The argument schema of a distribution function, one entry per argument:
+/// `num` a number, `optional` an optional number, `logical` a cumulative
+/// flag (read by [`dist::logical_arg`], which also takes "TRUE"/"FALSE" text).
+macro_rules! stats_schema {
+    ($($kind:ident),* $(,)?) => {{
+        use std::sync::LazyLock;
+        static SCHEMA: LazyLock<Vec<$crate::args::ArgSchema>> =
+            LazyLock::new(|| vec![$(stats_schema!(@ $kind)),*]);
+        &SCHEMA[..]
+    }};
+    (@ num) => {
+        $crate::args::ArgSchema::number_lenient_scalar()
+    };
+    (@ optional) => {
+        $crate::args::ArgSchema {
+            required: false,
+            ..$crate::args::ArgSchema::number_lenient_scalar()
+        }
+    };
+    (@ logical) => {
+        $crate::args::ArgSchema {
+            kinds: smallvec::smallvec![formualizer_common::ArgKind::Logical],
+            coercion: formualizer_common::CoercionPolicy::None,
+            ..$crate::args::ArgSchema::number_lenient_scalar()
+        }
+    };
+}
+
 fn scalar_like_value(arg: &ArgumentHandle<'_, '_>) -> Result<LiteralValue, ExcelError> {
     Ok(match arg.value()? {
         crate::traits::CalcValue::Scalar(v) | crate::traits::CalcValue::AnnotatedScalar(v, _) => v,
@@ -3001,45 +3029,15 @@ impl Function for DevsqFn {
 STATISTICAL DISTRIBUTION FUNCTIONS
 ═══════════════════════════════════════════════════════════════════════════ */
 
-/// Helper: Standard normal CDF, Φ(z)
+/// Helper: Standard normal CDF, Φ(z) = erfc(-z/√2)/2.
 ///
-/// Hart (1968) algorithm 5666 as given by West (2005), "Better approximations to
-/// cumulative normal functions". Absolute error is about 1e-16 across the real line.
+/// Cody's erfc keeps the relative precision of the lower tail (NORMSDIST(-8.5)
+/// is 9.4795348222032E-18 in Excel); below Excel's smallest number (from about
+/// z = -37.52) the result is 0, as in Excel.
 fn std_norm_cdf(z: f64) -> f64 {
-    if z.is_nan() {
-        return f64::NAN;
-    }
-    let a = z.abs();
-    let tail = if a > 37.0 {
-        0.0
-    } else {
-        let e = (-a * a / 2.0).exp();
-        if a < 7.07106781186547 {
-            let mut n = 3.52624965998911e-2 * a + 0.700383064443688;
-            n = n * a + 6.37396220353165;
-            n = n * a + 33.912866078383;
-            n = n * a + 112.079291497871;
-            n = n * a + 221.213596169931;
-            n = n * a + 220.206867912376;
-            let mut d = 8.83883476483184e-2 * a + 1.75566716318264;
-            d = d * a + 16.064177579207;
-            d = d * a + 86.7807322029461;
-            d = d * a + 296.564248779674;
-            d = d * a + 637.333633378831;
-            d = d * a + 793.826512519948;
-            d = d * a + 440.413735824752;
-            e * n / d
-        } else {
-            // Continued fraction for the far tail.
-            let mut b = a + 0.65;
-            b = a + 4.0 / b;
-            b = a + 3.0 / b;
-            b = a + 2.0 / b;
-            b = a + 1.0 / b;
-            e / b / (2.0 * std::f64::consts::PI).sqrt()
-        }
-    };
-    if z > 0.0 { 1.0 - tail } else { tail }
+    crate::coercion::underflow_to_zero(
+        0.5 * crate::builtins::engineering::erfc_direct(-z * std::f64::consts::FRAC_1_SQRT_2),
+    )
 }
 
 /// Helper: Standard normal PDF
@@ -3048,12 +3046,18 @@ fn std_norm_pdf(z: f64) -> f64 {
     inv_sqrt_2pi * (-0.5 * z * z).exp()
 }
 
-/// Helper: Inverse standard normal CDF (probit function)
-/// Uses Rational approximation from Abramowitz and Stegun
+/// Helper: Inverse standard normal CDF (probit function).
+///
+/// Acklam's rational approximation (relative error 1.15e-9), then two Halley
+/// steps on Φ(z) = p, which bring it to full precision. It solves in the
+/// lower tail, where p keeps its precision (1 - p is exact for p >= 1/2).
 #[allow(clippy::excessive_precision)]
 fn std_norm_inv(p: f64) -> Option<f64> {
-    if p <= 0.0 || p >= 1.0 {
+    if !(p > 0.0 && p < 1.0) {
         return None;
+    }
+    if p > 0.5 {
+        return std_norm_inv(1.0 - p).map(|z| -z);
     }
 
     // Coefficients for rational approximation
@@ -3088,29 +3092,27 @@ fn std_norm_inv(p: f64) -> Option<f64> {
     ];
 
     const P_LOW: f64 = 0.02425;
-    const P_HIGH: f64 = 1.0 - P_LOW;
 
-    let q = p - 0.5;
-
-    if p < P_LOW {
+    let mut z = if p < P_LOW {
         // Lower tail
         let r = (-2.0 * p.ln()).sqrt();
         let num = ((((C[0] * r + C[1]) * r + C[2]) * r + C[3]) * r + C[4]) * r + C[5];
         let den = (((D[0] * r + D[1]) * r + D[2]) * r + D[3]) * r + 1.0;
-        Some(num / den)
-    } else if p <= P_HIGH {
+        num / den
+    } else {
         // Central region
+        let q = p - 0.5;
         let r = q * q;
         let num = ((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5];
         let den = ((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0;
-        Some(q * num / den)
-    } else {
-        // Upper tail
-        let r = (-2.0 * (1.0 - p).ln()).sqrt();
-        let num = ((((C[0] * r + C[1]) * r + C[2]) * r + C[3]) * r + C[4]) * r + C[5];
-        let den = (((D[0] * r + D[1]) * r + D[2]) * r + D[3]) * r + 1.0;
-        Some(-num / den)
+        q * num / den
+    };
+    for _ in 0..2 {
+        let e = std_norm_cdf(z) - p;
+        let u = e * (2.0 * std::f64::consts::PI).sqrt() * (z * z / 2.0).exp();
+        z -= u / (1.0 + z * u / 2.0);
     }
+    Some(z)
 }
 
 /// Returns the standard normal probability for a z-score as either a CDF or PDF value.
@@ -3145,8 +3147,8 @@ pub struct NormSDistFn;
 /// Min args: 2
 /// Max args: 2
 /// Variadic: false
-/// Signature: NORM.S.DIST(arg1: number@scalar, arg2: number@scalar)
-/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
+/// Signature: NORM.S.DIST(arg1: number@scalar, arg2: logical@scalar)
+/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=logical,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for NormSDistFn {
@@ -3158,31 +3160,20 @@ impl Function for NormSDistFn {
         2
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-            ]
-        });
-        &SCHEMA[..]
+        stats_schema!(num, logical)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let z = coerce_num(&scalar_like_value(&args[0])?)?;
-        let cumulative = coerce_num(&scalar_like_value(&args[1])?)? != 0.0;
-
-        let result = if cumulative {
+        let z = dist::number_arg(args, 0)?;
+        let cumulative = dist::logical_arg(args, 1)?;
+        dist::result(Ok(if cumulative {
             std_norm_cdf(z)
         } else {
             std_norm_pdf(z)
-        };
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            result,
-        )))
+        }))
     }
 }
 
@@ -3208,7 +3199,7 @@ impl Function for NormSDistFn {
 /// ```yaml,sandbox
 /// title: "Upper-tail critical z-score"
 /// formula: "=NORM.S.INV(0.975)"
-/// expected: 1.959963986120195
+/// expected: 1.9599639845400536
 /// ```
 #[derive(Debug)]
 pub struct NormSInvFn;
@@ -3241,14 +3232,7 @@ impl Function for NormSInvFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let p = coerce_num(&scalar_like_value(&args[0])?)?;
-
-        match std_norm_inv(p) {
-            Some(z) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(z))),
-            None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            ))),
-        }
+        dist::result(dist::norm_inv(dist::number_arg(args, 0)?, 0.0, 1.0))
     }
 }
 
@@ -3284,8 +3268,8 @@ pub struct NormDistFn;
 /// Min args: 4
 /// Max args: 4
 /// Variadic: false
-/// Signature: NORM.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4: number@scalar)
-/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
+/// Signature: NORM.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4: logical@scalar)
+/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=logical,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for NormDistFn {
@@ -3297,43 +3281,18 @@ impl Function for NormDistFn {
         4
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-            ]
-        });
-        &SCHEMA[..]
+        stats_schema!(num, num, num, logical)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let x = coerce_num(&scalar_like_value(&args[0])?)?;
-        let mean = coerce_num(&scalar_like_value(&args[1])?)?;
-        let std_dev = coerce_num(&scalar_like_value(&args[2])?)?;
-        let cumulative = coerce_num(&scalar_like_value(&args[3])?)? != 0.0;
-
-        if std_dev <= 0.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        let z = (x - mean) / std_dev;
-
-        let result = if cumulative {
-            std_norm_cdf(z)
-        } else {
-            std_norm_pdf(z) / std_dev
-        };
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            result,
-        )))
+        let x = dist::number_arg(args, 0)?;
+        let mean = dist::number_arg(args, 1)?;
+        let std_dev = dist::number_arg(args, 2)?;
+        let cumulative = dist::logical_arg(args, 3)?;
+        dist::result(dist::norm_dist(x, mean, std_dev, cumulative))
     }
 }
 
@@ -3396,24 +3355,10 @@ impl Function for NormInvFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let p = coerce_num(&scalar_like_value(&args[0])?)?;
-        let mean = coerce_num(&scalar_like_value(&args[1])?)?;
-        let std_dev = coerce_num(&scalar_like_value(&args[2])?)?;
-
-        if std_dev <= 0.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        match std_norm_inv(p) {
-            Some(z) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-                mean + z * std_dev,
-            ))),
-            None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            ))),
-        }
+        let p = dist::number_arg(args, 0)?;
+        let mean = dist::number_arg(args, 1)?;
+        let std_dev = dist::number_arg(args, 2)?;
+        dist::result(dist::norm_inv(p, mean, std_dev))
     }
 }
 
@@ -3448,8 +3393,8 @@ pub struct LognormDistFn;
 /// Min args: 4
 /// Max args: 4
 /// Variadic: false
-/// Signature: LOGNORM.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4: number@scalar)
-/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
+/// Signature: LOGNORM.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4: logical@scalar)
+/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=logical,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for LognormDistFn {
@@ -3461,43 +3406,18 @@ impl Function for LognormDistFn {
         4
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-            ]
-        });
-        &SCHEMA[..]
+        stats_schema!(num, num, num, logical)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let x = coerce_num(&scalar_like_value(&args[0])?)?;
-        let mean = coerce_num(&scalar_like_value(&args[1])?)?;
-        let std_dev = coerce_num(&scalar_like_value(&args[2])?)?;
-        let cumulative = coerce_num(&scalar_like_value(&args[3])?)? != 0.0;
-
-        if x <= 0.0 || std_dev <= 0.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        let z = (x.ln() - mean) / std_dev;
-
-        let result = if cumulative {
-            std_norm_cdf(z)
-        } else {
-            std_norm_pdf(z) / (x * std_dev)
-        };
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            result,
-        )))
+        let x = dist::number_arg(args, 0)?;
+        let mean = dist::number_arg(args, 1)?;
+        let std_dev = dist::number_arg(args, 2)?;
+        let cumulative = dist::logical_arg(args, 3)?;
+        dist::result(dist::lognorm_dist(x, mean, std_dev, cumulative))
     }
 }
 
@@ -3560,24 +3480,10 @@ impl Function for LognormInvFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let p = coerce_num(&scalar_like_value(&args[0])?)?;
-        let mean = coerce_num(&scalar_like_value(&args[1])?)?;
-        let std_dev = coerce_num(&scalar_like_value(&args[2])?)?;
-
-        if std_dev <= 0.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        match std_norm_inv(p) {
-            Some(z) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-                (mean + z * std_dev).exp(),
-            ))),
-            None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            ))),
-        }
+        let p = dist::number_arg(args, 0)?;
+        let mean = dist::number_arg(args, 1)?;
+        let std_dev = dist::number_arg(args, 2)?;
+        dist::result(dist::lognorm_inv(p, mean, std_dev))
     }
 }
 
@@ -3737,299 +3643,15 @@ fn ln_gamma(x: f64) -> f64 {
     }
 }
 
-/// Helper: Regularized lower incomplete gamma function P(a, x)
-fn gamma_p(a: f64, x: f64) -> f64 {
-    if x < 0.0 || a <= 0.0 {
-        return 0.0;
-    }
-    if x == 0.0 {
-        return 0.0;
-    }
-
-    // Use series expansion for x < a+1
-    if x < a + 1.0 {
-        gamma_series(a, x)
-    } else {
-        // Use continued fraction for x >= a+1
-        1.0 - gamma_cf(a, x)
-    }
-}
-
-/// Helper: Series expansion for incomplete gamma
-fn gamma_series(a: f64, x: f64) -> f64 {
-    let ln_ga = ln_gamma(a);
-    let mut sum = 1.0 / a;
-    let mut term = sum;
-    for n in 1..200 {
-        term *= x / (a + n as f64);
-        sum += term;
-        if term.abs() < sum.abs() * 1e-15 {
-            break;
-        }
-    }
-    sum * (-x + a * x.ln() - ln_ga).exp()
-}
-
-/// Helper: Continued fraction for upper incomplete gamma Q(a,x)
-/// Using modified Lentz's algorithm (Numerical Recipes formulation)
-fn gamma_cf(a: f64, x: f64) -> f64 {
-    let ln_ga = ln_gamma(a);
-    const TINY: f64 = 1e-30;
-    const EPS: f64 = 1e-14;
-
-    // Set up for evaluating continued fraction by modified Lentz's method
-    let mut b = x + 1.0 - a;
-    let mut c = 1.0 / TINY;
-    let mut d = 1.0 / b;
-    let mut h = d;
-
-    for i in 1..=200 {
-        let an = -(i as f64) * (i as f64 - a);
-        b += 2.0;
-        d = an * d + b;
-        if d.abs() < TINY {
-            d = TINY;
-        }
-        c = b + an / c;
-        if c.abs() < TINY {
-            c = TINY;
-        }
-        d = 1.0 / d;
-        let delta = d * c;
-        h *= delta;
-        if (delta - 1.0).abs() <= EPS {
-            break;
-        }
-    }
-
-    h * (-x + a * x.ln() - ln_ga).exp()
-}
-
-/// Helper: Regularized incomplete beta function I_x(a,b)
-/// Uses the continued fraction representation (NIST DLMF 8.17.22)
-fn beta_i(x: f64, a: f64, b: f64) -> f64 {
-    if x <= 0.0 {
-        return 0.0;
-    }
-    if x >= 1.0 {
-        return 1.0;
-    }
-    if a <= 0.0 || b <= 0.0 {
-        return f64::NAN;
-    }
-
-    // Use symmetry for better convergence: I_x(a,b) = 1 - I_{1-x}(b,a)
-    if x > (a + 1.0) / (a + b + 2.0) {
-        return 1.0 - beta_i(1.0 - x, b, a);
-    }
-
-    // Compute the prefactor: x^a * (1-x)^b / (a * B(a,b))
-    let ln_beta = ln_gamma(a) + ln_gamma(b) - ln_gamma(a + b);
-    let ln_prefactor = a * x.ln() + b * (1.0 - x).ln() - ln_beta - a.ln();
-    let prefactor = ln_prefactor.exp();
-
-    // Evaluate the continued fraction using modified Lentz algorithm
-    // The CF is: 1 / (1 + d1/(1 + d2/(1 + ...)))
-    // where d_{2m+1} = -(a+m)(a+b+m)x / ((a+2m)(a+2m+1))
-    //       d_{2m}   = m(b-m)x / ((a+2m-1)(a+2m))
-    const EPS: f64 = 1e-14;
-    const TINY: f64 = 1e-30;
-
-    let qab = a + b;
-    let qap = a + 1.0;
-    let qam = a - 1.0;
-    let mut c = 1.0;
-    let mut d = 1.0 - qab * x / qap;
-    if d.abs() < TINY {
-        d = TINY;
-    }
-    d = 1.0 / d;
-    let mut h = d;
-
-    for m in 1..=200 {
-        let m_f64 = m as f64;
-        let m2 = 2.0 * m_f64;
-
-        // Even step: d_{2m} = m(b-m)x / ((a+2m-1)(a+2m))
-        let aa = m_f64 * (b - m_f64) * x / ((qam + m2) * (a + m2));
-        d = 1.0 + aa * d;
-        if d.abs() < TINY {
-            d = TINY;
-        }
-        c = 1.0 + aa / c;
-        if c.abs() < TINY {
-            c = TINY;
-        }
-        d = 1.0 / d;
-        h *= d * c;
-
-        // Odd step: d_{2m+1} = -(a+m)(a+b+m)x / ((a+2m)(a+2m+1))
-        let aa = -((a + m_f64) * (qab + m_f64) * x) / ((a + m2) * (qap + m2));
-        d = 1.0 + aa * d;
-        if d.abs() < TINY {
-            d = TINY;
-        }
-        c = 1.0 + aa / c;
-        if c.abs() < TINY {
-            c = TINY;
-        }
-        d = 1.0 / d;
-        let delta = d * c;
-        h *= delta;
-
-        if (delta - 1.0).abs() <= EPS {
-            break;
-        }
-    }
-
-    prefactor * h
-}
-
-/// Helper: T distribution CDF
-fn t_cdf(t: f64, df: f64) -> f64 {
-    let x = df / (df + t * t);
-    0.5 * (1.0 + t.signum() * (1.0 - beta_i(x, df / 2.0, 0.5)))
-}
-
-/// Helper: T distribution inverse CDF using Newton-Raphson
-fn t_inv(p: f64, df: f64) -> Option<f64> {
-    if p <= 0.0 || p >= 1.0 {
-        return None;
-    }
-
-    // Initial guess using normal approximation
-    let mut t = std_norm_inv(p)?;
-
-    // Newton-Raphson iteration
-    for _ in 0..50 {
-        let cdf = t_cdf(t, df);
-        let pdf = t_pdf(t, df);
-        if pdf.abs() < 1e-30 {
-            break;
-        }
-        let delta = (cdf - p) / pdf;
-        t -= delta;
-        if delta.abs() < 1e-12 {
-            break;
-        }
-    }
-
-    Some(t)
-}
-
-/// Helper: T distribution PDF
-fn t_pdf(t: f64, df: f64) -> f64 {
-    let coef =
-        (ln_gamma((df + 1.0) / 2.0) - ln_gamma(df / 2.0) - 0.5 * (df * std::f64::consts::PI).ln())
-            .exp();
-    coef * (1.0 + t * t / df).powf(-(df + 1.0) / 2.0)
-}
-
-/// Helper: Chi-square CDF
-fn chisq_cdf(x: f64, df: f64) -> f64 {
-    if x <= 0.0 {
-        return 0.0;
-    }
-    gamma_p(df / 2.0, x / 2.0)
-}
-
-/// Helper: Chi-square inverse CDF using Newton-Raphson
-fn chisq_inv(p: f64, df: f64) -> Option<f64> {
-    if p <= 0.0 || p >= 1.0 {
-        return None;
-    }
-
-    // Initial guess
-    let mut x = df.max(1.0);
-    if p < 0.5 {
-        x = x.min(1.0);
-    }
-
-    // Newton-Raphson iteration
-    for _ in 0..100 {
-        let cdf = chisq_cdf(x, df);
-        let pdf = chisq_pdf(x, df);
-        if pdf.abs() < 1e-30 {
-            break;
-        }
-        let delta = (cdf - p) / pdf;
-        let new_x = (x - delta).max(1e-15);
-        if (new_x - x).abs() < 1e-12 * x {
-            x = new_x;
-            break;
-        }
-        x = new_x;
-    }
-
-    Some(x)
-}
-
-/// Helper: Chi-square PDF
-fn chisq_pdf(x: f64, df: f64) -> f64 {
-    if x <= 0.0 {
-        return 0.0;
-    }
-    let k = df / 2.0;
-    ((k - 1.0) * x.ln() - x / 2.0 - k * 2.0_f64.ln() - ln_gamma(k)).exp()
-}
-
-/// Helper: F distribution CDF
-fn f_cdf(f: f64, d1: f64, d2: f64) -> f64 {
-    if f <= 0.0 {
-        return 0.0;
-    }
-    let x = d1 * f / (d1 * f + d2);
-    beta_i(x, d1 / 2.0, d2 / 2.0)
-}
-
-/// Helper: F distribution inverse CDF using Newton-Raphson
-fn f_inv(p: f64, d1: f64, d2: f64) -> Option<f64> {
-    if p <= 0.0 || p >= 1.0 {
-        return None;
-    }
-
-    // Initial guess
-    let mut f = 1.0;
-
-    // Newton-Raphson iteration
-    for _ in 0..100 {
-        let cdf = f_cdf(f, d1, d2);
-        let pdf = f_pdf(f, d1, d2);
-        if pdf.abs() < 1e-30 {
-            break;
-        }
-        let delta = (cdf - p) / pdf;
-        let new_f = (f - delta).max(1e-15);
-        if (new_f - f).abs() < 1e-12 * f {
-            f = new_f;
-            break;
-        }
-        f = new_f;
-    }
-
-    Some(f)
-}
-
-/// Helper: F distribution PDF
-fn f_pdf(f: f64, d1: f64, d2: f64) -> f64 {
-    if f <= 0.0 {
-        return 0.0;
-    }
-    let ln_beta = ln_gamma(d1 / 2.0) + ln_gamma(d2 / 2.0) - ln_gamma((d1 + d2) / 2.0);
-    let coef = (d1 / 2.0) * (d1 / d2).ln() + (d1 / 2.0 - 1.0) * f.ln()
-        - ((d1 + d2) / 2.0) * (1.0 + d1 * f / d2).ln()
-        - ln_beta;
-    coef.exp()
-}
-
 /// Returns the Student's t probability for `x` and a given degrees-of-freedom value.
 ///
 /// Use `T.DIST` in either cumulative mode (left-tail probability) or density mode.
 ///
 /// # Remarks
 /// - Set `cumulative` to non-zero for CDF mode, or `0` for PDF mode.
-/// - `deg_freedom` must be at least `1`.
-/// - Returns `#NUM!` when `deg_freedom < 1`.
+/// - `deg_freedom` is truncated and must lie in [1, 1E10].
+/// - Returns `#NUM!` when `deg_freedom` is outside that range.
+/// - `cumulative` is a logical: a number, TRUE/FALSE, or the text "TRUE"/"FALSE".
 /// - Invalid numeric coercions propagate as spreadsheet errors.
 ///
 /// # Examples
@@ -4053,8 +3675,8 @@ pub struct TDistFn;
 /// Min args: 3
 /// Max args: 3
 /// Variadic: false
-/// Signature: T.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar)
-/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
+/// Signature: T.DIST(arg1: number@scalar, arg2: number@scalar, arg3: logical@scalar)
+/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=logical,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for TDistFn {
@@ -4066,39 +3688,17 @@ impl Function for TDistFn {
         3
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-            ]
-        });
-        &SCHEMA[..]
+        stats_schema!(num, num, logical)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let x = coerce_num(&scalar_like_value(&args[0])?)?;
-        let df = coerce_num(&scalar_like_value(&args[1])?)?;
-        let cumulative = coerce_num(&scalar_like_value(&args[2])?)? != 0.0;
-
-        if df < 1.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        let result = if cumulative {
-            t_cdf(x, df)
-        } else {
-            t_pdf(x, df)
-        };
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            result,
-        )))
+        let x = dist::number_arg(args, 0)?;
+        let df = dist::whole_arg(args, 1)?;
+        let cumulative = dist::logical_arg(args, 2)?;
+        dist::result(dist::t_dist(x, df, cumulative))
     }
 }
 
@@ -4108,7 +3708,7 @@ impl Function for TDistFn {
 ///
 /// # Remarks
 /// - `probability` must be strictly between `0` and `1`.
-/// - `deg_freedom` must be at least `1`.
+/// - `deg_freedom` is truncated and must lie in [1, 1E10].
 /// - Returns `#NUM!` for out-of-range probability or invalid degrees of freedom.
 /// - Invalid numeric coercions propagate as spreadsheet errors.
 ///
@@ -4123,7 +3723,7 @@ impl Function for TDistFn {
 /// ```yaml,sandbox
 /// title: "Upper-tail critical value"
 /// formula: "=T.INV(0.975,10)"
-/// expected: 2.228138851986273
+/// expected: 2.2281388519862744
 /// ```
 #[derive(Debug)]
 pub struct TInvFn;
@@ -4160,23 +3760,9 @@ impl Function for TInvFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let p = coerce_num(&scalar_like_value(&args[0])?)?;
-        let df = coerce_num(&scalar_like_value(&args[1])?)?;
-
-        if df < 1.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        match t_inv(p, df) {
-            Some(result) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-                result,
-            ))),
-            None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            ))),
-        }
+        let p = dist::number_arg(args, 0)?;
+        let df = dist::whole_arg(args, 1)?;
+        dist::result(dist::t_inv(p, df))
     }
 }
 
@@ -4186,8 +3772,9 @@ impl Function for TInvFn {
 ///
 /// # Remarks
 /// - Set `cumulative` to non-zero for CDF mode, or `0` for PDF mode.
-/// - Requires `x >= 0` and `deg_freedom >= 1`.
+/// - Requires `x >= 0`; `deg_freedom` is truncated and must lie in [1, 1E10].
 /// - Returns `#NUM!` for negative `x` or invalid degrees of freedom.
+/// - The density at `x = 0` is `#NUM!` for 1 degree of freedom, `0.5` for 2 and `0` above.
 /// - Invalid numeric coercions propagate as spreadsheet errors.
 ///
 /// # Examples
@@ -4211,8 +3798,8 @@ pub struct ChisqDistFn;
 /// Min args: 3
 /// Max args: 3
 /// Variadic: false
-/// Signature: CHISQ.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar)
-/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
+/// Signature: CHISQ.DIST(arg1: number@scalar, arg2: number@scalar, arg3: logical@scalar)
+/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=logical,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for ChisqDistFn {
@@ -4224,39 +3811,17 @@ impl Function for ChisqDistFn {
         3
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-            ]
-        });
-        &SCHEMA[..]
+        stats_schema!(num, num, logical)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let x = coerce_num(&scalar_like_value(&args[0])?)?;
-        let df = coerce_num(&scalar_like_value(&args[1])?)?;
-        let cumulative = coerce_num(&scalar_like_value(&args[2])?)? != 0.0;
-
-        if df < 1.0 || x < 0.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        let result = if cumulative {
-            chisq_cdf(x, df)
-        } else {
-            chisq_pdf(x, df)
-        };
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            result,
-        )))
+        let x = dist::number_arg(args, 0)?;
+        let df = dist::whole_arg(args, 1)?;
+        let cumulative = dist::logical_arg(args, 2)?;
+        dist::result(dist::chisq_dist(x, df, cumulative))
     }
 }
 
@@ -4265,8 +3830,8 @@ impl Function for ChisqDistFn {
 /// `CHISQ.INV` inverts `CHISQ.DIST(x, deg_freedom, TRUE)`.
 ///
 /// # Remarks
-/// - `probability` must be strictly between `0` and `1`.
-/// - `deg_freedom` must be at least `1`.
+/// - `probability` must satisfy `0 <= probability < 1` (0 gives 0).
+/// - `deg_freedom` is truncated and must be at least `1`.
 /// - Returns `#NUM!` when arguments are outside valid ranges.
 /// - Invalid numeric coercions propagate as spreadsheet errors.
 ///
@@ -4318,23 +3883,9 @@ impl Function for ChisqInvFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let p = coerce_num(&scalar_like_value(&args[0])?)?;
-        let df = coerce_num(&scalar_like_value(&args[1])?)?;
-
-        if df < 1.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        match chisq_inv(p, df) {
-            Some(result) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-                result,
-            ))),
-            None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            ))),
-        }
+        let p = dist::number_arg(args, 0)?;
+        let df = dist::whole_arg(args, 1)?;
+        dist::result(dist::chisq_inv(p, df))
     }
 }
 
@@ -4344,7 +3895,8 @@ impl Function for ChisqInvFn {
 ///
 /// # Remarks
 /// - Set `cumulative` to non-zero for CDF mode, or `0` for PDF mode.
-/// - Requires `x >= 0`, `deg_freedom1 >= 1`, and `deg_freedom2 >= 1`.
+/// - Requires `x >= 0`; the degrees of freedom are truncated and must lie in [1, 1E10].
+/// - The density at `x = 0` is `#NUM!` for `deg_freedom1 = 1`, `1` for 2 and `0` above.
 /// - Returns `#NUM!` when any domain constraint is violated.
 /// - Invalid numeric coercions propagate as spreadsheet errors.
 ///
@@ -4369,8 +3921,8 @@ pub struct FDistFn;
 /// Min args: 4
 /// Max args: 4
 /// Variadic: false
-/// Signature: F.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4: number@scalar)
-/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
+/// Signature: F.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4: logical@scalar)
+/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=logical,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for FDistFn {
@@ -4382,41 +3934,18 @@ impl Function for FDistFn {
         4
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-            ]
-        });
-        &SCHEMA[..]
+        stats_schema!(num, num, num, logical)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let x = coerce_num(&scalar_like_value(&args[0])?)?;
-        let d1 = coerce_num(&scalar_like_value(&args[1])?)?;
-        let d2 = coerce_num(&scalar_like_value(&args[2])?)?;
-        let cumulative = coerce_num(&scalar_like_value(&args[3])?)? != 0.0;
-
-        if d1 < 1.0 || d2 < 1.0 || x < 0.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        let result = if cumulative {
-            f_cdf(x, d1, d2)
-        } else {
-            f_pdf(x, d1, d2)
-        };
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            result,
-        )))
+        let x = dist::number_arg(args, 0)?;
+        let d1 = dist::whole_arg(args, 1)?;
+        let d2 = dist::whole_arg(args, 2)?;
+        let cumulative = dist::logical_arg(args, 3)?;
+        dist::result(dist::f_dist(x, d1, d2, cumulative))
     }
 }
 
@@ -4425,8 +3954,8 @@ impl Function for FDistFn {
 /// `F.INV` inverts `F.DIST(x, deg_freedom1, deg_freedom2, TRUE)`.
 ///
 /// # Remarks
-/// - `probability` must be strictly between `0` and `1`.
-/// - `deg_freedom1` and `deg_freedom2` must each be at least `1`.
+/// - `probability` must satisfy `0 <= probability < 1` (0 gives 0).
+/// - `deg_freedom1` and `deg_freedom2` are truncated and must lie in [1, 1E10].
 /// - Returns `#NUM!` for invalid probability or degree-of-freedom arguments.
 /// - Invalid numeric coercions propagate as spreadsheet errors.
 ///
@@ -4479,24 +4008,10 @@ impl Function for FInvFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let p = coerce_num(&scalar_like_value(&args[0])?)?;
-        let d1 = coerce_num(&scalar_like_value(&args[1])?)?;
-        let d2 = coerce_num(&scalar_like_value(&args[2])?)?;
-
-        if d1 < 1.0 || d2 < 1.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        match f_inv(p, d1, d2) {
-            Some(result) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-                result,
-            ))),
-            None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            ))),
-        }
+        let p = dist::number_arg(args, 0)?;
+        let d1 = dist::whole_arg(args, 1)?;
+        let d2 = dist::whole_arg(args, 2)?;
+        dist::result(dist::f_inv(p, d1, d2))
     }
 }
 
@@ -4594,17 +4109,6 @@ fn factorial(n: i64) -> f64 {
     result
 }
 
-/// Helper: Log of binomial coefficient (n choose k)
-fn ln_binom(n: i64, k: i64) -> f64 {
-    if k < 0 || k > n {
-        return f64::NEG_INFINITY;
-    }
-    if k == 0 || k == n {
-        return 0.0;
-    }
-    ln_gamma((n + 1) as f64) - ln_gamma((k + 1) as f64) - ln_gamma((n - k + 1) as f64)
-}
-
 /// Returns the binomial probability for a count of successes across independent trials.
 ///
 /// Use `BINOM.DIST` to evaluate either exact-success probability (PMF) or cumulative probability
@@ -4637,8 +4141,8 @@ pub struct BinomDistFn;
 /// Min args: 4
 /// Max args: 4
 /// Variadic: false
-/// Signature: BINOM.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4: number@scalar)
-/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
+/// Signature: BINOM.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4: logical@scalar)
+/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=logical,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for BinomDistFn {
@@ -4650,51 +4154,18 @@ impl Function for BinomDistFn {
         4
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-            ]
-        });
-        &SCHEMA[..]
+        stats_schema!(num, num, num, logical)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let k = coerce_num(&scalar_like_value(&args[0])?)?.trunc() as i64;
-        let n = coerce_num(&scalar_like_value(&args[1])?)?.trunc() as i64;
-        let p = coerce_num(&scalar_like_value(&args[2])?)?;
-        let cumulative = coerce_num(&scalar_like_value(&args[3])?)? != 0.0;
-
-        if n < 0 || k < 0 || k > n || !(0.0..=1.0).contains(&p) {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        let result = if cumulative {
-            // CDF: sum from i=0 to k of P(X=i)
-            let mut sum = 0.0;
-            for i in 0..=k {
-                let ln_prob =
-                    ln_binom(n, i) + (i as f64) * p.ln() + ((n - i) as f64) * (1.0 - p).ln();
-                sum += ln_prob.exp();
-            }
-            sum
-        } else {
-            // PMF: P(X=k)
-            let ln_prob = ln_binom(n, k) + (k as f64) * p.ln() + ((n - k) as f64) * (1.0 - p).ln();
-            ln_prob.exp()
-        };
-
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            result,
-        )))
+        let k = dist::whole_arg(args, 0)?;
+        let n = dist::whole_arg(args, 1)?;
+        let p = dist::number_arg(args, 2)?;
+        let cumulative = dist::logical_arg(args, 3)?;
+        dist::result(dist::binom_dist(k, n, p, cumulative))
     }
 }
 
@@ -4729,8 +4200,8 @@ pub struct PoissonDistFn;
 /// Min args: 3
 /// Max args: 3
 /// Variadic: false
-/// Signature: POISSON.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar)
-/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
+/// Signature: POISSON.DIST(arg1: number@scalar, arg2: number@scalar, arg3: logical@scalar)
+/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=logical,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for PoissonDistFn {
@@ -4742,45 +4213,17 @@ impl Function for PoissonDistFn {
         3
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-            ]
-        });
-        &SCHEMA[..]
+        stats_schema!(num, num, logical)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let k = coerce_num(&scalar_like_value(&args[0])?)?.trunc() as i64;
-        let lambda = coerce_num(&scalar_like_value(&args[1])?)?;
-        let cumulative = coerce_num(&scalar_like_value(&args[2])?)? != 0.0;
-
-        if k < 0 || lambda < 0.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        let result = if cumulative {
-            // CDF: sum from i=0 to k of P(X=i) = 1 - Q(k+1, lambda)
-            // Using the regularized incomplete gamma function
-            1.0 - gamma_p((k + 1) as f64, lambda)
-        } else {
-            // PMF: P(X=k) = lambda^k * e^(-lambda) / k!
-            // Use log to avoid overflow
-            let ln_prob = (k as f64) * lambda.ln() - lambda - ln_gamma((k + 1) as f64);
-            ln_prob.exp()
-        };
-
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            result,
-        )))
+        let k = dist::whole_arg(args, 0)?;
+        let mean = dist::number_arg(args, 1)?;
+        let cumulative = dist::logical_arg(args, 2)?;
+        dist::result(dist::poisson_dist(k, mean, cumulative))
     }
 }
 
@@ -4815,8 +4258,8 @@ pub struct ExponDistFn;
 /// Min args: 3
 /// Max args: 3
 /// Variadic: false
-/// Signature: EXPON.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar)
-/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
+/// Signature: EXPON.DIST(arg1: number@scalar, arg2: number@scalar, arg3: logical@scalar)
+/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=logical,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for ExponDistFn {
@@ -4828,42 +4271,17 @@ impl Function for ExponDistFn {
         3
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-            ]
-        });
-        &SCHEMA[..]
+        stats_schema!(num, num, logical)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let x = coerce_num(&scalar_like_value(&args[0])?)?;
-        let lambda = coerce_num(&scalar_like_value(&args[1])?)?;
-        let cumulative = coerce_num(&scalar_like_value(&args[2])?)? != 0.0;
-
-        if x < 0.0 || lambda <= 0.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        let result = if cumulative {
-            // CDF: 1 - e^(-lambda*x)
-            1.0 - (-lambda * x).exp()
-        } else {
-            // PDF: lambda * e^(-lambda*x)
-            lambda * (-lambda * x).exp()
-        };
-
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            result,
-        )))
+        let x = dist::number_arg(args, 0)?;
+        let lambda = dist::number_arg(args, 1)?;
+        let cumulative = dist::logical_arg(args, 2)?;
+        dist::result(dist::expon_dist(x, lambda, cumulative))
     }
 }
 
@@ -4873,6 +4291,7 @@ impl Function for ExponDistFn {
 ///
 /// # Remarks
 /// - Requires `x >= 0`, `alpha > 0`, and `beta > 0`.
+/// - In PDF mode the density at `x = 0` is `#NUM!` for `alpha <= 1` and `0` above, as in Excel.
 /// - Set `cumulative` to non-zero for CDF mode, or `0` for PDF mode.
 /// - Returns `#NUM!` when any parameter is outside its valid range.
 /// - Invalid numeric coercions propagate as spreadsheet errors.
@@ -4898,8 +4317,8 @@ pub struct GammaDistFn;
 /// Min args: 4
 /// Max args: 4
 /// Variadic: false
-/// Signature: GAMMA.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4: number@scalar)
-/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
+/// Signature: GAMMA.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4: logical@scalar)
+/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=logical,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for GammaDistFn {
@@ -4911,45 +4330,18 @@ impl Function for GammaDistFn {
         4
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-            ]
-        });
-        &SCHEMA[..]
+        stats_schema!(num, num, num, logical)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let x = coerce_num(&scalar_like_value(&args[0])?)?;
-        let alpha = coerce_num(&scalar_like_value(&args[1])?)?; // shape
-        let beta = coerce_num(&scalar_like_value(&args[2])?)?; // scale
-        let cumulative = coerce_num(&scalar_like_value(&args[3])?)? != 0.0;
-
-        if x < 0.0 || alpha <= 0.0 || beta <= 0.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        let result = if cumulative {
-            // CDF: P(alpha, x/beta) where P is the regularized lower incomplete gamma
-            gamma_p(alpha, x / beta)
-        } else {
-            // PDF: x^(alpha-1) * e^(-x/beta) / (beta^alpha * Gamma(alpha))
-            let ln_pdf = (alpha - 1.0) * x.ln() - x / beta - alpha * beta.ln() - ln_gamma(alpha);
-            ln_pdf.exp()
-        };
-
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            result,
-        )))
+        let x = dist::number_arg(args, 0)?;
+        let alpha = dist::number_arg(args, 1)?;
+        let beta = dist::number_arg(args, 2)?;
+        let cumulative = dist::logical_arg(args, 3)?;
+        dist::result(dist::gamma_dist(x, alpha, beta, cumulative))
     }
 }
 
@@ -4961,7 +4353,7 @@ impl Function for GammaDistFn {
 /// - Requires `x >= 0`, `alpha > 0`, and `beta > 0`.
 /// - Set `cumulative` to non-zero for CDF mode, or `0` for PDF mode.
 /// - Returns `#NUM!` when parameters fall outside valid ranges.
-/// - In PDF mode at `x = 0`, behavior follows the Weibull shape-specific limit.
+/// - In PDF mode the density at `x = 0` is `0` for every `alpha`, as in Excel.
 ///
 /// # Examples
 ///
@@ -4984,8 +4376,8 @@ pub struct WeibullDistFn;
 /// Min args: 4
 /// Max args: 4
 /// Variadic: false
-/// Signature: WEIBULL.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4: number@scalar)
-/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
+/// Signature: WEIBULL.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4: logical@scalar)
+/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=logical,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for WeibullDistFn {
@@ -4997,54 +4389,18 @@ impl Function for WeibullDistFn {
         4
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-            ]
-        });
-        &SCHEMA[..]
+        stats_schema!(num, num, num, logical)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let x = coerce_num(&scalar_like_value(&args[0])?)?;
-        let alpha = coerce_num(&scalar_like_value(&args[1])?)?; // shape
-        let beta = coerce_num(&scalar_like_value(&args[2])?)?; // scale
-        let cumulative = coerce_num(&scalar_like_value(&args[3])?)? != 0.0;
-
-        if x < 0.0 || alpha <= 0.0 || beta <= 0.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        let result = if cumulative {
-            // CDF: 1 - e^(-(x/beta)^alpha)
-            1.0 - (-(x / beta).powf(alpha)).exp()
-        } else {
-            // PDF: (alpha/beta) * (x/beta)^(alpha-1) * e^(-(x/beta)^alpha)
-            if x == 0.0 {
-                if alpha < 1.0 {
-                    f64::INFINITY
-                } else if alpha == 1.0 {
-                    alpha / beta
-                } else {
-                    0.0
-                }
-            } else {
-                (alpha / beta) * (x / beta).powf(alpha - 1.0) * (-(x / beta).powf(alpha)).exp()
-            }
-        };
-
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            result,
-        )))
+        let x = dist::number_arg(args, 0)?;
+        let alpha = dist::number_arg(args, 1)?;
+        let beta = dist::number_arg(args, 2)?;
+        let cumulative = dist::logical_arg(args, 3)?;
+        dist::result(dist::weibull_dist(x, alpha, beta, cumulative))
     }
 }
 
@@ -5055,7 +4411,9 @@ impl Function for WeibullDistFn {
 ///
 /// # Remarks
 /// - Requires `alpha > 0`, `beta > 0`, and `A < B`.
-/// - `x` must lie within the inclusive interval `[A, B]`.
+/// - `x` must lie within the inclusive interval `[A, B]`; an omitted bound (`BETA.DIST(x,2,3,TRUE,0,)`)
+///   takes its default.
+/// - In PDF mode the density at `A` is `#NUM!` for `alpha <= 1` and at `B` for `beta <= 1`.
 /// - Set `cumulative` to non-zero for CDF mode, or `0` for PDF mode.
 /// - Returns `#NUM!` for invalid bounds, parameters, or out-of-range `x`.
 ///
@@ -5078,10 +4436,10 @@ pub struct BetaDistFn;
 /// Name: BETA.DIST
 /// Type: BetaDistFn
 /// Min args: 4
-/// Max args: variadic
-/// Variadic: true
-/// Signature: BETA.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4: number@scalar, arg5: number@scalar, arg6...: number@scalar)
-/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg5{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg6{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
+/// Max args: 6
+/// Variadic: false
+/// Signature: BETA.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4: logical@scalar, arg5?: number@scalar, arg6?: number@scalar)
+/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=logical,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg5{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg6{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for BetaDistFn {
@@ -5092,92 +4450,21 @@ impl Function for BetaDistFn {
     fn min_args(&self) -> usize {
         4
     }
-    fn variadic(&self) -> bool {
-        true
-    }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-            ]
-        });
-        &SCHEMA[..]
+        stats_schema!(num, num, num, logical, optional, optional)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let x = coerce_num(&scalar_like_value(&args[0])?)?;
-        let alpha = coerce_num(&scalar_like_value(&args[1])?)?;
-        let beta_param = coerce_num(&scalar_like_value(&args[2])?)?;
-        let cumulative = coerce_num(&scalar_like_value(&args[3])?)? != 0.0;
-
-        // Optional bounds A and B (default 0 and 1)
-        let a = if args.len() > 4 {
-            coerce_num(&scalar_like_value(&args[4])?)?
-        } else {
-            0.0
-        };
-        let b = if args.len() > 5 {
-            coerce_num(&scalar_like_value(&args[5])?)?
-        } else {
-            1.0
-        };
-
-        if alpha <= 0.0 || beta_param <= 0.0 || a >= b {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        // x must be in [a, b]
-        if x < a || x > b {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        // Transform x to standard [0,1] interval
-        let x_std = (x - a) / (b - a);
-
-        let result = if cumulative {
-            // CDF: I_x(alpha, beta) - regularized incomplete beta function
-            beta_i(x_std, alpha, beta_param)
-        } else {
-            // PDF: (x-A)^(alpha-1) * (B-x)^(beta-1) / ((B-A)^(alpha+beta-1) * B(alpha, beta))
-            let ln_beta = ln_gamma(alpha) + ln_gamma(beta_param) - ln_gamma(alpha + beta_param);
-            let scale = b - a;
-            if (x_std == 0.0 && alpha < 1.0) || (x_std == 1.0 && beta_param < 1.0) {
-                f64::INFINITY
-            } else if x_std == 0.0 {
-                if alpha == 1.0 {
-                    (1.0 - x_std).powf(beta_param - 1.0) / (scale * ln_beta.exp())
-                } else {
-                    0.0
-                }
-            } else if x_std == 1.0 {
-                if beta_param == 1.0 {
-                    x_std.powf(alpha - 1.0) / (scale * ln_beta.exp())
-                } else {
-                    0.0
-                }
-            } else {
-                let ln_pdf =
-                    (alpha - 1.0) * x_std.ln() + (beta_param - 1.0) * (1.0 - x_std).ln() - ln_beta;
-                ln_pdf.exp() / scale
-            }
-        };
-
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            result,
-        )))
+        let x = dist::number_arg(args, 0)?;
+        let alpha = dist::number_arg(args, 1)?;
+        let beta = dist::number_arg(args, 2)?;
+        let cumulative = dist::logical_arg(args, 3)?;
+        let a = dist::optional_arg(args, 4, 0.0)?;
+        let b = dist::optional_arg(args, 5, 1.0)?;
+        dist::result(dist::beta_dist(x, alpha, beta, cumulative, a, b))
     }
 }
 
@@ -5212,8 +4499,8 @@ pub struct NegbinomDistFn;
 /// Min args: 4
 /// Max args: 4
 /// Variadic: false
-/// Signature: NEGBINOM.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4: number@scalar)
-/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
+/// Signature: NEGBINOM.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4: logical@scalar)
+/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=logical,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for NegbinomDistFn {
@@ -5225,49 +4512,18 @@ impl Function for NegbinomDistFn {
         4
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-            ]
-        });
-        &SCHEMA[..]
+        stats_schema!(num, num, num, logical)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let number_f = coerce_num(&scalar_like_value(&args[0])?)?.trunc() as i64; // number of failures
-        let number_s = coerce_num(&scalar_like_value(&args[1])?)?.trunc() as i64; // number of successes
-        let prob_s = coerce_num(&scalar_like_value(&args[2])?)?; // probability of success
-        let cumulative = coerce_num(&scalar_like_value(&args[3])?)? != 0.0;
-
-        if number_f < 0 || number_s < 1 || prob_s <= 0.0 || prob_s >= 1.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        let result = if cumulative {
-            // CDF: sum from i=0 to number_f of P(X=i)
-            // This is equivalent to I_{prob_s}(number_s, number_f + 1) using regularized beta
-            beta_i(prob_s, number_s as f64, (number_f + 1) as f64)
-        } else {
-            // PMF: C(number_f + number_s - 1, number_s - 1) * prob_s^number_s * (1-prob_s)^number_f
-            // = C(k + r - 1, r - 1) * p^r * (1-p)^k where k = number_f, r = number_s
-            let ln_prob = ln_binom(number_f + number_s - 1, number_s - 1)
-                + (number_s as f64) * prob_s.ln()
-                + (number_f as f64) * (1.0 - prob_s).ln();
-            ln_prob.exp()
-        };
-
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            result,
-        )))
+        let number_f = dist::whole_arg(args, 0)?;
+        let number_s = dist::whole_arg(args, 1)?;
+        let prob_s = dist::number_arg(args, 2)?;
+        let cumulative = dist::logical_arg(args, 3)?;
+        dist::result(dist::negbinom_dist(number_f, number_s, prob_s, cumulative))
     }
 }
 
@@ -5302,8 +4558,8 @@ pub struct HypgeomDistFn;
 /// Min args: 5
 /// Max args: 5
 /// Variadic: false
-/// Signature: HYPGEOM.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4: number@scalar, arg5: number@scalar)
-/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg5{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
+/// Signature: HYPGEOM.DIST(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4: number@scalar, arg5: logical@scalar)
+/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg5{kinds=logical,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for HypgeomDistFn {
@@ -5315,84 +4571,26 @@ impl Function for HypgeomDistFn {
         5
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-            ]
-        });
-        &SCHEMA[..]
+        stats_schema!(num, num, num, num, logical)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let sample_s = coerce_num(&scalar_like_value(&args[0])?)?.trunc() as i64; // successes in sample
-        let number_sample = coerce_num(&scalar_like_value(&args[1])?)?.trunc() as i64; // sample size
-        let population_s = coerce_num(&scalar_like_value(&args[2])?)?.trunc() as i64; // successes in population
-        let number_pop = coerce_num(&scalar_like_value(&args[3])?)?.trunc() as i64; // population size
-        let cumulative = coerce_num(&scalar_like_value(&args[4])?)? != 0.0;
-
-        // Validation
-        if number_pop <= 0
-            || population_s < 0
-            || population_s > number_pop
-            || number_sample < 0
-            || number_sample > number_pop
-            || sample_s < 0
-        {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        // sample_s must be at least max(0, number_sample - (number_pop - population_s))
-        // and at most min(number_sample, population_s)
-        let min_successes = 0.max(number_sample - (number_pop - population_s));
-        let max_successes = number_sample.min(population_s);
-
-        if sample_s < min_successes || sample_s > max_successes {
-            // Return 0 for PMF, or appropriate CDF value
-            if cumulative {
-                if sample_s < min_successes {
-                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(0.0)));
-                } else {
-                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(1.0)));
-                }
-            } else {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(0.0)));
-            }
-        }
-
-        let result = if cumulative {
-            // CDF: sum from i=min_successes to sample_s of P(X=i)
-            let mut sum = 0.0;
-            for i in min_successes..=sample_s {
-                sum += hypgeom_pmf(i, number_sample, population_s, number_pop);
-            }
-            sum
-        } else {
-            // PMF: C(population_s, sample_s) * C(number_pop - population_s, number_sample - sample_s) / C(number_pop, number_sample)
-            hypgeom_pmf(sample_s, number_sample, population_s, number_pop)
-        };
-
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            result,
-        )))
+        let sample_s = dist::whole_arg(args, 0)?;
+        let number_sample = dist::whole_arg(args, 1)?;
+        let population_s = dist::whole_arg(args, 2)?;
+        let number_pop = dist::whole_arg(args, 3)?;
+        let cumulative = dist::logical_arg(args, 4)?;
+        dist::result(dist::hypgeom_dist(
+            sample_s,
+            number_sample,
+            population_s,
+            number_pop,
+            cumulative,
+        ))
     }
-}
-
-/// Helper: Hypergeometric PMF
-fn hypgeom_pmf(k: i64, n: i64, k_pop: i64, n_pop: i64) -> f64 {
-    // P(X=k) = C(K, k) * C(N-K, n-k) / C(N, n)
-    // Using logs to avoid overflow
-    let ln_prob = ln_binom(k_pop, k) + ln_binom(n_pop - k_pop, n - k) - ln_binom(n_pop, n);
-    ln_prob.exp()
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -6591,7 +5789,8 @@ impl Function for ConfidenceNormFn {
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         let alpha = coerce_num(&scalar_like_value(&args[0])?)?;
         let std_dev = coerce_num(&scalar_like_value(&args[1])?)?;
-        let size = coerce_num(&scalar_like_value(&args[2])?)?;
+        // Excel truncates the size: CONFIDENCE.NORM(0.05,2.5,50.7) is CONFIDENCE.NORM(0.05,2.5,50).
+        let size = coerce_num(&scalar_like_value(&args[2])?)?.trunc();
 
         // Validate inputs
         if alpha <= 0.0 || alpha >= 1.0 {
@@ -6637,7 +5836,7 @@ impl Function for ConfidenceNormFn {
 /// # Remarks
 /// - `alpha` must satisfy `0 < alpha < 1`.
 /// - `standard_dev` must be greater than `0`.
-/// - `size` must be at least `2` so that `df = size - 1` is valid.
+/// - `size` is truncated and must be at least `2` so that `df = size - 1` is valid.
 /// - Returns `#NUM!` when inputs are outside valid bounds.
 ///
 /// # Examples
@@ -6645,13 +5844,13 @@ impl Function for ConfidenceNormFn {
 /// ```yaml,sandbox
 /// title: "95% t-interval half-width"
 /// formula: "=CONFIDENCE.T(0.05,2,25)"
-/// expected: 0.8256636934020788
+/// expected: 0.8255594246512102
 /// ```
 ///
 /// ```yaml,sandbox
 /// title: "90% t-interval half-width"
 /// formula: "=CONFIDENCE.T(0.1,5,10)"
-/// expected: 2.9158049866307585
+/// expected: 2.898406037752281
 /// ```
 #[derive(Debug)]
 pub struct ConfidenceTFn;
@@ -6691,7 +5890,8 @@ impl Function for ConfidenceTFn {
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         let alpha = coerce_num(&scalar_like_value(&args[0])?)?;
         let std_dev = coerce_num(&scalar_like_value(&args[1])?)?;
-        let size = coerce_num(&scalar_like_value(&args[2])?)?;
+        // Excel truncates the size: CONFIDENCE.T(0.05,2,25.7) is CONFIDENCE.T(0.05,2,25).
+        let size = coerce_num(&scalar_like_value(&args[2])?)?.trunc();
 
         // Validate inputs - size must be >= 2 for t-distribution (df = size - 1 >= 1)
         if alpha <= 0.0 || alpha >= 1.0 {
@@ -6712,13 +5912,11 @@ impl Function for ConfidenceTFn {
 
         let df = size - 1.0;
 
-        // t_crit = T.INV(1 - alpha/2, df)
-        let t_crit = match t_inv(1.0 - alpha / 2.0, df) {
-            Some(t) => t,
-            None => {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                    ExcelError::new_num(),
-                )));
+        // t_crit = T.INV.2T(alpha, df)
+        let t_crit = match dist::t_inv_2t(alpha, df) {
+            Ok(t) => t,
+            Err(e) => {
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
             }
         };
 
@@ -6736,9 +5934,9 @@ impl Function for ConfidenceTFn {
 /// `Z.TEST` evaluates whether the sample mean is significantly greater than the target value.
 ///
 /// # Remarks
-/// - Uses provided `sigma` when supplied; otherwise computes population standard deviation.
+/// - Uses provided `sigma` when supplied; otherwise the sample standard deviation.
 /// - Returns `#NUM!` when `sigma <= 0`.
-/// - Returns `#DIV/0!` when implied standard deviation is zero.
+/// - Returns `#DIV/0!` when the sample standard deviation is zero or undefined (one value).
 /// - Returns `#N/A` when the data array has no numeric values.
 ///
 /// # Examples
@@ -6752,7 +5950,7 @@ impl Function for ConfidenceTFn {
 /// ```yaml,sandbox
 /// title: "Z-test with sigma estimated from sample"
 /// formula: "=Z.TEST({1,2,3,4,5},2)"
-/// expected: 0.056923149003329065
+/// expected: 0.07864960352514257
 /// ```
 #[derive(Debug)]
 pub struct ZTestFn;
@@ -6815,7 +6013,8 @@ impl Function for ZTestFn {
         let n = data.len() as f64;
         let mean: f64 = data.iter().sum::<f64>() / n;
 
-        // Calculate sigma: use provided value or compute population std dev
+        // Calculate sigma: the provided value (an empty argument is 0, so
+        // #NUM!), or the sample standard deviation
         let sigma = if args.len() > 2 {
             let s = coerce_num(&scalar_like_value(&args[2])?)?;
             if s <= 0.0 {
@@ -6825,10 +6024,11 @@ impl Function for ZTestFn {
             }
             s
         } else {
-            // Population standard deviation
-            let variance: f64 = data.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
+            // Sample standard deviation (Excel for Windows: Z.TEST({3,6,7,8,6,5,4,2,1,9},4)
+            // is 0.0905741968513638)
+            let variance: f64 = data.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);
             let std_dev = variance.sqrt();
-            if std_dev == 0.0 {
+            if !(std_dev > 0.0) {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new_div(),
                 )));
@@ -7943,7 +7143,7 @@ impl Function for FrequencyFn {
 /// `T.DIST.2T` computes `P(|T| > x)` for the specified degrees of freedom.
 ///
 /// # Remarks
-/// - Requires `x >= 0` and `deg_freedom >= 1`.
+/// - Requires `x >= 0`; `deg_freedom` is truncated and must lie in [1, 1E10].
 /// - Represents a two-sided tail area.
 /// - Returns `#NUM!` when arguments are outside valid ranges.
 /// - Invalid numeric coercions propagate as spreadsheet errors.
@@ -7996,19 +7196,9 @@ impl Function for TDist2TFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let x = coerce_num(&scalar_like_value(&args[0])?)?;
-        let df = coerce_num(&scalar_like_value(&args[1])?)?;
-
-        // x must be non-negative for T.DIST.2T, df must be >= 1
-        if x < 0.0 || df < 1.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        // Two-tailed: P(|T| > x) = 2 * (1 - t_cdf(x, df))
-        let p = 2.0 * (1.0 - t_cdf(x, df));
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(p)))
+        let x = dist::number_arg(args, 0)?;
+        let df = dist::whole_arg(args, 1)?;
+        dist::result(dist::t_dist_2t(x, df))
     }
 }
 
@@ -8019,8 +7209,9 @@ impl Function for TDist2TFn {
 /// `T.INV.2T` solves for `t` such that `P(|T| > t) = probability`.
 ///
 /// # Remarks
-/// - `probability` must satisfy `0 < probability <= 1`.
-/// - `deg_freedom` must be at least `1`.
+/// - `probability` must satisfy `0 < probability < 2`; above 1 the value is negative,
+///   `T.INV(1 - probability/2, deg_freedom)` (`TINV(1.1,10)` is -0.128890189293272).
+/// - `deg_freedom` is truncated and must lie in [1, 1E10].
 /// - Returns `#NUM!` for invalid probability or degree-of-freedom arguments.
 /// - Alias `TINV` is supported.
 ///
@@ -8035,7 +7226,7 @@ impl Function for TDist2TFn {
 /// ```yaml,sandbox
 /// title: "95% two-sided critical value"
 /// formula: "=T.INV.2T(0.05,10)"
-/// expected: 2.228138851986273
+/// expected: 2.2281388519862744
 /// ```
 #[derive(Debug)]
 pub struct TInv2TFn;
@@ -8075,28 +7266,9 @@ impl Function for TInv2TFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let p = coerce_num(&scalar_like_value(&args[0])?)?;
-        let df = coerce_num(&scalar_like_value(&args[1])?)?;
-
-        // probability must be in (0, 1], df >= 1
-        if p <= 0.0 || p > 1.0 || df < 1.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        // For two-tailed: we want t such that P(|T| > t) = p
-        // P(|T| > t) = 2 * (1 - F(t)) where F is CDF
-        // So 1 - F(t) = p/2, meaning F(t) = 1 - p/2
-        // Thus t = t_inv(1 - p/2, df)
-        match t_inv(1.0 - p / 2.0, df) {
-            Some(result) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-                result,
-            ))),
-            None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            ))),
-        }
+        let p = dist::number_arg(args, 0)?;
+        let df = dist::whole_arg(args, 1)?;
+        dist::result(dist::t_inv_2t(p, df))
     }
 }
 
@@ -8277,9 +7449,9 @@ impl Function for TTestFn {
         // Calculate p-value based on tails
         let t_abs = t_stat.abs();
         let p = if tails == 1 {
-            1.0 - t_cdf(t_abs, df)
+            dist::t_upper(t_abs, df)
         } else {
-            2.0 * (1.0 - t_cdf(t_abs, df))
+            2.0 * dist::t_upper(t_abs, df)
         };
 
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(p)))
@@ -8309,7 +7481,7 @@ impl Function for TTestFn {
 /// ```yaml,sandbox
 /// title: "Different variances example"
 /// formula: "=F.TEST({1,2,3,4},{1,1,1,5})"
-/// expected: 0.5466810975407987
+/// expected: 0.4909417371545593
 /// ```
 #[derive(Debug)]
 pub struct FTestFn;
@@ -8395,8 +7567,7 @@ impl Function for FTestFn {
         let df2 = n2f - 1.0;
 
         // Two-tailed p-value: min(F.DIST(f), 1-F.DIST(f)) * 2
-        let p_lower = f_cdf(f, df1, df2);
-        let p_upper = 1.0 - p_lower;
+        let (p_lower, p_upper) = dist::f_tails(f, df1, df2);
         let p = 2.0 * p_lower.min(p_upper);
 
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(p)))
@@ -8412,8 +7583,10 @@ impl Function for FTestFn {
 /// # Remarks
 /// - `actual_range` and `expected_range` must contain the same number of numeric points.
 /// - Expected values must be strictly greater than `0`.
-/// - Requires at least two categories (`df >= 1`).
-/// - Returns `#N/A` for length mismatches or empty inputs, and `#NUM!` for invalid expected values.
+/// - Degrees of freedom are `(rows - 1) * (columns - 1)` for a table, and one less than the
+///   count for a single row or column.
+/// - Returns `#N/A` for shape or length mismatches, empty inputs and a single cell, and `#NUM!`
+///   for invalid expected values.
 ///
 /// # Examples
 ///
@@ -8476,11 +7649,13 @@ impl Function for ChisqTestFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        let (rows, cols) = args[0].range_view_or_scalar()?.dims();
         let actual = collect_numeric_stats(&args[0..1])?;
         let expected = collect_numeric_stats(&args[1..2])?;
 
-        // Arrays must have same length
-        if actual.len() != expected.len() {
+        // Both ranges have the same shape and the same count of numbers
+        if args[1].range_view_or_scalar()?.dims() != (rows, cols) || actual.len() != expected.len()
+        {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_na(),
             )));
@@ -8503,17 +7678,21 @@ impl Function for ChisqTestFn {
             chi_sq += (obs - exp).powi(2) / exp;
         }
 
-        // Degrees of freedom = number of categories - 1
-        let df = (actual.len() - 1) as f64;
-
-        if df < 1.0 {
+        // Degrees of freedom: (rows - 1) * (columns - 1) for a table, one
+        // less than the count for a single row or column; a single cell has none.
+        let df = if rows > 1 && cols > 1 {
+            (rows - 1) * (cols - 1)
+        } else {
+            rows.max(cols) - 1
+        };
+        if df < 1 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
+                ExcelError::new_na(),
             )));
         }
 
-        // P-value = 1 - CHISQ.DIST(chi_sq, df, TRUE) = right-tail probability
-        let p = 1.0 - chisq_cdf(chi_sq, df);
+        // P-value: the right tail of chi-square at the statistic
+        let p = dist::chisq_tails(chi_sq, df as f64).1;
 
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(p)))
     }
@@ -8587,90 +7766,6 @@ fn collect_numeric_a(args: &[ArgumentHandle]) -> Result<Vec<f64>, ExcelError> {
         }
     }
     Ok(out)
-}
-
-/// Helper: inverse of the regularized incomplete beta function.
-/// Given p = I_x(a,b), find x. Uses Newton-Raphson with beta_i / beta PDF.
-fn beta_inv_helper(p: f64, a: f64, b: f64) -> Option<f64> {
-    if p <= 0.0 {
-        return Some(0.0);
-    }
-    if p >= 1.0 {
-        return Some(1.0);
-    }
-    if a <= 0.0 || b <= 0.0 {
-        return None;
-    }
-
-    // Initial guess from normal approximation (Abramowitz & Stegun 26.5.22)
-    let mut x = 0.5f64;
-
-    // Newton-Raphson
-    let ln_beta_ab = ln_gamma(a) + ln_gamma(b) - ln_gamma(a + b);
-    for _ in 0..100 {
-        let cdf = beta_i(x, a, b);
-        // Beta PDF: x^(a-1) * (1-x)^(b-1) / B(a,b)
-        let pdf = if x > 0.0 && x < 1.0 {
-            ((a - 1.0) * x.ln() + (b - 1.0) * (1.0 - x).ln() - ln_beta_ab).exp()
-        } else {
-            1e-30
-        };
-        if pdf.abs() < 1e-30 {
-            break;
-        }
-        let delta = (cdf - p) / pdf;
-        let new_x = (x - delta).clamp(1e-15, 1.0 - 1e-15);
-        if (new_x - x).abs() < 1e-14 {
-            x = new_x;
-            break;
-        }
-        x = new_x;
-    }
-
-    Some(x)
-}
-
-/// Helper: inverse of GAMMA.DIST CDF. Given p = P(alpha, x/beta), find x.
-fn gamma_inv_helper(p: f64, alpha: f64, beta: f64) -> Option<f64> {
-    if p <= 0.0 {
-        return Some(0.0);
-    }
-    if p >= 1.0 {
-        return None;
-    }
-    if alpha <= 0.0 || beta <= 0.0 {
-        return None;
-    }
-
-    // Initial guess
-    let mut x = alpha * beta;
-    if p < 0.5 {
-        x = x.min(beta);
-    }
-
-    // Newton-Raphson on the standardized gamma CDF (gamma_p)
-    for _ in 0..100 {
-        let z = x / beta;
-        let cdf = gamma_p(alpha, z);
-        // Gamma PDF: z^(alpha-1) * e^(-z) / Gamma(alpha) / beta
-        let pdf = if z > 0.0 {
-            ((alpha - 1.0) * z.ln() - z - ln_gamma(alpha)).exp() / beta
-        } else {
-            1e-30
-        };
-        if pdf.abs() < 1e-30 {
-            break;
-        }
-        let delta = (cdf - p) / pdf;
-        let new_x = (x - delta).max(1e-15);
-        if (new_x - x).abs() < 1e-12 * x.max(1e-15) {
-            x = new_x;
-            break;
-        }
-        x = new_x;
-    }
-
-    Some(x)
 }
 
 /* ─────────────────────────── AVERAGEA ──────────────────────────── */
@@ -9299,17 +8394,9 @@ impl Function for TDistRtFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let x = coerce_num(&scalar_like_value(&args[0])?)?;
-        let df = coerce_num(&scalar_like_value(&args[1])?)?;
-        if df < 1.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-        let result = 1.0 - t_cdf(x, df);
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            result,
-        )))
+        let x = dist::number_arg(args, 0)?;
+        let df = dist::whole_arg(args, 1)?;
+        dist::result(dist::t_dist_rt(x, df))
     }
 }
 
@@ -9373,17 +8460,9 @@ impl Function for ChisqDistRtFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let x = coerce_num(&scalar_like_value(&args[0])?)?;
-        let df = coerce_num(&scalar_like_value(&args[1])?)?;
-        if df < 1.0 || x < 0.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-        let result = 1.0 - chisq_cdf(x, df);
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            result,
-        )))
+        let x = dist::number_arg(args, 0)?;
+        let df = dist::whole_arg(args, 1)?;
+        dist::result(dist::chisq_dist_rt(x, df))
     }
 }
 
@@ -9447,27 +8526,9 @@ impl Function for ChisqInvRtFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let p = coerce_num(&scalar_like_value(&args[0])?)?;
-        let df = coerce_num(&scalar_like_value(&args[1])?)?;
-        if df < 1.0 || !(0.0..=1.0).contains(&p) {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-        // Right-tail: CHISQ.INV.RT(p, df) = CHISQ.INV(1-p, df)
-        if p == 0.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-        match chisq_inv(1.0 - p, df) {
-            Some(result) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-                result,
-            ))),
-            None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            ))),
-        }
+        let p = dist::number_arg(args, 0)?;
+        let df = dist::whole_arg(args, 1)?;
+        dist::result(dist::chisq_inv_rt(p, df))
     }
 }
 
@@ -9532,18 +8593,10 @@ impl Function for FDistRtFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let x = coerce_num(&scalar_like_value(&args[0])?)?;
-        let d1 = coerce_num(&scalar_like_value(&args[1])?)?;
-        let d2 = coerce_num(&scalar_like_value(&args[2])?)?;
-        if d1 < 1.0 || d2 < 1.0 || x < 0.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-        let result = 1.0 - f_cdf(x, d1, d2);
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            result,
-        )))
+        let x = dist::number_arg(args, 0)?;
+        let d1 = dist::whole_arg(args, 1)?;
+        let d2 = dist::whole_arg(args, 2)?;
+        dist::result(dist::f_dist_rt(x, d1, d2))
     }
 }
 
@@ -9608,32 +8661,10 @@ impl Function for FInvRtFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let p = coerce_num(&scalar_like_value(&args[0])?)?;
-        let d1 = coerce_num(&scalar_like_value(&args[1])?)?;
-        let d2 = coerce_num(&scalar_like_value(&args[2])?)?;
-        if d1 < 1.0 || d2 < 1.0 || !(0.0..=1.0).contains(&p) {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-        if p == 0.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-        // F.INV.RT(1, d1, d2) = 0 (entire right tail)
-        if p == 1.0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(0.0)));
-        }
-        // F.INV.RT(p, d1, d2) = F.INV(1-p, d1, d2)
-        match f_inv(1.0 - p, d1, d2) {
-            Some(result) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-                result,
-            ))),
-            None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            ))),
-        }
+        let p = dist::number_arg(args, 0)?;
+        let d1 = dist::whole_arg(args, 1)?;
+        let d2 = dist::whole_arg(args, 2)?;
+        dist::result(dist::f_inv_rt(p, d1, d2))
     }
 }
 
@@ -9660,7 +8691,7 @@ impl Function for FInvRtFn {
 ///   - NORM.INV
 /// faq:
 ///   - q: "When does BETA.INV return #NUM!?"
-///     a: "It returns #NUM! for non-positive alpha or beta, invalid bounds, or probabilities outside 0..1."
+///     a: "It returns #NUM! for non-positive alpha or beta, invalid bounds, or a probability that is not strictly between 0 and 1."
 /// ```
 #[derive(Debug)]
 pub struct BetaInvFn;
@@ -9668,10 +8699,10 @@ pub struct BetaInvFn;
 /// Name: BETA.INV
 /// Type: BetaInvFn
 /// Min args: 3
-/// Max args: variadic
-/// Variadic: true
-/// Signature: BETA.INV(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4: number@scalar, arg5...: number@scalar)
-/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg5{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
+/// Max args: 5
+/// Variadic: false
+/// Signature: BETA.INV(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4?: number@scalar, arg5?: number@scalar)
+/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg5{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
 impl Function for BetaInvFn {
@@ -9682,58 +8713,20 @@ impl Function for BetaInvFn {
     fn min_args(&self) -> usize {
         3
     }
-    fn variadic(&self) -> bool {
-        true
-    }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-                ArgSchema::number_lenient_scalar(),
-            ]
-        });
-        &SCHEMA[..]
+        stats_schema!(num, num, num, optional, optional)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let p = coerce_num(&scalar_like_value(&args[0])?)?;
-        let alpha = coerce_num(&scalar_like_value(&args[1])?)?;
-        let beta_param = coerce_num(&scalar_like_value(&args[2])?)?;
-        let a_bound = if args.len() > 3 {
-            coerce_num(&scalar_like_value(&args[3])?)?
-        } else {
-            0.0
-        };
-        let b_bound = if args.len() > 4 {
-            coerce_num(&scalar_like_value(&args[4])?)?
-        } else {
-            1.0
-        };
-
-        if alpha <= 0.0 || beta_param <= 0.0 || a_bound >= b_bound || !(0.0..=1.0).contains(&p) {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        match beta_inv_helper(p, alpha, beta_param) {
-            Some(x_std) => {
-                let result = a_bound + x_std * (b_bound - a_bound);
-                Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-                    result,
-                )))
-            }
-            None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            ))),
-        }
+        let p = dist::number_arg(args, 0)?;
+        let alpha = dist::number_arg(args, 1)?;
+        let beta = dist::number_arg(args, 2)?;
+        let a = dist::optional_arg(args, 3, 0.0)?;
+        let b = dist::optional_arg(args, 4, 1.0)?;
+        dist::result(dist::beta_inv(p, alpha, beta, a, b))
     }
 }
 
@@ -9817,11 +8810,9 @@ impl Function for BinomDistRangeFn {
             )));
         }
 
-        let mut sum = 0.0;
-        for k in s..=s2 {
-            let ln_prob = ln_binom(n, k) + (k as f64) * p.ln() + ((n - k) as f64) * (1.0 - p).ln();
-            sum += ln_prob.exp();
-        }
+        let sum: f64 = (s..=s2)
+            .map(|k| dist::binom_pmf(k as f64, n as f64, p))
+            .sum();
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(sum)))
     }
 }
@@ -9890,30 +8881,10 @@ impl Function for BinomInvFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let n = coerce_num(&scalar_like_value(&args[0])?)?.trunc() as i64;
-        let p = coerce_num(&scalar_like_value(&args[1])?)?;
-        let alpha = coerce_num(&scalar_like_value(&args[2])?)?;
-
-        if n < 0 || !(0.0..=1.0).contains(&p) || !(0.0..=1.0).contains(&alpha) {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        // Find smallest k such that BINOM.DIST(k, n, p, TRUE) >= alpha
-        let mut cum = 0.0;
-        for k in 0..=n {
-            let ln_prob = ln_binom(n, k) + (k as f64) * p.ln() + ((n - k) as f64) * (1.0 - p).ln();
-            cum += ln_prob.exp();
-            if cum >= alpha {
-                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-                    k as f64,
-                )));
-            }
-        }
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-            n as f64,
-        )))
+        let n = dist::whole_arg(args, 0)?;
+        let p = dist::number_arg(args, 1)?;
+        let alpha = dist::number_arg(args, 2)?;
+        dist::result(dist::binom_inv(n, p, alpha))
     }
 }
 
@@ -10056,24 +9027,10 @@ impl Function for GammaInvFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let p = coerce_num(&scalar_like_value(&args[0])?)?;
-        let alpha = coerce_num(&scalar_like_value(&args[1])?)?;
-        let beta = coerce_num(&scalar_like_value(&args[2])?)?;
-
-        if alpha <= 0.0 || beta <= 0.0 || !(0.0..=1.0).contains(&p) {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            )));
-        }
-
-        match gamma_inv_helper(p, alpha, beta) {
-            Some(result) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
-                result,
-            ))),
-            None => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_num(),
-            ))),
-        }
+        let p = dist::number_arg(args, 0)?;
+        let alpha = dist::number_arg(args, 1)?;
+        let beta = dist::number_arg(args, 2)?;
+        dist::result(dist::gamma_inv(p, alpha, beta))
     }
 }
 
@@ -10213,9 +9170,11 @@ impl Function for GammaLnPreciseFn {
     }
 }
 
+mod dist;
 mod ets;
 
 pub fn register_builtins() {
+    dist::register_builtins();
     crate::function_registry::register_builtin(Arc::new(ets::ForecastEtsFn));
     use std::sync::Arc;
     crate::function_registry::register_builtin(Arc::new(ForecastLinearFn));
@@ -10391,8 +9350,8 @@ mod tests_basic_stats {
                 "Φ({z}) = {got} != {expected}"
             );
         }
-        // Tails, including both sides of the |z| ≈ 7.07 branch switch. Hart/West is
-        // accurate in absolute terms; relative error in the far tail is only ~1e-8.
+        // Tails, on both sides of erfc's branch at x = 4 (|z| ≈ 5.66). The bounds are
+        // absolute; Cody's erfc is also relatively precise there.
         for (z, expected) in [
             (-5.0, 2.8665157187919455e-07),
             (-7.0, 1.279812543885835e-12),
