@@ -2485,6 +2485,18 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
         0
     }
 
+    /// The index of `cell`'s next random draw in its current evaluation: 0
+    /// for its first RAND, RANDBETWEEN or RANDARRAY call, 1 for the next, so
+    /// that each call draws its own value. Contexts that do not count give 0.
+    fn next_rng_draw(&self, _cell: Option<CellRef>) -> u64 {
+        0
+    }
+
+    /// `cell`'s formula starts evaluating: its random draws count from 0
+    /// again, so an evaluation repeats its draws (every settle pass of a
+    /// circular reference observes the same sample).
+    fn begin_cell_draws(&self, _cell: CellRef) {}
+
     /* ─────────────── Future-proof IO/backends hooks (default no-op) ─────────────── */
 
     /// Optional: Return the min/max used rows for a set of columns on a sheet.
@@ -2660,6 +2672,12 @@ pub trait FunctionContext<'ctx> {
     fn recalc_epoch(&self) -> u64;
     fn current_cell(&self) -> Option<CellRef>;
 
+    /// The index of the current cell's next random draw
+    /// ([`EvaluationContext::next_rng_draw`]); 0 where draws are not counted.
+    fn next_rng_draw(&self) -> u64 {
+        0
+    }
+
     /// Resolve a reference into a RangeView using the underlying engine context.
     fn resolve_range_view(
         &self,
@@ -2680,6 +2698,12 @@ pub trait FunctionContext<'ctx> {
         let epoch = match self.volatile_level() {
             VolatileLevel::OnRecalc => self.recalc_epoch(),
             _ => 0,
+        };
+        // A cell's later calls take their own stream; its first keeps the
+        // seed it always had.
+        let fn_salt = match self.next_rng_draw() {
+            0 => fn_salt,
+            draw => crate::rng::mix64(fn_salt, draw),
         };
         let (l0, l1) = compose_seed(self.workbook_seed(), sheet_id, row, col, fn_salt, epoch);
         small_rng_from_lanes(l0, l1)
@@ -2849,6 +2873,9 @@ impl<'a> FunctionContext<'a> for DefaultFunctionContext<'a> {
     }
     fn current_cell(&self) -> Option<CellRef> {
         self.current
+    }
+    fn next_rng_draw(&self) -> u64 {
+        self.base.next_rng_draw(self.current)
     }
 
     fn resolve_range_view(

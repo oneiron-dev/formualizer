@@ -1462,6 +1462,12 @@ pub struct Engine<R> {
     /// ([`Self::begin_evaluation_request`]) so all `NOW()`/`TODAY()` reads in
     /// one recalc — including SCC iteration passes — agree (spec §7.11).
     clock: crate::timezone::SnapshotClock,
+    /// Random draws made so far by each cell's current evaluation, so that
+    /// every RAND, RANDBETWEEN or RANDARRAY call (two in one formula, or one
+    /// inside a LAMBDA that MAKEARRAY calls per element) draws its own value,
+    /// as Excel's do. A cell's count restarts when its formula starts
+    /// evaluating; all are cleared at the start of every request.
+    rng_draws: std::sync::Mutex<FxHashMap<crate::CellRef, u64>>,
     thread_pool: Option<Arc<rayon::ThreadPool>>,
     pub recalc_epoch: u64,
     snapshot_id: std::sync::atomic::AtomicU64,
@@ -3513,6 +3519,7 @@ where
             config,
             workbook_load_limits: crate::engine::WorkbookLoadLimits::default(),
             clock: crate::timezone::SnapshotClock::new(clock),
+            rng_draws: std::sync::Mutex::new(FxHashMap::default()),
             thread_pool,
             recalc_epoch: 0,
             snapshot_id: std::sync::atomic::AtomicU64::new(1),
@@ -3690,6 +3697,7 @@ where
             config,
             workbook_load_limits: crate::engine::WorkbookLoadLimits::default(),
             clock: crate::timezone::SnapshotClock::new(clock),
+            rng_draws: std::sync::Mutex::new(FxHashMap::default()),
             thread_pool: Some(thread_pool),
             recalc_epoch: 0,
             snapshot_id: std::sync::atomic::AtomicU64::new(1),
@@ -4560,6 +4568,10 @@ where
         // read within this request (including SCC iteration passes) observes
         // this sample.
         self.clock.refresh();
+        self.rng_draws
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     /// End-of-recalc redirty: volatile vertices (as always) plus members of
@@ -28057,6 +28069,24 @@ where
 
     fn recalc_epoch(&self) -> u64 {
         self.recalc_epoch
+    }
+
+    fn begin_cell_draws(&self, cell: crate::CellRef) {
+        self.rng_draws
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&cell);
+    }
+
+    fn next_rng_draw(&self, cell: Option<crate::CellRef>) -> u64 {
+        let Some(cell) = cell else { return 0 };
+        let mut draws = self
+            .rng_draws
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let draw = draws.entry(cell).or_insert(0);
+        *draw += 1;
+        *draw - 1
     }
 
     fn workbook_sheet_count(&self) -> Option<usize> {

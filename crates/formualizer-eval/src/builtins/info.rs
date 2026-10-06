@@ -1841,10 +1841,10 @@ pub struct CellFn;
 /// 3-D references and a non-reference argument for `address`, `col` or `row`.
 /// An argument that evaluates to an error propagates that error unchanged.
 ///
-/// Known divergence: `CELL("contents", <blank cell>)` produces `Empty` in-graph
-/// where Excel produces numeric `0`, so `ISBLANK(CELL("contents",Z99))` is TRUE
-/// here and FALSE in Excel; tracked in #333 and to be resolved with the #319
-/// blank-coercion variant study.
+/// `CELL("contents", <blank cell>)` is the blank cell's value, as in Excel for
+/// Windows 16.0.20430: a formula cell caches it as 0, `ISBLANK` of it is TRUE,
+/// `ISNUMBER` FALSE and `&"x"` gives `"x"`
+/// (ops/excel-context-probe-20261006.md).
 ///
 /// ```yaml,sandbox
 /// title: "CELL contents"

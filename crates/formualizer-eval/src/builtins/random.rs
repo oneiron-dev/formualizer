@@ -78,6 +78,74 @@ impl Function for RandFn {
     }
 }
 
+impl RandBetweenFn {
+    /// One draw between `bottom` and `top`: from `bottom` rounded up to `top`
+    /// rounded down, but never below the low end (RANDBETWEEN(1.2,1.8) is 2);
+    /// `#NUM!` when `bottom > top`.
+    fn draw(&self, bottom: f64, top: f64, ctx: &dyn FunctionContext<'_>) -> LiteralValue {
+        if bottom > top {
+            return LiteralValue::Error(
+                ExcelError::new(formualizer_common::ExcelErrorKind::Num)
+                    .with_message("RANDBETWEEN: bottom > top".to_string()),
+            );
+        }
+        let low = bottom.ceil();
+        let high = top.floor().max(low);
+        let mut rng = ctx.rng_for_current(self.function_salt());
+        LiteralValue::Number(
+            (low + (rng.gen_range(0.0..1.0) * (high - low + 1.0)).floor()).min(high),
+        )
+    }
+}
+
+/// A RANDBETWEEN argument: one value, or the elements of an array value.
+enum Bound {
+    Value(LiteralValue),
+    Array(Vec<Vec<LiteralValue>>),
+}
+
+impl Bound {
+    fn iter(&self) -> impl Iterator<Item = &Vec<Vec<LiteralValue>>> {
+        match self {
+            Self::Array(cells) => Some(cells),
+            Self::Value(_) => None,
+        }
+        .into_iter()
+    }
+}
+
+/// A RANDBETWEEN argument as Excel reads it: an empty argument is `#N/A` and
+/// a multi-cell reference `#VALUE!`; an array value is drawn element by element.
+fn random_bound(arg: &ArgumentHandle<'_, '_>) -> Result<Bound, ExcelError> {
+    use formualizer_common::ExcelErrorKind;
+    if arg.is_omitted() {
+        return Err(ExcelError::new(ExcelErrorKind::Na));
+    }
+    let value = arg.value()?;
+    match crate::lift::array_rows(&value) {
+        Some(_) if arg.has_reference_semantics() => Err(ExcelError::new(ExcelErrorKind::Value)),
+        Some(cells) => Ok(Bound::Array(cells)),
+        None => Ok(Bound::Value(value.into_literal())),
+    }
+}
+
+/// A bound's number: a number, numeric or date text, or a blank cell (0); a
+/// logical (typed, in a cell or computed) or other text is `#VALUE!`.
+fn bound_number(value: &LiteralValue, arg: &ArgumentHandle<'_, '_>) -> Result<f64, ExcelError> {
+    match value {
+        LiteralValue::Error(error) => Err(error.clone()),
+        LiteralValue::Empty => Ok(0.0),
+        LiteralValue::Boolean(_) | LiteralValue::Array(_) => {
+            Err(ExcelError::new(formualizer_common::ExcelErrorKind::Value))
+        }
+        value => crate::coercion::to_serial_lenient_in_year(
+            value,
+            arg.date_system(),
+            Some(arg.current_year()),
+        ),
+    }
+}
+
 pub fn register_builtins() {
     crate::function_registry::register_builtin(std::sync::Arc::new(RandFn));
     crate::function_registry::register_builtin(std::sync::Arc::new(RandBetweenFn));
@@ -141,8 +209,8 @@ mod tests {
         ];
         let v = f.dispatch(&args, &fctx).unwrap().into_literal();
         match v {
-            LiteralValue::Int(n) => assert!((1..=3).contains(&n)),
-            _ => panic!("Expected Int"),
+            LiteralValue::Number(n) => assert!([1.0, 2.0, 3.0].contains(&n)),
+            _ => panic!("Expected a whole number"),
         }
     }
 }
@@ -155,8 +223,14 @@ pub struct RandBetweenFn;
 /// `RANDBETWEEN` evaluates both bounds, then samples an integer in `[low, high]`.
 ///
 /// # Remarks
-/// - Bounds are coerced to numbers and truncated to integers.
-/// - If `high < low`, the function returns `#NUM!`.
+/// - Bounds are numbers: numeric and date text convert and a blank cell is 0; a logical
+///   (typed, in a cell or computed) or other text is `#VALUE!`, and an empty argument
+///   `#N/A`.
+/// - If `bottom > top`, the function returns `#NUM!`.
+/// - The low end is `bottom` rounded up and the high end `top` rounded down, but never
+///   below the low end: `RANDBETWEEN(1.2,1.8)` is 2 (Excel for Windows 16.0.20430).
+/// - Each call draws its own value, and an array of bounds gives an array of draws; a
+///   multi-cell reference is `#VALUE!`.
 /// - The function is volatile and may return a different integer each recalculation.
 ///
 /// # Examples
@@ -188,7 +262,7 @@ pub struct RandBetweenFn;
 ///   - q: "Are both bounds included in RANDBETWEEN?"
 ///     a: "Yes. RANDBETWEEN samples an integer in the closed interval [low, high]."
 ///   - q: "What happens with decimal bounds like RANDBETWEEN(1.9, 4.2)?"
-///     a: "Bounds are truncated to integers before sampling, so this behaves like RANDBETWEEN(1, 4)."
+///     a: "The bottom rounds up and the top down, so this behaves like RANDBETWEEN(2, 4)."
 ///   - q: "Is RANDBETWEEN deterministic?"
 ///     a: "It is volatile, so results can change on recalculation, though a single evaluation context uses seeded randomness for reproducible execution."
 /// ```
@@ -221,29 +295,37 @@ impl Function for RandBetweenFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        // Evaluate bounds as integers
-        let lo_v = args[0].value()?.into_literal();
-        let hi_v = args[1].value()?.into_literal();
-        let lo = match lo_v {
-            LiteralValue::Int(n) => n,
-            LiteralValue::Number(n) => n as i64,
-            _ => 0,
+        let bottom = random_bound(&args[0])?;
+        let top = random_bound(&args[1])?;
+        let draw = |bottom: &LiteralValue, top: &LiteralValue| {
+            let bounds = bound_number(bottom, &args[0])
+                .and_then(|bottom| Ok((bottom, bound_number(top, &args[1])?)));
+            match bounds {
+                Ok((bottom, top)) => self.draw(bottom, top, ctx),
+                Err(error) => LiteralValue::Error(error),
+            }
         };
-        let hi = match hi_v {
-            LiteralValue::Int(n) => n,
-            LiteralValue::Number(n) => n as i64,
-            _ => 0,
+        // An array of bounds draws once per element (RANDBETWEEN({1,5},{1,5})
+        // is {1,5}); a multi-cell reference is #VALUE! (Excel for Windows
+        // 16.0.20430).
+        let (rows, cols) = crate::lift::broadcast_dims(bottom.iter().chain(top.iter()));
+        let value = match (&bottom, &top) {
+            (Bound::Value(bottom), Bound::Value(top)) => draw(bottom, top),
+            _ => {
+                let element = |bound: &Bound, row: usize, col: usize| match bound {
+                    Bound::Value(value) => value.clone(),
+                    Bound::Array(cells) => crate::lift::broadcast_get(cells, row, col),
+                };
+                let cells = (0..rows)
+                    .map(|row| {
+                        (0..cols)
+                            .map(|col| draw(&element(&bottom, row, col), &element(&top, row, col)))
+                            .collect()
+                    })
+                    .collect();
+                return Ok(crate::lift::array_result(cells, ctx.date_system()));
+            }
         };
-        if hi < lo {
-            return Err(ExcelError::new(formualizer_common::ExcelErrorKind::Num)
-                .with_message("RANDBETWEEN: hi < lo".to_string()));
-        }
-        let mut rng = ctx.rng_for_current(self.function_salt());
-        let n = if (hi - lo) as u64 == u64::MAX {
-            lo
-        } else {
-            rng.gen_range(lo..=hi)
-        };
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Int(n)))
+        Ok(crate::traits::CalcValue::Scalar(value))
     }
 }

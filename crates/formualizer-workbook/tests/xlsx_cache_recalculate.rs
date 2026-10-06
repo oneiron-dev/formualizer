@@ -601,9 +601,10 @@ fn nonportable_literal_errors_are_explicitly_rejected() {
 }
 #[test]
 fn engine_specific_errors_are_unsupported_results_not_invented_excel_tokens() {
-    // R1C1-style INDIRECT still evaluates to the engine-only #N/IMPL!.
+    // CELL over a union of references still evaluates to the engine-only
+    // #N/IMPL! (Excel reads the union's first area: CELL("row",(B2,C3)) is 2).
     let error = recalculate_xlsx_bytes(
-        &fixture("INDIRECT(&quot;R2C2:R3C3&quot;,FALSE)", "99"),
+        &fixture("CELL(&quot;row&quot;,(B2,C3))", "99"),
         Default::default(),
     )
     .unwrap_err();
@@ -613,6 +614,16 @@ fn engine_specific_errors_are_unsupported_results_not_invented_excel_tokens() {
                 || (feature.contains("no approved XLSX cache encoding") && context=="#N/IMPL!")),
         "unexpected error: {error:?}"
     );
+}
+#[test]
+fn r1c1_indirect_reads_relative_to_the_formula_cell() {
+    // RC[1] in A1 is B1, a blank cell (Excel for Windows 16.0.20430).
+    let out = recalculate_xlsx_bytes(
+        &fixture("INDIRECT(&quot;RC[1]&quot;,FALSE)+1", "99"),
+        Default::default(),
+    )
+    .unwrap();
+    assert_eq!(data(&out.bytes, 0), Data::Float(1.0));
 }
 #[test]
 fn arbitrary_stale_error_cache_is_not_evaluator_authority() {

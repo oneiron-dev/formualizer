@@ -7,6 +7,7 @@
 mod hasher;
 pub mod parser;
 pub mod pretty;
+mod r1c1;
 mod structured_ref;
 mod tests;
 pub mod tokenizer;

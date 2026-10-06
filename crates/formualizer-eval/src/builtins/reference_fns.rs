@@ -839,8 +839,12 @@ pub struct OffsetFn;
 /// # Remarks
 /// - `rows` and `cols` shift from the top-left of `reference`.
 /// - If omitted, `height` and `width` default to the original reference size.
-/// - A target that starts before row/column 1, a height or width below 1, or a resized
-///   reference that reaches past row 1,048,576 or column 16,384 returns `#REF!`.
+/// - A negative `height` or `width` extends up or left from the shifted corner
+///   (`OFFSET(B2,0,0,-2,-2)` is `A1:B2`). The far edge is `trunc(size) - 1` from the corner
+///   for a positive size and `trunc(size) + 1` for a negative one, so a size between -1
+///   and 1 spans two rows or columns (`OFFSET(C3,0,0,0.5)` is `C2:C3`).
+/// - A target that reaches before row/column 1 or past row 1,048,576 or column 16,384,
+///   or a height or width of 0, returns `#REF!`.
 /// - Offsets and sizes are numbers: a blank cell is 0, logicals and numeric text convert,
 ///   and other text returns `#VALUE!`.
 /// - In value context, a 1x1 result returns a scalar; larger results spill as an array.
@@ -880,7 +884,7 @@ pub struct OffsetFn;
 ///   - q: "What defaults are used when height and width are omitted?"
 ///     a: "OFFSET keeps the source reference size, then applies the row/column shift to that same-sized block."
 ///   - q: "When does OFFSET return #REF!?"
-///     a: "It returns #REF! if the shifted start goes to row/column <= 0, if requested height/width are non-positive, or if the result reaches past the last row or column of the sheet."
+///     a: "It returns #REF! if the result reaches before row/column 1 or past the last row or column of the sheet, or if the height or width is 0."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: OFFSET
@@ -972,29 +976,42 @@ fn offset_reference<'b>(
     // ranges are clamped to the used region.
     let (sheet, sr, sc, er, ec) = resolve_reference_bounds(ctx, &base)?;
 
-    // An omitted height or width keeps the reference's own size.
+    // An omitted height or width keeps the reference's own size. Excel puts
+    // the far edge trunc(size) - 1 rows (or columns) from the moved corner
+    // for a positive size and trunc(size) + 1 for a negative one, so a
+    // negative size extends up or left (OFFSET(B2,0,0,-2,-2) is A1:B2) and
+    // one between -1 and 1 spans two (OFFSET(C3,0,0,0.5) is C2:C3,
+    // OFFSET(C3,0,0,-0.5) C3:C4); only 0 is #REF! (Excel for Windows
+    // 16.0.20430).
     let size = |index: usize, own: i64| match args.get(index) {
-        Some(arg) if !arg.is_omitted() => offset_number(arg),
-        _ => Ok(own),
+        Some(arg) if !arg.is_omitted() => number_parameter(arg.value()?.into_literal(), arg),
+        _ => Ok(own as f64),
     };
     let height = size(3, i64::from(er) - i64::from(sr) + 1)?;
     let width = size(4, i64::from(ec) - i64::from(sc) + 1)?;
 
     let off_grid = || ExcelError::new(ExcelErrorKind::Ref);
-    if height < 1 || width < 1 {
+    if height == 0.0 || width == 0.0 {
         return Err(off_grid());
     }
-    let top = i64::from(sr).checked_add(rows).ok_or_else(off_grid)?;
-    let left = i64::from(sc).checked_add(cols).ok_or_else(off_grid)?;
-    let bottom = top.checked_add(height - 1).ok_or_else(off_grid)?;
-    let right = left.checked_add(width - 1).ok_or_else(off_grid)?;
+    let corner_row = i64::from(sr).checked_add(rows).ok_or_else(off_grid)?;
+    let corner_col = i64::from(sc).checked_add(cols).ok_or_else(off_grid)?;
+    // The first and last index a size spans from the corner.
+    let span = |corner: i64, size: f64| -> Option<(i64, i64)> {
+        let far = corner
+            .checked_add(size.trunc() as i64)?
+            .checked_add(if size > 0.0 { -1 } else { 1 })?;
+        Some((corner.min(far), corner.max(far)))
+    };
+    let (top, bottom) = span(corner_row, height).ok_or_else(off_grid)?;
+    let (left, right) = span(corner_col, width).ok_or_else(off_grid)?;
     let on_grid = |first: i64, last: i64, max: u32| first >= 1 && last <= i64::from(max);
     if !on_grid(top, bottom, EXCEL_MAX_ROW) || !on_grid(left, right, EXCEL_MAX_COL) {
         return Err(off_grid());
     }
     // Every bound is now within 1..=1,048,576.
     let (top, left, bottom, right) = (top as u32, left as u32, bottom as u32, right as u32);
-    Ok(if height == 1 && width == 1 {
+    Ok(if top == bottom && left == right {
         ReferenceType::cell(sheet, top, left)
     } else {
         ReferenceType::range(sheet, Some(top), Some(left), Some(bottom), Some(right))
@@ -1077,7 +1094,9 @@ pub struct IndirectFn;
 ///
 /// # Remarks
 /// - `a1_style` defaults to `TRUE` (A1 style parsing).
-/// - `a1_style=FALSE` (R1C1 parsing) is currently not implemented and returns `#N/IMPL!`.
+/// - `a1_style=FALSE` reads R1C1 text as Excel does: `R2C3`, `R[-1]C[2]` relative to the
+///   formula's cell (wrapping around the grid's edge), whole rows `R2` and columns `C3`,
+///   ranges `R1C1:R2C2`, with an optional sheet (`ReferenceType::parse_r1c1`).
 /// - Invalid or unresolved references return `#REF!`; so does a number, logical or blank `ref_text`.
 /// - A defined name must be defined as a reference: a name that holds a value
 ///   (`={1,2,3}`, `=5`, a formula that evaluates to no reference) is `#REF!`.
@@ -1110,7 +1129,7 @@ pub struct IndirectFn;
 ///   - OFFSET
 /// faq:
 ///   - q: "What happens if a1_style is FALSE?"
-///     a: "R1C1 parsing is not implemented here yet, so INDIRECT(...,FALSE) returns #N/IMPL!."
+///     a: "ref_text is read as R1C1 text: INDIRECT(\"R[1]C\",FALSE) is the cell below the formula's."
 ///   - q: "How are bad reference strings reported?"
 ///     a: "If the text cannot be parsed or resolved to a valid reference, INDIRECT returns #REF!."
 /// ```
@@ -1155,8 +1174,11 @@ impl Function for IndirectFn {
                 .context
                 .is_value_name(name, ctx.current_sheet())
         };
+        let origin = ctx
+            .current_cell()
+            .map(|cell| (cell.coord.row() + 1, cell.coord.col() + 1));
         Some(
-            indirect_text_reference(args)
+            indirect_text_reference(args, origin)
                 .and_then(|reference| crate::traits::reference_as_area(ctx, reference))
                 .and_then(|reference| indirect_reference_exists(reference, ctx, holds_value)),
         )
@@ -1203,8 +1225,12 @@ impl Function for IndirectFn {
     }
 }
 
-/// The reference INDIRECT's text spells (A1 style), before checking that it exists.
-fn indirect_text_reference(args: &[ArgumentHandle<'_, '_>]) -> Result<ReferenceType, ExcelError> {
+/// The reference INDIRECT's text spells, before checking that it exists; R1C1
+/// text is read relative to `origin`, the formula's 1-based row and column.
+fn indirect_text_reference(
+    args: &[ArgumentHandle<'_, '_>],
+    origin: Option<(u32, u32)>,
+) -> Result<ReferenceType, ExcelError> {
     if args.is_empty() {
         return Err(ExcelError::new(ExcelErrorKind::Value));
     }
@@ -1234,18 +1260,28 @@ fn indirect_text_reference(args: &[ArgumentHandle<'_, '_>]) -> Result<ReferenceT
 
     if !a1_style {
         // The A1/R1C1 flag does not apply to defined names or tables (they are
-        // neither A1 nor R1C1 syntax). Excel resolves `INDIRECT(name, FALSE)`
-        // exactly like `INDIRECT(name)`, so handle those before refusing R1C1.
-        // Real R1C1 cell/range text remains unsupported.
-        return match ReferenceType::from_string(&ref_text) {
-            Ok(reference @ (ReferenceType::NamedRange(_) | ReferenceType::Table(_))) => {
-                Ok(reference)
+        // neither A1 nor R1C1 syntax): Excel resolves `INDIRECT(name, FALSE)`
+        // exactly like `INDIRECT(name)`. No name can spell R1C1 text.
+        // No name holds a space, and `R` and `C` name no table
+        // (`R[1048576]` is R1C1 text off the grid).
+        return ReferenceType::parse_r1c1(&ref_text, origin).or_else(|_| {
+            let name = ref_text.trim_end_matches(' ');
+            if name.contains(char::is_whitespace) {
+                return Err(ExcelError::new(ExcelErrorKind::Ref));
             }
-            _ => Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
-                "INDIRECT with R1C1 style (second argument FALSE) is not yet supported",
-            )),
-        };
+            match ReferenceType::from_string(name) {
+                Ok(reference @ ReferenceType::NamedRange(_)) => Ok(reference),
+                Ok(ReferenceType::Table(table))
+                    if !table.name.eq_ignore_ascii_case("R")
+                        && !table.name.eq_ignore_ascii_case("C") =>
+                {
+                    Ok(ReferenceType::Table(table))
+                }
+                _ => Err(ExcelError::new(ExcelErrorKind::Ref)),
+            }
+        });
     }
+    let ref_text = a1_text(&ref_text);
 
     let sheet_name = |sheet: formualizer_common::SheetLocator<'_>| match sheet {
         formualizer_common::SheetLocator::Current => None,
@@ -1277,6 +1313,41 @@ fn indirect_text_reference(args: &[ArgumentHandle<'_, '_>]) -> Result<ReferenceT
             }
             _ => Err(ExcelError::new(ExcelErrorKind::Ref)),
         },
+    }
+}
+
+/// A1 text as Excel's INDIRECT reads it: spaces may trail the text, follow
+/// the sheet's `!` and surround the `:` between two cells (`A1 : B2`), but not
+/// lead the text, sit inside a part or by the `:` of a row or column range
+/// (`A :B` is #REF!), as Excel for Windows 16.0.20430 reads it.
+fn a1_text(text: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    let trimmed = text.trim_end_matches(' ');
+    let (sheet, area) = match trimmed.rfind('!') {
+        Some(bang) => trimmed.split_at(bang + 1),
+        None => ("", trimmed),
+    };
+    let area = if sheet.is_empty() {
+        area
+    } else {
+        area.trim_start_matches(' ')
+    };
+    let area = match area.split_once(':') {
+        Some((first, second)) => {
+            let (start, end) = (first.trim_end_matches(' '), second.trim_start_matches(' '));
+            let cell = |part: &str| formualizer_common::parse_a1_1based(part).is_ok();
+            if (start.len(), end.len()) != (first.len(), second.len()) && cell(start) && cell(end) {
+                Cow::Owned(format!("{start}:{end}"))
+            } else {
+                Cow::Borrowed(area)
+            }
+        }
+        None => Cow::Borrowed(area),
+    };
+    if sheet.len() + area.len() == text.len() {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(format!("{sheet}{area}"))
     }
 }
 

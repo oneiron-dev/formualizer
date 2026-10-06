@@ -541,6 +541,12 @@ impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
     fn recalc_epoch(&self) -> u64 {
         self.engine.recalc_epoch()
     }
+    fn next_rng_draw(&self, cell: Option<CellRef>) -> u64 {
+        self.engine.next_rng_draw(cell)
+    }
+    fn begin_cell_draws(&self, cell: CellRef) {
+        self.engine.begin_cell_draws(cell)
+    }
     fn used_rows_for_columns(
         &self,
         sheet: &str,

@@ -1620,10 +1620,13 @@ pub struct RandArrayFn;
 /// `RANDARRAY` can return decimal values or whole numbers in a specified range.
 ///
 /// # Remarks
-/// - Defaults: `rows=1`, `columns=1`, `min=0`, `max=1`, `whole_number=FALSE`.
+/// - Defaults: `rows=1`, `columns=1`, `min=0`, `max=1`, `whole_number=FALSE`; an empty
+///   argument takes its default.
 /// - The function is non-deterministic and recalculates to new values.
 /// - For whole numbers, values are generated in an inclusive integer range.
-/// - `rows <= 0`, `columns <= 0`, or invalid integer bounds return `#VALUE!`.
+/// - An argument's error comes first. Then a negative `rows` or `columns` is `#VALUE!`,
+///   a zero one (sizes truncate) `#CALC!`, and `max < min`, or a `min` or `max` that is
+///   not whole when `whole_number` is TRUE, `#VALUE!` (Excel for Windows 16.0.20430).
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -1742,80 +1745,76 @@ impl Function for RandArrayFn {
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         use rand::Rng;
 
-        // Extract numbers (allow float but coerce to i64 for dimensions)
-        let num = |a: &ArgumentHandle| -> Result<f64, ExcelError> {
-            Ok(match a.value()?.into_literal() {
-                LiteralValue::Int(i) => i as f64,
-                LiteralValue::Number(n) => n,
-                LiteralValue::Error(e) => return Err(e),
-                _other => {
-                    return Err(ExcelError::new(ExcelErrorKind::Value));
-                }
-            })
+        // Every argument is read first, so its error comes before any check
+        // of the values (RANDARRAY(-1,1/0) is #DIV/0!). Numbers: a logical
+        // and numeric text convert, a blank cell is 0, other text #VALUE!; an
+        // empty or missing argument takes its default.
+        let number = |index: usize, default: f64| -> Result<f64, ExcelError> {
+            match args.get(index) {
+                Some(arg) if !arg.is_omitted() => match arg.value()?.into_literal() {
+                    LiteralValue::Error(e) => Err(e),
+                    LiteralValue::Empty => Ok(0.0),
+                    LiteralValue::Array(_) => Err(ExcelError::new(ExcelErrorKind::Value)),
+                    LiteralValue::Boolean(flag) => Ok(f64::from(u8::from(flag))),
+                    value => crate::coercion::to_number_lenient_with_locale(&value, &ctx.locale()),
+                },
+                _ => Ok(default),
+            }
+        };
+        let rows = number(0, 1.0)?.trunc();
+        let cols = number(1, 1.0)?.trunc();
+        let min_val = number(2, 0.0)?;
+        let max_val = number(3, 1.0)?;
+        let whole_number = match args.get(4) {
+            Some(arg) if !arg.is_omitted() => {
+                crate::coercion::to_logical(&arg.value()?.into_literal())?
+            }
+            _ => false,
         };
 
-        let rows = if !args.is_empty() {
-            num(&args[0])? as i64
-        } else {
-            1
+        // A negative size is #VALUE! and an empty one #CALC!, before the
+        // bounds: max below min, or a whole-number bound that is not whole,
+        // is #VALUE! (Excel for Windows 16.0.20430).
+        let error = |kind| {
+            Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                ExcelError::new(kind),
+            )))
         };
-        let cols = if args.len() >= 2 {
-            num(&args[1])? as i64
-        } else {
-            1
-        };
-        let min_val = if args.len() >= 3 { num(&args[2])? } else { 0.0 };
-        let max_val = if args.len() >= 4 { num(&args[3])? } else { 1.0 };
-        let whole_number = if args.len() >= 5 {
-            matches!(args[4].value()?.into_literal(), LiteralValue::Boolean(true))
-        } else {
-            false
-        };
-
-        // Validate dimensions
-        if rows <= 0 || cols <= 0 {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new(ExcelErrorKind::Value),
-            )));
+        if rows < 0.0 || cols < 0.0 {
+            return error(ExcelErrorKind::Value);
         }
-
-        // Validate min <= max for whole numbers
-        if whole_number && min_val > max_val {
-            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new(ExcelErrorKind::Value),
-            )));
+        if rows == 0.0 || cols == 0.0 {
+            return error(ExcelErrorKind::Calc);
         }
-
+        if min_val > max_val || (whole_number && (min_val.fract() != 0.0 || max_val.fract() != 0.0))
+        {
+            return error(ExcelErrorKind::Value);
+        }
+        // More rows or columns than the grid has is #VALUE!.
+        if rows > 1_048_576.0 || cols > 16_384.0 {
+            return error(ExcelErrorKind::Value);
+        }
+        let (rows, cols) = (rows as i64, cols as i64);
         if let Some(e) = generated_array_too_large(rows, cols) {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
         }
 
         let mut rng = ctx.rng_for_current(self.function_salt());
-        let mut out: Vec<Vec<LiteralValue>> = Vec::with_capacity(rows as usize);
-
-        for _r in 0..rows {
-            let mut row_vec: Vec<LiteralValue> = Vec::with_capacity(cols as usize);
-            for _c in 0..cols {
-                let value = if whole_number {
-                    // Generate random integer in range [min, max] inclusive
-                    let min_int = min_val.ceil() as i64;
-                    let max_int = max_val.floor() as i64;
-                    if min_int > max_int {
-                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                            ExcelError::new(ExcelErrorKind::Value),
-                        )));
-                    }
-                    let rand_int = rng.gen_range(min_int..=max_int);
-                    LiteralValue::Int(rand_int)
-                } else {
-                    // Generate random float in range [min, max)
-                    let rand_float = rng.r#gen::<f64>() * (max_val - min_val) + min_val;
-                    LiteralValue::Number(rand_float)
-                };
-                row_vec.push(value);
-            }
-            out.push(row_vec);
-        }
+        let out: Vec<Vec<LiteralValue>> = (0..rows)
+            .map(|_| {
+                (0..cols)
+                    .map(|_| {
+                        let r: f64 = rng.gen_range(0.0..1.0);
+                        LiteralValue::Number(if whole_number {
+                            // An integer from min to max inclusive.
+                            (min_val + (r * (max_val - min_val + 1.0)).floor()).min(max_val)
+                        } else {
+                            min_val + r * (max_val - min_val)
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
 
         Ok(collapse_if_scalar(out, ctx.date_system()))
     }
@@ -3748,8 +3747,10 @@ mod tests {
         let wb = TestWorkbook::new().with_function(Arc::new(RandArrayFn));
         let ctx = wb.interpreter();
         let f = ctx.context.get_function("", "RANDARRAY").unwrap();
+        // Within the grid's rows and columns but too many cells; past the
+        // grid it is #VALUE! (RANDARRAY(1048577), Excel for Windows 16.0.20430).
         let rows = lit(LiteralValue::Number(1e6));
-        let cols = lit(LiteralValue::Number(1e6));
+        let cols = lit(LiteralValue::Number(16_384.0));
         let args = vec![
             ArgumentHandle::new(&rows, &ctx),
             ArgumentHandle::new(&cols, &ctx),

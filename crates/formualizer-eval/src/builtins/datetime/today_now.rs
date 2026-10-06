@@ -2,7 +2,7 @@
 
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, FunctionContext};
-use formualizer_common::{ExcelError, LiteralValue, date_to_serial_for, datetime_to_serial_for};
+use formualizer_common::{ExcelError, LiteralValue, date_to_serial_for};
 use formualizer_macros::func_caps;
 
 /// Returns the current date as a volatile serial value.
@@ -82,7 +82,9 @@ impl Function for TodayFn {
 ///
 /// # Remarks
 /// - `NOW` is volatile and may produce a different value at each recalculation.
-/// - The integer part is the current date serial; the fractional part is time of day.
+/// - The integer part is the current date serial; the fractional part is time of day,
+///   to the hundredth of a second, the resolution of Excel's clock (Excel for Windows
+///   16.0.20430: `NOW()*8640000` is a whole number).
 /// - Serial output respects the active workbook date system (`1900` or `1904`).
 ///
 /// # Examples
@@ -143,8 +145,12 @@ impl Function for NowFn {
         _args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        use chrono::Timelike;
         let now = ctx.clock().now();
-        let serial = datetime_to_serial_for(ctx.date_system(), &now);
+        let centiseconds =
+            now.num_seconds_from_midnight() * 100 + (now.nanosecond() % 1_000_000_000) / 10_000_000;
+        let serial = date_to_serial_for(ctx.date_system(), &now.date())
+            + f64::from(centiseconds) / 8_640_000.0;
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
             serial,
         )))

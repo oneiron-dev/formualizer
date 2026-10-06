@@ -365,7 +365,7 @@ type RangePartWithAbs = (AxisPartWithAbs, AxisPartWithAbs);
 
 /// Result of extracting the sheet portion of a reference string.
 #[derive(Debug, Clone)]
-enum SheetSpec {
+pub(crate) enum SheetSpec {
     /// No sheet segment was present (e.g. plain `A1`).
     None,
     /// Standard single-sheet reference (`Sheet1!A1`, `'Sheet 1'!A1`).
@@ -1210,7 +1210,7 @@ impl ReferenceType {
 
     /// Extract sheet specification (none, single sheet, or 3D sheet range)
     /// from a reference string.
-    fn extract_sheet_spec(reference: &str) -> (SheetSpec, String) {
+    pub(crate) fn extract_sheet_spec(reference: &str) -> (SheetSpec, String) {
         let Some((first_name, after_first, first_quoted)) = Self::read_sheet_segment(reference, 0)
         else {
             // No sheet segment recognised – fall back to looking for a bare

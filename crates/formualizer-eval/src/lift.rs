@@ -106,6 +106,9 @@ pub(crate) fn lift_spec(name: &str) -> Option<Lift> {
         | "ODDLPRICE" | "ODDLYIELD" => Lift::All,
         // The schedule is an array.
         "FVSCHEDULE" => Lift::Only(&[0]),
+        // An array of sizes or bounds makes one array per element, each
+        // giving its first value (RANDARRAY({1,2}) spills two draws).
+        "RANDARRAY" => Lift::All,
         // Statistical distributions, current and compatibility names alike,
         // take single values only (SUM(T.DIST({0,1},10,TRUE)) is two values).
         "NORM.DIST" | "NORM.INV" | "NORM.S.DIST" | "NORM.S.INV" | "STANDARDIZE" | "FISHER"
@@ -302,6 +305,10 @@ pub(crate) fn legacy_arg(fun: &dyn Function, index: usize) -> LegacyArg {
         | "DAVERAGE" | "DCOUNT" | "DCOUNTA" | "DGET" | "DMAX" | "DMIN" | "DPRODUCT" | "DSTDEV"
         | "DSTDEVP" | "DSUM" | "DVAR" | "DVARP" => Reference,
         "CELL" | "XNPV" => split(1, Value, Reference),
+        // Analysis ToolPak bounds do not intersect: RANDBETWEEN(A1:A2,100) is
+        // #VALUE! in a formula saved without the array flag (Excel for Windows
+        // 16.0.20430).
+        "RANDBETWEEN" => Reference,
         "XIRR" => split(2, Reference, Value),
         "SERIESSUM" => split(3, Value, Reference),
         "TEXTJOIN" => {

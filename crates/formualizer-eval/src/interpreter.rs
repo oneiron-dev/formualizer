@@ -251,6 +251,7 @@ impl<'a> Interpreter<'a> {
         current_sheet: &'a str,
         cell: crate::CellRef,
     ) -> Self {
+        context.begin_cell_draws(cell);
         Self {
             context,
             current_sheet,
@@ -318,6 +319,7 @@ impl<'a> Interpreter<'a> {
     }
 
     pub(crate) fn with_current_cell(&self, cell: crate::CellRef) -> Self {
+        self.context.begin_cell_draws(cell);
         Self {
             context: self.context,
             current_sheet: self.current_sheet,
