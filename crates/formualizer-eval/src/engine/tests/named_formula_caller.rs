@@ -5,7 +5,7 @@
 //! recorded for the host.
 
 use crate::engine::named_range::{NameScope, NamedDefinition};
-use crate::engine::{Engine, EvalConfig};
+use crate::engine::{CycleConfig, CycleDetection, CyclePolicy, Engine, EvalConfig};
 use crate::test_workbook::TestWorkbook;
 use formualizer_common::{ExcelErrorKind, LiteralValue};
 use formualizer_parse::parser::parse;
@@ -16,6 +16,17 @@ fn engine(seed: u64) -> Engine<TestWorkbook> {
         ..EvalConfig::default()
     };
     Engine::new(TestWorkbook::new(), config)
+}
+
+/// Excel with iterative calculation off, as the cache writer runs it.
+fn retain_engine() -> Engine<TestWorkbook> {
+    Engine::new(
+        TestWorkbook::new(),
+        EvalConfig::default().with_cycle(CycleConfig {
+            detection: CycleDetection::Runtime,
+            policy: CyclePolicy::RetainLastValue,
+        }),
+    )
 }
 
 fn define(engine: &mut Engine<TestWorkbook>, name: &str, formula: &str) {
@@ -201,5 +212,120 @@ fn indirect_text_naming_a_workbook_is_recorded() {
         ),
     ] {
         assert_eq!(reads_a_workbook(text), (false, expected), "{text}");
+    }
+}
+
+#[test]
+fn a_name_reading_its_callers_cell_is_a_circular_reference() {
+    // Review of oneiron #1295: Loop = INDIRECT("RC",FALSE)+1 in B2 reads B2.
+    // The read was no dependency of B2, so B2 was scheduled as acyclic and
+    // cached 1 (B2 read as blank). Like =INDIRECT("RC",FALSE)+1 written in
+    // B2, it is circular, and with iteration off B2 keeps its last calculated
+    // value (17, the file's cache).
+    for written in ["=Loop", "=INDIRECT(\"RC\",FALSE)+1"] {
+        let mut engine = retain_engine();
+        define(&mut engine, "Loop", "=INDIRECT(\"RC\",FALSE)+1");
+        formula(&mut engine, "Sheet1", 2, 2, written);
+        engine.set_last_calculated_value("Sheet1", 2, 2, LiteralValue::Number(17.0));
+        engine.evaluate_all().unwrap();
+        assert_eq!(number(&engine, "Sheet1", 2, 2), 17.0, "{written}");
+        assert_eq!(
+            engine.last_cycle_telemetry().live_cycles_witnessed,
+            1,
+            "{written}"
+        );
+    }
+}
+
+#[test]
+fn a_names_reads_are_its_callers_dependencies() {
+    let mut engine = retain_engine();
+    define(&mut engine, "Next", "=INDIRECT(\"RC[1]\",FALSE)");
+    define(&mut engine, "Loop", "=INDIRECT(\"RC\",FALSE)+1");
+    define(&mut engine, "Again", "=Loop*1");
+    define(&mut engine, "Fixed", "=INDIRECT(\"Sheet1!B8\")+1");
+    define(&mut engine, "Prev", "=INDIRECT(\"RC[-1]\",FALSE)");
+    // B4 reads C4 through Next, and C4 reads B4: a cycle through the name.
+    formula(&mut engine, "Sheet1", 4, 2, "=Next+1");
+    formula(&mut engine, "Sheet1", 4, 3, "=B4*2");
+    engine.set_last_calculated_value("Sheet1", 4, 2, LiteralValue::Number(3.0));
+    engine.set_last_calculated_value("Sheet1", 4, 3, LiteralValue::Number(6.0));
+    // Through a name that uses the name.
+    formula(&mut engine, "Sheet1", 6, 2, "=Again");
+    engine.set_last_calculated_value("Sheet1", 6, 2, LiteralValue::Number(5.0));
+    // A name whose INDIRECT text is fixed reads its target for every caller.
+    formula(&mut engine, "Sheet1", 8, 2, "=Fixed");
+    engine.set_last_calculated_value("Sheet1", 8, 2, LiteralValue::Number(9.0));
+    // In a branch IF does not take, the name is not read: no circularity.
+    formula(&mut engine, "Sheet1", 9, 2, "=IF(TRUE,5,Loop)");
+    // B10 reads A10 through Prev; A10 is a formula over C12, both entered
+    // after B10, so only the read through the name orders them.
+    formula(&mut engine, "Sheet1", 10, 2, "=Prev+1");
+    formula(&mut engine, "Sheet1", 10, 1, "=C12*2");
+    engine
+        .set_cell_value("Sheet1", 12, 3, LiteralValue::Number(21.0))
+        .unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(number(&engine, "Sheet1", 4, 2), 3.0);
+    assert_eq!(number(&engine, "Sheet1", 4, 3), 6.0);
+    assert_eq!(number(&engine, "Sheet1", 6, 2), 5.0);
+    assert_eq!(number(&engine, "Sheet1", 8, 2), 9.0);
+    assert_eq!(number(&engine, "Sheet1", 9, 2), 5.0);
+    assert_eq!(number(&engine, "Sheet1", 10, 1), 42.0);
+    assert_eq!(number(&engine, "Sheet1", 10, 2), 43.0);
+    assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 3);
+}
+
+#[test]
+fn a_name_resolved_as_a_reference_draws_once() {
+    // Review of oneiron #1295: Pick = OFFSET(Sheet1!$C$1,RANDBETWEEN(0,1),0)
+    // in B1 = Pick+0 was resolved as a reference (drawing 0.508..., row
+    // offset 1), discarded because it is one cell, and evaluated again
+    // (drawing 0.114..., offset 0): 10 where the inline formula gives 20 for
+    // seed 7. A name evaluates once where it is used, drawing what the same
+    // formula written there draws.
+    let run = |seed: u64, written: &str| {
+        let mut engine = engine(seed);
+        define(
+            &mut engine,
+            "Pick",
+            "=OFFSET(Sheet1!$C$1,RANDBETWEEN(0,1),0)",
+        );
+        engine
+            .set_cell_value("Sheet1", 1, 3, LiteralValue::Number(10.0))
+            .unwrap();
+        engine
+            .set_cell_value("Sheet1", 2, 3, LiteralValue::Number(20.0))
+            .unwrap();
+        formula(&mut engine, "Sheet1", 1, 2, written);
+        // A workbook's ordinary formulas are not array formulas.
+        engine.use_legacy_array_semantics();
+        engine.evaluate_all().unwrap();
+        value(&engine, "Sheet1", 1, 2)
+    };
+    let inline = "OFFSET(Sheet1!$C$1,RANDBETWEEN(0,1),0)";
+    assert_eq!(run(7, "=Pick+0"), LiteralValue::Number(20.0));
+    assert_eq!(run(7, &format!("={inline}+0")), LiteralValue::Number(20.0));
+    for form in [
+        "=Pick+0",
+        "=-Pick",
+        "=ABS(Pick)",
+        "=Pick&\"\"",
+        "=N(Pick)",
+        "=SUM(Pick)",
+        "=Pick+Pick",
+        "=ROW(Pick)+RAND()",
+        "=Pick*RAND()",
+        "=INDEX(Pick,1)+RAND()",
+        "=IF(TRUE,Pick)+RAND()",
+    ] {
+        let inline_form = form.replace("Pick", inline);
+        for seed in 1..=12 {
+            assert_eq!(
+                run(seed, form),
+                run(seed, &inline_form),
+                "{form} seed {seed}"
+            );
+        }
     }
 }

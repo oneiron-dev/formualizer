@@ -5,6 +5,7 @@ use crate::engine::used_extent::{
     ExtentPolicy, OpenRangeBounds, ResolvedExtent, resolve_used_extent_with_fallback,
 };
 use crate::formula_plane::region_index::Region;
+use crate::interpreter::EvaluationScope;
 use crate::traits::{
     EvaluationContext, FunctionProvider, NamedRangeResolver, Range, RangeResolver,
     ReferenceResolver, Resolver, SourceResolver, Table, TableResolver,
@@ -219,11 +220,12 @@ impl<'a, R: EvaluationContext> EvaluationContext for DynamicRefCollector<'a, R> 
         name: &str,
         current_sheet: &str,
     ) -> Option<Result<ReferenceType, ExcelError>> {
-        self.engine.resolve_name_reference(name, current_sheet)
+        self.engine
+            .resolve_name_reference_via(self, name, current_sheet)
     }
 
     fn is_value_name(&self, name: &str, current_sheet: &str) -> bool {
-        self.engine.is_value_name(name, current_sheet)
+        self.engine.is_value_name_via(self, name, current_sheet)
     }
 
     fn resolve_name_reference_array(
@@ -232,7 +234,7 @@ impl<'a, R: EvaluationContext> EvaluationContext for DynamicRefCollector<'a, R> 
         current_sheet: &str,
     ) -> Option<Result<Vec<Vec<Result<ReferenceType, ExcelError>>>, ExcelError>> {
         self.engine
-            .resolve_name_reference_array(name, current_sheet)
+            .resolve_name_reference_array_via(self, name, current_sheet)
     }
 
     fn resolve_name_areas(
@@ -240,7 +242,8 @@ impl<'a, R: EvaluationContext> EvaluationContext for DynamicRefCollector<'a, R> 
         name: &str,
         current_sheet: &str,
     ) -> Option<Result<Vec<ReferenceType>, ExcelError>> {
-        self.engine.resolve_name_areas(name, current_sheet)
+        self.engine
+            .resolve_name_areas_via(self, name, current_sheet)
     }
 
     fn workbook_file_name(&self) -> Option<String> {
@@ -339,6 +342,12 @@ impl<'a, R: EvaluationContext> EvaluationContext for DynamicRefCollector<'a, R> 
                 {
                     let vid = nr.vertex;
                     self.collected.lock().unwrap().insert(vid);
+                }
+                // A name's formula evaluates for the formula that uses it,
+                // through this collector: what it reads (`INDIRECT("RC",FALSE)`
+                // used in B2 reads B2) the formula reads.
+                if let Some(view) = self.engine.named_formula_view(self, name, current_sheet) {
+                    return view;
                 }
             }
             ReferenceType::Table(_) => {
@@ -507,6 +516,9 @@ impl DynamicRefVirtualDepProvider {
             .graph
             .get_cell_ref(v)
             .unwrap_or_else(|| engine.graph.make_cell_ref(sheet_name, 0, 0));
+        // The names the formula uses read from its cell, as when it
+        // calculates; the draws made here are its own and discarded.
+        let _scope = EvaluationScope::reads_of(cell_ref);
         let interpreter = engine.formula_interpreter(&collector, sheet_name, cell_ref);
         let _ = interpreter.evaluate_arena_ast(
             ast_id,

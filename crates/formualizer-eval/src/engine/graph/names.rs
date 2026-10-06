@@ -470,6 +470,7 @@ impl DependencyGraph {
                 if !referenced_names.is_empty() {
                     self.attach_vertex_to_names(vertex, &referenced_names);
                 }
+                self.mark_name_users_dynamic(vertex);
                 self.rebuild_area_numbering_name_consumers(&dependents);
                 // Propagate from the rebound name vertex itself, after its
                 // edges are current, so the transitive closure is reached.
@@ -664,8 +665,87 @@ impl DependencyGraph {
                 recorded.push(name_vertex);
             }
         }
+        if self.is_formula_vertex(vertex)
+            && recorded
+                .iter()
+                .any(|&name_vertex| self.name_reads_dynamically(name_vertex))
+        {
+            self.store.set_dynamic(vertex, true);
+        }
         if !recorded.is_empty() {
             self.vertex_to_names.insert(vertex, recorded);
+        }
+    }
+
+    fn is_formula_vertex(&self, vertex: VertexId) -> bool {
+        matches!(
+            self.store.kind(vertex),
+            VertexKind::FormulaScalar | VertexKind::FormulaArray
+        )
+    }
+
+    /// Whether the formula of the name at `name_vertex` reads references it
+    /// finds while it calculates (INDIRECT, OFFSET), itself or through a name
+    /// it uses. A name evaluates for the formula that uses it, so that
+    /// formula reads them, from its own cell (`Loop = INDIRECT("RC",FALSE)+1`
+    /// used in B2 reads B2): it is dynamic like the formula written in the
+    /// name's place, and what it reads is found the same way.
+    pub(crate) fn name_reads_dynamically(&self, name_vertex: VertexId) -> bool {
+        let mut seen = FxHashSet::default();
+        let mut pending = vec![name_vertex];
+        while let Some(vertex) = pending.pop() {
+            if !seen.insert(vertex) {
+                continue;
+            }
+            let Some(named) = self.named_range_by_vertex(vertex) else {
+                continue;
+            };
+            if let NamedDefinition::Formula { ast, .. } = &named.definition
+                && self.is_ast_dynamic(ast)
+            {
+                return true;
+            }
+            pending.extend(
+                self.edges
+                    .out_edges(vertex)
+                    .iter()
+                    .copied()
+                    .filter(|&dependency| {
+                        matches!(
+                            self.store.kind(dependency),
+                            VertexKind::NamedScalar | VertexKind::NamedArray
+                        )
+                    }),
+            );
+        }
+        false
+    }
+
+    /// Mark the formulas using the name at `name_vertex`, directly or through
+    /// other names, dynamic when the name reads dynamically (see
+    /// [`Self::name_reads_dynamically`]); a formula entered later is marked
+    /// as it attaches to the name.
+    fn mark_name_users_dynamic(&mut self, name_vertex: VertexId) {
+        if !self.name_reads_dynamically(name_vertex) {
+            return;
+        }
+        let mut seen = FxHashSet::default();
+        let mut pending = vec![name_vertex];
+        while let Some(vertex) = pending.pop() {
+            if !seen.insert(vertex) {
+                continue;
+            }
+            let Some(named) = self.named_range_by_vertex(vertex) else {
+                continue;
+            };
+            let users: Vec<VertexId> = named.dependents.iter().copied().collect();
+            for user in users {
+                if self.is_formula_vertex(user) {
+                    self.store.set_dynamic(user, true);
+                } else {
+                    pending.push(user);
+                }
+            }
         }
     }
 
@@ -782,6 +862,7 @@ impl DependencyGraph {
         {
             self.attach_vertex_to_names(vertex, &referenced_names);
         }
+        self.mark_name_users_dynamic(vertex);
         let dependents = self
             .named_range_by_vertex(vertex)
             .map(|named| named.dependents.iter().copied().collect::<Vec<_>>())

@@ -653,6 +653,48 @@ fn indirect_text_naming_a_workbook_is_unsupported() {
     assert_eq!(data(&out.bytes, 1), Data::Float(42.0));
 }
 #[test]
+fn a_circular_reference_through_a_name_keeps_its_cache() {
+    // Review of oneiron #1295: Loop = INDIRECT("RC",FALSE)+1 used in B2 reads
+    // B2. With iteration off Excel leaves the circular formula uncalculated,
+    // keeping its last value, the file's 17; it was cached as 1.
+    let mut p = parts("<row r=\"2\"><c r=\"B2\"><f>Loop</f><v>17</v></c></row>");
+    let wb = p.get_mut("xl/workbook.xml").unwrap();
+    *wb = wb.replace(
+        "</workbook>",
+        "<definedNames><definedName name=\"Loop\">INDIRECT(&quot;RC&quot;,FALSE)+1</definedName></definedNames></workbook>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let mut x = Xlsx::new(Cursor::new(&out.bytes)).unwrap();
+    let sheet = x.worksheet_range("Sheet1").unwrap();
+    assert_eq!(sheet.get_value((1, 1)), Some(&Data::Float(17.0)));
+}
+#[test]
+fn a_reference_name_draws_as_the_formula_written_in_its_place() {
+    // Review of oneiron #1295: Pick = OFFSET(Sheet1!$C$1,RANDBETWEEN(0,1),0)
+    // and B1 = Pick+0 under seed 7 draw what the inline formula draws (20);
+    // resolving Pick as a reference spent a draw and gave 10.
+    for formula in ["Pick+0", "OFFSET(Sheet1!$C$1,RANDBETWEEN(0,1),0)+0"] {
+        let mut p = parts(&format!(
+            "<row r=\"1\"><c r=\"B1\"><f>{formula}</f><v>0</v></c><c r=\"C1\"><v>10</v></c></row><row r=\"2\"><c r=\"C2\"><v>20</v></c></row>"
+        ));
+        let wb = p.get_mut("xl/workbook.xml").unwrap();
+        *wb = wb.replace(
+            "</workbook>",
+            "<definedNames><definedName name=\"Pick\">OFFSET(Sheet1!$C$1,RANDBETWEEN(0,1),0)</definedName></definedNames></workbook>",
+        );
+        let mut options = XlsxRecalculateOptions::default();
+        options.eval_config.workbook_seed = 7;
+        let out = recalculate_xlsx_bytes(&pack(&p), options).unwrap();
+        let mut x = Xlsx::new(Cursor::new(&out.bytes)).unwrap();
+        let sheet = x.worksheet_range("Sheet1").unwrap();
+        assert_eq!(
+            sheet.get_value((0, 1)),
+            Some(&Data::Float(20.0)),
+            "{formula}"
+        );
+    }
+}
+#[test]
 fn arbitrary_stale_error_cache_is_not_evaluator_authority() {
     let mut p = single("1+1", "<v>#FUTURE_ERROR!</v>");
     let s = p.get_mut(SHEET).unwrap();

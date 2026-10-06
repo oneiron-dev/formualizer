@@ -719,12 +719,17 @@ impl<'a, 'b> Typer<'a, 'b> {
             return ResultShape::Unknown;
         }
         // A name for a cell or a range is a reference; a name for a constant
-        // or a formula may hold an array.
-        match at
-            .interp
-            .context
-            .resolve_name_reference(name, at.interp.current_sheet())
-        {
+        // or a formula may hold an array. Only its shape is read here: what
+        // resolving it drew is drawn again where it is evaluated.
+        let resolved = crate::interpreter::EvaluationScope::probe(
+            || {
+                at.interp
+                    .context
+                    .resolve_name_reference(name, at.interp.current_sheet())
+            },
+            |_| false,
+        );
+        match resolved {
             Some(Ok(_)) => ResultShape::Single,
             _ => ResultShape::Unknown,
         }

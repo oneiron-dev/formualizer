@@ -5746,8 +5746,15 @@ where
     /// that uses it: ROW(), INDIRECT's relative R1C1 text and `#This Row` in
     /// the name read that formula's row and column (on `sheet`), and its
     /// random calls continue that formula's draws. Resolved for no formula
-    /// (for the graph), the name sits at A1 of `sheet`.
-    fn named_formula_interpreter<'c>(&'c self, sheet: &'c str) -> Interpreter<'c> {
+    /// (for the graph), the name sits at A1 of `sheet`. It reads through
+    /// `context`, the context of the formula that uses it: what the name
+    /// reads, that formula reads, for its dependencies and circular
+    /// references as for its value.
+    fn named_formula_interpreter<'c>(
+        &'c self,
+        context: &'c dyn crate::traits::EvaluationContext,
+        sheet: &'c str,
+    ) -> Interpreter<'c> {
         let cell = match EvaluationScope::cell() {
             Some(caller) => {
                 self.graph
@@ -5755,20 +5762,42 @@ where
             }
             None => self.graph.make_cell_ref(sheet, 0, 0),
         };
-        Interpreter::new_for_name(self, sheet, cell)
+        Interpreter::new_for_name(context, sheet, cell)
+    }
+
+    /// The value of the defined name `name` used on `current_sheet` when it
+    /// is a formula, evaluated through `context` for the formula that uses
+    /// it ([`Self::named_formula_interpreter`]); `None` for any other name.
+    pub(crate) fn named_formula_view<'c>(
+        &'c self,
+        context: &'c dyn crate::traits::EvaluationContext,
+        name: &str,
+        current_sheet: &str,
+    ) -> Option<Result<RangeView<'c>, ExcelError>> {
+        let current_id = self.graph.sheet_id(current_sheet)?;
+        let named = self.graph.resolve_name_entry(name, current_id)?;
+        let NamedDefinition::Formula { ast, .. } = &named.definition else {
+            return None;
+        };
+        let context_sheet = match named.scope {
+            NameScope::Sheet(id) => id,
+            NameScope::Workbook => current_id,
+        };
+        Some(self.evaluate_named_formula(context, context_sheet, ast))
     }
 
     /// Evaluate a named formula in `sheet_id` as a range view: it may yield a
     /// reference (OFFSET(...)), an array constant ({0,1,2}) or a single value.
     fn evaluate_named_formula<'c>(
         &'c self,
+        context: &'c dyn crate::traits::EvaluationContext,
         sheet_id: SheetId,
         ast: &formualizer_parse::parser::ASTNode,
     ) -> Result<RangeView<'c>, ExcelError> {
         Self::in_named_formula(|| {
             let sheet = self.graph.sheet_name(sheet_id);
             let _scope = EvaluationScope::name();
-            let interpreter = self.named_formula_interpreter(sheet);
+            let interpreter = self.named_formula_interpreter(context, sheet);
             match interpreter.evaluate_ast(ast)? {
                 crate::traits::CalcValue::Range(view) => Ok(view),
                 other => match other.into_literal() {
@@ -27868,8 +27897,142 @@ where
         Self::union_used_bounds(arrow_bounds, formula_bounds)
     }
 
-    /// [`EvaluationContext::resolve_name_reference`], computed afresh.
-    fn resolve_name_reference_once(&self, name: &str, current_sheet: &str) -> NameReference {
+    /// [`EvaluationContext::resolve_name_reference`] for a formula reading
+    /// through `context` (the engine, or a context recording that formula's
+    /// reads): the name's formula reads through it. A name that is no
+    /// reference holds a value, which the formula reads on the value path,
+    /// evaluating it again: what resolving it drew is drawn again there.
+    pub(crate) fn resolve_name_reference_via(
+        &self,
+        context: &dyn crate::traits::EvaluationContext,
+        name: &str,
+        current_sheet: &str,
+    ) -> NameReference {
+        // Each name resolves once while a name resolves, so a chain of names
+        // costs work linear in its length (see `memoized_name_reference`).
+        EvaluationScope::probe(
+            || {
+                memoized_name_reference(name, current_sheet, || {
+                    self.resolve_name_reference_once(context, name, current_sheet)
+                })
+            },
+            Option::is_some,
+        )
+    }
+
+    /// [`EvaluationContext::is_value_name`] through `context` (see
+    /// [`Self::resolve_name_reference_via`]). It only classifies the name:
+    /// what resolving it drew is drawn again where the name is read.
+    pub(crate) fn is_value_name_via(
+        &self,
+        context: &dyn crate::traits::EvaluationContext,
+        name: &str,
+        current_sheet: &str,
+    ) -> bool {
+        let Some(current_id) = self.graph.sheet_id(current_sheet) else {
+            return false;
+        };
+        match self.graph.resolve_name_entry(name, current_id) {
+            // A formula holds a value unless it evaluates to a reference: `=Konst`
+            // for a name holding a value, or `=IF(TRUE,42)`, holds a value too.
+            Some(named) => match &named.definition {
+                NamedDefinition::Formula { ast, .. } => {
+                    !self.yields_reference(ast)
+                        || EvaluationScope::probe(
+                            || context.resolve_name_reference(name, current_sheet),
+                            |_| false,
+                        )
+                        .is_none()
+                }
+                NamedDefinition::Literal(_) => true,
+                _ => false,
+            },
+            None => false,
+        }
+    }
+
+    /// [`EvaluationContext::resolve_name_reference_array`] through `context`
+    /// (see [`Self::resolve_name_reference_via`]).
+    pub(crate) fn resolve_name_reference_array_via(
+        &self,
+        context: &dyn crate::traits::EvaluationContext,
+        name: &str,
+        current_sheet: &str,
+    ) -> Option<Result<Vec<Vec<Result<ReferenceType, ExcelError>>>, ExcelError>> {
+        let current_id = self.graph.sheet_id(current_sheet)?;
+        let named = self.graph.resolve_name_entry(name, current_id)?;
+        let NamedDefinition::Formula { ast, .. } = &named.definition else {
+            return None;
+        };
+        if !self.yields_reference(ast) {
+            return None;
+        }
+        let sheet_id = match named.scope {
+            NameScope::Sheet(id) => id,
+            NameScope::Workbook => current_id,
+        };
+        let sheet = self.graph.sheet_name(sheet_id);
+        let _scope = EvaluationScope::name();
+        let interpreter = self.named_formula_interpreter(context, sheet);
+        let formula = crate::traits::ArgumentHandle::new(ast, &interpreter);
+        Self::in_named_formula(|| formula.reference_array()).transpose()
+    }
+
+    /// [`EvaluationContext::resolve_name_areas`] through `context` (see
+    /// [`Self::resolve_name_reference_via`]).
+    pub(crate) fn resolve_name_areas_via(
+        &self,
+        context: &dyn crate::traits::EvaluationContext,
+        name: &str,
+        current_sheet: &str,
+    ) -> Option<Result<Vec<ReferenceType>, ExcelError>> {
+        let current_id = self.graph.sheet_id(current_sheet)?;
+        let named = self.graph.resolve_name_entry(name, current_id)?;
+        // A union, an intersection with one, or a name for another name
+        // (which may be one); `evaluate_ast_as_areas` declines anything else.
+        let NamedDefinition::Formula { ast, .. } = &named.definition else {
+            return None;
+        };
+        let sheet_id = match named.scope {
+            NameScope::Sheet(id) => id,
+            NameScope::Workbook => current_id,
+        };
+        let sheet = self.graph.sheet_name(sheet_id);
+        let _scope = EvaluationScope::name();
+        let interpreter = self.named_formula_interpreter(context, sheet);
+        let areas = match Self::in_named_formula(|| Ok(interpreter.evaluate_ast_as_areas(ast))) {
+            Ok(areas) => areas?,
+            Err(err) => return Some(Err(err)),
+        };
+        // The areas lie on the sheet the name is evaluated on, wherever the
+        // formula that uses the name sits.
+        Some(areas.map(|areas| {
+            areas
+                .into_iter()
+                .map(|mut area| {
+                    if let ReferenceType::Cell {
+                        sheet: area_sheet, ..
+                    }
+                    | ReferenceType::Range {
+                        sheet: area_sheet, ..
+                    } = &mut area
+                        && area_sheet.is_none()
+                    {
+                        *area_sheet = Some(sheet.to_string());
+                    }
+                    area
+                })
+                .collect()
+        }))
+    }
+
+    /// [`Self::resolve_name_reference_via`], computed afresh.
+    fn resolve_name_reference_once(
+        &self,
+        context: &dyn crate::traits::EvaluationContext,
+        name: &str,
+        current_sheet: &str,
+    ) -> NameReference {
         let current_id = self.graph.sheet_id(current_sheet)?;
         let named = self.graph.resolve_name_entry(name, current_id)?;
         // A name for a cell or range is that reference (INDEX(Years,2) picks
@@ -27909,14 +28072,14 @@ where
         };
         let sheet = self.graph.sheet_name(sheet_id);
         let _scope = EvaluationScope::name();
-        let interpreter = self.named_formula_interpreter(sheet);
+        let interpreter = self.named_formula_interpreter(context, sheet);
         let resolved = Self::in_named_formula(|| {
             Ok(match interpreter.try_evaluate_ast_as_reference(ast) {
                 // A name for another name (`=Konst`, `=INDIRECT("Amounts")`) is
                 // the reference that name resolves to, and holds a value when
                 // that name does.
                 Some(Ok(ReferenceType::NamedRange(other))) => {
-                    self.resolve_name_reference(&other, sheet)
+                    context.resolve_name_reference(&other, sheet)
                 }
                 result => result,
             })
@@ -27989,22 +28152,7 @@ where
     R: EvaluationContext,
 {
     fn is_value_name(&self, name: &str, current_sheet: &str) -> bool {
-        let Some(current_id) = self.graph.sheet_id(current_sheet) else {
-            return false;
-        };
-        match self.graph.resolve_name_entry(name, current_id) {
-            // A formula holds a value unless it evaluates to a reference: `=Konst`
-            // for a name holding a value, or `=IF(TRUE,42)`, holds a value too.
-            Some(named) => match &named.definition {
-                NamedDefinition::Formula { ast, .. } => {
-                    !self.yields_reference(ast)
-                        || self.resolve_name_reference(name, current_sheet).is_none()
-                }
-                NamedDefinition::Literal(_) => true,
-                _ => false,
-            },
-            None => false,
-        }
+        self.is_value_name_via(self, name, current_sheet)
     }
 
     fn resolve_name_reference(
@@ -28012,11 +28160,7 @@ where
         name: &str,
         current_sheet: &str,
     ) -> Option<Result<ReferenceType, ExcelError>> {
-        // Each name resolves once while a name resolves, so a chain of names
-        // costs work linear in its length (see `memoized_name_reference`).
-        memoized_name_reference(name, current_sheet, || {
-            self.resolve_name_reference_once(name, current_sheet)
-        })
+        self.resolve_name_reference_via(self, name, current_sheet)
     }
 
     fn resolve_name_reference_array(
@@ -28024,23 +28168,7 @@ where
         name: &str,
         current_sheet: &str,
     ) -> Option<Result<Vec<Vec<Result<ReferenceType, ExcelError>>>, ExcelError>> {
-        let current_id = self.graph.sheet_id(current_sheet)?;
-        let named = self.graph.resolve_name_entry(name, current_id)?;
-        let NamedDefinition::Formula { ast, .. } = &named.definition else {
-            return None;
-        };
-        if !self.yields_reference(ast) {
-            return None;
-        }
-        let sheet_id = match named.scope {
-            NameScope::Sheet(id) => id,
-            NameScope::Workbook => current_id,
-        };
-        let sheet = self.graph.sheet_name(sheet_id);
-        let _scope = EvaluationScope::name();
-        let interpreter = self.named_formula_interpreter(sheet);
-        let formula = crate::traits::ArgumentHandle::new(ast, &interpreter);
-        Self::in_named_formula(|| formula.reference_array()).transpose()
+        self.resolve_name_reference_array_via(self, name, current_sheet)
     }
 
     fn resolve_name_areas(
@@ -28048,44 +28176,7 @@ where
         name: &str,
         current_sheet: &str,
     ) -> Option<Result<Vec<ReferenceType>, ExcelError>> {
-        let current_id = self.graph.sheet_id(current_sheet)?;
-        let named = self.graph.resolve_name_entry(name, current_id)?;
-        // A union, an intersection with one, or a name for another name
-        // (which may be one); `evaluate_ast_as_areas` declines anything else.
-        let NamedDefinition::Formula { ast, .. } = &named.definition else {
-            return None;
-        };
-        let sheet_id = match named.scope {
-            NameScope::Sheet(id) => id,
-            NameScope::Workbook => current_id,
-        };
-        let sheet = self.graph.sheet_name(sheet_id);
-        let _scope = EvaluationScope::name();
-        let interpreter = self.named_formula_interpreter(sheet);
-        let areas = match Self::in_named_formula(|| Ok(interpreter.evaluate_ast_as_areas(ast))) {
-            Ok(areas) => areas?,
-            Err(err) => return Some(Err(err)),
-        };
-        // The areas lie on the sheet the name is evaluated on, wherever the
-        // formula that uses the name sits.
-        Some(areas.map(|areas| {
-            areas
-                .into_iter()
-                .map(|mut area| {
-                    if let ReferenceType::Cell {
-                        sheet: area_sheet, ..
-                    }
-                    | ReferenceType::Range {
-                        sheet: area_sheet, ..
-                    } = &mut area
-                        && area_sheet.is_none()
-                    {
-                        *area_sheet = Some(sheet.to_string());
-                    }
-                    area
-                })
-                .collect()
-        }))
+        self.resolve_name_areas_via(self, name, current_sheet)
     }
 
     fn clock(&self) -> &dyn crate::timezone::ClockProvider {
@@ -28792,7 +28883,7 @@ where
                                 NameScope::Workbook => self.graph.sheet_id(current_sheet),
                             }
                             .unwrap_or_else(|| self.graph.default_sheet_id());
-                            return self.evaluate_named_formula(context_sheet, ast);
+                            return self.evaluate_named_formula(self, context_sheet, ast);
                         }
                     }
                 }

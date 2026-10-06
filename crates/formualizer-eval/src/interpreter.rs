@@ -224,6 +224,33 @@ impl EvaluationScope {
         Self::start(None)
     }
 
+    /// `cell`'s formula evaluates to find what it reads, not for its value,
+    /// whatever else runs on this thread: the names it uses read from `cell`
+    /// as they do when it calculates, and no evaluation's draws change.
+    pub(crate) fn reads_of(cell: CellRef) -> Self {
+        Self::start(Some(cell))
+    }
+
+    /// Run `probe`, which evaluates something the formula running on this
+    /// thread may evaluate again (a defined name resolved as a reference to
+    /// see whether it is one, then read as a value). When `kept` says its
+    /// result is not used, the draws it made are forgotten: the evaluation
+    /// that follows draws them again, as the formula written without the
+    /// name draws them once (`Pick+0` with `Pick` holding
+    /// `OFFSET($C$1,RANDBETWEEN(0,1),0)` is `OFFSET($C$1,RANDBETWEEN(0,1),0)+0`).
+    pub(crate) fn probe<T>(probe: impl FnOnce() -> T, kept: impl FnOnce(&T) -> bool) -> T {
+        let before = EVALUATION.get().map(|running| running.draws);
+        let result = probe();
+        if !kept(&result)
+            && let Some(draws) = before
+            && let Some(mut running) = EVALUATION.get()
+        {
+            running.draws = draws;
+            EVALUATION.set(Some(running));
+        }
+        result
+    }
+
     fn start(cell: Option<CellRef>) -> Self {
         Self {
             previous: Some(EVALUATION.replace(Some(Evaluation { cell, draws: 0 }))),
@@ -1189,15 +1216,19 @@ impl<'a> Interpreter<'a> {
             });
         }
         // A name for a range intersects through that range; a name for a cell,
-        // a constant or a computed value evaluates as usual.
+        // a constant or a computed value evaluates as usual, drawing again
+        // what resolving it drew.
         if let ReferenceType::NamedRange(name) = &reference {
-            let named = self
-                .context
-                .resolve_name_reference(name, self.current_sheet);
-            return Ok(match named {
-                Some(Ok(named)) if !matches!(named, ReferenceType::Cell { .. }) => Some(named),
-                _ => None,
-            });
+            return Ok(EvaluationScope::probe(
+                || match self
+                    .context
+                    .resolve_name_reference(name, self.current_sheet)
+                {
+                    Some(Ok(named)) if !matches!(named, ReferenceType::Cell { .. }) => Some(named),
+                    _ => None,
+                },
+                Option::is_some,
+            ));
         }
         Ok(Some(reference))
     }

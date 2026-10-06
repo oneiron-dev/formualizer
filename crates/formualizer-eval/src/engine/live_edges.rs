@@ -391,16 +391,19 @@ impl<'a, R: EvaluationContext> FunctionProvider for RecordingContext<'a, R> {
 }
 
 impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
+    // A defined name's formula evaluates for the member that uses it,
+    // through this context: what the name reads, the member reads.
     fn resolve_name_reference(
         &self,
         name: &str,
         current_sheet: &str,
     ) -> Option<Result<ReferenceType, ExcelError>> {
-        self.engine.resolve_name_reference(name, current_sheet)
+        self.engine
+            .resolve_name_reference_via(self, name, current_sheet)
     }
 
     fn is_value_name(&self, name: &str, current_sheet: &str) -> bool {
-        self.engine.is_value_name(name, current_sheet)
+        self.engine.is_value_name_via(self, name, current_sheet)
     }
 
     fn resolve_name_reference_array(
@@ -409,7 +412,7 @@ impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
         current_sheet: &str,
     ) -> Option<Result<Vec<Vec<Result<ReferenceType, ExcelError>>>, ExcelError>> {
         self.engine
-            .resolve_name_reference_array(name, current_sheet)
+            .resolve_name_reference_array_via(self, name, current_sheet)
     }
 
     fn resolve_name_areas(
@@ -417,7 +420,8 @@ impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
         name: &str,
         current_sheet: &str,
     ) -> Option<Result<Vec<ReferenceType>, ExcelError>> {
-        self.engine.resolve_name_areas(name, current_sheet)
+        self.engine
+            .resolve_name_areas_via(self, name, current_sheet)
     }
 
     /* ── intercept-and-record ── */
@@ -433,6 +437,14 @@ impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
         // the rect recording below (which covers Cell/Range definitions).
         if let ReferenceType::NamedRange(name) = reference {
             self.record_name(name);
+            // A name's formula evaluates for the member that uses it, through
+            // this context: what it reads (`INDIRECT("RC",FALSE)` used in B2
+            // reads B2) is recorded as the member's read.
+            if let Some(view) = self.engine.named_formula_view(self, name, current_sheet) {
+                let view = view?;
+                self.record_view(&view);
+                return Ok(view);
+            }
         }
         let view = self.engine.resolve_range_view(reference, current_sheet)?;
         self.record_view(&view);
