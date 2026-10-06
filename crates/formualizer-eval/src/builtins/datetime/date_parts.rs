@@ -128,7 +128,7 @@ fn yearfrac_us_30_360_days(start: NaiveDate, end: NaiveDate) -> i64 {
 /// when both dates are in the same leap year or the range includes a 29
 /// February, and 365 otherwise (ODFF 1.2 4.11.7.7; Apache POI and LibreOffice
 /// agree).
-fn yearfrac_actual_year_length(start: NaiveDate, end: NaiveDate) -> f64 {
+pub(crate) fn yearfrac_actual_year_length(start: NaiveDate, end: NaiveDate) -> f64 {
     let (sy, ey) = (start.year(), end.year());
     let more_than_a_year =
         ey > sy + 1 || (ey == sy + 1 && (end.month(), end.day()) > (start.month(), start.day()));

@@ -94,7 +94,14 @@ pub(crate) fn lift_spec(name: &str) -> Option<Lift> {
         | "GAMMA" | "GAMMALN" | "GAMMALN.PRECISE" => Lift::All,
         // Financial
         "PMT" | "IPMT" | "PPMT" | "PV" | "FV" | "NPER" | "RATE" | "EFFECT" | "NOMINAL" | "DB"
-        | "DDB" | "SLN" | "SYD" | "ISPMT" | "RRI" | "PDURATION" => Lift::All,
+        | "DDB" | "SLN" | "SYD" | "ISPMT" | "RRI" | "PDURATION" | "VDB" | "AMORLINC"
+        | "AMORDEGRC" | "COUPDAYBS" | "COUPDAYS" | "COUPDAYSNC" | "COUPNCD" | "COUPNUM"
+        | "COUPPCD" | "ACCRINT" | "ACCRINTM" | "PRICE" | "YIELD" | "DURATION" | "MDURATION"
+        | "TBILLEQ" | "TBILLPRICE" | "TBILLYIELD" | "DISC" | "INTRATE" | "RECEIVED"
+        | "PRICEDISC" | "YIELDDISC" | "PRICEMAT" | "YIELDMAT" | "ODDFPRICE" | "ODDFYIELD"
+        | "ODDLPRICE" | "ODDLYIELD" => Lift::All,
+        // The schedule is an array.
+        "FVSCHEDULE" => Lift::Only(&[0]),
         // Statistical distributions, current and compatibility names alike,
         // take single values only (SUM(T.DIST({0,1},10,TRUE)) is two values).
         "NORM.DIST" | "NORM.INV" | "NORM.S.DIST" | "NORM.S.INV" | "STANDARDIZE" | "FISHER"

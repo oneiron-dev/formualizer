@@ -1,264 +1,135 @@
-//! Bond pricing functions: ACCRINT, ACCRINTM, PRICE, YIELD
+//! Coupon bonds and Treasury bills: ACCRINT, ACCRINTM, PRICE, YIELD,
+//! DURATION, MDURATION, TBILLEQ, TBILLPRICE, TBILLYIELD, on the day counts
+//! and coupon schedule of `coupon.rs`, as Excel for Windows 16.0.20430
+//! computes them (ops/excel-finance-probe-20261006.md).
 
+use super::coupon::{
+    Basis, Period, add_months, coupon_date, date, days_us_30_360, frequency, logical,
+    number_schema, number_value, numbers, period, periods_back,
+};
 use crate::args::ArgSchema;
-use crate::coercion::to_serial_strict;
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, CalcValue, FunctionContext};
 use chrono::{Datelike, NaiveDate};
-use formualizer_common::{ExcelError, LiteralValue, try_serial_to_date_for};
+use formualizer_common::ExcelError;
 use formualizer_macros::func_caps;
 
-/// Numeric coercion for bond arguments.
-///
-/// `settlement`, `maturity` and `issue` are date arguments, and a workbook
-/// loaded from XLSX holds genuine `Date` cells there. The previous local
-/// copy of the value -> number policy had no date arm, so `PRICE(A1,B1,...)`
-/// over date cells returned `#VALUE!` (see #328). Delegates to the central
-/// [`crate::coercion::to_serial_strict`].
-///
-/// These are number parameters, so text converts as VALUE() converts it:
-/// numeric text, and date or time text in the workbook's date system
-/// (`"12:00"` is 0.5), as the argument validation already reads it.
-fn coerce_num(arg: &ArgumentHandle) -> Result<f64, ExcelError> {
-    let v = arg.value()?.into_literal();
-    match v {
-        LiteralValue::Text(_) => crate::coercion::to_serial_lenient_in_year(
-            &v,
-            arg.date_system(),
-            Some(arg.current_year()),
-        ),
-        other => to_serial_strict(&other, arg.date_system()),
-    }
-}
+/// The par value ACCRINT and ACCRINTM take when the argument is left empty.
+const DEFAULT_PAR: f64 = 1000.0;
 
-/// Day count basis calculation
-/// Returns (num_days, year_basis) for the given basis type
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum DayCountBasis {
-    UsNasd30360 = 0,   // US (NASD) 30/360
-    ActualActual = 1,  // Actual/actual
-    Actual360 = 2,     // Actual/360
-    Actual365 = 3,     // Actual/365
-    European30360 = 4, // European 30/360
-}
-
-impl DayCountBasis {
-    fn from_int(basis: i32) -> Result<Self, ExcelError> {
-        match basis {
-            0 => Ok(DayCountBasis::UsNasd30360),
-            1 => Ok(DayCountBasis::ActualActual),
-            2 => Ok(DayCountBasis::Actual360),
-            3 => Ok(DayCountBasis::Actual365),
-            4 => Ok(DayCountBasis::European30360),
-            _ => Err(ExcelError::new_num()),
-        }
-    }
-}
-
-/// Check if a year is a leap year
-fn is_leap_year(year: i32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
-}
-
-/// Check if a date is the last day of the month
-fn is_last_day_of_month(date: &NaiveDate) -> bool {
-    let next_day = *date + chrono::Duration::days(1);
-    next_day.month() != date.month()
-}
-
-/// Calculate days between two dates using the specified basis
-fn days_between(start: &NaiveDate, end: &NaiveDate, basis: DayCountBasis) -> i32 {
-    match basis {
-        DayCountBasis::UsNasd30360 => days_30_360_us(start, end),
-        DayCountBasis::ActualActual | DayCountBasis::Actual360 | DayCountBasis::Actual365 => {
-            (*end - *start).num_days() as i32
-        }
-        DayCountBasis::European30360 => days_30_360_eu(start, end),
-    }
-}
-
-/// Calculate days using US (NASD) 30/360 method
-fn days_30_360_us(start: &NaiveDate, end: &NaiveDate) -> i32 {
-    let mut sd = start.day() as i32;
-    let sm = start.month() as i32;
-    let sy = start.year();
-
-    let mut ed = end.day() as i32;
-    let em = end.month() as i32;
-    let ey = end.year();
-
-    // Adjust for last day of February
-    let start_is_last_feb = sm == 2 && is_last_day_of_month(start);
-    let end_is_last_feb = em == 2 && is_last_day_of_month(end);
-
-    if start_is_last_feb && end_is_last_feb {
-        ed = 30;
-    }
-    if start_is_last_feb {
-        sd = 30;
-    }
-    if ed == 31 && sd >= 30 {
-        ed = 30;
-    }
-    if sd == 31 {
-        sd = 30;
-    }
-
-    (ey - sy) * 360 + (em - sm) * 30 + (ed - sd)
-}
-
-/// Calculate days using European 30/360 method
-fn days_30_360_eu(start: &NaiveDate, end: &NaiveDate) -> i32 {
-    let mut sd = start.day() as i32;
-    let sm = start.month() as i32;
-    let sy = start.year();
-
-    let mut ed = end.day() as i32;
-    let em = end.month() as i32;
-    let ey = end.year();
-
-    if sd == 31 {
-        sd = 30;
-    }
-    if ed == 31 {
-        ed = 30;
-    }
-
-    (ey - sy) * 360 + (em - sm) * 30 + (ed - sd)
-}
-
-/// Calculate the year fraction between two dates.
-///
-/// For Actual/Actual we mirror the prorated year-boundary behavior used by YEARFRAC
-/// rather than averaging year lengths across the entire span. This keeps bond accrual
-/// math aligned with the engine's date-part functions for cross-year ranges.
-fn year_fraction(start: &NaiveDate, end: &NaiveDate, basis: DayCountBasis) -> f64 {
-    if start == end {
-        return 0.0;
-    }
-
-    let (s, e, sign) = if start <= end {
-        (start, end, 1.0)
+/// ACCRINT's par: an empty argument (`ACCRINT(i,f,s,0.1,,2)`) is 1,000.
+fn par_arg(args: &[ArgumentHandle], index: usize, value: f64) -> f64 {
+    if args.get(index).is_some_and(|arg| arg.is_omitted()) {
+        DEFAULT_PAR
     } else {
-        (end, start, -1.0)
-    };
-
-    let frac = match basis {
-        DayCountBasis::UsNasd30360 | DayCountBasis::European30360 => {
-            days_between(s, e, basis) as f64 / 360.0
-        }
-        DayCountBasis::Actual360 => ((*e - *s).num_days() as f64) / 360.0,
-        DayCountBasis::Actual365 => ((*e - *s).num_days() as f64) / 365.0,
-        DayCountBasis::ActualActual => {
-            let actual_days = (*e - *s).num_days() as f64;
-            if s.year() == e.year() {
-                actual_days / if is_leap_year(s.year()) { 366.0 } else { 365.0 }
-            } else {
-                let start_year_end = NaiveDate::from_ymd_opt(s.year() + 1, 1, 1).unwrap();
-                let end_year_start = NaiveDate::from_ymd_opt(e.year(), 1, 1).unwrap();
-
-                let mut out = (start_year_end - *s).num_days() as f64
-                    / if is_leap_year(s.year()) { 366.0 } else { 365.0 };
-                for _year in (s.year() + 1)..e.year() {
-                    out += 1.0;
-                }
-                out + (*e - end_year_start).num_days() as f64
-                    / if is_leap_year(e.year()) { 366.0 } else { 365.0 }
-            }
-        }
-    };
-
-    sign * frac
-}
-
-/// Find the coupon date before settlement date
-fn coupon_date_before(settlement: &NaiveDate, maturity: &NaiveDate, frequency: i32) -> NaiveDate {
-    let months_between_coupons = 12 / frequency;
-    let mut coupon_date = *maturity;
-
-    // Work backwards from maturity to find the coupon date just before settlement
-    while coupon_date >= *settlement {
-        coupon_date = add_months(&coupon_date, -months_between_coupons);
-    }
-    coupon_date
-}
-
-/// Find the coupon date after settlement date
-fn coupon_date_after(settlement: &NaiveDate, maturity: &NaiveDate, frequency: i32) -> NaiveDate {
-    let months_between_coupons = 12 / frequency;
-    let prev_coupon = coupon_date_before(settlement, maturity, frequency);
-    add_months(&prev_coupon, months_between_coupons)
-}
-
-/// Add months to a date, handling end-of-month adjustments
-fn add_months(date: &NaiveDate, months: i32) -> NaiveDate {
-    let total_months = date.year() * 12 + date.month() as i32 - 1 + months;
-    let new_year = total_months / 12;
-    let new_month = (total_months % 12 + 1) as u32;
-
-    // Try to keep the same day, but cap at month's end
-    let mut new_day = date.day();
-    loop {
-        if let Some(d) = NaiveDate::from_ymd_opt(new_year, new_month, new_day) {
-            return d;
-        }
-        new_day -= 1;
-        if new_day == 0 {
-            // Fallback - should never reach here
-            return NaiveDate::from_ymd_opt(new_year, new_month, 1).unwrap();
-        }
+        value
     }
 }
 
-/// Count the number of coupons remaining
-fn coupons_remaining(settlement: &NaiveDate, maturity: &NaiveDate, frequency: i32) -> i32 {
-    let months_between_coupons = 12 / frequency;
-    let mut count = 0;
-    let mut coupon_date = coupon_date_after(settlement, maturity, frequency);
-
-    while coupon_date <= *maturity {
-        count += 1;
-        coupon_date = add_months(&coupon_date, months_between_coupons);
-    }
-    count
-}
-
-/// Returns accrued interest for a coupon-bearing security.
+/// Accrued interest of a security paying periodic interest, Excel's way.
 ///
-/// `ACCRINT` calculates interest from either `issue` or the previous coupon date up to
-/// `settlement`, depending on `calc_method`.
+/// The accrual is counted in the quasi-coupon periods of `first_interest`'s
+/// schedule. It ends in the period that starts on the coupon date on or
+/// before settlement when settlement is after the first interest date and
+/// `from_issue` is set; otherwise in the period that ends on the first
+/// interest date, so that a settlement before that period counts negative
+/// days and a settlement after it counts every day since in that one period.
+/// Each earlier period back to issue adds a whole period when `from_issue` is
+/// set and nothing when it is not, and the period holding issue adds the
+/// days from issue to its end.
+fn accrued_interest(
+    issue: NaiveDate,
+    first_interest: NaiveDate,
+    settlement: NaiveDate,
+    frequency: u32,
+    basis: Basis,
+    from_issue: bool,
+) -> f64 {
+    let months = 12 / frequency as i32;
+    let mut k = if settlement > first_interest && from_issue {
+        periods_back(first_interest, settlement, months)
+    } else {
+        1
+    };
+    let pcd = coupon_date(first_interest, k * months);
+    let start = issue.max(pcd);
+    let length = basis.period_days(
+        &period_containing(pcd, first_interest, frequency),
+        frequency,
+    );
+    let mut periods = basis.days(start, settlement) / length;
+
+    let mut end = pcd;
+    while end > issue {
+        k += 1;
+        let begin = coupon_date(first_interest, k * months);
+        periods += if issue <= begin {
+            if from_issue { 1.0 } else { 0.0 }
+        } else {
+            let (days, length) = match basis {
+                Basis::Us30 => (
+                    days_us_30_360(issue, end, false) as f64,
+                    days_us_30_360(begin, end, true) as f64,
+                ),
+                Basis::Actual | Basis::Euro30 => (basis.days(issue, end), basis.days(begin, end)),
+                _ => (
+                    basis.days(issue, end),
+                    basis.period_days(&period_containing(begin, end, frequency), frequency),
+                ),
+            };
+            days / length
+        };
+        end = begin;
+    }
+    periods
+}
+
+/// The coupon period holding `date` on `anchor`'s schedule; the period ending
+/// on `anchor` when `date` is `anchor`.
+fn period_containing(date: NaiveDate, anchor: NaiveDate, frequency: u32) -> Period {
+    let months = 12 / frequency as i32;
+    let k = if date == anchor {
+        1
+    } else {
+        periods_back(anchor, date, months)
+    };
+    Period {
+        pcd: coupon_date(anchor, k * months),
+        ncd: coupon_date(anchor, (k - 1) * months),
+        coupons: None,
+    }
+}
+
+/// Returns the accrued interest for a security that pays periodic interest.
 ///
 /// # Remarks
-/// - Date inputs are spreadsheet serial dates; `settlement` must be after `issue`.
-/// - `rate` is the annual coupon rate as a decimal (for example, `0.06` for 6%), and `par` is principal amount; both must be positive.
-/// - `frequency` must be `1` (annual), `2` (semiannual), or `4` (quarterly).
-/// - `basis` codes: `0=US(NASD)30/360`, `1=Actual/Actual`, `2=Actual/360`, `3=Actual/365`, `4=European30/360`.
-/// - `calc_method`: non-zero accrues from `issue`; `0` accrues from the previous coupon date.
-/// - Return value is in the same currency units as `par` and is positive for valid positive inputs.
+/// - Accrues in the quasi-coupon periods of `first_interest`'s schedule. `calc_method` TRUE
+///   (the default) counts every whole period from issue; FALSE counts only the days from issue
+///   to the first period and the days in settlement's stretch of it.
+/// - `rate` and `par` must be positive (an empty `par` is 1,000); settlement must be after issue.
+/// - `frequency` is 1, 2 or 4 and `basis` 0 to 4 after truncation, otherwise `#NUM!`.
 ///
 /// # Examples
 ///
 /// ```yaml,sandbox
-/// title: "Accrue from issue date (default calc_method)"
-/// formula: "=ACCRINT(DATE(2024,1,1), DATE(2024,7,1), DATE(2024,7,1), 0.06, 1000, 2, 0)"
-/// expected: 30
+/// title: "Accrued from issue, 30/360"
+/// formula: "=ACCRINT(DATE(2008,3,1),DATE(2008,8,31),DATE(2008,5,1),0.1,1000,2,0)"
+/// expected: 16.666666666666664
 /// ```
 ///
 /// ```yaml,sandbox
-/// title: "Accrue from previous coupon (calc_method = 0)"
-/// formula: "=ACCRINT(DATE(2024,1,1), DATE(2024,7,1), DATE(2024,10,1), 0.08, 1000, 2, 0, 0)"
-/// expected: 20
+/// title: "Issue more than a period before the first interest date"
+/// formula: "=ACCRINT(DATE(2007,4,5),DATE(2008,8,31),DATE(2008,5,1),0.1,1000,2,0,TRUE)"
+/// expected: 107.50000000000001
 /// ```
 /// ```yaml,docs
 /// related:
 ///   - ACCRINTM
+///   - COUPPCD
 ///   - PRICE
-///   - YIELD
 /// faq:
-///   - q: "When does `calc_method` change the result?"
-///     a: "`calc_method=0` accrues from the previous coupon date; any non-zero value accrues from `issue`."
-///   - q: "Which inputs return `#NUM!`?"
-///     a: "Invalid `basis`, non-positive `rate`/`par`, unsupported `frequency`, or `settlement <= issue` return `#NUM!`."
+///   - q: "Does `calc_method` matter when settlement is before the first interest date?"
+///     a: "Yes, when issue is more than a period before it: FALSE leaves out the whole periods between issue and the first interest period."
 /// ```
 #[derive(Debug)]
 pub struct AccrintFn;
@@ -285,134 +156,59 @@ impl Function for AccrintFn {
         true
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(), // issue
-                ArgSchema::number_lenient_scalar(), // first_interest
-                ArgSchema::number_lenient_scalar(), // settlement
-                ArgSchema::number_lenient_scalar(), // rate
-                ArgSchema::number_lenient_scalar(), // par
-                ArgSchema::number_lenient_scalar(), // frequency
-                ArgSchema::number_lenient_scalar(), // basis (optional)
-                ArgSchema::number_lenient_scalar(), // calc_method (optional)
-            ]
-        });
-        &SCHEMA[..]
+        number_schema(8)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
-        // Check minimum required arguments
-        if args.len() < 6 {
-            return Ok(CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_value(),
-            )));
-        }
-
-        let issue_serial = coerce_num(&args[0])?;
-        let first_interest_serial = coerce_num(&args[1])?;
-        let settlement_serial = coerce_num(&args[2])?;
-        let rate = coerce_num(&args[3])?;
-        let par = coerce_num(&args[4])?;
-        let frequency = coerce_num(&args[5])?.trunc() as i32;
-        let basis_int = if args.len() > 6 {
-            coerce_num(&args[6])?.trunc() as i32
-        } else {
-            0
-        };
-        let calc_method = if args.len() > 7 {
-            coerce_num(&args[7])?.trunc() as i32
-        } else {
-            1
-        };
-
-        // Validate inputs
-        if rate <= 0.0 || par <= 0.0 {
-            return Ok(CalcValue::Scalar(
-                LiteralValue::Error(ExcelError::new_num()),
-            ));
-        }
-        if frequency != 1 && frequency != 2 && frequency != 4 {
-            return Ok(CalcValue::Scalar(
-                LiteralValue::Error(ExcelError::new_num()),
-            ));
-        }
-
-        let basis = DayCountBasis::from_int(basis_int)?;
-
         let system = ctx.date_system();
-        let issue = try_serial_to_date_for(system, issue_serial)?;
-        let first_interest = try_serial_to_date_for(system, first_interest_serial)?;
-        let settlement = try_serial_to_date_for(system, settlement_serial)?;
-
-        // settlement must be after issue
-        if settlement <= issue {
-            return Ok(CalcValue::Scalar(
-                LiteralValue::Error(ExcelError::new_num()),
-            ));
-        }
-
-        // Calculate accrued interest
-        // If calc_method is TRUE (or 1), calculate from issue to settlement
-        // If calc_method is FALSE (or 0), calculate from last coupon to settlement
-        let accrued_interest = if calc_method != 0 {
-            // Calculate from issue date to settlement date
-            // ACCRINT = par * rate * year_fraction(issue, settlement)
-            let yf = year_fraction(&issue, &settlement, basis);
-            par * rate * yf
-        } else {
-            // Calculate from last coupon date to settlement
-            let prev_coupon = coupon_date_before(&settlement, &first_interest, frequency);
-            let start_date = if prev_coupon < issue {
-                issue
-            } else {
-                prev_coupon
-            };
-            let yf = year_fraction(&start_date, &settlement, basis);
-            par * rate * yf
-        };
-
-        Ok(CalcValue::Scalar(LiteralValue::Number(accrued_interest)))
+        let value = (|| {
+            let [issue, first_interest, settlement, rate, par, freq, basis] =
+                numbers(&args[..args.len().min(7)], [0.0; 7])?;
+            let from_issue = logical(args, 7, true)?;
+            let par = par_arg(args, 4, par);
+            let issue = date(issue, system)?;
+            let first_interest = date(first_interest, system)?;
+            let settlement = date(settlement, system)?;
+            let frequency = frequency(freq)?;
+            let basis = Basis::new(basis)?;
+            if rate <= 0.0 || par <= 0.0 || settlement <= issue {
+                return Err(ExcelError::new_num());
+            }
+            let periods = accrued_interest(
+                issue,
+                first_interest,
+                settlement,
+                frequency,
+                basis,
+                from_issue,
+            );
+            Ok(par * rate / frequency as f64 * periods)
+        })();
+        Ok(number_value(value))
     }
 }
 
-/// Returns accrued interest for a security that pays interest at maturity.
-///
-/// `ACCRINTM` accrues from `issue` to `settlement` with no periodic coupon schedule.
+/// Returns the accrued interest for a security that pays interest at
+/// maturity.
 ///
 /// # Remarks
-/// - Date inputs are spreadsheet serial dates and must satisfy `settlement > issue`.
-/// - `rate` is an annual decimal rate (for example, `0.05` for 5%), and `par` must be positive.
-/// - `basis` codes: `0=US(NASD)30/360`, `1=Actual/Actual`, `2=Actual/360`, `3=Actual/365`, `4=European30/360`.
-/// - Return value is accrued interest amount in the same currency units as `par`.
-/// - With positive `rate` and `par`, the result is positive.
+/// - `par * rate * YEARFRAC(issue, settlement, basis)`; an empty `par` is 1,000.
+/// - `rate` and `par` must be positive; settlement before issue is `#NUM!`, on issue 0.
 ///
 /// # Examples
 ///
 /// ```yaml,sandbox
-/// title: "One full 30/360 year"
-/// formula: "=ACCRINTM(DATE(2024,1,1), DATE(2025,1,1), 0.05, 1000, 0)"
-/// expected: 50
-/// ```
-///
-/// ```yaml,sandbox
-/// title: "European 30/360 half-year accrual"
-/// formula: "=ACCRINTM(DATE(2024,2,28), DATE(2024,8,28), 0.04, 1000, 4)"
-/// expected: 20
+/// title: "Actual/365"
+/// formula: "=ACCRINTM(DATE(2008,4,1),DATE(2008,6,15),0.1,1000,3)"
+/// expected: 20.54794520547945
 /// ```
 /// ```yaml,docs
 /// related:
 ///   - ACCRINT
-///   - PRICE
-///   - YIELD
-/// faq:
-///   - q: "Does `ACCRINTM` use coupon frequency?"
-///     a: "No. It accrues directly from `issue` to `settlement` with no periodic coupon schedule."
-///   - q: "What causes `#NUM!`?"
-///     a: "Invalid `basis`, non-positive `rate`/`par`, or `settlement <= issue`."
+///   - YEARFRAC
 /// ```
 #[derive(Debug)]
 pub struct AccrintmFn;
@@ -439,104 +235,116 @@ impl Function for AccrintmFn {
         true
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(), // issue
-                ArgSchema::number_lenient_scalar(), // settlement
-                ArgSchema::number_lenient_scalar(), // rate
-                ArgSchema::number_lenient_scalar(), // par
-                ArgSchema::number_lenient_scalar(), // basis (optional)
-            ]
-        });
-        &SCHEMA[..]
+        number_schema(5)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
-        // Check minimum required arguments
-        if args.len() < 4 {
-            return Ok(CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_value(),
-            )));
-        }
-
-        let issue_serial = coerce_num(&args[0])?;
-        let settlement_serial = coerce_num(&args[1])?;
-        let rate = coerce_num(&args[2])?;
-        let par = coerce_num(&args[3])?;
-        let basis_int = if args.len() > 4 {
-            coerce_num(&args[4])?.trunc() as i32
-        } else {
-            0
-        };
-
-        // Validate inputs
-        if rate <= 0.0 || par <= 0.0 {
-            return Ok(CalcValue::Scalar(
-                LiteralValue::Error(ExcelError::new_num()),
-            ));
-        }
-
-        let basis = DayCountBasis::from_int(basis_int)?;
-
         let system = ctx.date_system();
-        let issue = try_serial_to_date_for(system, issue_serial)?;
-        let settlement = try_serial_to_date_for(system, settlement_serial)?;
-
-        // settlement must be after issue
-        if settlement <= issue {
-            return Ok(CalcValue::Scalar(
-                LiteralValue::Error(ExcelError::new_num()),
-            ));
-        }
-
-        // ACCRINTM = par * rate * year_fraction(issue, settlement)
-        let yf = year_fraction(&issue, &settlement, basis);
-        let accrued_interest = par * rate * yf;
-
-        Ok(CalcValue::Scalar(LiteralValue::Number(accrued_interest)))
+        let value = (|| {
+            let [issue, settlement, rate, par, basis] = numbers(args, [0.0; 5])?;
+            let par = par_arg(args, 3, par);
+            let issue = date(issue, system)?;
+            let settlement = date(settlement, system)?;
+            let basis = Basis::new(basis)?;
+            if rate <= 0.0 || par <= 0.0 || settlement < issue {
+                return Err(ExcelError::new_num());
+            }
+            Ok(par * rate * basis.year_fraction(issue, settlement))
+        })();
+        Ok(number_value(value))
     }
 }
 
-/// Returns clean price per 100 face value for a coupon-paying security.
-///
-/// `PRICE` discounts remaining coupons and redemption to settlement and subtracts accrued
-/// coupon interest according to the chosen day-count basis.
+/// The price per 100 face value at an annual yield: the remaining coupons and
+/// the redemption discounted from settlement, less the interest accrued since
+/// the previous coupon date. The days to the next coupon are the period's days
+/// less the days before settlement, whatever the basis.
+pub(crate) fn bond_price(
+    settlement: NaiveDate,
+    period: &Period,
+    coupons: i32,
+    rate: f64,
+    yld: f64,
+    redemption: f64,
+    frequency: u32,
+    basis: Basis,
+) -> f64 {
+    let f = frequency as f64;
+    let e = basis.period_days(period, frequency);
+    let a = basis.days_before(period, settlement);
+    let dsc = e - a;
+    let coupon = 100.0 * rate / f;
+    if coupons == 1 {
+        return (redemption + coupon) / (1.0 + dsc / e * yld / f) - a / e * coupon;
+    }
+    let x = 1.0 + yld / f;
+    let t = dsc / e;
+    let mut value = redemption / x.powf(coupons as f64 - 1.0 + t);
+    for k in 1..=coupons {
+        value += coupon / x.powf(k as f64 - 1.0 + t);
+    }
+    value - a / e * coupon
+}
+
+/// The settlement and coupon arguments PRICE, YIELD and DURATION share:
+/// settlement before maturity, frequency 1, 2 or 4, basis 0 to 4.
+struct Bond {
+    settlement: NaiveDate,
+    period: Period,
+    coupons: i32,
+    frequency: u32,
+    basis: Basis,
+}
+
+fn bond(
+    settlement: f64,
+    maturity: f64,
+    freq: f64,
+    basis: f64,
+    ctx: &dyn FunctionContext<'_>,
+) -> Result<Bond, ExcelError> {
+    let system = ctx.date_system();
+    let settlement = date(settlement, system)?;
+    let maturity = date(maturity, system)?;
+    let frequency = frequency(freq)?;
+    let basis = Basis::new(basis)?;
+    if settlement >= maturity {
+        return Err(ExcelError::new_num());
+    }
+    let period = period(settlement, maturity, frequency, system);
+    let coupons = period.count()?;
+    Ok(Bond {
+        settlement,
+        period,
+        coupons,
+        frequency,
+        basis,
+    })
+}
+
+/// Returns the price per 100 face value of a security that pays periodic
+/// interest.
 ///
 /// # Remarks
-/// - Date inputs are spreadsheet serial dates and must satisfy `maturity > settlement`.
-/// - `rate` (coupon) and `yld` (yield) are annual decimal rates; `redemption` is amount paid per 100 face value at maturity.
-/// - `frequency` must be `1` (annual), `2` (semiannual), or `4` (quarterly).
-/// - `basis` codes: `0=US(NASD)30/360`, `1=Actual/Actual`, `2=Actual/360`, `3=Actual/365`, `4=European30/360`.
-/// - Return value is quoted per 100 face value; positive inputs usually produce a positive price.
-/// - Coupon schedule is derived by stepping backward from `maturity`, with end-of-month adjustment behavior in month arithmetic.
+/// - `rate` and `yld` must be at least 0 and `redemption` positive, otherwise `#NUM!`.
+/// - The coupon schedule is counted back from maturity (see COUPPCD); the days to the next
+///   coupon are COUPDAYS - COUPDAYBS, as Excel counts them, for every basis.
 ///
 /// # Examples
 ///
 /// ```yaml,sandbox
-/// title: "Single remaining coupon period"
-/// formula: "=PRICE(DATE(2024,4,1), DATE(2024,7,1), 0.06, 0.05, 100, 2, 0)"
-/// expected: 100.2283950617284
-/// ```
-///
-/// ```yaml,sandbox
-/// title: "Par bond when coupon rate equals yield"
-/// formula: "=PRICE(DATE(2024,3,1), DATE(2026,3,1), 0.05, 0.05, 100, 2, 0)"
-/// expected: 100
+/// title: "Semiannual bond, 30/360"
+/// formula: "=PRICE(DATE(2008,2,15),DATE(2017,11,15),0.0575,0.065,100,2,0)"
+/// expected: 94.63436162132213
 /// ```
 /// ```yaml,docs
 /// related:
 ///   - YIELD
-///   - ACCRINT
-///   - ACCRINTM
-/// faq:
-///   - q: "Why is `PRICE` quoted per 100 even if my bond face value differs?"
-///     a: "This implementation follows Excel quoting conventions and returns clean price per 100 face value."
-///   - q: "Which domain checks return `#NUM!`?"
-///     a: "`maturity <= settlement`, invalid `basis`, unsupported `frequency`, negative `rate`/`yld`, or non-positive `redemption`."
+///   - DURATION
+///   - COUPDAYS
 /// ```
 #[derive(Debug)]
 pub struct PriceFn;
@@ -563,175 +371,117 @@ impl Function for PriceFn {
         true
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(), // settlement
-                ArgSchema::number_lenient_scalar(), // maturity
-                ArgSchema::number_lenient_scalar(), // rate (coupon rate)
-                ArgSchema::number_lenient_scalar(), // yld (yield)
-                ArgSchema::number_lenient_scalar(), // redemption
-                ArgSchema::number_lenient_scalar(), // frequency
-                ArgSchema::number_lenient_scalar(), // basis (optional)
-            ]
-        });
-        &SCHEMA[..]
+        number_schema(7)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
-        // Check minimum required arguments
-        if args.len() < 6 {
-            return Ok(CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_value(),
-            )));
-        }
-
-        let settlement_serial = coerce_num(&args[0])?;
-        let maturity_serial = coerce_num(&args[1])?;
-        let rate = coerce_num(&args[2])?;
-        let yld = coerce_num(&args[3])?;
-        let redemption = coerce_num(&args[4])?;
-        let frequency = coerce_num(&args[5])?.trunc() as i32;
-        let basis_int = if args.len() > 6 {
-            coerce_num(&args[6])?.trunc() as i32
-        } else {
-            0
-        };
-
-        // Validate inputs
-        if rate < 0.0 || yld < 0.0 || redemption <= 0.0 {
-            return Ok(CalcValue::Scalar(
-                LiteralValue::Error(ExcelError::new_num()),
-            ));
-        }
-        if frequency != 1 && frequency != 2 && frequency != 4 {
-            return Ok(CalcValue::Scalar(
-                LiteralValue::Error(ExcelError::new_num()),
-            ));
-        }
-
-        let basis = DayCountBasis::from_int(basis_int)?;
-
-        let system = ctx.date_system();
-        let settlement = try_serial_to_date_for(system, settlement_serial)?;
-        let maturity = try_serial_to_date_for(system, maturity_serial)?;
-
-        // maturity must be after settlement
-        if maturity <= settlement {
-            return Ok(CalcValue::Scalar(
-                LiteralValue::Error(ExcelError::new_num()),
-            ));
-        }
-
-        let price = calculate_price(
-            &settlement,
-            &maturity,
-            rate,
-            yld,
-            redemption,
-            frequency,
-            basis,
-        );
-        Ok(CalcValue::Scalar(LiteralValue::Number(price)))
+        let value = (|| {
+            let [settlement, maturity, rate, yld, redemption, freq, basis] =
+                numbers(args, [0.0; 7])?;
+            let b = bond(settlement, maturity, freq, basis, ctx)?;
+            if rate < 0.0 || yld < 0.0 || redemption <= 0.0 {
+                return Err(ExcelError::new_num());
+            }
+            Ok(bond_price(
+                b.settlement,
+                &b.period,
+                b.coupons,
+                rate,
+                yld,
+                redemption,
+                b.frequency,
+                b.basis,
+            ))
+        })();
+        Ok(number_value(value))
     }
 }
 
-/// Calculate bond price using standard bond pricing formula
-fn calculate_price(
-    settlement: &NaiveDate,
-    maturity: &NaiveDate,
-    rate: f64,
-    yld: f64,
-    redemption: f64,
-    frequency: i32,
-    basis: DayCountBasis,
-) -> f64 {
-    let n = coupons_remaining(settlement, maturity, frequency);
-    let coupon = 100.0 * rate / frequency as f64;
-
-    // Find previous and next coupon dates
-    let next_coupon = coupon_date_after(settlement, maturity, frequency);
-    let prev_coupon = coupon_date_before(settlement, maturity, frequency);
-
-    // Calculate fraction of period from settlement to next coupon
-    let days_to_next = days_between(settlement, &next_coupon, basis) as f64;
-    let days_in_period = days_between(&prev_coupon, &next_coupon, basis) as f64;
-
-    let dsn = if days_in_period > 0.0 {
-        days_to_next / days_in_period
-    } else {
-        0.0
+/// YIELD with one coupon left: the simple yield over the days from settlement
+/// to the coupon, counted by the basis; the period is 360/frequency days on
+/// the 30/360 bases and its actual days on the others.
+fn single_coupon_yield(b: &Bond, rate: f64, price: f64, redemption: f64) -> f64 {
+    let f = b.frequency as f64;
+    let a = b.basis.days_before(&b.period, b.settlement);
+    let dsr = b.basis.days(b.settlement, b.period.ncd);
+    let e = match b.basis {
+        Basis::Us30 | Basis::Euro30 => 360.0 / f,
+        _ => Basis::Actual.days(b.period.pcd, b.period.ncd),
     };
-
-    let yld_per_period = yld / frequency as f64;
-
-    if n == 1 {
-        // Short first period (single coupon remaining)
-        // Price = (redemption + coupon) / (1 + dsn * yld_per_period) - (1 - dsn) * coupon
-        (redemption + coupon) / (1.0 + dsn * yld_per_period) - (1.0 - dsn) * coupon
-    } else {
-        // Multiple coupons remaining
-        // Price = sum of discounted coupons + discounted redemption - accrued interest
-        let discount_factor = 1.0 + yld_per_period;
-
-        // Discount factor for first coupon (fractional period)
-        let first_discount = discount_factor.powf(dsn);
-
-        // Present value of coupon payments
-        let mut pv_coupons = 0.0;
-        for k in 0..n {
-            let discount = first_discount * discount_factor.powi(k);
-            pv_coupons += coupon / discount;
-        }
-
-        // Present value of redemption
-        let pv_redemption = redemption / (first_discount * discount_factor.powi(n - 1));
-
-        // Accrued interest (negative because we subtract it)
-        let accrued = (1.0 - dsn) * coupon;
-
-        pv_coupons + pv_redemption - accrued
-    }
+    let paid = redemption / 100.0 + rate / f;
+    let cost = price / 100.0 + a / e * rate / f;
+    (paid - cost) / cost * f * e / dsr
 }
 
-/// Returns annual yield for a coupon-paying security from its market price.
-///
-/// `YIELD` solves for the annual rate that makes `PRICE(...)` match the input `pr`.
+/// The yield at which `bond_price` is `price`: Newton's method on the price,
+/// which is convex and falling in the yield, so the iterates approach the root
+/// from below once the first step is taken.
+fn solve_yield(b: &Bond, rate: f64, price: f64, redemption: f64) -> Option<f64> {
+    let f = b.frequency as f64;
+    let at = |y: f64| {
+        bond_price(
+            b.settlement,
+            &b.period,
+            b.coupons,
+            rate,
+            y,
+            redemption,
+            b.frequency,
+            b.basis,
+        )
+    };
+    let e = b.basis.period_days(&b.period, b.frequency);
+    let t = (e - b.basis.days_before(&b.period, b.settlement)) / e;
+    let coupon = 100.0 * rate / f;
+    let slope = |y: f64| {
+        let x = 1.0 + y / f;
+        let n = b.coupons as f64;
+        let mut d = -(n - 1.0 + t) * redemption / x.powf(n + t) / f;
+        for k in 1..=b.coupons {
+            let p = k as f64 - 1.0 + t;
+            d -= p * coupon / x.powf(p + 1.0) / f;
+        }
+        d
+    };
+    let floor = -f;
+    let mut y = 0.05_f64.max(rate);
+    for _ in 0..200 {
+        let d = slope(y);
+        if !d.is_finite() || d == 0.0 {
+            return None;
+        }
+        let mut next = y - (at(y) - price) / d;
+        if next <= floor {
+            next = (y + floor) / 2.0;
+        }
+        if (next - y).abs() <= 1e-15 * next.abs().max(1e-10) {
+            return Some(next);
+        }
+        y = next;
+    }
+    ((at(y) - price).abs() <= 1e-9 * price).then_some(y)
+}
+
+/// Returns the yield of a security that pays periodic interest.
 ///
 /// # Remarks
-/// - Date inputs are spreadsheet serial dates and must satisfy `maturity > settlement`.
-/// - `rate` is coupon rate (annual decimal), `pr` is price per 100 face value, and `redemption` is redemption per 100; `pr` and `redemption` must be positive.
-/// - `frequency` must be `1` (annual), `2` (semiannual), or `4` (quarterly).
-/// - `basis` codes: `0=US(NASD)30/360`, `1=Actual/Actual`, `2=Actual/360`, `3=Actual/365`, `4=European30/360`.
-/// - Result is an annualized decimal yield (for example, `0.05` means 5%).
-/// - This implementation uses Newton-Raphson iteration; if it cannot converge, it returns `#NUM!`.
+/// - With one coupon left the yield is computed directly; otherwise it is the yield at which
+///   PRICE gives `pr`, found by Newton's method. It may be negative.
+/// - `rate` must be at least 0, `pr` and `redemption` positive.
 ///
 /// # Examples
 ///
 /// ```yaml,sandbox
-/// title: "Par price implies coupon-rate yield"
-/// formula: "=YIELD(DATE(2024,3,1), DATE(2026,3,1), 0.05, 100, 100, 2, 0)"
-/// expected: 0.05
-/// ```
-///
-/// ```yaml,sandbox
-/// title: "Yield recovered from a discounted price"
-/// formula: "=YIELD(DATE(2024,2,15), DATE(2027,2,15), 0.05, 97.2914042780609, 100, 2, 0)"
-/// expected: 0.06
+/// title: "Semiannual bond, 30/360"
+/// formula: "=YIELD(DATE(2008,2,15),DATE(2016,11,15),0.0575,95.04287,100,2,0)"
+/// expected: 0.06500000688073
 /// ```
 /// ```yaml,docs
 /// related:
 ///   - PRICE
-///   - ACCRINT
-///   - ACCRINTM
-/// faq:
-///   - q: "What does the returned `YIELD` represent?"
-///     a: "It is an annualized decimal yield (for example, `0.06` means 6% per year)."
-///   - q: "When does `YIELD` return `#NUM!` besides invalid inputs?"
-///     a: "The Newton-Raphson solve can fail to converge or hit an unstable derivative; in those cases it returns `#NUM!`."
 /// ```
 #[derive(Debug)]
 pub struct YieldFn;
@@ -758,193 +508,219 @@ impl Function for YieldFn {
         true
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(), // settlement
-                ArgSchema::number_lenient_scalar(), // maturity
-                ArgSchema::number_lenient_scalar(), // rate (coupon rate)
-                ArgSchema::number_lenient_scalar(), // pr (price)
-                ArgSchema::number_lenient_scalar(), // redemption
-                ArgSchema::number_lenient_scalar(), // frequency
-                ArgSchema::number_lenient_scalar(), // basis (optional)
-            ]
-        });
-        &SCHEMA[..]
+        number_schema(7)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
-        // Check minimum required arguments
-        if args.len() < 6 {
-            return Ok(CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new_value(),
-            )));
-        }
-
-        let settlement_serial = coerce_num(&args[0])?;
-        let maturity_serial = coerce_num(&args[1])?;
-        let rate = coerce_num(&args[2])?;
-        let pr = coerce_num(&args[3])?;
-        let redemption = coerce_num(&args[4])?;
-        let frequency = coerce_num(&args[5])?.trunc() as i32;
-        let basis_int = if args.len() > 6 {
-            coerce_num(&args[6])?.trunc() as i32
-        } else {
-            0
-        };
-
-        // Validate inputs
-        if rate < 0.0 || pr <= 0.0 || redemption <= 0.0 {
-            return Ok(CalcValue::Scalar(
-                LiteralValue::Error(ExcelError::new_num()),
-            ));
-        }
-        if frequency != 1 && frequency != 2 && frequency != 4 {
-            return Ok(CalcValue::Scalar(
-                LiteralValue::Error(ExcelError::new_num()),
-            ));
-        }
-
-        let basis = DayCountBasis::from_int(basis_int)?;
-
-        let system = ctx.date_system();
-        let settlement = try_serial_to_date_for(system, settlement_serial)?;
-        let maturity = try_serial_to_date_for(system, maturity_serial)?;
-
-        // maturity must be after settlement
-        if maturity <= settlement {
-            return Ok(CalcValue::Scalar(
-                LiteralValue::Error(ExcelError::new_num()),
-            ));
-        }
-
-        // Use Newton-Raphson to find yield where price = target price
-        let yld = calculate_yield(
-            &settlement,
-            &maturity,
-            rate,
-            pr,
-            redemption,
-            frequency,
-            basis,
-        );
-
-        match yld {
-            Some(y) => Ok(CalcValue::Scalar(LiteralValue::Number(y))),
-            None => Ok(CalcValue::Scalar(
-                LiteralValue::Error(ExcelError::new_num()),
-            )),
-        }
+        let value = (|| {
+            let [settlement, maturity, rate, price, redemption, freq, basis] =
+                numbers(args, [0.0; 7])?;
+            let b = bond(settlement, maturity, freq, basis, ctx)?;
+            if rate < 0.0 || price <= 0.0 || redemption <= 0.0 {
+                return Err(ExcelError::new_num());
+            }
+            if b.coupons <= 1 {
+                return Ok(single_coupon_yield(&b, rate, price, redemption));
+            }
+            solve_yield(&b, rate, price, redemption).ok_or_else(ExcelError::new_num)
+        })();
+        Ok(number_value(value))
     }
 }
 
-/// Calculate yield using Newton-Raphson iteration
-fn calculate_yield(
-    settlement: &NaiveDate,
-    maturity: &NaiveDate,
-    rate: f64,
-    target_price: f64,
-    redemption: f64,
-    frequency: i32,
-    basis: DayCountBasis,
-) -> Option<f64> {
-    const MAX_ITER: i32 = 100;
-    const EPSILON: f64 = 1e-10;
-
-    // Initial guess based on coupon rate
-    let mut yld = rate;
-    if yld == 0.0 {
-        yld = 0.05; // Default guess if rate is 0
+/// Macaulay duration in years: the cash flows' times, from settlement in
+/// coupon periods (the first one COUPDAYS - COUPDAYBS over COUPDAYS),
+/// weighted by their discounted values.
+fn macaulay_duration(b: &Bond, coupon_rate: f64, yld: f64) -> f64 {
+    let f = b.frequency as f64;
+    let e = b.basis.period_days(&b.period, b.frequency);
+    let dsc = e - b.basis.days_before(&b.period, b.settlement);
+    let x1 = dsc / e;
+    let x3 = yld / f + 1.0;
+    let n = b.coupons as f64;
+    let x2 = x1 + n - 1.0;
+    let x4 = x3.powf(x2);
+    let mut weighted = x2 * 100.0 / x4;
+    let mut value = 100.0 / x4;
+    for k in 1..=b.coupons {
+        let t = k as f64 - 1.0 + x1;
+        let cash = (100.0 * coupon_rate / f) / x3.powf(t);
+        weighted += cash * t;
+        value += cash;
     }
-
-    for _ in 0..MAX_ITER {
-        let price = calculate_price(
-            settlement, maturity, rate, yld, redemption, frequency, basis,
-        );
-        let diff = price - target_price;
-
-        if diff.abs() < EPSILON {
-            return Some(yld);
-        }
-
-        // Calculate derivative numerically
-        let delta = 0.0001;
-        let price_up = calculate_price(
-            settlement,
-            maturity,
-            rate,
-            yld + delta,
-            redemption,
-            frequency,
-            basis,
-        );
-        let derivative = (price_up - price) / delta;
-
-        if derivative.abs() < EPSILON {
-            return None;
-        }
-
-        let new_yld = yld - diff / derivative;
-
-        // Prevent yield from going too negative
-        if new_yld < -0.99 {
-            yld = -0.99;
-        } else {
-            yld = new_yld;
-        }
-
-        // Prevent yield from going too high
-        if yld > 10.0 {
-            yld = 10.0;
-        }
-    }
-
-    // If close enough after max iterations, return the result
-    let final_price = calculate_price(
-        settlement, maturity, rate, yld, redemption, frequency, basis,
-    );
-    if (final_price - target_price).abs() < 0.01 {
-        Some(yld)
-    } else {
-        None
-    }
+    weighted / value / f
 }
 
-/// Returns bond-equivalent yield for a US Treasury bill.
-///
-/// `TBILLEQ` converts a T-bill discount rate into an annualized bond-equivalent yield
-/// so it can be compared with coupon-bearing securities.
+fn duration_args(
+    args: &[ArgumentHandle],
+    ctx: &dyn FunctionContext<'_>,
+) -> Result<(Bond, f64, f64), ExcelError> {
+    let [settlement, maturity, coupon, yld, freq, basis] = numbers(args, [0.0; 6])?;
+    let b = bond(settlement, maturity, freq, basis, ctx)?;
+    if coupon < 0.0 || yld < 0.0 {
+        return Err(ExcelError::new_num());
+    }
+    Ok((b, coupon, yld))
+}
+
+/// Returns the Macaulay duration of a security that pays periodic interest.
 ///
 /// # Remarks
-/// - Date inputs are spreadsheet serial dates; `maturity` must be after `settlement`.
-/// - The T-bill must mature within one year of settlement (DSM <= 365).
-/// - `discount` is the T-bill discount rate as a decimal (e.g. `0.09` for 9%).
-/// - For bills with DSM <= 182: `yield = 365 * discount / (360 - discount * DSM)`.
-/// - For bills with DSM > 182 a quadratic coupon-equivalent formula is used.
-/// - Returns `#NUM!` for invalid dates, non-positive discount, or DSM out of range.
+/// - `coupon` and `yld` must be at least 0.
 ///
 /// # Examples
-/// ```excel
-/// =TBILLEQ(DATE(2024,1,1), DATE(2024,4,1), 0.038)
-/// ```
 ///
 /// ```yaml,sandbox
-/// title: "Short bill bond-equivalent yield"
-/// formula: '=TBILLEQ(DATE(2024,1,1), DATE(2024,4,1), 0.038)'
-/// expected: 0.03890144779577161
+/// title: "30-year semiannual bond"
+/// formula: "=DURATION(DATE(2018,7,1),DATE(2048,1,1),0.08,0.09,2,1)"
+/// expected: 10.919145281591932
 /// ```
+/// ```yaml,docs
+/// related:
+///   - MDURATION
+///   - PRICE
+/// ```
+#[derive(Debug)]
+pub struct DurationFn;
+
+/// [formualizer-docgen:schema:start]
+/// Name: DURATION
+/// Type: DurationFn
+/// Min args: 5
+/// Max args: variadic
+/// Variadic: true
+/// Signature: DURATION(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4: number@scalar, arg5: number@scalar, arg6...: number@scalar)
+/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg5{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg6{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
+/// Caps: PURE
+/// [formualizer-docgen:schema:end]
+impl Function for DurationFn {
+    func_caps!(PURE);
+    fn name(&self) -> &'static str {
+        "DURATION"
+    }
+    fn min_args(&self) -> usize {
+        5
+    }
+    fn variadic(&self) -> bool {
+        true
+    }
+    fn arg_schema(&self) -> &'static [ArgSchema] {
+        number_schema(6)
+    }
+    fn eval<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+    ) -> Result<CalcValue<'b>, ExcelError> {
+        let value =
+            duration_args(args, ctx).map(|(b, coupon, yld)| macaulay_duration(&b, coupon, yld));
+        Ok(number_value(value))
+    }
+}
+
+/// Returns the modified duration of a security that pays periodic interest:
+/// DURATION / (1 + yld / frequency).
 ///
+/// # Examples
+///
+/// ```yaml,sandbox
+/// title: "8-year semiannual bond"
+/// formula: "=MDURATION(DATE(2008,1,1),DATE(2016,1,1),0.08,0.09,2,1)"
+/// expected: 5.735669813918838
+/// ```
+/// ```yaml,docs
+/// related:
+///   - DURATION
+/// ```
+#[derive(Debug)]
+pub struct MdurationFn;
+
+/// [formualizer-docgen:schema:start]
+/// Name: MDURATION
+/// Type: MdurationFn
+/// Min args: 5
+/// Max args: variadic
+/// Variadic: true
+/// Signature: MDURATION(arg1: number@scalar, arg2: number@scalar, arg3: number@scalar, arg4: number@scalar, arg5: number@scalar, arg6...: number@scalar)
+/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg5{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg6{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
+/// Caps: PURE
+/// [formualizer-docgen:schema:end]
+impl Function for MdurationFn {
+    func_caps!(PURE);
+    fn name(&self) -> &'static str {
+        "MDURATION"
+    }
+    fn min_args(&self) -> usize {
+        5
+    }
+    fn variadic(&self) -> bool {
+        true
+    }
+    fn arg_schema(&self) -> &'static [ArgSchema] {
+        number_schema(6)
+    }
+    fn eval<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+    ) -> Result<CalcValue<'b>, ExcelError> {
+        let value = duration_args(args, ctx).map(|(b, coupon, yld)| {
+            macaulay_duration(&b, coupon, yld) / (yld / b.frequency as f64 + 1.0)
+        });
+        Ok(number_value(value))
+    }
+}
+
+/// The days from settlement to maturity of a Treasury bill: maturity after
+/// settlement and no more than a year after it.
+fn bill_days(
+    settlement: f64,
+    maturity: f64,
+    ctx: &dyn FunctionContext<'_>,
+) -> Result<f64, ExcelError> {
+    let system = ctx.date_system();
+    let settlement = date(settlement, system)?;
+    let maturity = date(maturity, system)?;
+    // A year after 29 February is 1 March.
+    let year_later =
+        NaiveDate::from_ymd_opt(settlement.year() + 1, settlement.month(), settlement.day())
+            .unwrap_or_else(|| add_months(settlement, 12).succ_opt().expect("a date"));
+    if maturity <= settlement || maturity > year_later {
+        return Err(ExcelError::new_num());
+    }
+    Ok((maturity - settlement).num_days() as f64)
+}
+
+fn bill_args(
+    args: &[ArgumentHandle],
+    ctx: &dyn FunctionContext<'_>,
+) -> Result<(f64, f64), ExcelError> {
+    let [settlement, maturity, third] = numbers(args, [0.0; 3])?;
+    Ok((bill_days(settlement, maturity, ctx)?, third))
+}
+
+/// Returns the bond-equivalent yield for a Treasury bill.
+///
+/// # Remarks
+/// - Maturity must be after settlement and at most one year after it; `discount` positive,
+///   and the bill's price, 100 * (1 - discount * DSM / 360), positive.
+/// - Up to 182 days: `365 * discount / (360 - discount * DSM)`; beyond, the root of the
+///   coupon-equivalent quadratic.
+///
+/// # Examples
+///
+/// ```yaml,sandbox
+/// title: "Bill of 62 days"
+/// formula: "=TBILLEQ(DATE(2008,3,31),DATE(2008,6,1),0.0914)"
+/// expected: 0.09415149356594302
+/// ```
 /// ```yaml,docs
 /// related:
 ///   - TBILLPRICE
 ///   - TBILLYIELD
-///   - YIELD
-/// faq:
-///   - q: "Why does TBILLEQ differ from the discount rate?"
-///     a: "TBILLEQ annualizes the bill using a bond-equivalent convention so it can be compared with coupon-bearing yields."
 /// ```
 #[derive(Debug)]
 pub struct TbilleqFn;
@@ -968,99 +744,51 @@ impl Function for TbilleqFn {
         3
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(), // settlement
-                ArgSchema::number_lenient_scalar(), // maturity
-                ArgSchema::number_lenient_scalar(), // discount
-            ]
-        });
-        &SCHEMA[..]
+        number_schema(3)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
-        let settlement_serial = coerce_num(&args[0])?;
-        let maturity_serial = coerce_num(&args[1])?;
-        let discount = coerce_num(&args[2])?;
-
-        if discount <= 0.0 {
-            return Ok(CalcValue::Scalar(
-                LiteralValue::Error(ExcelError::new_num()),
-            ));
-        }
-
-        let system = ctx.date_system();
-        let settlement = try_serial_to_date_for(system, settlement_serial)?;
-        let maturity = try_serial_to_date_for(system, maturity_serial)?;
-
-        if maturity <= settlement {
-            return Ok(CalcValue::Scalar(
-                LiteralValue::Error(ExcelError::new_num()),
-            ));
-        }
-
-        let dsm = (maturity - settlement).num_days() as f64;
-        if dsm > 365.0 || dsm <= 0.0 {
-            return Ok(CalcValue::Scalar(
-                LiteralValue::Error(ExcelError::new_num()),
-            ));
-        }
-
-        let result = if dsm <= 182.0 {
-            365.0 * discount / (360.0 - discount * dsm)
-        } else {
-            // Coupon-equivalent yield for long-dated T-bills (> 182 days)
-            // Microsoft formula: (-2a + 2*sqrt(a^2 - (2a-1)*(1 - 1/p))) / (2a-1)
-            // where a = DSM/365 and p = price as fraction of par
-            let price_frac = 1.0 - discount * dsm / 360.0;
-            let a = dsm / 365.0;
-            let inner = a * a - (2.0 * a - 1.0) * (1.0 - 1.0 / price_frac);
-            if inner < 0.0 {
-                return Ok(CalcValue::Scalar(
-                    LiteralValue::Error(ExcelError::new_num()),
-                ));
+        let value = bill_args(args, ctx).and_then(|(dsm, discount)| {
+            let price = 1.0 - discount * dsm / 360.0;
+            if discount <= 0.0 || price <= 0.0 {
+                return Err(ExcelError::new_num());
             }
-            (-2.0 * a + 2.0 * inner.sqrt()) / (2.0 * a - 1.0)
-        };
-
-        Ok(CalcValue::Scalar(LiteralValue::Number(result)))
+            if dsm <= 182.0 {
+                return Ok(365.0 * discount / (360.0 - discount * dsm));
+            }
+            // A bill of 366 days is a year of 366 days.
+            let a = dsm / if dsm == 366.0 { 366.0 } else { 365.0 };
+            let inner = a * a - (2.0 * a - 1.0) * (1.0 - 1.0 / price);
+            if inner < 0.0 {
+                return Err(ExcelError::new_num());
+            }
+            Ok((-2.0 * a + 2.0 * inner.sqrt()) / (2.0 * a - 1.0))
+        });
+        Ok(number_value(value))
     }
 }
 
-/// Returns price per $100 face value for a US Treasury bill.
-///
-/// `TBILLPRICE` computes the dollar price from a discount rate using
-/// `price = 100 * (1 - discount * DSM / 360)`.
+/// Returns the price per 100 face value of a Treasury bill:
+/// `100 * (1 - discount * DSM / 360)`.
 ///
 /// # Remarks
-/// - Date inputs are spreadsheet serial dates; `maturity` must be after `settlement`.
-/// - The T-bill must mature within one year of settlement (DSM <= 365).
-/// - `discount` is a decimal discount rate; must be positive.
-/// - Returns `#NUM!` for invalid dates, non-positive discount, or DSM out of range.
+/// - Maturity must be after settlement and at most one year after it; `discount` and the
+///   price must be positive.
 ///
 /// # Examples
-/// ```excel
-/// =TBILLPRICE(DATE(2024,1,1), DATE(2024,4,1), 0.038)
-/// ```
 ///
 /// ```yaml,sandbox
-/// title: "Price a 91-day T-bill"
-/// formula: '=TBILLPRICE(DATE(2024,1,1), DATE(2024,4,1), 0.038)'
-/// expected: 99.03944444444444
+/// title: "Bill of 62 days"
+/// formula: "=TBILLPRICE(DATE(2008,3,31),DATE(2008,6,1),0.09)"
+/// expected: 98.45
 /// ```
-///
 /// ```yaml,docs
 /// related:
 ///   - TBILLEQ
 ///   - TBILLYIELD
-///   - PRICE
-/// faq:
-///   - q: "What does TBILLPRICE quote?"
-///     a: "The result is the dollar price per 100 of face value, following Excel's Treasury-bill convention."
 /// ```
 #[derive(Debug)]
 pub struct TbillpriceFn;
@@ -1084,83 +812,40 @@ impl Function for TbillpriceFn {
         3
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(), // settlement
-                ArgSchema::number_lenient_scalar(), // maturity
-                ArgSchema::number_lenient_scalar(), // discount
-            ]
-        });
-        &SCHEMA[..]
+        number_schema(3)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
-        let settlement_serial = coerce_num(&args[0])?;
-        let maturity_serial = coerce_num(&args[1])?;
-        let discount = coerce_num(&args[2])?;
-
-        if discount <= 0.0 {
-            return Ok(CalcValue::Scalar(
-                LiteralValue::Error(ExcelError::new_num()),
-            ));
-        }
-
-        let system = ctx.date_system();
-        let settlement = try_serial_to_date_for(system, settlement_serial)?;
-        let maturity = try_serial_to_date_for(system, maturity_serial)?;
-
-        if maturity <= settlement {
-            return Ok(CalcValue::Scalar(
-                LiteralValue::Error(ExcelError::new_num()),
-            ));
-        }
-
-        let dsm = (maturity - settlement).num_days() as f64;
-        if dsm > 365.0 || dsm <= 0.0 {
-            return Ok(CalcValue::Scalar(
-                LiteralValue::Error(ExcelError::new_num()),
-            ));
-        }
-
-        let price = 100.0 * (1.0 - discount * dsm / 360.0);
-        Ok(CalcValue::Scalar(LiteralValue::Number(price)))
+        let value = bill_args(args, ctx).and_then(|(dsm, discount)| {
+            let price = 100.0 * (1.0 - discount * dsm / 360.0);
+            if discount <= 0.0 || price <= 0.0 {
+                return Err(ExcelError::new_num());
+            }
+            Ok(price)
+        });
+        Ok(number_value(value))
     }
 }
 
-/// Returns the yield for a US Treasury bill.
-///
-/// `TBILLYIELD` computes the discount-rate yield from a T-bill's price using
-/// `yield = (100 - price) / price * (360 / DSM)`.
+/// Returns the yield of a Treasury bill: `(100 - pr) / pr * 360 / DSM`.
 ///
 /// # Remarks
-/// - Date inputs are spreadsheet serial dates; `maturity` must be after `settlement`.
-/// - The T-bill must mature within one year of settlement (DSM <= 365).
-/// - `price` is the dollar price per $100 face value; must be positive.
-/// - Returns `#NUM!` for invalid dates, non-positive price, or DSM out of range.
+/// - Maturity must be after settlement and at most one year after it; `pr` positive.
 ///
 /// # Examples
-/// ```excel
-/// =TBILLYIELD(DATE(2024,1,1), DATE(2024,4,1), 98.5)
-/// ```
 ///
 /// ```yaml,sandbox
-/// title: "Yield from quoted T-bill price"
-/// formula: '=TBILLYIELD(DATE(2024,1,1), DATE(2024,4,1), 98.5)'
-/// expected: 0.060244324203715074
+/// title: "Bill of 62 days"
+/// formula: "=TBILLYIELD(DATE(2008,3,31),DATE(2008,6,1),98.45)"
+/// expected: 0.09141696292534264
 /// ```
-///
 /// ```yaml,docs
 /// related:
-///   - TBILLPRICE
 ///   - TBILLEQ
-///   - YIELD
-/// faq:
-///   - q: "Is TBILLYIELD the same as bond-equivalent yield?"
-///     a: "No. TBILLYIELD gives the bill's discount-rate yield, while TBILLEQ converts that pricing into a bond-equivalent yield."
+///   - TBILLPRICE
 /// ```
 #[derive(Debug)]
 pub struct TbillyieldFn;
@@ -1184,50 +869,20 @@ impl Function for TbillyieldFn {
         3
     }
     fn arg_schema(&self) -> &'static [ArgSchema] {
-        use std::sync::LazyLock;
-        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
-            vec![
-                ArgSchema::number_lenient_scalar(), // settlement
-                ArgSchema::number_lenient_scalar(), // maturity
-                ArgSchema::number_lenient_scalar(), // price
-            ]
-        });
-        &SCHEMA[..]
+        number_schema(3)
     }
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
-        let settlement_serial = coerce_num(&args[0])?;
-        let maturity_serial = coerce_num(&args[1])?;
-        let price = coerce_num(&args[2])?;
-
-        if price <= 0.0 {
-            return Ok(CalcValue::Scalar(
-                LiteralValue::Error(ExcelError::new_num()),
-            ));
-        }
-
-        let system = ctx.date_system();
-        let settlement = try_serial_to_date_for(system, settlement_serial)?;
-        let maturity = try_serial_to_date_for(system, maturity_serial)?;
-
-        if maturity <= settlement {
-            return Ok(CalcValue::Scalar(
-                LiteralValue::Error(ExcelError::new_num()),
-            ));
-        }
-
-        let dsm = (maturity - settlement).num_days() as f64;
-        if dsm > 365.0 || dsm <= 0.0 {
-            return Ok(CalcValue::Scalar(
-                LiteralValue::Error(ExcelError::new_num()),
-            ));
-        }
-
-        let yld = (100.0 - price) / price * (360.0 / dsm);
-        Ok(CalcValue::Scalar(LiteralValue::Number(yld)))
+        let value = bill_args(args, ctx).and_then(|(dsm, price)| {
+            if price <= 0.0 {
+                return Err(ExcelError::new_num());
+            }
+            Ok((100.0 - price) / price * 360.0 / dsm)
+        });
+        Ok(number_value(value))
     }
 }
 
@@ -1237,6 +892,8 @@ pub fn register_builtins() {
     crate::function_registry::register_builtin(Arc::new(AccrintmFn));
     crate::function_registry::register_builtin(Arc::new(PriceFn));
     crate::function_registry::register_builtin(Arc::new(YieldFn));
+    crate::function_registry::register_builtin(Arc::new(DurationFn));
+    crate::function_registry::register_builtin(Arc::new(MdurationFn));
     crate::function_registry::register_builtin(Arc::new(TbilleqFn));
     crate::function_registry::register_builtin(Arc::new(TbillpriceFn));
     crate::function_registry::register_builtin(Arc::new(TbillyieldFn));
@@ -1244,37 +901,18 @@ pub fn register_builtins() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use formualizer_common::LiteralValue;
 
-    #[test]
-    fn year_fraction_actual_actual_prorates_cross_year_ranges() {
-        let start = NaiveDate::from_ymd_opt(2023, 12, 1).unwrap();
-        let end = NaiveDate::from_ymd_opt(2024, 3, 1).unwrap();
-        let expected = 31.0 / 365.0 + 60.0 / 366.0;
-        let actual = year_fraction(&start, &end, DayCountBasis::ActualActual);
-        assert!(
-            (actual - expected).abs() < 1e-12,
-            "expected {expected}, got {actual}"
-        );
-    }
-
-    #[test]
-    fn year_fraction_actual_actual_is_sign_symmetric() {
-        let start = NaiveDate::from_ymd_opt(2023, 12, 1).unwrap();
-        let end = NaiveDate::from_ymd_opt(2024, 3, 1).unwrap();
-        let forward = year_fraction(&start, &end, DayCountBasis::ActualActual);
-        let backward = year_fraction(&end, &start, DayCountBasis::ActualActual);
-        assert!((forward + backward).abs() < 1e-12);
-    }
-
-    fn eval_bond_formula(system: crate::engine::DateSystem, formula: &str) -> LiteralValue {
+    fn eval_in(system: crate::engine::DateSystem, formula: &str) -> LiteralValue {
         use crate::engine::{Engine, EvalConfig};
         use crate::interpreter::Interpreter;
         use crate::test_workbook::TestWorkbook;
         use formualizer_parse::parser::parse;
 
-        let wb = TestWorkbook::new().with_function(std::sync::Arc::new(AccrintmFn));
-        let engine = Engine::new(wb, EvalConfig::default().with_date_system(system));
+        let engine = Engine::new(
+            TestWorkbook::new(),
+            EvalConfig::default().with_date_system(system),
+        );
         let interpreter = Interpreter::new(&engine, "Sheet1");
         interpreter
             .evaluate_ast(&parse(formula).expect("formula should parse"))
@@ -1284,26 +922,21 @@ mod tests {
 
     /// Bond day counts depend on the calendar dates the serials denote, so the
     /// same issue/settlement pair must accrue identically in both date systems.
+    /// The dates are in 1904: read as 1900 serials they land on other dates.
     #[test]
     fn accrintm_follows_workbook_date_system_1900_and_1904() {
         use crate::engine::DateSystem;
+        use chrono::{Datelike, NaiveDate};
         use formualizer_common::date_to_serial_for;
 
-        // Dates in 1904 are deliberate. Actual/360 accrual depends only on the
-        // *difference* between the two dates, which is epoch-invariant, so a
-        // modern date pair cannot detect a misread date system at all. Anchored
-        // at the 1904 epoch the settlement serials are small, and reading them
-        // as 1900 serials lands on entirely different calendar dates -- which is
-        // exactly the confusion this test exists to catch.
         let issue = NaiveDate::from_ymd_opt(1904, 1, 1).unwrap();
         let settlement = NaiveDate::from_ymd_opt(1904, 7, 1).unwrap();
         // Actual/360 over 182 days: 1000 * 0.1 * 182 / 360.
         let expected = 1000.0 * 0.1 * 182.0 / 360.0;
-
         for system in [DateSystem::Excel1900, DateSystem::Excel1904] {
             let i = date_to_serial_for(system, &issue);
             let s = date_to_serial_for(system, &settlement);
-            match eval_bond_formula(system, &format!("=ACCRINTM({i},{s},0.1,1000,2)")) {
+            match eval_in(system, &format!("=ACCRINTM({i},{s},0.1,1000,2)")) {
                 LiteralValue::Number(n) => assert!(
                     (n - expected).abs() < 1e-9,
                     "ACCRINTM under {system:?}: expected {expected}, got {n}"

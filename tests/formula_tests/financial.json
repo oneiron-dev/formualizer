@@ -90,15 +90,15 @@
     },
     {
       "formula": "=DDB(10000,1000,5,1.9)",
-      "result": 4000.0,
+      "result": 2525.7834699574214,
       "result_type": "float",
-      "description": "DDB fractional period truncated to integer"
+      "description": "DDB fractional period: book value after 0.9 periods times the rate (Excel for Windows)"
     },
     {
       "formula": "=DDB(10000,1000,5,2.5)",
-      "result": 2400.0,
+      "result": 1859.03200617956,
       "result_type": "float",
-      "description": "DDB fractional period 2.5 treated as period 2"
+      "description": "DDB fractional period 2.5: book value after 1.5 periods times the rate"
     },
     {
       "formula": "=DDB(10000,1000,5,1,1.5)",
@@ -126,15 +126,15 @@
     },
     {
       "formula": "=DDB(10000,1000,5,0.5)",
-      "result": "#NUM!",
-      "result_type": "error",
-      "description": "DDB sub-unit fractional period truncates to zero and returns NUM error"
+      "result": 4000.0,
+      "result_type": "float",
+      "description": "DDB period below 1 depreciates the full cost times the rate"
     },
     {
       "formula": "=DDB(10000,1000,5,5.9)",
-      "result": 296.0,
-      "result_type": "float",
-      "description": "DDB period 5.9 truncates to 5 (within life) and returns period 5 result"
+      "result": "#NUM!",
+      "result_type": "error",
+      "description": "DDB period past the life is a NUM error"
     },
     {
       "formula": "=IRR({-1000, 400, 400, 400, 400})",

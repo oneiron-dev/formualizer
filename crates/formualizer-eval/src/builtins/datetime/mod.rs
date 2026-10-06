@@ -13,6 +13,7 @@ mod serial;
 mod today_now;
 mod weekday_workday;
 
+pub(crate) use date_parts::yearfrac_actual_year_length;
 pub use serial::{
     create_date_normalized, date_to_serial, date_to_serial_for, datetime_to_serial,
     datetime_to_serial_for, serial_to_date, serial_to_datetime, serial_to_datetime_for,

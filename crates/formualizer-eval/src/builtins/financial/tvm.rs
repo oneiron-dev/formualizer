@@ -1,4 +1,5 @@
-//! Time Value of Money functions: PMT, PV, FV, NPV, NPER, RATE, IPMT, PPMT, XNPV, XIRR, DOLLARDE, DOLLARFR
+//! Time Value of Money functions: PMT, PV, FV, NPV, NPER, RATE, IPMT, PPMT, XNPV, XIRR, DOLLARDE, DOLLARFR,
+//! FVSCHEDULE
 
 use crate::args::ArgSchema;
 use crate::coercion::to_serial_strict;
@@ -2666,6 +2667,109 @@ impl Function for PdurationFn {
     }
 }
 
+/// Returns the future value of a principal after compounding by a schedule
+/// of interest rates: `principal * (1 + r1) * (1 + r2) * ...`.
+///
+/// # Remarks
+/// - The schedule is a range, an array or a single value; blank cells are skipped. A
+///   logical, or text in a range or array, is `#VALUE!`; a single text value converts.
+/// - An error in the schedule is the result.
+///
+/// # Examples
+///
+/// ```yaml,sandbox
+/// title: "Three yearly rates"
+/// formula: "=FVSCHEDULE(1,{0.09,0.11,0.1})"
+/// expected: 1.3308900000000004
+/// ```
+/// ```yaml,docs
+/// related:
+///   - FV
+///   - RRI
+/// ```
+#[derive(Debug)]
+pub struct FvscheduleFn;
+
+/// [formualizer-docgen:schema:start]
+/// Name: FVSCHEDULE
+/// Type: FvscheduleFn
+/// Min args: 2
+/// Max args: 2
+/// Variadic: false
+/// Signature: FVSCHEDULE(arg1: number@scalar, arg2: any@scalar)
+/// Arg schema: arg1{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg2{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
+/// Caps: PURE
+/// [formualizer-docgen:schema:end]
+impl Function for FvscheduleFn {
+    func_caps!(PURE);
+    fn name(&self) -> &'static str {
+        "FVSCHEDULE"
+    }
+    fn min_args(&self) -> usize {
+        2
+    }
+    fn arg_schema(&self) -> &'static [ArgSchema] {
+        use std::sync::LazyLock;
+        static SCHEMA: LazyLock<Vec<ArgSchema>> =
+            LazyLock::new(|| vec![ArgSchema::number_lenient_scalar(), ArgSchema::any()]);
+        &SCHEMA[..]
+    }
+    fn eval<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        _ctx: &dyn FunctionContext<'b>,
+    ) -> Result<CalcValue<'b>, ExcelError> {
+        let value = (|| {
+            let mut value = super::coupon::number(&args[0])?;
+            let rate = |cell: &LiteralValue| -> Result<Option<f64>, ExcelError> {
+                match cell {
+                    LiteralValue::Number(n) => Ok(Some(*n)),
+                    LiteralValue::Int(i) => Ok(Some(*i as f64)),
+                    LiteralValue::Empty => Ok(None),
+                    LiteralValue::Error(e) => Err(e.clone()),
+                    LiteralValue::Date(_)
+                    | LiteralValue::DateTime(_)
+                    | LiteralValue::Time(_)
+                    | LiteralValue::Duration(_) => {
+                        to_serial_strict(cell, args[1].date_system()).map(Some)
+                    }
+                    _ => Err(ExcelError::new_value()),
+                }
+            };
+            match args[1].value()? {
+                CalcValue::Range(range) => {
+                    let (rows, cols) = range.dims();
+                    for r in 0..rows {
+                        for c in 0..cols {
+                            if let Some(r) = rate(&range.get_cell(r, c))? {
+                                value *= 1.0 + r;
+                            }
+                        }
+                    }
+                }
+                CalcValue::Scalar(LiteralValue::Array(rows))
+                | CalcValue::AnnotatedScalar(LiteralValue::Array(rows), _) => {
+                    for cell in rows.iter().flatten() {
+                        if let Some(r) = rate(cell)? {
+                            value *= 1.0 + r;
+                        }
+                    }
+                }
+                CalcValue::Scalar(_) | CalcValue::AnnotatedScalar(..) => {
+                    value *= 1.0 + super::coupon::number(&args[1])?;
+                }
+                CalcValue::Callable(_) => {
+                    return Err(ExcelError::new(ExcelErrorKind::Calc)
+                        .with_message("LAMBDA value must be invoked"));
+                }
+            }
+            // Excel reports a product past the largest number as 0.
+            Ok(if value.is_finite() { value } else { 0.0 })
+        })();
+        Ok(super::coupon::number_value(value))
+    }
+}
+
 pub fn register_builtins() {
     use std::sync::Arc;
     crate::function_registry::register_builtin(Arc::new(PmtFn));
@@ -2689,6 +2793,7 @@ pub fn register_builtins() {
     crate::function_registry::register_builtin(Arc::new(RriFn));
     crate::function_registry::register_builtin(Arc::new(IspmtFn));
     crate::function_registry::register_builtin(Arc::new(PdurationFn));
+    crate::function_registry::register_builtin(Arc::new(FvscheduleFn));
 }
 
 #[cfg(test)]

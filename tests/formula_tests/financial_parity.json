@@ -150,9 +150,9 @@
     },
     {
       "formula": "=ACCRINTM(DATE(2023,12,1), DATE(2024,3,1), 0.12, 1000, 1)",
-      "result": 29.86391196945879,
+      "result": 29.83606557377049,
       "result_type": "float",
-      "description": "ACCRINTM Actual/Actual prorates across year boundary"
+      "description": "ACCRINTM Actual/Actual divides by a 366-day year when the span holds 29 February (YEARFRAC rule)"
     }
   ]
 }
