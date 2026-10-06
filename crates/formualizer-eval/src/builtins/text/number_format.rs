@@ -119,8 +119,10 @@ fn split_sections(code: &str) -> Vec<&str> {
         }
         match c {
             '"' if !bracket => quoted = !quoted,
-            // `\x`, `!x`, `_x` and `*x` take the next character literally.
-            '\\' | '!' | '_' | '*' if !quoted && !bracket => escaped = true,
+            // `\x`, `_x` and `*x` take the next character literally. `!` is a
+            // character of its own in Excel for Windows 16.0.20430
+            // (TEXT(5,"!0") is "!5", TEXT(123,"0!.0") is "123!.0").
+            '\\' | '_' | '*' if !quoted && !bracket => escaped = true,
             '[' if !quoted => bracket = true,
             ']' if !quoted => bracket = false,
             ';' if !quoted && !bracket => {
@@ -207,12 +209,12 @@ fn parse_section(text: &str) -> Result<Section, ExcelError> {
                 i = end + 1;
                 continue;
             }
-            // `\`, `!`, `_` and `*` need a character to act on.
-            '\\' | '!' | '_' | '*' if i + 1 == chars.len() => {
+            // `\`, `_` and `*` need a character to act on.
+            '\\' | '_' | '*' if i + 1 == chars.len() => {
                 return Err(ExcelError::new_value());
             }
-            // `!` shows the next character as it is, like `\`.
-            '\\' | '!' => {
+            // `\` shows the next character as it is.
+            '\\' => {
                 push_lit(toks, &chars[i + 1].to_string());
                 i += 2;
                 continue;
@@ -440,6 +442,11 @@ pub(crate) fn format_number(
     };
     if section.toks.is_empty() {
         return Ok(String::new());
+    }
+    // A text section shows a number as General, without its literal text:
+    // TEXT(5,"!@") is "5" and TEXT(-5,"!@") "-5" (Excel for Windows 16.0.20430).
+    if section.has(&Tok::At) {
+        return Ok(format_general(value));
     }
     if section.is_date() {
         return format_date(section, magnitude, system);
@@ -948,17 +955,26 @@ fn format_scientific(toks: &[Tok], value: f64) -> String {
             .collect();
         fill + &int
     };
-    for t in int_toks {
-        match t {
-            Tok::Lit(s) => out.push_str(s),
-            Tok::Digit(_) => {}
-            _ => {}
+    // Literal text keeps its side of the mantissa's digits: before them, or
+    // after the integer or decimal digits it follows (`0.0!E+0` is `1.2!E+4`).
+    let last_digit = int_toks
+        .iter()
+        .rposition(|t| matches!(t, Tok::Digit(_)))
+        .unwrap_or(0);
+    let literals = |toks: &[Tok], out: &mut String| {
+        for t in toks {
+            if let Tok::Lit(s) = t {
+                out.push_str(s);
+            }
         }
-    }
+    };
+    literals(&int_toks[..last_digit], &mut out);
     out.push_str(&int_text);
+    literals(&int_toks[last_digit..], &mut out);
     if point.is_some() {
         out.push('.');
         out.push_str(&frac);
+        literals(frac_toks, &mut out);
     }
     out.push(if upper { 'E' } else { 'e' });
     if exponent < 0 {
@@ -1260,11 +1276,10 @@ mod tests {
             "\u{f1}",
             "0 \u{d1}",
             "\u{144}\u{148}",
-            // Unterminated quotes and brackets, dangling `\` `!` `_` `*`.
+            // Unterminated quotes and brackets, dangling `\` `_` `*`.
             "\"abc",
             "[Red",
             "0\\",
-            "0!",
             "0_",
             "0*",
             // At most four sections.
@@ -1361,19 +1376,48 @@ mod tests {
         assert_eq!(fmt(5.0, "0.0\"b\""), "5.0b");
     }
 
+    /// `!` is a character of its own in Excel for Windows 16.0.20430, not an
+    /// escape (probes 6-7 of ops/excel-context-probe-20261006.md); `\`
+    /// escapes.
     #[test]
-    fn bang_shows_the_next_character_as_written() {
-        assert_eq!(fmt(5.0, "0!n"), "5n");
-        assert_eq!(fmt(5.0, "0!E"), "5E");
-        assert_eq!(fmt(5.0, "0!B"), "5B");
-        assert_eq!(fmt(5.0, "0!b"), "5b");
+    fn bang_is_a_character_of_its_own() {
         assert_eq!(fmt(5.0, "0\\n"), "5n");
-        assert_eq!(fmt(203.0, "!r0c00"), "r2c03");
-        assert_eq!(fmt(123456.0, "0!.0,"), "12.3");
-        assert_eq!(fmt(3.0, "0!!"), "3!");
-        // An escaped `;` does not start a section.
-        assert_eq!(fmt(-5.0, "0;0!;"), "5;");
-        assert_eq!(format_text("abc", "!n@").unwrap(), "nabc");
+        assert_eq!(fmt(203.0, "!r0c00"), "!r2c03");
+        assert_eq!(fmt(203.0, "!R0C00"), "!R2C03");
+        assert_eq!(fmt(7.0, "!r0c00"), "!r0c07");
+        assert_eq!(fmt(5.0, "0!c"), "5!c");
+        assert_eq!(fmt(123.0, "0!.0"), "123!.0");
+        assert_eq!(fmt(5.0, "!0"), "!5");
+        assert_eq!(fmt(5.0, "0!"), "5!");
+        assert_eq!(fmt(5.0, "0!!"), "5!!");
+        assert_eq!(fmt(5.0, "!d"), "!5");
+        assert_eq!(fmt(0.5, "!h"), "!12");
+        assert_eq!(fmt(1234.0, "#,##0!.00"), "1,234!.00");
+        assert_eq!(fmt(5.0, "0\\!"), "5!");
+        assert_eq!(fmt(5.0, "!\"x\"0"), "!x5");
+        assert_eq!(fmt(5.0, "[Red]!0"), "!5");
+        assert_eq!(fmt(0.5, "0!%"), "50!%");
+        assert_eq!(fmt(-5.0, "!0;!-0"), "!-5");
+        assert_eq!(fmt(-5.0, "0!;0"), "5");
+        assert_eq!(fmt(5.0, "0!0"), "0!5");
+        assert_eq!(fmt(5.0, "#!#"), "!5");
+        assert_eq!(fmt(12345.0, "0.0!E+0"), "1.2!E+4");
+        assert_eq!(fmt(1234.5, "$#,##0!.00"), "$1,234!.50");
+        assert_eq!(fmt(45000.0, "yyyy!mm"), "2023!03");
+        assert_eq!(fmt(45000.0, "!yyyy"), "!2023");
+        assert_eq!(fmt(5.0, "!*0"), "!");
+        assert_eq!(fmt(5.0, "!_0"), "! ");
+        assert_eq!(fmt(5.0, "!"), "!");
+        assert_eq!(fmt(5.0, "!@"), "5");
+        assert_eq!(fmt(-5.0, "!@"), "-5");
+        assert_eq!(fmt(5.0, "@"), "5");
+        assert_eq!(fmt(5.0, "\"a\"@"), "5");
+        assert_eq!(fmt(5.0, "\\x@"), "5");
+        assert_eq!(format_text("q", "\\x@").unwrap(), "xq");
+        assert!(format_number(5.0, "0!n", DateSystem::Excel1900).is_err());
+        assert!(format_text("abc", "!n@").is_err());
+        assert_eq!(format_text("abc", "!@").unwrap(), "!abc");
+        assert!(format_number(5.0, "0!\"", DateSystem::Excel1900).is_err());
     }
 
     #[test]
