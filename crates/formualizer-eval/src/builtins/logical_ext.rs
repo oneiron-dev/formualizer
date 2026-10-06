@@ -253,7 +253,7 @@ impl Function for IfErrorFn {
             )));
         }
         match args[0].value() {
-            Ok(cv) if matches!(cv.as_scalar(), Some(LiteralValue::Error(_))) => {
+            Ok(cv) if matches!(single_value(&cv), Some(LiteralValue::Error(_))) => {
                 crate::traits::record_selection("IFERROR", args, Some(1));
                 args[1].value()
             }
@@ -269,6 +269,15 @@ impl Function for IfErrorFn {
                 args[1].value()
             }
         }
+    }
+}
+
+/// The one value of `value`: a scalar, or the cell of a one-cell range (`A1:A1`,
+/// or a cell of a closed linked workbook, which reads as such a range).
+fn single_value(value: &crate::traits::CalcValue<'_>) -> Option<LiteralValue> {
+    match value {
+        crate::traits::CalcValue::Range(view) if view.dims() == (1, 1) => view.as_1x1(),
+        other => other.as_scalar().cloned(),
     }
 }
 
@@ -389,7 +398,7 @@ impl Function for IfNaFn {
             )));
         }
         let value = args[0].value()?;
-        match value.as_scalar() {
+        match single_value(&value).as_ref() {
             Some(LiteralValue::Error(e)) if e.kind == formualizer_common::ExcelErrorKind::Na => {
                 crate::traits::record_selection("IFNA", args, Some(1));
                 args[1].value()

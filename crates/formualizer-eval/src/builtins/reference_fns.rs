@@ -2,7 +2,7 @@ use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
 use crate::function::{FnCaps, Function, FunctionResolution};
 use crate::traits::{ArgumentHandle, FunctionContext};
 use formualizer_common::{ArgKind, ExcelError, ExcelErrorKind, LiteralValue};
-use formualizer_parse::parser::ReferenceType;
+use formualizer_parse::parser::{ExternalRefKind, ExternalReference, ReferenceType};
 
 fn arg_byref_array() -> Vec<ArgSchema> {
     vec![
@@ -126,6 +126,66 @@ fn resolve_reference_bounds<'b>(
         } => Ok((sheet.clone(), *row, *col, *row, *col)),
         _ => Err(ExcelError::new(ExcelErrorKind::Ref)),
     }
+}
+
+/// The rows and columns (1-based start row, start column, end row, end
+/// column) a reference into a closed linked workbook spans, once the link is
+/// known to name its sheet (`#REF!` otherwise). A whole column or row reaches
+/// the sheet's edge; another open end stops where the saved values read stop.
+fn linked_bounds<'b>(
+    ctx: &dyn FunctionContext<'b>,
+    reference: &ReferenceType,
+    kind: ExternalRefKind,
+) -> Result<(u32, u32, u32, u32), ExcelError> {
+    let view = ctx.resolve_range_view(reference, ctx.current_sheet())?;
+    Ok(match kind {
+        ExternalRefKind::Cell { row, col, .. } => (row, col, row, col),
+        ExternalRefKind::Range {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            ..
+        } => index_static_bounds(start_row, start_col, end_row, end_col).unwrap_or_else(|| {
+            let (rows, cols) = view.dims();
+            let (sr, sc) = (start_row.unwrap_or(1), start_col.unwrap_or(1));
+            (
+                sr,
+                sc,
+                end_row.unwrap_or(sr + (rows.max(1) as u32) - 1),
+                end_col.unwrap_or(sc + (cols.max(1) as u32) - 1),
+            )
+        }),
+    })
+}
+
+/// The reference `local` (a cell or range on no sheet) selects, placed in the
+/// linked workbook and sheet of `ext`.
+fn linked_reference(ext: &ExternalReference, local: ReferenceType) -> ReferenceType {
+    let kind = match local {
+        ReferenceType::Cell { row, col, .. } => ExternalRefKind::cell(row, col),
+        ReferenceType::Range {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            ..
+        } => ExternalRefKind::Range {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            start_row_abs: false,
+            start_col_abs: false,
+            end_row_abs: false,
+            end_col_abs: false,
+        },
+        other => return other,
+    };
+    ReferenceType::External(ExternalReference {
+        kind,
+        ..ext.clone()
+    })
 }
 
 /// The `n`th (1-based, `n >= 1`) row or column of the span `start..=end`, or
@@ -291,9 +351,30 @@ impl IndexFn {
             Ok(base) => base,
             Err(error) => return Some(Err(error)),
         };
-        let (sheet, sr, sc, er, ec) = match resolve_reference_bounds(ctx, &base) {
+        // A reference into a closed linked workbook selects by the rows and
+        // columns it is written with, in the same linked sheet: INDEX returns
+        // a reference there, whose value is the one saved with the link.
+        let linked = match &base {
+            ReferenceType::External(ext)
+                if crate::engine::external_book::is_link_index(ext.book.token()) =>
+            {
+                Some(ext.clone())
+            }
+            _ => None,
+        };
+        let bounds = match &linked {
+            Some(ext) => {
+                linked_bounds(ctx, &base, ext.kind).map(|(sr, sc, er, ec)| (None, sr, sc, er, ec))
+            }
+            None => resolve_reference_bounds(ctx, &base),
+        };
+        let (sheet, sr, sc, er, ec) = match bounds {
             Ok(bounds) => bounds,
             Err(error) => return Some(Err(error)),
+        };
+        let place = |reference: ReferenceType| match &linked {
+            Some(ext) => linked_reference(ext, reference),
+            None => reference,
         };
         // A lone index selects a column of a single-row reference; otherwise it
         // selects a row and the omitted column_num acts as 0 (the entire row).
@@ -333,24 +414,24 @@ impl IndexFn {
             let Some(r) = nth_within(sr, er, row) else {
                 return off_reference();
             };
-            return Some(Ok(if sc == ec {
+            return Some(Ok(place(if sc == ec {
                 ReferenceType::cell(sheet, r, sc)
             } else {
                 range_ref(sheet, r, sc, r, ec)
-            }));
+            })));
         }
         if row == 0 {
             let Some(c) = nth_within(sc, ec, col) else {
                 return off_reference();
             };
-            return Some(Ok(if sr == er {
+            return Some(Ok(place(if sr == er {
                 ReferenceType::cell(sheet, sr, c)
             } else {
                 range_ref(sheet, sr, c, er, c)
-            }));
+            })));
         }
         match (nth_within(sr, er, row), nth_within(sc, ec, col)) {
-            (Some(r), Some(c)) => Some(Ok(ReferenceType::cell(sheet, r, c))),
+            (Some(r), Some(c)) => Some(Ok(place(ReferenceType::cell(sheet, r, c)))),
             _ => off_reference(),
         }
     }
@@ -568,6 +649,9 @@ impl Function for IndexFn {
                 Ok(areas) => Self::reference_from_areas(args, ctx, &areas),
                 Err(error) => Some(Err(error)),
             };
+        }
+        if let Some(base) = args[0].linked_book_reference() {
+            return Self::reference_from_base(args, ctx, base);
         }
         let base = match args[0].resolve_reference_or_value() {
             Ok(FunctionResolution::Reference(reference)) => reference,

@@ -4,9 +4,12 @@
 //! formulas) saves the referenced values alongside the link (the xlsx
 //! `externalLink` part). When the linked workbook is not open, Excel evaluates
 //! those references from the saved values: a cell missing from a saved sheet
-//! is blank, and a sheet the link does not name is `#REF!`.
+//! is blank, and a sheet the link does not name is `#REF!`. A sheet Excel could
+//! not read when it last refreshed the link (`refreshError`), or saved no
+//! values for at all, is known only by the cells it saved: every other cell of
+//! it is `#REF!` (Excel for Windows 16.0.20430).
 
-use formualizer_common::LiteralValue;
+use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use std::collections::BTreeMap;
 
 /// Values saved for one linked workbook.
@@ -22,6 +25,7 @@ pub struct ExternalSheet {
     cells: BTreeMap<(u32, u32), LiteralValue>,
     max_row: u32,
     max_col: u32,
+    refresh_error: bool,
 }
 
 impl ExternalBook {
@@ -61,7 +65,19 @@ impl ExternalSheet {
         &self.name
     }
 
-    /// Record the saved value of a cell (1-based row and column).
+    /// Mark the sheet as one Excel could not read when it last refreshed the
+    /// link (`refreshError`), or saved no values for: a cell it did not save
+    /// is `#REF!`, not blank.
+    pub fn set_refresh_error(&mut self, refresh_error: bool) {
+        self.refresh_error = refresh_error;
+    }
+
+    pub fn refresh_error(&self) -> bool {
+        self.refresh_error
+    }
+
+    /// Record the saved value of a cell (1-based row and column); a saved
+    /// blank is `LiteralValue::Empty`.
     pub fn set(&mut self, row: u32, col: u32, value: LiteralValue) {
         if row == 0 || col == 0 {
             return;
@@ -71,12 +87,22 @@ impl ExternalSheet {
         self.cells.insert((row, col), value);
     }
 
-    /// Saved value of a cell; cells that were not saved are blank.
+    /// Saved value of a cell; a cell that was not saved is [`Self::unsaved`].
     pub fn get(&self, row: u32, col: u32) -> LiteralValue {
         self.cells
             .get(&(row, col))
             .cloned()
-            .unwrap_or(LiteralValue::Empty)
+            .unwrap_or_else(|| self.unsaved())
+    }
+
+    /// The value of a cell that was not saved: blank, or `#REF!` on a sheet
+    /// with a refresh error.
+    pub fn unsaved(&self) -> LiteralValue {
+        if self.refresh_error {
+            LiteralValue::Error(ExcelError::new(ExcelErrorKind::Ref))
+        } else {
+            LiteralValue::Empty
+        }
     }
 
     /// Last saved (row, col), or (0, 0) when nothing was saved.

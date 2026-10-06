@@ -14,7 +14,7 @@ use crate::function_contract::{FunctionContextDependence, FunctionSemanticContra
 use crate::traits::{ArgumentHandle, FunctionContext};
 use formualizer_common::{ArgKind, ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
-use formualizer_parse::parser::ReferenceType;
+use formualizer_parse::parser::{ExternalRefKind, ReferenceType};
 
 #[derive(Debug)]
 pub struct RowFn;
@@ -143,8 +143,14 @@ impl Function for RowFn {
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
 
+        let position = match linked_position(&reference, ctx) {
+            Ok(position) => position,
+            Err(e) if e.kind == ExcelErrorKind::Cancelled => return Err(e),
+            Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+        };
+
         // Row numbers (1-based) spanned by the reference.
-        let (first, last) = match &reference {
+        let (first, last) = match position.as_ref().unwrap_or(&reference) {
             ReferenceType::Cell { row, .. } => (*row as i64, *row as i64),
             // A whole column (A:A) starts at row 1 and ends where it is read.
             ReferenceType::Range {
@@ -277,8 +283,13 @@ impl Function for RowsFn {
 
         // Try to get reference first, fall back to array literal
         if let Ok(reference) = args[0].as_reference_or_eval() {
+            let position = match linked_position(&reference, ctx) {
+                Ok(position) => position,
+                Err(e) if e.kind == ExcelErrorKind::Cancelled => return Err(e),
+                Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+            };
             // Calculate number of rows
-            let rows = match &reference {
+            let rows = match position.as_ref().unwrap_or(&reference) {
                 ReferenceType::Cell { .. } => 1,
                 ReferenceType::Range {
                     start_row: Some(sr),
@@ -460,8 +471,14 @@ impl Function for ColumnFn {
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
 
+        let position = match linked_position(&reference, ctx) {
+            Ok(position) => position,
+            Err(e) if e.kind == ExcelErrorKind::Cancelled => return Err(e),
+            Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+        };
+
         // Column numbers (1-based) spanned by the reference.
-        let (first, last) = match &reference {
+        let (first, last) = match position.as_ref().unwrap_or(&reference) {
             ReferenceType::Cell { col, .. } => (*col as i64, *col as i64),
             // A whole row (5:5) starts at column 1 and ends where it is read.
             ReferenceType::Range {
@@ -609,7 +626,39 @@ fn open_axis_end(
     } else {
         (view.start_col(), view.dims().1)
     };
-    Ok((start as i64 + len as i64).max(first))
+    // A linked workbook's saved values come as a view of their own, which
+    // starts at the reference's first row (column).
+    let start = match reference {
+        ReferenceType::External(_) => first - 1,
+        _ => start as i64,
+    };
+    Ok((start + len as i64).max(first))
+}
+
+/// A reference into a closed linked workbook (`[1]Data!K2:K9`) evaluates to
+/// the values saved with the link, but keeps the position it is written with:
+/// `ROW([1]Data!K2:K9)` is `{2;...;9}`, as for a local range. Gives the local
+/// reference of the same shape once the linked sheet is known to be readable
+/// (a sheet the link does not name is `#REF!`), and `None` for any other
+/// reference.
+fn linked_position(
+    reference: &ReferenceType,
+    ctx: &dyn FunctionContext<'_>,
+) -> Result<Option<ReferenceType>, ExcelError> {
+    let ReferenceType::External(ext) = reference else {
+        return Ok(None);
+    };
+    ctx.resolve_range_view(reference, ctx.current_sheet())?;
+    Ok(Some(match ext.kind {
+        ExternalRefKind::Cell { row, col, .. } => ReferenceType::cell(None, row, col),
+        ExternalRefKind::Range {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            ..
+        } => ReferenceType::range(None, start_row, start_col, end_row, end_col),
+    }))
 }
 
 /// ROW/COLUMN result: a single index, or for a multi-row (multi-column)
@@ -728,8 +777,13 @@ impl Function for ColumnsFn {
 
         // Try to get reference first, fall back to array literal
         if let Ok(reference) = args[0].as_reference_or_eval() {
+            let position = match linked_position(&reference, ctx) {
+                Ok(position) => position,
+                Err(e) if e.kind == ExcelErrorKind::Cancelled => return Err(e),
+                Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+            };
             // Calculate number of columns
-            let cols = match &reference {
+            let cols = match position.as_ref().unwrap_or(&reference) {
                 ReferenceType::Cell { .. } => 1,
                 ReferenceType::Range {
                     start_col: Some(sc),

@@ -764,6 +764,14 @@ impl Function for IsRefFn {
         let Ok(reference) = args[0].as_reference_or_eval() else {
             return Ok(scalar(LiteralValue::Boolean(false)));
         };
+        // A reference into a closed linked workbook is one, whatever the
+        // saved values hold, while the link names its sheet.
+        if let formualizer_parse::parser::ReferenceType::External(_) = &reference {
+            let readable = ctx
+                .resolve_range_view(&reference, ctx.current_sheet())
+                .is_ok();
+            return Ok(scalar(LiteralValue::Boolean(readable)));
+        }
         let is_ref = match ctx.inspect_reference(&reference) {
             Ok(Some(info)) => info.first_cell.is_some() || info.sheet_count.is_some(),
             Ok(None) => true,

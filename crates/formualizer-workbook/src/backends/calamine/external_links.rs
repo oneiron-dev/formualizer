@@ -108,12 +108,20 @@ fn cell_value(kind: Option<&str>, text: &str) -> LiteralValue {
     }
 }
 
+/// The values saved for one sheet: its cells (a saved blank has no value) and
+/// whether Excel could not read the sheet when it last refreshed the link.
+#[derive(Default)]
+struct SavedSheet {
+    cells: Vec<(u32, u32, LiteralValue)>,
+    refresh_error: bool,
+}
+
 /// Parse one `externalLink` part; `None` unless it links a workbook.
 fn parse_external_book(part: &[u8]) -> Option<ExternalBook> {
     let mut xml = XmlReader::from_reader(BufReader::new(part));
     let mut buf = Vec::new();
     let mut names = Vec::new();
-    let mut saved: BTreeMap<usize, Vec<(u32, u32, LiteralValue)>> = BTreeMap::new();
+    let mut saved: BTreeMap<usize, SavedSheet> = BTreeMap::new();
     let mut in_book = false;
     let mut sheet: Option<usize> = None;
     let mut cell: Option<(u32, u32, Option<String>)> = None;
@@ -128,8 +136,16 @@ fn parse_external_book(part: &[u8]) -> Option<ExternalBook> {
                 match e.local_name().as_ref() {
                     b"externalBook" => in_book = true,
                     b"sheetName" if in_book => names.push(local_attr(&xml, e, b"val")?),
-                    b"sheetData" if in_book && !empty => {
-                        sheet = local_attr(&xml, e, b"sheetId").and_then(|id| id.parse().ok());
+                    b"sheetData" if in_book => {
+                        let index: Option<usize> =
+                            local_attr(&xml, e, b"sheetId").and_then(|id| id.parse().ok());
+                        if let Some(index) = index {
+                            saved.entry(index).or_default().refresh_error = matches!(
+                                local_attr(&xml, e, b"refreshError").as_deref(),
+                                Some("1" | "true")
+                            );
+                        }
+                        sheet = if empty { None } else { index };
                     }
                     b"cell" if sheet.is_some() => {
                         let position = local_attr(&xml, e, b"r").and_then(|r| {
@@ -138,11 +154,10 @@ fn parse_external_book(part: &[u8]) -> Option<ExternalBook> {
                                 .map(|(row, col, _, _)| (row, col))
                         });
                         if let Some((row, col)) = position {
+                            cell = Some((row, col, local_attr(&xml, e, b"t")));
+                            value = None;
                             if empty {
-                                // A saved blank.
-                            } else {
-                                cell = Some((row, col, local_attr(&xml, e, b"t")));
-                                value = None;
+                                record_cell(&mut saved, sheet, &mut cell, &mut value);
                             }
                         }
                     }
@@ -163,17 +178,7 @@ fn parse_external_book(part: &[u8]) -> Option<ExternalBook> {
             }
             Event::End(ref e) => match e.local_name().as_ref() {
                 b"v" => in_value = false,
-                b"cell" => {
-                    if let (Some((row, col, kind)), Some(text), Some(index)) =
-                        (cell.take(), value.take(), sheet)
-                    {
-                        saved.entry(index).or_default().push((
-                            row,
-                            col,
-                            cell_value(kind.as_deref(), &text),
-                        ));
-                    }
-                }
+                b"cell" => record_cell(&mut saved, sheet, &mut cell, &mut value),
                 b"sheetData" => sheet = None,
                 b"externalBook" => in_book = false,
                 _ => {}
@@ -188,11 +193,39 @@ fn parse_external_book(part: &[u8]) -> Option<ExternalBook> {
     let mut book = ExternalBook::new();
     for (index, name) in names.into_iter().enumerate() {
         let sheet = book.add_sheet(name);
-        for (row, col, value) in saved.remove(&index).unwrap_or_default() {
+        // A sheet the link saves no data for reads as one Excel could not
+        // refresh: every cell of it is #REF!.
+        let saved = saved.remove(&index).unwrap_or(SavedSheet {
+            cells: Vec::new(),
+            refresh_error: true,
+        });
+        sheet.set_refresh_error(saved.refresh_error);
+        for (row, col, value) in saved.cells {
             sheet.set(row, col, value);
         }
     }
     Some(book)
+}
+
+/// Record the cell just read on its sheet: its value, or a saved blank when it
+/// holds none.
+fn record_cell(
+    saved: &mut BTreeMap<usize, SavedSheet>,
+    sheet: Option<usize>,
+    cell: &mut Option<(u32, u32, Option<String>)>,
+    value: &mut Option<String>,
+) {
+    if let (Some((row, col, kind)), Some(index)) = (cell.take(), sheet) {
+        let value = match value.take() {
+            Some(text) => cell_value(kind.as_deref(), &text),
+            None => LiteralValue::Empty,
+        };
+        saved
+            .entry(index)
+            .or_default()
+            .cells
+            .push((row, col, value));
+    }
 }
 
 #[cfg(test)]
@@ -213,8 +246,28 @@ mod tests {
         assert!(
             matches!(qa.get(2, 5), LiteralValue::Error(e) if e.kind == formualizer_common::ExcelErrorKind::Div)
         );
+        // A saved blank is blank; every other cell of a sheet with a refresh
+        // error is #REF!.
         assert_eq!(qa.get(2, 6), LiteralValue::Empty);
-        assert_eq!(qa.extent(), (2, 5));
+        assert!(
+            matches!(qa.get(2, 7), LiteralValue::Error(e) if e.kind == formualizer_common::ExcelErrorKind::Ref)
+        );
+        assert_eq!(qa.extent(), (2, 6));
+    }
+
+    #[test]
+    fn unsaved_cells_are_blank_unless_the_sheet_has_a_refresh_error() {
+        let part = br#"<externalLink xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><externalBook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"><sheetNames><sheetName val="Ok"/><sheetName val="Failed"/><sheetName val="Empty"/><sheetName val="NotSaved"/></sheetNames><sheetDataSet><sheetData sheetId="0"><row r="1"><cell r="A1"><v>1</v></cell></row></sheetData><sheetData sheetId="1" refreshError="1"><row r="1"><cell r="A1"><v>1</v></cell></row></sheetData><sheetData sheetId="2"/></sheetDataSet></externalBook></externalLink>"#;
+        let book = parse_external_book(part).expect("workbook link");
+        let is_ref = |v: LiteralValue| matches!(v, LiteralValue::Error(e) if e.kind == formualizer_common::ExcelErrorKind::Ref);
+        assert_eq!(book.sheet("Ok").unwrap().get(2, 1), LiteralValue::Empty);
+        assert_eq!(
+            book.sheet("Failed").unwrap().get(1, 1),
+            LiteralValue::Number(1.0)
+        );
+        assert!(is_ref(book.sheet("Failed").unwrap().get(2, 1)));
+        assert_eq!(book.sheet("Empty").unwrap().get(1, 1), LiteralValue::Empty);
+        assert!(is_ref(book.sheet("NotSaved").unwrap().get(1, 1)));
     }
 
     #[test]

@@ -522,6 +522,40 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         }
     }
 
+    /// The reference into a closed linked workbook (`[1]Data!A1:B9`) this
+    /// argument is written as, placed for the formula cell; `None` for any
+    /// other argument. It reads the values saved with the link.
+    pub(crate) fn linked_book_reference(&self) -> Option<ReferenceType> {
+        let reference = match &self.expr {
+            ArgumentExpr::Ast(node) => match &node.node_type {
+                ASTNodeType::Reference {
+                    reference: reference @ ReferenceType::External(_),
+                    ..
+                } => reference.clone(),
+                _ => return None,
+            },
+            ArgumentExpr::Arena {
+                id,
+                data_store,
+                sheet_registry,
+            } => match data_store.get_node(*id) {
+                Some(crate::engine::arena::AstNodeData::Reference {
+                    ref_type: ref_type @ crate::engine::arena::CompactRefType::External { .. },
+                    ..
+                }) => data_store.reconstruct_reference_type_for_eval(ref_type, sheet_registry),
+                _ => return None,
+            },
+        };
+        match &reference {
+            ReferenceType::External(ext)
+                if crate::engine::external_book::is_link_index(ext.book.token()) =>
+            {
+                self.interp.reference_for_current_offset(&reference).ok()
+            }
+            _ => None,
+        }
+    }
+
     /// Whether this argument is written as a reference into a linked workbook,
     /// which evaluates from the values saved with the link while it is closed.
     pub fn is_external_reference(&self) -> bool {

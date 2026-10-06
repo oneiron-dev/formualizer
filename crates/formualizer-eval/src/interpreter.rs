@@ -1042,10 +1042,25 @@ impl<'a> Interpreter<'a> {
             CompactRefType::Range { .. }
                 | CompactRefType::NamedRange(_)
                 | CompactRefType::Table { .. }
+                | CompactRefType::External {
+                    kind: formualizer_parse::parser::ExternalRefKind::Range { .. },
+                    ..
+                }
         ) {
             return Ok(None);
         }
         let reference = data_store.reconstruct_reference_type_for_eval(ref_type, sheet_registry);
+        // A range of a closed linked workbook intersects by the rows and
+        // columns it is written with, like a range of this workbook.
+        if let ReferenceType::External(ext) = &reference {
+            if !crate::engine::external_book::is_link_index(ext.book.token()) {
+                return Ok(None);
+            }
+            return Ok(self
+                .effective_reference(&reference)
+                .ok()
+                .map(std::borrow::Cow::into_owned));
+        }
         let reference = self.effective_reference(&reference)?.into_owned();
         // A LET name or LAMBDA parameter bound to a range is that range written
         // here; any other local is a value.
@@ -1984,47 +1999,11 @@ impl<'a> Interpreter<'a> {
                 ..
             } => {
                 let sheet_name = sheet.as_deref().unwrap_or(self.current_sheet);
-
-                // A whole column or row (A:A, 3:3, A5:A) spans the sheet on its open
-                // axis, so it intersects every row or column of the sheet.
-                let (sr, sc, er, ec) = (
-                    start_row.unwrap_or(1),
-                    start_col.unwrap_or(1),
-                    end_row.unwrap_or(1_048_576),
-                    end_col.unwrap_or(16_384),
-                );
-
-                // Normalize bounds (A10:A1 is legal syntax; treat as swapped).
-                let (mut sr, mut er) = (sr, er);
-                let (mut sc, mut ec) = (sc, ec);
-                if sr > er {
-                    std::mem::swap(&mut sr, &mut er);
-                }
-                if sc > ec {
-                    std::mem::swap(&mut sc, &mut ec);
-                }
-
-                let pick = if sr == er && sc == ec {
-                    // A single cell needs no intersection.
-                    (sr, sc)
-                } else if sc == ec {
-                    // Column vector: intersect by row
-                    if cur_r1 < sr || cur_r1 > er {
-                        return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
-                    }
-                    (cur_r1, sc)
-                } else if sr == er {
-                    // Row vector: intersect by column
-                    if cur_c1 < sc || cur_c1 > ec {
-                        return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
-                    }
-                    (sr, cur_c1)
-                } else {
-                    // 2D: require both axes
-                    if cur_r1 < sr || cur_r1 > er || cur_c1 < sc || cur_c1 > ec {
-                        return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
-                    }
-                    (cur_r1, cur_c1)
+                let Some(pick) = intersected_cell(
+                    (*start_row, *start_col, *end_row, *end_col),
+                    (cur_r1, cur_c1),
+                ) else {
+                    return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
                 };
 
                 // A blank cell stays blank (not 0) for the consumer to coerce.
@@ -2035,6 +2014,40 @@ impl<'a> Interpreter<'a> {
                     self.current_sheet,
                 ) {
                     Ok(v) => v,
+                    Err(e) => LiteralValue::Error(e),
+                }
+            }
+            // A range of a closed linked workbook: the cell at the intersection,
+            // read from the values saved with the link.
+            ReferenceType::External(ext)
+                if crate::engine::external_book::is_link_index(ext.book.token()) =>
+            {
+                let bounds = match ext.kind {
+                    formualizer_parse::parser::ExternalRefKind::Cell { row, col, .. } => {
+                        (Some(row), Some(col), Some(row), Some(col))
+                    }
+                    formualizer_parse::parser::ExternalRefKind::Range {
+                        start_row,
+                        start_col,
+                        end_row,
+                        end_col,
+                        ..
+                    } => (start_row, start_col, end_row, end_col),
+                };
+                let Some((row, col)) = intersected_cell(bounds, (cur_r1, cur_c1)) else {
+                    return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
+                };
+                let cell = ReferenceType::External(formualizer_parse::parser::ExternalReference {
+                    kind: formualizer_parse::parser::ExternalRefKind::cell(row, col),
+                    ..ext.clone()
+                });
+                match self
+                    .context
+                    .resolve_range_view(&cell, self.current_sheet)
+                    .map(|view| view.as_1x1())
+                {
+                    Ok(Some(value)) => value,
+                    Ok(None) => LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)),
                     Err(e) => LiteralValue::Error(e),
                 }
             }
@@ -2849,5 +2862,40 @@ mod function_result_tests {
         assert!(positive_zero(&rows[1][0]));
         assert_eq!(rows[2][0], LiteralValue::Number(-1.5));
         assert_eq!(rows[3][0], LiteralValue::Text("-0".into()));
+    }
+}
+
+/// The cell where the formula cell at 1-based `current` (row, column)
+/// implicitly intersects a range with 1-based `bounds` (start row, start
+/// column, end row, end column; `None` where a whole column or row reaches the
+/// sheet's edge), or `None` when it misses the range. A single cell needs no
+/// intersection, a column intersects by row, a row by column and a block by
+/// both. Reversed bounds (A10:A1) read as written in order.
+fn intersected_cell(
+    bounds: (Option<u32>, Option<u32>, Option<u32>, Option<u32>),
+    current: (u32, u32),
+) -> Option<(u32, u32)> {
+    let (start_row, start_col, end_row, end_col) = bounds;
+    let (cur_r1, cur_c1) = current;
+    let (mut sr, mut sc, mut er, mut ec) = (
+        start_row.unwrap_or(1),
+        start_col.unwrap_or(1),
+        end_row.unwrap_or(1_048_576),
+        end_col.unwrap_or(16_384),
+    );
+    if sr > er {
+        std::mem::swap(&mut sr, &mut er);
+    }
+    if sc > ec {
+        std::mem::swap(&mut sc, &mut ec);
+    }
+    if sr == er && sc == ec {
+        Some((sr, sc))
+    } else if sc == ec {
+        (sr..=er).contains(&cur_r1).then_some((cur_r1, sc))
+    } else if sr == er {
+        (sc..=ec).contains(&cur_c1).then_some((sr, cur_c1))
+    } else {
+        ((sr..=er).contains(&cur_r1) && (sc..=ec).contains(&cur_c1)).then_some((cur_r1, cur_c1))
     }
 }

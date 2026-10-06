@@ -28130,6 +28130,12 @@ where
         };
 
         let info = match reference {
+            // A closed linked workbook keeps values only: ISFORMULA,
+            // FORMULATEXT, SHEET and SHEETS find no cell or sheet there (#N/A,
+            // Excel for Windows 16.0.20430).
+            ReferenceType::External(ext) if self.graph.is_linked_book_ref(ext) => {
+                return Err(ExcelError::new(ExcelErrorKind::Na));
+            }
             ReferenceType::Cell {
                 sheet, row, col, ..
             } => {
@@ -32028,7 +32034,9 @@ where
 
 /// Values of a reference into a linked workbook, from its saved values.
 /// A sheet the link does not name is #REF!; open-ended bounds stop at the
-/// last saved cell.
+/// last saved cell. Every cell past the saved ones of a sheet with a refresh
+/// error is #REF!, so an axis cut short there keeps one more row (column) to
+/// carry that error to the functions that read it.
 fn external_book_rows(
     book: &crate::engine::external_book::ExternalBook,
     ext: &formualizer_parse::parser::ExternalReference,
@@ -32067,13 +32075,31 @@ fn external_book_rows(
     if sr == 0 || sc == 0 {
         return Err(ExcelError::new(ExcelErrorKind::Ref));
     }
+    // The written extent, where an open axis reaches the sheet's edge.
+    let (full_er, full_ec) = match ext.kind {
+        ExternalRefKind::Range {
+            end_row, end_col, ..
+        } => (
+            end_row.unwrap_or(1_048_576).max(sr),
+            end_col.unwrap_or(16_384).max(sc),
+        ),
+        ExternalRefKind::Cell { .. } => (er, ec),
+    };
     if u64::from(er - sr + 1) * u64::from(ec - sc + 1) > MAX_CELLS {
-        // Beyond the last saved cell every value is blank.
+        // Beyond the last saved cell every value is blank (or #REF!).
         er = er.min(max_row.max(sr));
         ec = ec.min(max_col.max(sc));
         if u64::from(er - sr + 1) * u64::from(ec - sc + 1) > MAX_CELLS {
             return Err(ExcelError::new(ExcelErrorKind::NImpl)
                 .with_message("External reference too large".to_string()));
+        }
+    }
+    if sheet.refresh_error() {
+        if er < full_er {
+            er += 1;
+        }
+        if ec < full_ec {
+            ec += 1;
         }
     }
     Ok(sheet.rows(sr, sc, er, ec))
