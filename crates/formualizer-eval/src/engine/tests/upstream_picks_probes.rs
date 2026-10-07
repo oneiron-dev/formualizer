@@ -1249,6 +1249,14 @@ fn xlookup_single_cell_lookup_array() {
             "F1:F2",
             &[&[V::N(10.0)], &[V::N(20.0)]],
         ),
+        // H04: single cell, next smaller, last to first
+        (
+            "=SUM(XLOOKUP(1.25,A1,B1:B3,,-1,-1))",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::N(60.0)]],
+        ),
     ]);
 }
 
@@ -1431,6 +1439,14 @@ fn xlookup_arrays_returned_by_functions() {
             "F1",
             &[&[V::E(ExcelErrorKind::Value)]],
         ),
+        // H03: CHOOSE second whole column
+        (
+            "=XLOOKUP(4,CHOOSE(2,C:C,A:A),B:B)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::N(40.0)]],
+        ),
     ]);
 }
 
@@ -1551,5 +1567,59 @@ fn range_operator_over_values() {
             "F1",
             &[&[V::B(false)]],
         ),
+        // H05: range operator, XLOOKUP error on the right
+        (
+            "=SUM(B5:XLOOKUP(2,A1:A3,{10;20;30;40;50}))",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Value)]],
+        ),
+        // H06: range operator over IF's random number
+        (
+            "=ERROR.TYPE(SUM(IF(TRUE,RAND()):B5))",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::N(3.0)]],
+        ),
+        // H07: range operator over IF's #DIV/0! branch
+        (
+            "=ERROR.TYPE(SUM(IF(RAND()<2,1/0,5):B5))",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::N(2.0)]],
+        ),
+        // H08: range operator over IF's 5 branch
+        (
+            "=ERROR.TYPE(SUM(IF(RAND()>2,1/0,5):B5))",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::N(3.0)]],
+        ),
     ]);
+}
+
+/// The range operator resolves a function operand once: the random number IF selects is
+/// not drawn again for its value, so the formula's last RAND() is its second draw, as in
+/// `RAND()*0+RAND()` (review of oneiron chore/formualizer-upstream-picks).
+#[test]
+fn range_operator_resolves_a_function_operand_once() {
+    let value = |formula: &str| {
+        let config = EvalConfig {
+            workbook_seed: 7,
+            ..EvalConfig::default()
+        };
+        let mut engine = Engine::new(TestWorkbook::new(), config);
+        engine
+            .set_cell_formula("Sheet1", 1, 6, parse(formula).unwrap())
+            .unwrap();
+        engine.evaluate_all().unwrap();
+        engine.get_cell_value("Sheet1", 1, 6)
+    };
+    let once = value("=RAND()*0+RAND()");
+    assert!(matches!(once, Some(LiteralValue::Number(_))), "{once:?}");
+    assert_eq!(value("=IFERROR(SUM(IF(TRUE,RAND()):B5),0)+RAND()"), once);
 }
