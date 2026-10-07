@@ -75,10 +75,14 @@ fn generated_array_too_large(rows: i64, cols: i64) -> Option<ExcelError> {
 /// occupies: `XLOOKUP(v,A1:A3,B1:B4)` is `#VALUE!` even when `B4` is blank,
 /// and `XLOOKUP(v,A:A,B1:B10)` is `#VALUE!` because `A:A` declares every row.
 /// A view is trimmed to the used region along an open (whole-column or
-/// whole-row) axis, so for a reference written in the formula the declared
-/// extent is read from the reference itself. Anything else (a computed array,
-/// a reference-returning function, a defined name) is measured by its view.
+/// whole-row) axis, so for a reference the declared extent is read from the
+/// reference itself: one written in the formula, a name or LET local bound to
+/// one, or one a function returns (`XLOOKUP(2,INDIRECT("A:A"),B:B)` searches
+/// and `XLOOKUP(2,INDIRECT("A:A"),B1:B5)` is `#VALUE!`). The function's
+/// reference is the resolution the argument's range view was read from, so
+/// nothing is evaluated again. A computed array is measured by its view.
 fn declared_shape(handle: &ArgumentHandle<'_, '_>, view: (usize, usize)) -> (usize, usize) {
+    use crate::function::FunctionResolution;
     use formualizer_parse::parser::ReferenceType;
 
     let span = |start: Option<u32>, end: Option<u32>, limit: i64| -> usize {
@@ -86,7 +90,13 @@ fn declared_shape(handle: &ArgumentHandle<'_, '_>, view: (usize, usize)) -> (usi
         let end = end.map_or(limit, i64::from);
         (end - start + 1).max(0) as usize
     };
-    match handle.bare_reference() {
+    let reference = match handle.resolve_reference_or_value() {
+        Ok(FunctionResolution::Reference(
+            reference @ (ReferenceType::Cell { .. } | ReferenceType::Range { .. }),
+        )) => Some(reference),
+        _ => handle.bare_reference(),
+    };
+    match reference {
         Some(ReferenceType::Cell { .. }) => (1, 1),
         Some(ReferenceType::Range {
             start_row,
@@ -684,8 +694,10 @@ impl XLookupFn {
         } else if match_mode == -1 || match_mode == 1 {
             // A linear scan: unsorted data is searched, not rejected. A
             // linear search mode searches the lookup array as written,
-            // blank cells past its used range included.
-            let written_len = if matches!(search_mode, 1 | -1) {
+            // blank cells past its used range included. A single cell keeps
+            // the orientation its return array gave it: a match is that
+            // array's whole column when it is one.
+            let written_len = if matches!(search_mode, 1 | -1) && !single_cell {
                 let (written_vertical, written_len) = approximate_search_extent(
                     &args[1],
                     (lookup_rows, lookup_cols),
@@ -733,10 +745,11 @@ impl XLookupFn {
 /// reference and an entry matched: the matched row (lookup column) or column
 /// (lookup row) of return_array. A whole-column return array gives the matched
 /// whole column, which keeps its 1,048,576 rows. `None` when the result is a
-/// value: if_not_found for no match, a return array that is not a cell or
-/// range reference, or a lookup value or mode holding an array, over which
-/// XLOOKUP lifts. An error XLOOKUP gives (the lookup value's, the arrays'
-/// shape, #N/A for no match without if_not_found) is `Err`.
+/// value: if_not_found for no match unless it is written as a reference, a
+/// return array that is not a cell or range reference, or a lookup value or
+/// mode holding an array, over which XLOOKUP lifts. An error XLOOKUP gives
+/// (the lookup value's, the arrays' shape, #N/A for no match without
+/// if_not_found) is `Err`.
 fn xlookup_reference<'a, 'b>(
     args: &[ArgumentHandle<'a, 'b>],
     ctx: &dyn FunctionContext<'b>,
@@ -774,7 +787,14 @@ fn xlookup_reference<'a, 'b>(
         XlookupMatch::NotFound if args.len() < 4 || args[3].is_omitted() => {
             Err(ExcelError::new(ExcelErrorKind::Na))
         }
-        XlookupMatch::NotFound => Ok(None),
+        // if_not_found written as a reference is the result as a reference:
+        // SUM(XLOOKUP(9,A1:A3,B1:B3,B5):B5) is 50 (probe G06).
+        XlookupMatch::NotFound => Ok(args[3].bare_reference().filter(|reference| {
+            matches!(
+                reference,
+                ReferenceType::Cell { .. } | ReferenceType::Range { .. }
+            )
+        })),
     }
 }
 

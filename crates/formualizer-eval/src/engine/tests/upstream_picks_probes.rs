@@ -2,7 +2,8 @@
 //! (ops/excel-upstream-picks-probe-20261008.md, job probe-upstream-picks-1): `^` groups left
 //! to right (upstream 2475598b), a ragged array literal is not a formula (a3a5d796), and
 //! XLOOKUP compares the lengths its lookup and return arrays declare before it searches
-//! (c2c724d7). Each formula as typed in F1 (or the first cell of the range it spills to) of a
+//! (c2c724d7), with the review's cases (job probe-upstream-picks-3: a reference a function
+//! returns, approximate matches on a single cell, the range operator over values). Each formula as typed in F1 (or the first cell of the range it spills to) of a
 //! sheet whose Z1 holds the recorder's =1111+2222; a defined name as the Name Manager holds
 //! it, defined the way the workbook loader defines it (a range address as a range name, open
 //! bounds reaching the sheet's edge; anything else as a formula name). Numbers to 1e-12
@@ -961,8 +962,8 @@ fn xlookup_declared_lengths() {
 }
 
 /// A single-cell lookup array pairs with a one-row return array (the match is a row of it) or
-/// a one-column one (the match is its column, which spills); a return array of two or more
-/// rows and columns is `#VALUE!`, before `if_not_found`.
+/// a one-column one (the match is its column, which spills), in every match and search mode;
+/// a return array of two or more rows and columns is `#VALUE!`, before `if_not_found`.
 #[test]
 fn xlookup_single_cell_lookup_array() {
     check(&[
@@ -1148,6 +1149,407 @@ fn xlookup_single_cell_lookup_array() {
             &[],
             "F1",
             &[&[V::E(ExcelErrorKind::Value)]],
+        ),
+        // P01: single cell, exact or next smaller, summed
+        (
+            "=SUM(XLOOKUP(1,A1,B1:B2,,-1))",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::N(30.0)]],
+        ),
+        // P02: single cell, exact or next larger, summed
+        (
+            "=SUM(XLOOKUP(1,A1,B1:B2,,1))",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::N(30.0)]],
+        ),
+        // P03: single cell, next smaller, spill
+        (
+            "=XLOOKUP(1,A1,B1:B2,,-1)",
+            GRID,
+            &[],
+            "F1:F2",
+            &[&[V::N(10.0)], &[V::N(20.0)]],
+        ),
+        // P04: single cell, smaller match
+        (
+            "=XLOOKUP(1.5,A1,B1:B2,,-1)",
+            GRID,
+            &[],
+            "F1:F2",
+            &[&[V::N(10.0)], &[V::N(20.0)]],
+        ),
+        // P05: single cell, larger match
+        (
+            "=XLOOKUP(0.5,A1,B1:B2,,1)",
+            GRID,
+            &[],
+            "F1:F2",
+            &[&[V::N(10.0)], &[V::N(20.0)]],
+        ),
+        // P06: single cell, no smaller
+        (
+            "=XLOOKUP(0.5,A1,B1:B2,,-1)",
+            GRID,
+            &[],
+            "F1:F2",
+            &[&[V::E(ExcelErrorKind::Na)], &[V::Blank]],
+        ),
+        // P07: single cell vs row, next smaller
+        (
+            "=XLOOKUP(1,A1,B1:C1,,-1)",
+            GRID,
+            &[],
+            "F1:G1",
+            &[&[V::N(10.0), V::N(100.0)]],
+        ),
+        // P08: single cell, next smaller, last to first
+        (
+            "=XLOOKUP(1,A1,B1:B2,,-1,-1)",
+            GRID,
+            &[],
+            "F1:F2",
+            &[&[V::N(10.0)], &[V::N(20.0)]],
+        ),
+        // P09: single cell, next smaller, binary
+        (
+            "=XLOOKUP(1,A1,B1:B2,,-1,2)",
+            GRID,
+            &[],
+            "F1:F2",
+            &[&[V::N(10.0)], &[V::N(20.0)]],
+        ),
+        // P10: single cell vs 2x2, next smaller
+        (
+            "=XLOOKUP(1,A1,B1:C2,,-1)",
+            GRID,
+            &[],
+            "F1:G2",
+            &[
+                &[V::E(ExcelErrorKind::Value), V::Blank],
+                &[V::Blank, V::Blank],
+            ],
+        ),
+        // P11: single cell, next smaller, reference result
+        (
+            "=SUM(XLOOKUP(1,A1,B1:B2,,-1):B5)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::N(150.0)]],
+        ),
+        // P12: single cell, next larger, binary descending
+        (
+            "=XLOOKUP(1,A1,B1:B2,,1,-2)",
+            GRID,
+            &[],
+            "F1:F2",
+            &[&[V::N(10.0)], &[V::N(20.0)]],
+        ),
+    ]);
+}
+
+/// A reference a function returns (INDIRECT, OFFSET, INDEX, IF, CHOOSE, through LET or a name)
+/// declares its own extent, as a written one does: `INDIRECT("A:A")` is every row.
+#[test]
+fn xlookup_arrays_returned_by_functions() {
+    check(&[
+        // F01: INDIRECT whole column vs whole column
+        (
+            "=XLOOKUP(2,INDIRECT(\"A:A\"),B:B)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::N(20.0)]],
+        ),
+        // F02: INDIRECT whole column vs bounded
+        (
+            "=XLOOKUP(2,INDIRECT(\"A:A\"),B1:B5)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Value)]],
+        ),
+        // F03: INDIRECT 3 vs 4
+        (
+            "=XLOOKUP(2,INDIRECT(\"A1:A3\"),B1:B4)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Value)]],
+        ),
+        // F04: IF whole column vs whole column
+        (
+            "=XLOOKUP(2,IF(TRUE,A:A),B:B)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::N(20.0)]],
+        ),
+        // F05: IF whole column vs bounded
+        (
+            "=XLOOKUP(2,IF(TRUE,A:A),B1:B5)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Value)]],
+        ),
+        // F06: CHOOSE whole column vs whole column
+        (
+            "=XLOOKUP(2,CHOOSE(1,A:A),B:B)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::N(20.0)]],
+        ),
+        // F07: OFFSET full height vs whole column
+        (
+            "=XLOOKUP(2,OFFSET(A1,0,0,1048576,1),B:B)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::N(20.0)]],
+        ),
+        // F08: INDEX column vs whole column
+        (
+            "=XLOOKUP(2,INDEX(A:B,0,1),B:B)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::N(20.0)]],
+        ),
+        // F09: INDEX column vs bounded
+        (
+            "=XLOOKUP(2,INDEX(A:B,0,1),B1:B5)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Value)]],
+        ),
+        // F10: whole column vs INDIRECT whole column
+        (
+            "=XLOOKUP(2,A:A,INDIRECT(\"B:B\"))",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::N(20.0)]],
+        ),
+        // F11: whole column vs INDIRECT bounded
+        (
+            "=XLOOKUP(2,A:A,INDIRECT(\"B1:B5\"))",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Value)]],
+        ),
+        // F12: bounded vs INDIRECT whole column
+        (
+            "=XLOOKUP(2,A1:A5,INDIRECT(\"B:B\"))",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Value)]],
+        ),
+        // F13: LET of INDIRECT whole column
+        (
+            "=LET(r,INDIRECT(\"A:A\"),XLOOKUP(2,r,B:B))",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::N(20.0)]],
+        ),
+        // F14: whole row vs INDIRECT whole row
+        (
+            "=XLOOKUP(2,8:8,INDIRECT(\"9:9\"))",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::N(20.0)]],
+        ),
+        // F15: INDIRECT whole row vs bounded
+        (
+            "=XLOOKUP(2,INDIRECT(\"8:8\"),A9:D9)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Value)]],
+        ),
+        // F16: IF return bounded equal
+        (
+            "=XLOOKUP(2,A1:A5,IF(TRUE,B1:B5))",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::N(20.0)]],
+        ),
+        // F17: whole column vs IF bounded
+        (
+            "=XLOOKUP(2,A:A,IF(TRUE,B1:B5))",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Value)]],
+        ),
+        // F18: INDIRECT whole column, last to first
+        (
+            "=XLOOKUP(2,INDIRECT(\"A:A\"),B:B,,0,-1)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::N(20.0)]],
+        ),
+        // F19: INDIRECT whole column, reference result
+        (
+            "=SUM(XLOOKUP(2,INDIRECT(\"A:A\"),B:B):B5)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::N(140.0)]],
+        ),
+        // F20: INDIRECT name vs whole-column name
+        (
+            "=XLOOKUP(2,LookInd,RetCol)",
+            GRID,
+            &[
+                ("LookInd", "=INDIRECT(\"Sheet1!A:A\")"),
+                ("RetCol", "=Sheet1!$B:$B"),
+            ],
+            "F1",
+            &[&[V::N(20.0)]],
+        ),
+        // F21: INDIRECT name vs bounded name
+        (
+            "=XLOOKUP(2,LookInd,RetB5)",
+            GRID,
+            &[
+                ("LookInd", "=INDIRECT(\"Sheet1!A:A\")"),
+                ("RetB5", "=Sheet1!$B$1:$B$5"),
+            ],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Value)]],
+        ),
+    ]);
+}
+
+/// The range operator over a function that gives a value: the value's error, or `#VALUE!`;
+/// XLOOKUP's if_not_found written as a reference is a reference.
+#[test]
+fn range_operator_over_values() {
+    check(&[
+        // G01: range operator over XLOOKUP with array return, 3 vs 4
+        (
+            "=SUM(XLOOKUP(2,A1:A3,{10;20;30;40}):B5)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Value)]],
+        ),
+        // G02: range operator over XLOOKUP's value 20
+        (
+            "=SUM(XLOOKUP(2,A1:A3,{10;20;30}):B5)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Value)]],
+        ),
+        // G03: range operator over XLOOKUP's #N/A, array return
+        (
+            "=SUM(XLOOKUP(9,A1:A3,{10;20;30}):B5)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Na)]],
+        ),
+        // G04: range operator over XLOOKUP with computed return, 3 vs 4
+        (
+            "=SUM(XLOOKUP(2,A1:A3,B1:B4*1):B5)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Value)]],
+        ),
+        // G05: range operator over if_not_found text, array return
+        (
+            "=SUM(XLOOKUP(9,A1:A3,{10;20;30},\"nf\"):B5)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Value)]],
+        ),
+        // G06: if_not_found a reference
+        (
+            "=SUM(XLOOKUP(9,A1:A3,B1:B3,B5):B5)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::N(50.0)]],
+        ),
+        // G07: if_not_found text, reference return
+        (
+            "=SUM(XLOOKUP(9,A1:A3,B1:B3,\"nf\"):B5)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Value)]],
+        ),
+        // G08: ROWS over a value range
+        (
+            "=ROWS(XLOOKUP(2,A1:A3,{10;20;30}):B5)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Value)]],
+        ),
+        // G09: error on the right of the range operator
+        (
+            "=SUM(B1:XLOOKUP(2,A1:A3,{10;20;30;40}))",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Value)]],
+        ),
+        // G10: range operator over IF's #N/A
+        (
+            "=SUM(IF(TRUE,NA()):B5)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Na)]],
+        ),
+        // G11: range operator over IF's number
+        (
+            "=SUM(IF(TRUE,5):B5)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Value)]],
+        ),
+        // G12: range operator over CHOOSE's #DIV/0!
+        (
+            "=SUM(CHOOSE(1,1/0):B5)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Div)]],
+        ),
+        // G14: range operator over INDEX out of range
+        (
+            "=SUM(INDEX(B1:B5,9):B5)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Ref)]],
+        ),
+        // G15: ISREF of a range over a value
+        (
+            "=ISREF(XLOOKUP(2,A1:A3,{10;20;30}):B5)",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::B(false)]],
         ),
     ]);
 }

@@ -646,8 +646,8 @@ impl<'a> Interpreter<'a> {
                     .ok_or_else(|| ExcelError::new(ExcelErrorKind::Null))
             }
             ASTNodeType::BinaryOp { op, left, right } if op == ":" => {
-                let lref = self.evaluate_ast_as_reference(left)?;
-                let rref = self.evaluate_ast_as_reference(right)?;
+                let lref = self.range_operand_reference(left)?;
+                let rref = self.range_operand_reference(right)?;
                 self.combine_reference_areas(lref, rref)
             }
             ASTNodeType::Array(_)
@@ -910,6 +910,39 @@ impl<'a> Interpreter<'a> {
         Ok(areas)
     }
 
+    /// One side of the range operator `:` as a reference. A function there
+    /// that gives a value instead of a reference makes the range that value's
+    /// error, or `#VALUE!` for any other value, as Excel for Windows
+    /// 16.0.20430 computes it: `SUM(IF(TRUE,NA()):B5)` is `#N/A`,
+    /// `SUM(XLOOKUP(2,A1:A3,{10;20;30;40}):B5)` the arrays' `#VALUE!` and
+    /// `SUM(IF(TRUE,5):B5)` `#VALUE!` (probes G01-G15 of
+    /// ops/excel-upstream-picks-probe-20261008.md). The value is read only
+    /// when the function declines to give a reference.
+    fn range_operand_reference(&self, node: &ASTNode) -> Result<ReferenceType, ExcelError> {
+        match self.try_evaluate_ast_as_reference(node) {
+            Some(reference) => reference,
+            None => Err(range_operand_value_error(
+                self.evaluate_ast(node).map(|value| value.into_literal()),
+            )),
+        }
+    }
+
+    /// The arena form of [`Self::range_operand_reference`].
+    fn arena_range_operand_reference(
+        &self,
+        node_id: AstNodeId,
+        data_store: &DataStore,
+        sheet_registry: &SheetRegistry,
+    ) -> Result<ReferenceType, ExcelError> {
+        match self.try_evaluate_arena_ast_as_reference(node_id, data_store, sheet_registry) {
+            Some(reference) => reference,
+            None => Err(range_operand_value_error(
+                self.evaluate_arena_ast(node_id, data_store, sheet_registry)
+                    .map(|value| value.into_literal()),
+            )),
+        }
+    }
+
     pub(crate) fn try_evaluate_ast_as_reference(
         &self,
         node: &ASTNode,
@@ -994,15 +1027,22 @@ impl<'a> Interpreter<'a> {
                     return Err(ExcelError::new(ExcelErrorKind::Ref)
                         .with_message("Expression cannot be used as a reference"));
                 }
-                let lref =
-                    self.evaluate_arena_ast_as_reference(*left_id, data_store, sheet_registry)?;
-                let rref =
-                    self.evaluate_arena_ast_as_reference(*right_id, data_store, sheet_registry)?;
                 if op == " " {
+                    let lref =
+                        self.evaluate_arena_ast_as_reference(*left_id, data_store, sheet_registry)?;
+                    let rref = self.evaluate_arena_ast_as_reference(
+                        *right_id,
+                        data_store,
+                        sheet_registry,
+                    )?;
                     return self
                         .intersect_reference_areas(lref, rref)?
                         .ok_or_else(|| ExcelError::new(ExcelErrorKind::Null));
                 }
+                let lref =
+                    self.arena_range_operand_reference(*left_id, data_store, sheet_registry)?;
+                let rref =
+                    self.arena_range_operand_reference(*right_id, data_store, sheet_registry)?;
                 self.combine_reference_areas(lref, rref)
             }
             _ => Err(ExcelError::new(ExcelErrorKind::Ref)
@@ -1621,9 +1661,9 @@ impl<'a> Interpreter<'a> {
                 }
                 if op == ":" {
                     let range = self
-                        .evaluate_arena_ast_as_reference(*left_id, data_store, sheet_registry)
+                        .arena_range_operand_reference(*left_id, data_store, sheet_registry)
                         .and_then(|lref| {
-                            let rref = self.evaluate_arena_ast_as_reference(
+                            let rref = self.arena_range_operand_reference(
                                 *right_id,
                                 data_store,
                                 sheet_registry,
@@ -2266,8 +2306,8 @@ impl<'a> Interpreter<'a> {
             return self.intersection_value(intersection);
         }
         if op == ":" {
-            let range = self.evaluate_ast_as_reference(left_node).and_then(|lref| {
-                let rref = self.evaluate_ast_as_reference(right_node)?;
+            let range = self.range_operand_reference(left_node).and_then(|lref| {
+                let rref = self.range_operand_reference(right_node)?;
                 self.combine_reference_areas(lref, rref)
             });
             return self.range_value(range);
@@ -2918,6 +2958,16 @@ fn shift_axis_for_offset(value: u32, delta: i64, is_absolute: bool) -> Result<u3
 fn unsupported_reference_relocation_error() -> ExcelError {
     ExcelError::new(ExcelErrorKind::Ref)
         .with_message("Unsupported reference relocation for FormulaPlane span evaluation")
+}
+
+/// The error a range operand that is a value, not a reference, gives the range:
+/// its own error, or `#VALUE!` (see `Interpreter::range_operand_reference`).
+fn range_operand_value_error(value: Result<LiteralValue, ExcelError>) -> ExcelError {
+    match value {
+        Ok(LiteralValue::Error(error)) | Err(error) => error,
+        Ok(_) => ExcelError::new(ExcelErrorKind::Value)
+            .with_message("A range operand is a value, not a reference"),
+    }
 }
 
 #[cfg(test)]
