@@ -404,11 +404,14 @@ impl Function for XLookupFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Option<Result<formualizer_parse::parser::ReferenceType, ExcelError>> {
+        // An error XLOOKUP gives is its result as a reference too, so a range
+        // operator built on it is that error: SUM(XLOOKUP(2,A1:A3,B1:B4):B5) is
+        // the arrays' #VALUE!, and a match that is not found gives #N/A, as in
+        // Excel for Windows 16.0.20430 (probes X46 and N08 of
+        // ops/excel-upstream-picks-probe-20261008.md), not the operator's #REF!.
         match xlookup_reference(args, ctx) {
             Ok(reference) => reference.map(Ok),
-            Err(error) if error.kind == ExcelErrorKind::Cancelled => Some(Err(error)),
-            // The value path reports the error.
-            Err(_) => None,
+            Err(error) => Some(Err(error)),
         }
     }
 
@@ -533,7 +536,15 @@ impl XLookupFn {
         let (declared_lookup_rows, declared_lookup_cols) =
             declared_shape(&args[1], (lookup_rows, lookup_cols));
         let (declared_ret_rows, declared_ret_cols) = declared_shape(&args[2], (ret_rows, ret_cols));
-        let length_mismatch = if declared_lookup_cols == 1 {
+        // A single cell is both: it pairs with a one-row return array (the match
+        // is that row) or a one-column one (the match is that column, which
+        // spills), so XLOOKUP(1,A1,B1:B2) is {10;20} in Excel for Windows
+        // 16.0.20430, and only a return array of two or more rows and columns is
+        // `#VALUE!` (probes S01 and S03 of ops/excel-upstream-picks-probe-20261008.md).
+        let single_cell = declared_lookup_rows == 1 && declared_lookup_cols == 1;
+        let length_mismatch = if single_cell {
+            declared_ret_rows != 1 && declared_ret_cols != 1
+        } else if declared_lookup_cols == 1 {
             declared_lookup_rows != declared_ret_rows
         } else if declared_lookup_rows == 1 {
             declared_lookup_cols != declared_ret_cols
@@ -553,7 +564,9 @@ impl XLookupFn {
         // If the lookup range is completely empty (used-region trimmed to 0),
         // fall back to the return range's used-region length and treat missing lookup
         // cells as Empty.
-        let mut vertical = if lookup_cols == 1 {
+        let mut vertical = if single_cell && declared_ret_rows != 1 {
+            false
+        } else if lookup_cols == 1 {
             true
         } else if lookup_rows == 1 {
             false
@@ -720,9 +733,10 @@ impl XLookupFn {
 /// reference and an entry matched: the matched row (lookup column) or column
 /// (lookup row) of return_array. A whole-column return array gives the matched
 /// whole column, which keeps its 1,048,576 rows. `None` when the result is a
-/// value: no match (if_not_found or #N/A), a return array that is not a cell
-/// or range reference, or a lookup value or mode holding an array, over which
-/// XLOOKUP lifts.
+/// value: if_not_found for no match, a return array that is not a cell or
+/// range reference, or a lookup value or mode holding an array, over which
+/// XLOOKUP lifts. An error XLOOKUP gives (the lookup value's, the arrays'
+/// shape, #N/A for no match without if_not_found) is `Err`.
 fn xlookup_reference<'a, 'b>(
     args: &[ArgumentHandle<'a, 'b>],
     ctx: &dyn FunctionContext<'b>,
@@ -746,16 +760,22 @@ fn xlookup_reference<'a, 'b>(
         }
     }
     let lookup_value = args[0].value()?.into_literal();
-    if matches!(lookup_value, LiteralValue::Error(_)) {
-        return Ok(None);
+    if let LiteralValue::Error(error) = lookup_value {
+        return Err(error);
     }
-    let XlookupMatch::Found {
-        index, vertical, ..
-    } = XLookupFn::find_match(args, ctx, lookup_value)?
-    else {
-        return Ok(None);
-    };
-    Ok(matched_reference(return_reference, index, vertical))
+    match XLookupFn::find_match(args, ctx, lookup_value)? {
+        XlookupMatch::Found {
+            index, vertical, ..
+        } => Ok(matched_reference(return_reference, index, vertical)),
+        XlookupMatch::Settled(settled) => match settled.into_literal() {
+            LiteralValue::Error(error) => Err(error),
+            _ => Ok(None),
+        },
+        XlookupMatch::NotFound if args.len() < 4 || args[3].is_omitted() => {
+            Err(ExcelError::new(ExcelErrorKind::Na))
+        }
+        XlookupMatch::NotFound => Ok(None),
+    }
 }
 
 /// Row (`vertical`) or column `index` of a cell or range reference, or `None`
