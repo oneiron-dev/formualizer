@@ -924,9 +924,13 @@ impl<'a> Interpreter<'a> {
         let ASTNodeType::Function { name, args } = &node.node_type else {
             return self.evaluate_ast_as_reference(node);
         };
-        let fun = self.context.get_function("", name).ok_or_else(|| {
-            ExcelError::new(ExcelErrorKind::Name).with_message(format!("Unknown function: {name}"))
-        })?;
+        // A name that is not a builtin (a LET-bound LAMBDA, or no function at
+        // all) is resolved as an argument is: its call's value or #NAME?.
+        let Some(fun) = self.context.get_function("", name) else {
+            return range_operand_resolution(
+                ArgumentHandle::new(node, self).resolve_reference_or_value(),
+            );
+        };
         let handles: Vec<ArgumentHandle> = args
             .iter()
             .map(|arg| ArgumentHandle::new(arg, self))
@@ -951,9 +955,12 @@ impl<'a> Interpreter<'a> {
             return self.evaluate_arena_ast_as_reference(node_id, data_store, sheet_registry);
         };
         let name = data_store.resolve_ast_string(*name_id);
-        let fun = self.context.get_function("", name).ok_or_else(|| {
-            ExcelError::new(ExcelErrorKind::Name).with_message(format!("Unknown function: {name}"))
-        })?;
+        let Some(fun) = self.context.get_function("", name) else {
+            return range_operand_resolution(
+                ArgumentHandle::new_arena(node_id, self, data_store, sheet_registry)
+                    .resolve_reference_or_value(),
+            );
+        };
         let args = data_store.get_args(node_id).ok_or_else(|| {
             ExcelError::new(ExcelErrorKind::Value).with_message("Missing function args")
         })?;
@@ -2997,16 +3004,34 @@ fn range_operand<'b>(
     if let Some(reference) = fun.eval_reference(handles, fctx) {
         return reference;
     }
-    Err(
-        match fun
-            .dispatch(handles, fctx)
-            .map(|value| value.into_literal())
-        {
-            Ok(LiteralValue::Error(error)) | Err(error) => error,
-            Ok(_) => ExcelError::new(ExcelErrorKind::Value)
-                .with_message("A range operand is a value, not a reference"),
-        },
-    )
+    Err(range_operand_value_error(
+        fun.dispatch(handles, fctx)
+            .map(|value| value.into_literal()),
+    ))
+}
+
+/// A range operand resolved as an argument is: its reference, its reference
+/// error, or for a value that value's error or `#VALUE!`.
+fn range_operand_resolution(
+    resolution: Result<crate::function::FunctionResolution<'_>, ExcelError>,
+) -> Result<ReferenceType, ExcelError> {
+    match resolution? {
+        crate::function::FunctionResolution::Reference(reference) => Ok(reference),
+        crate::function::FunctionResolution::ReferenceError(error) => Err(error),
+        crate::function::FunctionResolution::Value(value) => {
+            Err(range_operand_value_error(Ok(value.into_literal())))
+        }
+    }
+}
+
+/// The error a range operand that is a value, not a reference, gives the
+/// range: its own error, or `#VALUE!`.
+fn range_operand_value_error(value: Result<LiteralValue, ExcelError>) -> ExcelError {
+    match value {
+        Ok(LiteralValue::Error(error)) | Err(error) => error,
+        Ok(_) => ExcelError::new(ExcelErrorKind::Value)
+            .with_message("A range operand is a value, not a reference"),
+    }
 }
 
 #[cfg(test)]

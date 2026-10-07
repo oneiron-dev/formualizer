@@ -1625,3 +1625,28 @@ fn range_operator_resolves_a_function_operand_once() {
     // INDEX over a value declines to give a reference; its argument is still drawn once.
     assert_eq!(value("=IFERROR(SUM(INDEX(RAND(),1):B5),0)+RAND()"), once);
 }
+
+/// A LET-bound LAMBDA called as a range operand resolves as an argument does: its error,
+/// or `#VALUE!` for another value (fourth review pass of oneiron
+/// chore/formualizer-upstream-picks; job probe-upstream-picks-5).
+#[test]
+fn range_operator_over_a_let_lambda_call() {
+    check(&[
+        // L01
+        (
+            "=LET(f,LAMBDA(x,NA()),SUM(f(1):B5))",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Na)]],
+        ),
+        // L02
+        (
+            "=LET(f,LAMBDA(x,5),SUM(f(1):B5))",
+            GRID,
+            &[],
+            "F1",
+            &[&[V::E(ExcelErrorKind::Value)]],
+        ),
+    ]);
+}
