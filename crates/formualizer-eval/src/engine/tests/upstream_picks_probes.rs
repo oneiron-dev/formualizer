@@ -1622,4 +1622,6 @@ fn range_operator_resolves_a_function_operand_once() {
     let once = value("=RAND()*0+RAND()");
     assert!(matches!(once, Some(LiteralValue::Number(_))), "{once:?}");
     assert_eq!(value("=IFERROR(SUM(IF(TRUE,RAND()):B5),0)+RAND()"), once);
+    // INDEX over a value declines to give a reference; its argument is still drawn once.
+    assert_eq!(value("=IFERROR(SUM(INDEX(RAND(),1):B5),0)+RAND()"), once);
 }

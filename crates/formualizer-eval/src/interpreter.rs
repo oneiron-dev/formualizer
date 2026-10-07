@@ -916,15 +916,28 @@ impl<'a> Interpreter<'a> {
     /// 16.0.20430 computes it: `SUM(IF(TRUE,NA()):B5)` is `#N/A`,
     /// `SUM(XLOOKUP(2,A1:A3,{10;20;30;40}):B5)` the arrays' `#VALUE!` and
     /// `SUM(IF(TRUE,5):B5)` `#VALUE!` (probes G01-G15 of
-    /// ops/excel-upstream-picks-probe-20261008.md). The function resolves
-    /// once, as an argument does ([`ArgumentHandle::resolve_reference_or_value`]),
-    /// so a branch IF selects or a random draw is not evaluated again for
-    /// the value.
+    /// ops/excel-upstream-picks-probe-20261008.md). The function's value is
+    /// read through the argument handles its reference attempt used, so an
+    /// argument it evaluated (a branch IF selects, a random draw) is read
+    /// from their cache, not evaluated again.
     fn range_operand_reference(&self, node: &ASTNode) -> Result<ReferenceType, ExcelError> {
-        if !matches!(node.node_type, ASTNodeType::Function { .. }) {
+        let ASTNodeType::Function { name, args } = &node.node_type else {
             return self.evaluate_ast_as_reference(node);
-        }
-        range_operand(ArgumentHandle::new(node, self).resolve_reference_or_value())
+        };
+        let fun = self.context.get_function("", name).ok_or_else(|| {
+            ExcelError::new(ExcelErrorKind::Name).with_message(format!("Unknown function: {name}"))
+        })?;
+        let handles: Vec<ArgumentHandle> = args
+            .iter()
+            .map(|arg| ArgumentHandle::new(arg, self))
+            .collect();
+        let fctx = DefaultFunctionContext::new_with_sheet(
+            self.context,
+            self.current_cell,
+            self.current_sheet,
+        );
+        let _call_dates = self.enter_function_call();
+        range_operand(fun.as_ref(), &handles, &fctx)
     }
 
     /// The arena form of [`Self::range_operand_reference`].
@@ -934,16 +947,25 @@ impl<'a> Interpreter<'a> {
         data_store: &DataStore,
         sheet_registry: &SheetRegistry,
     ) -> Result<ReferenceType, ExcelError> {
-        if !matches!(
-            data_store.get_node(node_id),
-            Some(AstNodeData::Function { .. })
-        ) {
+        let Some(AstNodeData::Function { name_id, .. }) = data_store.get_node(node_id) else {
             return self.evaluate_arena_ast_as_reference(node_id, data_store, sheet_registry);
-        }
-        range_operand(
-            ArgumentHandle::new_arena(node_id, self, data_store, sheet_registry)
-                .resolve_reference_or_value(),
-        )
+        };
+        let name = data_store.resolve_ast_string(*name_id);
+        let fun = self.context.get_function("", name).ok_or_else(|| {
+            ExcelError::new(ExcelErrorKind::Name).with_message(format!("Unknown function: {name}"))
+        })?;
+        let args = data_store.get_args(node_id).ok_or_else(|| {
+            ExcelError::new(ExcelErrorKind::Value).with_message("Missing function args")
+        })?;
+        let fctx = DefaultFunctionContext::new_with_sheet(
+            self.context,
+            self.current_cell,
+            self.current_sheet,
+        );
+        let _call_dates = self.enter_function_call();
+        self.with_arena_call_handles(fun.as_ref(), args, data_store, sheet_registry, |handles| {
+            range_operand(fun.as_ref(), handles, &fctx)
+        })
     }
 
     pub(crate) fn try_evaluate_ast_as_reference(
@@ -2963,21 +2985,28 @@ fn unsupported_reference_relocation_error() -> ExcelError {
         .with_message("Unsupported reference relocation for FormulaPlane span evaluation")
 }
 
-/// A function operand of the range operator, resolved: its reference, its
-/// reference error, or for a value that value's error or `#VALUE!` (see
-/// `Interpreter::range_operand_reference`).
-fn range_operand(
-    resolution: Result<crate::function::FunctionResolution<'_>, ExcelError>,
+/// A function operand of the range operator: its reference, or when it gives
+/// a value instead, that value's error or `#VALUE!` (see
+/// `Interpreter::range_operand_reference`). The value is computed with the
+/// handles of the reference attempt.
+fn range_operand<'b>(
+    fun: &dyn crate::function::Function,
+    handles: &[ArgumentHandle<'_, 'b>],
+    fctx: &dyn crate::traits::FunctionContext<'b>,
 ) -> Result<ReferenceType, ExcelError> {
-    match resolution? {
-        crate::function::FunctionResolution::Reference(reference) => Ok(reference),
-        crate::function::FunctionResolution::ReferenceError(error) => Err(error),
-        crate::function::FunctionResolution::Value(value) => Err(match value.into_literal() {
-            LiteralValue::Error(error) => error,
-            _ => ExcelError::new(ExcelErrorKind::Value)
-                .with_message("A range operand is a value, not a reference"),
-        }),
+    if let Some(reference) = fun.eval_reference(handles, fctx) {
+        return reference;
     }
+    Err(
+        match fun
+            .dispatch(handles, fctx)
+            .map(|value| value.into_literal())
+        {
+            Ok(LiteralValue::Error(error)) | Err(error) => error,
+            Ok(_) => ExcelError::new(ExcelErrorKind::Value)
+                .with_message("A range operand is a value, not a reference"),
+        },
+    )
 }
 
 #[cfg(test)]
