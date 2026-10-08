@@ -1,18 +1,20 @@
 #![cfg(feature = "xlsx-recalc")]
 //! Workbooks whose formulas read closed linked workbooks, recalculated and
 //! compared cell by cell with Excel for Windows 16.0.20430: probes 1 to 5 of
-//! ops/excel-extlinks-probe-20261006.md, each kept to the rows the fork
-//! computes as Excel did (`excel-values.tsv`). Excel saw the links closed
-//! (UpdateLinks=0, CalculateFullRebuild), so it read the values the
-//! externalLink parts save, as the fork does.
+//! ops/excel-extlinks-probe-20261006.md and the links2 probes of
+//! ops/excel-links2-probe-20261008.md, each kept to the rows the fork
+//! computes as Excel did (`excel-values.tsv`, `excel-values-links2.tsv`).
+//! Excel saw the links closed (UpdateLinks=0, CalculateFullRebuild), so it
+//! read the values the externalLink parts save, as the fork does.
 use calamine::{Data, Reader, Xlsx};
 use formualizer_workbook::{XlsxRecalculateOptions, recalculate_xlsx_bytes};
 use std::{io::Cursor, path::Path};
 
-#[test]
-fn linked_workbook_probes_match_excel_for_windows() {
+/// Recalculate each workbook `values` names and compare its Sheet1 column E
+/// with Excel's values; returns the number of rows checked.
+fn check_against_excel(values: &str) -> usize {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/linked-workbooks");
-    let expected = std::fs::read_to_string(dir.join("excel-values.tsv")).unwrap();
+    let expected = std::fs::read_to_string(dir.join(values)).unwrap();
     let mut outputs = std::collections::BTreeMap::new();
     let mut checked = 0;
     for line in expected.lines().filter(|line| !line.starts_with('#')) {
@@ -49,5 +51,19 @@ fn linked_workbook_probes_match_excel_for_windows() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 181);
+    checked
+}
+
+#[test]
+fn linked_workbook_probes_match_excel_for_windows() {
+    assert_eq!(check_against_excel("excel-values.tsv"), 181);
+}
+
+/// Approximate lookups over open and bounded linked ranges (Excel bisects
+/// the range as written, past the saved cells), INDEX at a computed position
+/// (a range it returns intersects a legacy formula's cell), and `[0]`, the
+/// workbook itself.
+#[test]
+fn links2_probes_match_excel_for_windows() {
+    assert_eq!(check_against_excel("excel-values-links2.tsv"), 155);
 }

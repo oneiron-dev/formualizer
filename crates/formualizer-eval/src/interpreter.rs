@@ -1321,9 +1321,13 @@ impl<'a> Interpreter<'a> {
     }
 
     /// Whether `view` is cells of a sheet spanning more than one cell, rather
-    /// than a computed array.
+    /// than a computed array: cells of this workbook, or of a closed linked
+    /// workbook's range however a function returned it.
     fn is_sheet_range(view: &crate::engine::range_view::RangeView<'_>) -> bool {
-        view.sheet_name() != "__tmp" && !view.is_empty() && view.dims() != (1, 1)
+        match view.linked_reference() {
+            Some(reference) => !linked_single_cell(reference),
+            None => view.sheet_name() != "__tmp" && !view.is_empty() && view.dims() != (1, 1),
+        }
     }
 
     /// An operand of a value operator. In a legacy formula's value context a
@@ -2131,6 +2135,20 @@ impl<'a> Interpreter<'a> {
                 other => other,
             },
             crate::traits::CalcValue::Range(rv) => {
+                // The values of a closed linked workbook's range, however a
+                // function returned them (INDEX(...,0), IF(...)), intersect by
+                // the rows and columns the range spans in the linked sheet,
+                // where a cell the link did not save is blank or #REF!.
+                if let Some(reference) = rv.linked_reference() {
+                    if linked_single_cell(reference)
+                        && let Some(value) = rv.as_1x1()
+                    {
+                        return value;
+                    }
+                    return self.implicit_intersection_from_reference(&ReferenceType::External(
+                        reference.clone(),
+                    ));
+                }
                 if rv.is_empty() {
                     return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value));
                 }
@@ -3137,6 +3155,26 @@ mod function_result_tests {
 /// sheet's edge), or `None` when it misses the range. A single cell needs no
 /// intersection, a column intersects by row, a row by column and a block by
 /// both. Reversed bounds (A10:A1) read as written in order.
+/// Whether a reference into a closed linked workbook spans one cell (`A1`,
+/// `A1:A1`), so its value needs no intersection.
+fn linked_single_cell(reference: &formualizer_parse::parser::ExternalReference) -> bool {
+    match reference.kind {
+        formualizer_parse::parser::ExternalRefKind::Cell { .. } => true,
+        formualizer_parse::parser::ExternalRefKind::Range {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            ..
+        } => {
+            start_row.is_some()
+                && start_row == end_row
+                && start_col.is_some()
+                && start_col == end_col
+        }
+    }
+}
+
 fn intersected_cell(
     bounds: (Option<u32>, Option<u32>, Option<u32>, Option<u32>),
     current: (u32, u32),

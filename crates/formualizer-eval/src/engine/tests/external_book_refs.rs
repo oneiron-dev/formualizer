@@ -454,6 +454,49 @@ fn legacy_formulas_intersect_linked_ranges_with_the_formula_cell() {
     );
 }
 
+/// A range of a closed linked workbook that a function returns (INDEX at row
+/// 0, here computed, or through IF and IFERROR) intersects a legacy formula's
+/// cell by the rows and columns it spans in the linked sheet, as a written
+/// one does, where a cell the link did not save is blank or #REF!: Excel for
+/// Windows 16.0.20430, job probe-w2-links2-1
+/// (ops/excel-links2-probe-20261008.md), where the fork took the top-left
+/// value.
+#[test]
+fn a_linked_range_a_function_returns_intersects_a_legacy_formula() {
+    let mut engine = engine_with_failed_sheet();
+    let cases = [
+        (1, 3, "=IFERROR(INDEX([1]Rates!B1:B4,SMALL({0,1},1)),\"\")"),
+        (2, 3, "=INDEX([1]Rates!B1:B4,SMALL({0,1},1))*2"),
+        (4, 3, "=IF(TRUE,INDEX([1]Rates!B1:B4,SMALL({0,1},1)))"),
+        (9, 3, "=INDEX([1]Rates!B1:B4,SMALL({0,1},1))*2"),
+        (5, 2, "=INDEX([1]Rates!A2:C2,SMALL({0,1},1))+1"),
+        (4, 4, "=INDEX([2]Failed!A:A,FALSE)"),
+        (2, 4, "=INDEX([2]Failed!A:A,0)+1"),
+        (9, 4, "=INDEX([2]Failed!A1:B9,0,SMALL({1,2},1))"),
+    ];
+    for (row, col, formula) in cases {
+        engine
+            .set_cell_formula("Sheet1", row, col, parse(formula).unwrap())
+            .unwrap();
+    }
+    engine.use_legacy_array_semantics();
+    engine.evaluate_all().unwrap();
+    let value = |row, col| number_like(engine.get_cell_value("Sheet1", row, col));
+    assert_eq!(value(1, 3), Some(LiteralValue::Number(3.0)));
+    assert_eq!(value(2, 3), Some(LiteralValue::Number(10.0)));
+    assert_eq!(value(4, 3), Some(LiteralValue::Number(7.0)));
+    match value(9, 3) {
+        Some(LiteralValue::Error(e)) => assert_eq!(e.kind, ExcelErrorKind::Value),
+        other => panic!("row 9, outside B1:B4: expected #VALUE!, got {other:?}"),
+    }
+    // A row intersects by the formula's column: B2 is 5.
+    assert_eq!(value(5, 2), Some(LiteralValue::Number(6.0)));
+    // Failed!A4 is the text saved there; A2 is 2; A9 was not saved.
+    assert_eq!(value(4, 4), Some(LiteralValue::Text("x".into())));
+    assert_eq!(value(2, 4), Some(LiteralValue::Number(3.0)));
+    assert_ref_error(value(9, 4), "=INDEX([2]Failed!A1:B9,0,1) in row 9");
+}
+
 /// Whole numbers as numbers, whatever integer type the engine keeps.
 fn number_like(value: Option<LiteralValue>) -> Option<LiteralValue> {
     match value {

@@ -73,6 +73,10 @@ pub struct RangeView<'a> {
     /// returns such a reference returns all of it (see
     /// [`Self::with_reference_extent`]).
     reference_extent: Option<(u32, u32)>,
+    /// The reference into a closed linked workbook this view holds the saved
+    /// values of (see [`Self::with_linked_reference`]); `None` for any other
+    /// view.
+    linked_reference: Option<Arc<formualizer_parse::parser::ExternalReference>>,
 }
 
 impl<'a> core::fmt::Debug for RangeView<'a> {
@@ -306,6 +310,7 @@ impl<'a> RangeView<'a> {
             cols,
             cancel_token: None,
             reference_extent: None,
+            linked_reference: None,
         }
     }
 
@@ -365,6 +370,27 @@ impl<'a> RangeView<'a> {
         self.reference_extent
     }
 
+    /// Records that this view holds the values saved for `reference`, a range
+    /// of a closed linked workbook: the values have no place on a sheet of
+    /// this workbook, but the reference keeps the rows and columns they come
+    /// from, by which a legacy formula intersects them with its own cell. A
+    /// view derived from this one (a sub-view, a computed array) does not
+    /// carry it.
+    #[must_use]
+    pub(crate) fn with_linked_reference(
+        mut self,
+        reference: &formualizer_parse::parser::ExternalReference,
+    ) -> Self {
+        self.linked_reference = Some(Arc::new(reference.clone()));
+        self
+    }
+
+    /// The closed linked workbook's range this view holds the values of (see
+    /// [`Self::with_linked_reference`]).
+    pub(crate) fn linked_reference(&self) -> Option<&formualizer_parse::parser::ExternalReference> {
+        self.linked_reference.as_deref()
+    }
+
     #[inline]
     pub fn sheet(&self) -> &arrow_store::ArrowSheet {
         match &self.backing {
@@ -415,6 +441,7 @@ impl<'a> RangeView<'a> {
                 cols: 0,
                 cancel_token,
                 reference_extent: None,
+                linked_reference: None,
             });
         }
 
@@ -428,6 +455,7 @@ impl<'a> RangeView<'a> {
             cols: ncols,
             cancel_token,
             reference_extent: None,
+            linked_reference: None,
         })
     }
 
@@ -465,7 +493,13 @@ impl<'a> RangeView<'a> {
             }
             rows.push(row);
         }
-        RangeView::try_from_owned_rows(rows, self.sheet().date_system, self.cancel_token.clone())
+        let mut view = RangeView::try_from_owned_rows(
+            rows,
+            self.sheet().date_system,
+            self.cancel_token.clone(),
+        )?;
+        view.linked_reference = self.linked_reference;
+        Ok(view)
     }
 
     pub fn expand_to(&self, rows: usize, cols: usize) -> RangeView<'a> {
@@ -484,6 +518,7 @@ impl<'a> RangeView<'a> {
             cols,
             cancel_token: self.cancel_token.clone(),
             reference_extent: None,
+            linked_reference: None,
         }
     }
 
@@ -505,6 +540,7 @@ impl<'a> RangeView<'a> {
             cols,
             cancel_token: self.cancel_token.clone(),
             reference_extent: None,
+            linked_reference: None,
         }
     }
 

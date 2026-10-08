@@ -28596,7 +28596,8 @@ where
                 Ok(RangeView::from_owned_rows(
                     external_book_rows(book, ext)?,
                     self.config.date_system,
-                ))
+                )
+                .with_linked_reference(ext))
             }
             ReferenceType::External(ext) => {
                 let name = ext.raw.as_str();
