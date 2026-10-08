@@ -705,6 +705,16 @@ fn recalculate_xlsx_bytes_here(
     if let Some(reason) = engine.displayed_precision_unknown() {
         return Err(unsupported("precision as displayed", reason));
     }
+    // Excel keeps the saved value of a formula on a live circular reference
+    // and of the formulas that read it (=A1*2 over a circular A1 stays 99);
+    // the engine calculates the readers again from the kept value. Under
+    // precision as displayed those results are refused, not stored rounded.
+    if cell_formats.is_some() && engine.last_cycle_telemetry().live_cycles_witnessed > 0 {
+        return Err(unsupported(
+            "precision as displayed",
+            "a circular reference",
+        ));
+    }
     let calc_always = calc_always::calc_always(&engine, &sheets, &plans, &defined_names)?;
     checkpoint(&options.cancel)?;
     // INDIRECT text that names a workbook ('[Book.xlsx]Sheet1'!A1) reads this

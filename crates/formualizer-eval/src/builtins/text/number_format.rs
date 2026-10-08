@@ -464,9 +464,17 @@ pub(crate) fn format_number(
 pub(crate) fn displayed_sections(code: &str) -> Result<Vec<DisplayedSection>, String> {
     let sections =
         parse_sections(code).map_err(|_| format!("a number format Excel cannot read: {code:?}"))?;
-    let mut displayed = sections
+    if let Some(why) = unopenable(code, &sections) {
+        return Err(format!("{why}: {code:?}"));
+    }
+    // The last of two or three sections formats text when it has `@`:
+    // `0;@` stores -2/3 as -1, as `0` alone does.
+    let numeric = match sections.len() {
+        2 | 3 if sections[sections.len() - 1].has(&Tok::At) => sections.len() - 1,
+        n => n.min(3),
+    };
+    let mut displayed = sections[..numeric]
         .iter()
-        .take(3)
         .map(|section| displayed_section(section, code))
         .collect::<Result<Vec<_>, _>>()?;
     if sections.len() == 1 && sections[0].condition.is_some() {
@@ -510,14 +518,32 @@ fn displayed_section(section: &Section, code: &str) -> Result<DisplayedSection, 
     if let Some(slash) = fraction_slash(toks) {
         // As shown: a fixed denominator, else up to as many digits as the
         // denominator has placeholders.
-        let (places, fixed, _) = fraction_denominator(toks, slash);
+        let (mut places, mut fixed, end) = fraction_denominator(toks, slash);
+        // Zeros before a number are part of it: `# ?/05` and `# ?/005` store
+        // fifths, while `# ?/0` and `# ?/00` take one and two digits.
+        if let Some(Tok::Lit(text)) = toks.get(end)
+            && !places.is_empty()
+            && text.starts_with(|c: char| c.is_ascii_digit())
+        {
+            if places.iter().any(|k| *k != '0') {
+                return Err(format!(
+                    "a fraction denominator of placeholders and digits: {code:?}"
+                ));
+            }
+            places.clear();
+            fixed = text.chars().take_while(char::is_ascii_digit).collect();
+        }
+        // Excel rounds to a fixed denominator up to 32768 and stores larger
+        // ones unrounded or by another rule (`# ?/65535` keeps one digit).
         let denominator = if fixed.is_empty() {
             None
         } else {
             Some(
                 fixed
                     .parse::<u64>()
-                    .map_err(|_| format!("a fraction denominator out of range: {code:?}"))?
+                    .ok()
+                    .filter(|denominator| *denominator <= 32768)
+                    .ok_or_else(|| format!("a fraction denominator out of range: {code:?}"))?
                     .max(1),
             )
         };
@@ -536,6 +562,131 @@ fn displayed_section(section: &Section, code: &str) -> Result<DisplayedSection, 
         decimals: digits(frac_toks) as i32,
         shift: 2 * percents - 3 * comma_roles(int_toks, frac_toks).scale,
     })
+}
+
+/// Why Excel for Windows 16.0.20430 will not open a workbook that formats a
+/// cell with `code`, as far as jobs probe-w2-precision-6 to -8 measured
+/// (`Workbooks.Open` fails); `None` when it opens or was not seen to fail.
+fn unopenable(code: &str, sections: &[Section]) -> Option<&'static str> {
+    // 123 characters open, 129 do not.
+    if code.chars().count() > 123 {
+        return Some("a number format longer than Excel opens");
+    }
+    let last = sections.len() - 1;
+    let mut conditions = 0;
+    for (i, (section, text)) in sections.iter().zip(split_sections(code)).enumerate() {
+        let toks = &section.toks;
+        if section.has(&Tok::At) {
+            if i != last {
+                return Some("a text section (`@`) before another section");
+            }
+            if section.condition.is_some() {
+                return Some("a condition on a text section (`@`)");
+            }
+            if toks.iter().any(|t| {
+                matches!(
+                    t,
+                    Tok::Digit(_) | Tok::Point | Tok::Percent | Tok::Slash | Tok::Exp { .. }
+                )
+            }) {
+                return Some("`@` beside number codes");
+            }
+        }
+        if i == 3 && toks.iter().any(|t| matches!(t, Tok::Digit(_))) {
+            return Some("digit placeholders in the fourth (text) section");
+        }
+        if let Some(why) = unopenable_brackets(text) {
+            return Some(why);
+        }
+        conditions += usize::from(section.condition.is_some());
+        if section.is_date() {
+            continue;
+        }
+        let exps: Vec<usize> = (0..toks.len())
+            .filter(|&e| matches!(toks[e], Tok::Exp { .. }))
+            .collect();
+        if let [e] = exps[..] {
+            let before = toks[..e].iter().any(|t| matches!(t, Tok::Digit(_)));
+            if !before || !matches!(toks.get(e + 1), Some(Tok::Digit(_))) {
+                return Some("an exponent without digits on both sides");
+            }
+        } else if exps.len() > 1 {
+            return Some("two exponents in one section");
+        }
+        let slashes = toks.iter().filter(|t| **t == Tok::Slash).count();
+        if slashes > 0 {
+            let Some(slash) = fraction_slash(toks).filter(|_| slashes == 1) else {
+                return Some("a `/` that makes no fraction");
+            };
+            if !exps.is_empty() || toks[..slash].contains(&Tok::Point) {
+                return Some("a fraction with a decimal point or an exponent");
+            }
+        }
+    }
+    // Two conditional sections open, three do not.
+    (conditions > 2).then_some("three conditions")
+}
+
+/// What in the brackets of one section's `text`, or in its unquoted letters,
+/// keeps Excel from opening the workbook: brackets other than one condition,
+/// one color (the eight names or `Color1` to `Color56`), `$` currency and
+/// locale, `DBNum1` to `DBNum4` and elapsed time; or a bare `g`.
+fn unopenable_brackets(text: &str) -> Option<&'static str> {
+    const COLORS: [&str; 8] = [
+        "black", "blue", "cyan", "green", "magenta", "red", "white", "yellow",
+    ];
+    let (mut colors, mut conditions) = (0, 0);
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                chars.by_ref().find(|&q| q == '"');
+            }
+            '\\' | '_' | '*' => {
+                chars.next();
+            }
+            'g' | 'G'
+                if chars
+                    .as_str()
+                    .get(..6)
+                    .is_some_and(|rest| rest.eq_ignore_ascii_case("eneral")) =>
+            {
+                chars.nth(5);
+            }
+            'g' | 'G' => return Some("an unquoted `g`"),
+            '[' => {
+                let inner: String = chars.by_ref().take_while(|&q| q != ']').collect();
+                let lower = inner.to_ascii_lowercase();
+                if inner.starts_with('$') {
+                    continue;
+                }
+                if inner.starts_with(['<', '>', '=']) {
+                    match parse_condition(&inner) {
+                        Some((_, n)) if n.is_finite() => conditions += 1,
+                        _ => return Some("a condition Excel cannot read"),
+                    }
+                } else if COLORS.contains(&lower.as_str())
+                    || lower
+                        .strip_prefix("color")
+                        .and_then(|n| n.trim().parse::<u8>().ok())
+                        .is_some_and(|n| (1..=56).contains(&n))
+                {
+                    colors += 1;
+                } else if !(matches!(lower.as_str(), "dbnum1" | "dbnum2" | "dbnum3" | "dbnum4")
+                    || (!lower.is_empty()
+                        && matches!(lower.as_bytes()[0], b'h' | b'm' | b's')
+                        && lower.bytes().all(|b| b == lower.as_bytes()[0])))
+                {
+                    return Some("a bracket Excel does not read in a number format");
+                }
+                if colors > 1 || conditions > 1 {
+                    return Some("two colors or two conditions in one section");
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Render text with the text section (the fourth, or one containing `@`).

@@ -24,14 +24,18 @@
 //!   `330.0E-3`) and `0.0E+0%` stores it as 0.3333 (shown `3.3E-1%`).
 //! - A fraction section stores the value's whole number plus the fraction it
 //!   shows (also when it shows an improper fraction), computed in doubles:
-//!   `?/?` stores 1.66 as 1 + 2/3 (shown `5/3`). A fixed denominator rounds to it (`# ?/8`
-//!   stores 2.675 as 2 5/8); otherwise the fraction is the last continued
+//!   `?/?` stores 1.66 as 1 + 2/3 (shown `5/3`). A fixed denominator up to
+//!   32768 rounds to it (`# ?/8` stores 2.675 as 2 5/8; `# ?/05` stores
+//!   fifths, `# ?/0` takes one digit); a larger one is stored unrounded or by
+//!   another rule and is refused. Otherwise the fraction is the last continued
 //!   fraction convergent whose denominator has at most as many digits as
 //!   the format's (`# ?/?` stores 13/17 as 3/4, not the closer 7/9).
 //! - Conditions are not consulted: a positive value takes the first section
 //!   and a negative value the second (when there is one), whatever the
 //!   conditions say, and keeps its sign; `[>100]0;0.00` stores `=2/3` as 1.
 //!   Excel reads a lone conditional section as that section and General.
+//! - The last of two or three sections formats text when it holds `@`, so
+//!   `0;@` and `[>1]0;@` store every number as `0` does (-2/3 as -1).
 //! - An empty section passes the value to the next one (`;0.00` stores
 //!   positive values with two decimals); with none left, 15 digits.
 //! - Zero stays zero, and so does any value that rounds to it or below the
@@ -39,6 +43,10 @@
 //!   2.3E-308 as 0). For a value that rounds past the largest double
 //!   (2^1023*(2-2^-52) under General, 1.79E+308 under `0.0E+0`) Excel saves
 //!   #NUM!, yet compares the cell as a number (=A1=0 is FALSE, =A1*1 #NUM!).
+//! - Excel will not open a workbook with a format such as `0.0@`, `@;0`,
+//!   `0;0;0;0`, `# ?/100000`, `0.0 ?/?`, `E+0`, `[Foo]0`, `[Red][Blue]0`,
+//!   three conditions, a bare `g` or more than 123 characters; such formats
+//!   are refused.
 
 use crate::builtins::text::number_format;
 

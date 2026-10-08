@@ -17,10 +17,11 @@ const OFFICE: &str = "http://schemas.openxmlformats.org/officeDocument/2006/rela
 const XLDAPR: &str = "<metadataTypes count=\"1\"><metadataType name=\"XLDAPR\" minSupportedVersion=\"120000\" copy=\"1\" pasteAll=\"1\" pasteValues=\"1\" merge=\"1\" splitFirst=\"1\" rowColShift=\"1\" clearFormats=\"1\" clearComments=\"1\" assign=\"1\" coerce=\"1\" cellMeta=\"1\"/></metadataTypes><futureMetadata name=\"XLDAPR\" count=\"1\"><bk><extLst><ext uri=\"{bdbb8cdc-fa1e-496e-a857-3c3f30c029c3}\"><xda:dynamicArrayProperties fDynamic=\"1\" fCollapsed=\"0\"/></ext></extLst></bk></futureMetadata><cellMetadata count=\"1\"><bk><rc t=\"1\" v=\"0\"/></bk></cellMetadata>";
 
 /// A cell: its address; its number format, a code or `#N` for built-in
-/// format N; its content: `=` and a formula, `{ref}=` or `{ref}#=` for a
-/// legacy or dynamic array formula over `ref`, nothing for an array member,
-/// else a number; and the value Excel stored, if a formula's: a number,
-/// `TRUE`/`FALSE`, an error or `'` and text.
+/// format N; its content: `=` and a formula (then a tab and the value the
+/// file caches for it, if any), `{ref}=` or `{ref}#=` for a legacy or dynamic
+/// array formula over `ref`, nothing for an array member, else a number; and
+/// the value Excel stored, if a formula's: a number, `TRUE`/`FALSE`, an error
+/// or `'` and text.
 type Cell = (&'static str, &'static str, &'static str, &'static str);
 
 fn escape(text: &str) -> String {
@@ -84,8 +85,12 @@ fn package(cells: &[(String, String, String)], precision_as_displayed: bool) -> 
                 escape(formula)
             )
         } else if let Some(formula) = content.strip_prefix('=') {
+            let (formula, cache) = match formula.split_once('\t') {
+                Some((formula, cache)) => (formula, format!("<v>{cache}</v>")),
+                None => (formula, String::new()),
+            };
             format!(
-                "<c r=\"{address}\" s=\"{s}\"><f>{}</f></c>",
+                "<c r=\"{address}\" s=\"{s}\"><f>{}</f>{cache}</c>",
                 escape(formula)
             )
         } else if content.is_empty() {
@@ -3561,6 +3566,114 @@ fn j5_ext_6() {
     check("5 ext-6", &owned(J5_EXT_6), true);
 }
 
+/// Job probe-w2-precision-6, case fmt-012.
+#[rustfmt::skip]
+const J6_FMT_012: &[Cell] = &[
+    ("A1", "0;@", "=1234.5678", "1235"),
+    ("B1", "General", "=A1*1", "1235"),
+    ("A2", "0;@", "=1/3", "0"),
+    ("B2", "General", "=A2*1", "0"),
+    ("A3", "0;@", "=-2/3", "-1"),
+    ("B3", "General", "=A3*1", "-1"),
+    ("A4", "0;@", "=0.0625", "0"),
+    ("B4", "General", "=A4*1", "0"),
+];
+
+#[test]
+fn j6_fmt_012() {
+    check("6 fmt-012", &owned(J6_FMT_012), true);
+}
+
+/// Job probe-w2-precision-6, case fmt-019.
+#[rustfmt::skip]
+const J6_FMT_019: &[Cell] = &[
+    ("A1", "[>1]0;@", "=1234.5678", "1235"),
+    ("B1", "General", "=A1*1", "1235"),
+    ("A2", "[>1]0;@", "=1/3", "0"),
+    ("B2", "General", "=A2*1", "0"),
+    ("A3", "[>1]0;@", "=-2/3", "-1"),
+    ("B3", "General", "=A3*1", "-1"),
+    ("A4", "[>1]0;@", "=0.0625", "0"),
+    ("B4", "General", "=A4*1", "0"),
+];
+
+#[test]
+fn j6_fmt_019() {
+    check("6 fmt-019", &owned(J6_FMT_019), true);
+}
+
+/// Job probe-w2-precision-6, case fmt-036.
+#[rustfmt::skip]
+const J6_FMT_036: &[Cell] = &[
+    ("A1", "#\\ ?/05", "=1234.5678", "1234.6"),
+    ("B1", "General", "=A1*1", "1234.6"),
+    ("A2", "#\\ ?/05", "=1/3", "0.4"),
+    ("B2", "General", "=A2*1", "0.4"),
+    ("A3", "#\\ ?/05", "=-2/3", "-0.6"),
+    ("B3", "General", "=A3*1", "-0.6"),
+    ("A4", "#\\ ?/05", "=0.0625", "0"),
+    ("B4", "General", "=A4*1", "0"),
+];
+
+#[test]
+fn j6_fmt_036() {
+    check("6 fmt-036", &owned(J6_FMT_036), true);
+}
+
+/// Job probe-w2-precision-7, case fmt-068.
+#[rustfmt::skip]
+const J7_FMT_068: &[Cell] = &[
+    ("A1", "#\\ ?/005", "=1234.5678", "1234.6"),
+    ("B1", "General", "=A1*1", "1234.6"),
+    ("A2", "#\\ ?/005", "=1/3", "0.4"),
+    ("B2", "General", "=A2*1", "0.4"),
+    ("A3", "#\\ ?/005", "=-2/3", "-0.6"),
+    ("B3", "General", "=A3*1", "-0.6"),
+    ("A4", "#\\ ?/005", "=0.0625", "0"),
+    ("B4", "General", "=A4*1", "0"),
+];
+
+#[test]
+fn j7_fmt_068() {
+    check("7 fmt-068", &owned(J7_FMT_068), true);
+}
+
+/// Job probe-w2-precision-7, case fmt-073.
+#[rustfmt::skip]
+const J7_FMT_073: &[Cell] = &[
+    ("A1", "[<1]0.0;@", "=1234.5678", "1234.6"),
+    ("B1", "General", "=A1*1", "1234.6"),
+    ("A2", "[<1]0.0;@", "=1/3", "0.3"),
+    ("B2", "General", "=A2*1", "0.3"),
+    ("A3", "[<1]0.0;@", "=-2/3", "-0.7"),
+    ("B3", "General", "=A3*1", "-0.7"),
+    ("A4", "[<1]0.0;@", "=0.0625", "0.1"),
+    ("B4", "General", "=A4*1", "0.1"),
+];
+
+#[test]
+fn j7_fmt_073() {
+    check("7 fmt-073", &owned(J7_FMT_073), true);
+}
+
+/// Job probe-w2-precision-7, case fmt-074.
+#[rustfmt::skip]
+const J7_FMT_074: &[Cell] = &[
+    ("A1", "[>1]0.0;@", "=1234.5678", "1234.6"),
+    ("B1", "General", "=A1*1", "1234.6"),
+    ("A2", "[>1]0.0;@", "=1/3", "0.3"),
+    ("B2", "General", "=A2*1", "0.3"),
+    ("A3", "[>1]0.0;@", "=-2/3", "-0.7"),
+    ("B3", "General", "=A3*1", "-0.7"),
+    ("A4", "[>1]0.0;@", "=0.0625", "0.1"),
+    ("B4", "General", "=A4*1", "0.1"),
+];
+
+#[test]
+fn j7_fmt_074() {
+    check("7 fmt-074", &owned(J7_FMT_074), true);
+}
+
 /// A scientific format scaled by a comma (`0.0,E+0`, which Excel saves for `0.0E+0,`) stores
 /// every number as 0 in Excel; the fork does not reproduce it and refuses the workbook (it
 /// stored 0.33 for =1/3).
@@ -3702,4 +3815,185 @@ fn a_number_rounded_past_the_largest_double_is_refused() {
     for (case, cells) in PAST_LARGEST {
         refused(case, &owned(cells));
     }
+}
+
+/// Fixed fraction denominators past 32768: Excel stores the value unrounded (`# ?/50000`
+/// keeps 1/3) or by another rule (`# ?/65535` stores 1234.5678 as 1234 4/7); up to
+/// 32768 it rounds to the denominator. The fork refuses them.
+#[rustfmt::skip]
+const LARGE_DENOMINATORS: &[(&str, &[Cell])] = &[
+    ("probe-w2-precision-6 fmt-025", &[
+        ("A1", "#\\ ?/99999", "=1234.5678", ""),
+        ("B1", "General", "=A1*1", ""),
+        ("A2", "#\\ ?/99999", "=1/3", ""),
+        ("B2", "General", "=A2*1", ""),
+        ("A3", "#\\ ?/99999", "=-2/3", ""),
+        ("B3", "General", "=A3*1", ""),
+        ("A4", "#\\ ?/99999", "=0.0625", ""),
+        ("B4", "General", "=A4*1", ""),
+    ]),
+    ("probe-w2-precision-7 fmt-064", &[
+        ("A1", "#\\ ?/50000", "=1234.5678", ""),
+        ("B1", "General", "=A1*1", ""),
+        ("A2", "#\\ ?/50000", "=1/3", ""),
+        ("B2", "General", "=A2*1", ""),
+        ("A3", "#\\ ?/50000", "=-2/3", ""),
+        ("B3", "General", "=A3*1", ""),
+        ("A4", "#\\ ?/50000", "=0.0625", ""),
+        ("B4", "General", "=A4*1", ""),
+    ]),
+    ("probe-w2-precision-7 fmt-065", &[
+        ("A1", "#\\ ?/99998", "=1234.5678", ""),
+        ("B1", "General", "=A1*1", ""),
+        ("A2", "#\\ ?/99998", "=1/3", ""),
+        ("B2", "General", "=A2*1", ""),
+        ("A3", "#\\ ?/99998", "=-2/3", ""),
+        ("B3", "General", "=A3*1", ""),
+        ("A4", "#\\ ?/99998", "=0.0625", ""),
+        ("B4", "General", "=A4*1", ""),
+    ]),
+    ("probe-w2-precision-8 fmt-021", &[
+        ("A1", "#\\ ?/32769", "=1234.5678", ""),
+        ("B1", "General", "=A1*1", ""),
+        ("A2", "#\\ ?/32769", "=1/3", ""),
+        ("B2", "General", "=", ""),
+        ("A3", "#\\ ?/32769", "=-2/3", ""),
+        ("B3", "General", "=", ""),
+        ("A4", "#\\ ?/32769", "=0.0625", ""),
+        ("B4", "General", "=", ""),
+        ("A5", "#\\ ?/32769", "=PI()", ""),
+        ("B5", "General", "=", ""),
+        ("A6", "#\\ ?/32769", "=1/7", ""),
+        ("B6", "General", "=", ""),
+    ]),
+    ("probe-w2-precision-8 fmt-022", &[
+        ("A1", "#\\ ?/40000", "=1234.5678", ""),
+        ("B1", "General", "=A1*1", ""),
+        ("A2", "#\\ ?/40000", "=1/3", ""),
+        ("B2", "General", "=", ""),
+        ("A3", "#\\ ?/40000", "=-2/3", ""),
+        ("B3", "General", "=", ""),
+        ("A4", "#\\ ?/40000", "=0.0625", ""),
+        ("B4", "General", "=", ""),
+        ("A5", "#\\ ?/40000", "=PI()", ""),
+        ("B5", "General", "=", ""),
+        ("A6", "#\\ ?/40000", "=1/7", ""),
+        ("B6", "General", "=", ""),
+    ]),
+    ("probe-w2-precision-8 fmt-023", &[
+        ("A1", "#\\ ?/65535", "=1234.5678", ""),
+        ("B1", "General", "=A1*1", ""),
+        ("A2", "#\\ ?/65535", "=1/3", ""),
+        ("B2", "General", "=", ""),
+        ("A3", "#\\ ?/65535", "=-2/3", ""),
+        ("B3", "General", "=", ""),
+        ("A4", "#\\ ?/65535", "=0.0625", ""),
+        ("B4", "General", "=", ""),
+        ("A5", "#\\ ?/65535", "=PI()", ""),
+        ("B5", "General", "=", ""),
+        ("A6", "#\\ ?/65535", "=1/7", ""),
+        ("B6", "General", "=", ""),
+    ]),
+    ("probe-w2-precision-8 fmt-024", &[
+        ("A1", "#\\ ?/65536", "=1234.5678", ""),
+        ("B1", "General", "=A1*1", ""),
+        ("A2", "#\\ ?/65536", "=1/3", ""),
+        ("B2", "General", "=", ""),
+        ("A3", "#\\ ?/65536", "=-2/3", ""),
+        ("B3", "General", "=", ""),
+        ("A4", "#\\ ?/65536", "=0.0625", ""),
+        ("B4", "General", "=", ""),
+        ("A5", "#\\ ?/65536", "=PI()", ""),
+        ("B5", "General", "=", ""),
+        ("A6", "#\\ ?/65536", "=1/7", ""),
+        ("B6", "General", "=", ""),
+    ]),
+];
+
+#[test]
+fn a_fixed_denominator_past_32768_is_refused() {
+    for (case, cells) in LARGE_DENOMINATORS {
+        refused(case, &owned(cells));
+    }
+}
+
+/// Number formats Excel for Windows 16.0.20430 will not open a workbook with (each on
+/// =1234.5678, =1/3, =-2/3 and =0.0625, precision as displayed on): `@` beside number codes, in
+/// an earlier section or under a condition; fixed denominators from 100000; a fraction with
+/// a decimal point or an exponent, two fractions or a lone `/`; an exponent without digits
+/// on both sides or twice; unknown brackets, colors past 56, two colors or conditions in a
+/// section, three conditions or one past the largest double; digits in the fourth section;
+/// a bare `g`; more than 123 characters. The fork refuses them.
+#[rustfmt::skip]
+const UNOPENABLE: &[(&str, &str)] = &[
+    ("probe-w2-precision-6 fmt-000", "0.0@"),
+    ("probe-w2-precision-6 fmt-005", "@%"),
+    ("probe-w2-precision-6 fmt-007", "@."),
+    ("probe-w2-precision-6 fmt-008", "@/"),
+    ("probe-w2-precision-6 fmt-014", "@;0"),
+    ("probe-w2-precision-6 fmt-015", "0;@;0"),
+    ("probe-w2-precision-6 fmt-017", "@;@"),
+    ("probe-w2-precision-6 fmt-018", "[>1]@"),
+    ("probe-w2-precision-6 fmt-026", "# ?/100000"),
+    ("probe-w2-precision-6 fmt-034", "# ?/10000000000000"),
+    ("probe-w2-precision-6 fmt-042", "0.0 ?/?"),
+    ("probe-w2-precision-6 fmt-044", "?/?E+0"),
+    ("probe-w2-precision-6 fmt-045", "# ?/? ?/?"),
+    ("probe-w2-precision-6 fmt-046", "0/"),
+    ("probe-w2-precision-6 fmt-047", "/0"),
+    ("probe-w2-precision-6 fmt-051", "0E+"),
+    ("probe-w2-precision-6 fmt-052", "E+0"),
+    ("probe-w2-precision-6 fmt-053", "0E+0E+0"),
+    ("probe-w2-precision-6 fmt-059", "[Foo]0"),
+    ("probe-w2-precision-6 fmt-061", "[Color57]0"),
+    ("probe-w2-precision-6 fmt-062", "[Color0]0"),
+    ("probe-w2-precision-6 fmt-063", "[Red][Blue]0"),
+    ("probe-w2-precision-6 fmt-064", "[>1][<5]0"),
+    ("probe-w2-precision-6 fmt-065", "[>1]0;[>2]0;[>3]0"),
+    ("probe-w2-precision-6 fmt-077", "0;0;0;0"),
+    ("probe-w2-precision-6 fmt-092", "0 g"),
+    ("probe-w2-precision-7 fmt-052", "g0"),
+    ("probe-w2-precision-7 fmt-071", "[>1]0;[<-1]0;[=0]0"),
+    ("probe-w2-precision-7 fmt-099", "[ENG]0"),
+    ("probe-w2-precision-7 fmt-100", "[~]0"),
+    ("probe-w2-precision-7 fmt-102", "[>1e400]0"),
+    ("probe-w2-precision-8 fmt-002", "0.0\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""),
+    ("probe-w2-precision-8 fmt-011", "0.0\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x"),
+];
+
+#[test]
+fn a_format_excel_will_not_open_is_refused() {
+    for (case, format) in UNOPENABLE {
+        let cells: Vec<_> = ["1234.5678", "1/3", "-2/3", "0.0625"]
+            .iter()
+            .enumerate()
+            .map(|(i, value)| {
+                (
+                    format!("A{}", i + 1),
+                    (*format).to_owned(),
+                    format!("={value}"),
+                    String::new(),
+                )
+            })
+            .collect();
+        refused(case, &cells);
+    }
+}
+
+/// Job probe-w2-precision-sol2-2, case cycle-pad: A1 reads itself (iteration off) and the
+/// file caches 1.23456, 99, 88 and 77. Excel keeps all four, the readers of A1 included, and
+/// calculates Z1 (3333); the fork calculates B1:D1 again from A1 (2.46912, 0.33, 2.46912)
+/// and so refuses the workbook.
+#[rustfmt::skip]
+const CIRCULAR: &[Cell] = &[
+    ("A1", "0.0", "=A1\t1.2345600000000001", ""),
+    ("B1", "General", "=A1*2\t99", ""),
+    ("C1", "0.00", "=IF(A1>0,1/3,0)\t88", ""),
+    ("D1", "General", "=B1*1\t77", ""),
+    ("Z1", "General", "=1111+2222", ""),
+];
+
+#[test]
+fn a_circular_reference_is_refused() {
+    refused("probe-w2-precision-sol2-2 cycle-pad", &owned(CIRCULAR));
 }
