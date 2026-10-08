@@ -702,11 +702,8 @@ fn recalculate_xlsx_bytes_here(
         engine.evaluate_all()?;
     }
     checkpoint(&options.cancel)?;
-    if engine.displayed_precision_unknown() {
-        return Err(unsupported(
-            "precision as displayed",
-            "a number shown by a format section of literal text only",
-        ));
+    if let Some(reason) = engine.displayed_precision_unknown() {
+        return Err(unsupported("precision as displayed", reason));
     }
     let calc_always = calc_always::calc_always(&engine, &sheets, &plans, &defined_names)?;
     checkpoint(&options.cancel)?;

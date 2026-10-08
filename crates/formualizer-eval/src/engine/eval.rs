@@ -1101,18 +1101,15 @@ enum ArrayFormulaShape {
     Fixed { rows: u32, cols: u32 },
 }
 
-/// Fit an array formula's result to the cells it was entered over: a single
-/// row or column repeats, positions beyond the result are #N/A and the rest
-/// of a larger result is dropped.
 /// A number (or a date, time or duration, as its serial) stored under
 /// `format`; any other value as it is. A value the format leaves unchanged
-/// keeps its kind. `Err` hands the value back unchanged where the stored
-/// value is not known.
+/// keeps its kind. `Err` hands the value back unchanged, with the reason,
+/// where the stored value is not known.
 fn displayed_value(
     value: LiteralValue,
     format: &crate::precision::DisplayedFormat,
     system: formualizer_common::DateSystem,
-) -> Result<LiteralValue, LiteralValue> {
+) -> Result<LiteralValue, (LiteralValue, DisplayedUnknown)> {
     let number = match &value {
         LiteralValue::Number(n) => *n,
         LiteralValue::Int(i) => *i as f64,
@@ -1127,11 +1124,26 @@ fn displayed_value(
     };
     match format.round(number) {
         Some(stored) if stored.to_bits() == number.to_bits() => Ok(value),
+        Some(stored) if stored.is_infinite() => Err((value, DisplayedUnknown::PastLargest)),
         Some(stored) => Ok(LiteralValue::Number(stored)),
-        None => Err(value),
+        None => Err((value, DisplayedUnknown::LiteralSection)),
     }
 }
 
+/// Why the value a cell stores under precision as displayed is not known.
+#[derive(Clone, Copy)]
+enum DisplayedUnknown {
+    /// A number shown by a section of literal text only (`0;"none"`).
+    LiteralSection = 1,
+    /// A number its format rounds past the largest double: Excel saves
+    /// #NUM! and =A1*1 is #NUM!, but =A1=0 is FALSE (Excel for Windows
+    /// 16.0.20430, job probe-w2-precision-sol-raw).
+    PastLargest = 2,
+}
+
+/// Fit an array formula's result to the cells it was entered over: a single
+/// row or column repeats, positions beyond the result are #N/A and the rest
+/// of a larger result is dropped.
 fn fit_array_formula_result(value: LiteralValue, rows: u32, cols: u32) -> LiteralValue {
     let source = match value {
         LiteralValue::Array(source) if !source.is_empty() && !source[0].is_empty() => source,
@@ -1503,8 +1515,9 @@ pub struct Engine<R> {
     /// [`Self::text_named_workbook`].
     text_named_workbook: std::sync::atomic::AtomicBool,
     /// Some formula published a number whose stored value under precision
-    /// as displayed is not known; see [`Self::displayed_precision_unknown`].
-    displayed_precision_unknown: std::sync::atomic::AtomicBool,
+    /// as displayed is not known, a bit per [`DisplayedUnknown`]; see
+    /// [`Self::displayed_precision_unknown`].
+    displayed_precision_unknown: std::sync::atomic::AtomicU8,
     thread_pool: Option<Arc<rayon::ThreadPool>>,
     pub recalc_epoch: u64,
     snapshot_id: std::sync::atomic::AtomicU64,
@@ -3567,7 +3580,7 @@ where
             clock: crate::timezone::SnapshotClock::new(clock),
             rng_draws: std::sync::Mutex::new(FxHashMap::default()),
             text_named_workbook: std::sync::atomic::AtomicBool::new(false),
-            displayed_precision_unknown: std::sync::atomic::AtomicBool::new(false),
+            displayed_precision_unknown: std::sync::atomic::AtomicU8::new(0),
             thread_pool,
             recalc_epoch: 0,
             snapshot_id: std::sync::atomic::AtomicU64::new(1),
@@ -3748,7 +3761,7 @@ where
             clock: crate::timezone::SnapshotClock::new(clock),
             rng_draws: std::sync::Mutex::new(FxHashMap::default()),
             text_named_workbook: std::sync::atomic::AtomicBool::new(false),
-            displayed_precision_unknown: std::sync::atomic::AtomicBool::new(false),
+            displayed_precision_unknown: std::sync::atomic::AtomicU8::new(0),
             thread_pool: Some(thread_pool),
             recalc_epoch: 0,
             snapshot_id: std::sync::atomic::AtomicU64::new(1),
@@ -5719,9 +5732,9 @@ where
             let format = formats
                 .get(&(cell.sheet_id, row, col))
                 .map_or(&general, |format| format.as_ref());
-            displayed_value(value, format, system).unwrap_or_else(|value| {
+            displayed_value(value, format, system).unwrap_or_else(|(value, unknown)| {
                 self.displayed_precision_unknown
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                    .fetch_or(unknown as u8, std::sync::atomic::Ordering::Relaxed);
                 value
             })
         };
@@ -5942,13 +5955,22 @@ where
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Whether a formula evaluated under [`Self::use_precision_as_displayed`]
-    /// published a number whose cell format Excel's stored value is not known
-    /// for (a section of literal text only showing a number); the number was
+    /// Why a formula evaluated under [`Self::use_precision_as_displayed`]
+    /// published a number whose stored value Excel's behaviour is not known
+    /// for, if one did: a section of literal text only showing a number, or
+    /// a number its format rounds past the largest double. The number was
     /// published unrounded, so a host refuses the result.
-    pub fn displayed_precision_unknown(&self) -> bool {
-        self.displayed_precision_unknown
-            .load(std::sync::atomic::Ordering::Relaxed)
+    pub fn displayed_precision_unknown(&self) -> Option<&'static str> {
+        let unknown = self
+            .displayed_precision_unknown
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if unknown & DisplayedUnknown::LiteralSection as u8 != 0 {
+            Some("a number shown by a format section of literal text only")
+        } else if unknown & DisplayedUnknown::PastLargest as u8 != 0 {
+            Some("a number its format rounds past the largest number")
+        } else {
+            None
+        }
     }
 
     /// Whether the formula at `address` is dirty only because it is volatile

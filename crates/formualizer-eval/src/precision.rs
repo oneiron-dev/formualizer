@@ -13,9 +13,15 @@
 //!   stores 1234.5678 as 1000. Digits are read off the value to 15
 //!   significant digits and rounded half away from zero (2.675 is 2.68 under
 //!   `0.00`); the result is the double nearest that decimal.
+//! - The 15 significant digits are the nearest, and a value exactly halfway
+//!   between two (a 16th digit 5 and nothing after it) goes toward zero:
+//!   100000000000001.5 is 100000000000001 and 32771/32768
+//!   (1.000091552734375) is 1.00009155273437, under General and every number
+//!   section.
 //! - A scientific section stores as many significant digits as it has
-//!   decimal places plus one, however many integer digits it shows:
-//!   `##0.0E+0` stores `=1/3` as 0.33 (shown `330.0E-3`).
+//!   decimal places plus one, and two more for each percent sign, however
+//!   many integer digits it shows: `##0.0E+0` stores `=1/3` as 0.33 (shown
+//!   `330.0E-3`) and `0.0E+0%` stores it as 0.3333 (shown `3.3E-1%`).
 //! - A fraction section stores the value's whole number plus the fraction it
 //!   shows (also when it shows an improper fraction), computed in doubles:
 //!   `?/?` stores 1.66 as 1 + 2/3 (shown `5/3`). A fixed denominator rounds to it (`# ?/8`
@@ -28,7 +34,11 @@
 //!   Excel reads a lone conditional section as that section and General.
 //! - An empty section passes the value to the next one (`;0.00` stores
 //!   positive values with two decimals); with none left, 15 digits.
-//! - Zero stays zero, and so does any value that rounds to it.
+//! - Zero stays zero, and so does any value that rounds to it or below the
+//!   smallest normal double (General stores 2^-1022 as 0, `0E+0` stores
+//!   2.3E-308 as 0). For a value that rounds past the largest double
+//!   (2^1023*(2-2^-52) under General, 1.79E+308 under `0.0E+0`) Excel saves
+//!   #NUM!, yet compares the cell as a number (=A1=0 is FALSE, =A1*1 #NUM!).
 
 use crate::builtins::text::number_format;
 
@@ -79,7 +89,8 @@ impl DisplayedFormat {
     }
 
     /// The value a cell formatted with this format stores for `value`, or
-    /// `None` where Excel's stored value is not known.
+    /// `None` where Excel's stored value is not known. An infinite value is
+    /// a decimal past the largest double (see the module notes).
     pub fn round(&self, value: f64) -> Option<f64> {
         if value == 0.0 {
             return Some(0.0);
@@ -93,9 +104,7 @@ impl DisplayedFormat {
             .find(|section| **section != Section::Empty)
             .unwrap_or(&Section::Significant);
         let stored = section.round(value.abs())?;
-        Some(if !stored.is_finite() {
-            value
-        } else if stored == 0.0 {
+        Some(if stored < f64::MIN_POSITIVE {
             0.0
         } else if value < 0.0 {
             -stored
@@ -135,20 +144,15 @@ impl Section {
     }
 }
 
-/// The double nearest `magnitude` to 15 significant digits, times 10^`shift`,
-/// rounded half away from zero to the number of significant digits `keep`
-/// gives for the decimal exponent of its first digit, then divided by
-/// 10^`shift` again. Every step is on decimal digits, as Excel shows them.
+/// `magnitude` to 15 significant digits ([`fifteen_digits`]), times
+/// 10^`shift`, rounded half away from zero to the number of significant
+/// digits `keep` gives for the decimal exponent of its first digit, then
+/// divided by 10^`shift` again: the double nearest that decimal (infinite
+/// past the largest). Every step is on decimal digits, as Excel shows them.
 fn decimal(magnitude: f64, shift: i32, keep: impl Fn(i32) -> i32) -> f64 {
-    let text = format!("{magnitude:.14e}");
-    let (mantissa, exponent) = text.split_once('e').expect("scientific notation");
-    let mut digits: Vec<u8> = mantissa
-        .bytes()
-        .filter(u8::is_ascii_digit)
-        .map(|digit| digit - b'0')
-        .collect();
+    let (mut digits, exponent) = fifteen_digits(magnitude);
     // `magnitude` is digits[0].digits[1..] x 10^exponent.
-    let mut exponent = exponent.parse::<i32>().expect("exponent") + shift;
+    let mut exponent = exponent + shift;
     let kept = keep(exponent);
     if kept < 0 || (kept == 0 && digits[0] < 5) {
         return 0.0;
@@ -180,6 +184,51 @@ fn decimal(magnitude: f64, shift: i32, keep: impl Fn(i32) -> i32) -> f64 {
     format!("{integer}e{scale}")
         .parse()
         .expect("decimal digits parse")
+}
+
+/// The 15 significant digits of `magnitude` (positive and finite) and the
+/// decimal exponent of the first: the nearest, and toward zero when
+/// `magnitude` is exactly halfway between two.
+fn fifteen_digits(magnitude: f64) -> (Vec<u8>, i32) {
+    // Sixteen digits are exact when `magnitude` is a tie: the 16th is a 5
+    // with nothing after it.
+    let (sixteen, exponent) = scientific_digits(&format!("{magnitude:.15e}"));
+    if sixteen[15] == 5 && is_exactly(&sixteen, exponent - 15, magnitude) {
+        return (sixteen[..15].to_vec(), exponent);
+    }
+    scientific_digits(&format!("{magnitude:.14e}"))
+}
+
+/// The digits and exponent of Rust's `{:e}` notation.
+fn scientific_digits(text: &str) -> (Vec<u8>, i32) {
+    let (mantissa, exponent) = text.split_once('e').expect("scientific notation");
+    let digits = mantissa
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .map(|digit| digit - b'0')
+        .collect();
+    (digits, exponent.parse().expect("exponent"))
+}
+
+/// Whether `magnitude` is exactly the integer `digits` (odd: it ends in 5)
+/// times 10^`scale`. Such a product is a double only when its odd part,
+/// `digits` x 5^`scale`, or `digits` / 5^-`scale`, is an integer below 2^53.
+fn is_exactly(digits: &[u8], scale: i32, magnitude: f64) -> bool {
+    const LIMIT: u128 = 1 << 53;
+    let integer = digits
+        .iter()
+        .fold(0u128, |integer, digit| integer * 10 + u128::from(*digit));
+    if scale >= 0 {
+        let odd = integer * 5u128.pow(scale.min(2) as u32);
+        return scale <= 1 && odd < LIMIT && magnitude == (odd as f64) * 2f64.powi(scale);
+    }
+    let fives = 5u128.checked_pow(scale.unsigned_abs());
+    match fives {
+        Some(fives) if integer % fives == 0 && integer / fives < LIMIT => {
+            magnitude == ((integer / fives) as f64) / 2f64.powi(-scale)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]

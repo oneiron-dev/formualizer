@@ -495,9 +495,16 @@ fn displayed_section(section: &Section, code: &str) -> Result<DisplayedSection, 
                 "a lowercase exponent Excel does not format cells with: {code:?}"
             ));
         }
-        let (_, decimals, _) = split_point(&toks[..e]);
+        let (integers, decimals, _) = split_point(&toks[..e]);
+        // Excel keeps no comma typed before `E` and saves one typed after the
+        // exponent as `0.0,E+0`, which stores every number as 0; what other
+        // scaled scientific formats store was not measured.
+        if comma_roles(integers, decimals).scale > 0 || toks[e..].contains(&Tok::Comma) {
+            return Err(format!("a scientific format scaled by a comma: {code:?}"));
+        }
+        let percents = toks.iter().filter(|t| **t == Tok::Percent).count() as i32;
         return Ok(DisplayedSection::Scientific {
-            digits: 1 + digits(decimals) as i32,
+            digits: 1 + digits(decimals) as i32 + 2 * percents,
         });
     }
     if let Some(slash) = fraction_slash(toks) {
