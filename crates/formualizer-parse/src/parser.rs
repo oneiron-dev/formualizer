@@ -804,6 +804,17 @@ impl ReferenceType {
             SheetSpec::Range { .. } => unreachable!(),
         };
 
+        // `[0]` is the workbook itself in a file's formulas, as `[1]` is the
+        // first workbook it links to: `[0]!Rate` is this workbook's own
+        // `Rate`, and `[0]Sheet1!A1` its `Sheet1!A1`.
+        if let Some(local) = sheet.as_deref().and_then(|name| name.strip_prefix("[0]")) {
+            return if local.is_empty() {
+                Self::parse_excel_reference(&ref_part)
+            } else {
+                Self::parse_excel_reference(&format!("'{}'!{ref_part}", local.replace('\'', "''")))
+            };
+        }
+
         // Table references live in the ref_part (e.g., "Table1[Column]").
         // Sheet names can contain '[' for external workbook refs (e.g., "[1]Sheet1!A1").
         if ref_part.contains('[') {

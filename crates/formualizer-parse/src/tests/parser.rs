@@ -2394,6 +2394,57 @@ mod reference_tests {
     }
 
     #[test]
+    fn test_book_zero_is_the_workbook_itself() {
+        // `[0]` names the workbook the formula is in.
+        assert_eq!(
+            ReferenceType::from_string("[0]!PeriodInActual").unwrap(),
+            ReferenceType::NamedRange("PeriodInActual".to_string())
+        );
+        assert_eq!(
+            ReferenceType::from_string("[0]Sheet1!$A$2").unwrap(),
+            ReferenceType::Cell {
+                sheet: Some("Sheet1".to_string()),
+                row: 2,
+                col: 1,
+                row_abs: true,
+                col_abs: true,
+            }
+        );
+        assert_eq!(
+            ReferenceType::from_string("'[0]Bob''s Sheet'!A1:A3").unwrap(),
+            ReferenceType::range_with_abs(
+                Some("Bob's Sheet".to_string()),
+                Some(1),
+                Some(1),
+                Some(3),
+                Some(1),
+                false,
+                false,
+                false,
+                false,
+            )
+        );
+        assert_eq!(
+            ReferenceType::from_string("[0]Sheet1!Scoped").unwrap(),
+            ReferenceType::NamedRange("'Sheet1'!Scoped".to_string())
+        );
+        // Through the tokenizer, in a defined name's formula.
+        let ast = parse("=([0]!PeriodInActual*(#REF!>0))*[0]!PeriodInPlan").unwrap();
+        assert_eq!(
+            ast.get_dependencies(),
+            [
+                &ReferenceType::NamedRange("PeriodInActual".to_string()),
+                &ReferenceType::NamedRange("PeriodInPlan".to_string()),
+            ]
+        );
+        // Another book index stays a linked workbook.
+        assert!(matches!(
+            ReferenceType::from_string("[1]Sheet1!A1").unwrap(),
+            ReferenceType::External(_)
+        ));
+    }
+
+    #[test]
     fn test_sheet_scoped_table_reference_is_not_external() {
         let ref_type = ReferenceType::from_string("Sheet1!Table1[Column1]").unwrap();
         assert_eq!(
