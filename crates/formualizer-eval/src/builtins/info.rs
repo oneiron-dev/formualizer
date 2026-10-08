@@ -2007,11 +2007,35 @@ impl Function for CellFn {
             return Ok(scalar(non_reference_error(&args[1])?));
         };
 
-        // `C:\Reports\[Book.xlsx]Sheet` for the reference's sheet, its name
-        // as the workbook spells it and never quoted; empty text while the
-        // workbook has never been saved to a file.
+        // The reference must name cells the workbook has: a sheet it lacks
+        // (`INDIRECT("Nope!B2")`) is #REF!, and a name it does not define is
+        // the name's own #NAME?, for every info type (Excel for Windows
+        // 16.0.20430, job probe-w2-hostinfo-4).
+        let reference_info = match ctx.inspect_reference(&reference) {
+            Ok(info) => info,
+            Err(_)
+                if matches!(
+                    reference,
+                    formualizer_parse::parser::ReferenceType::NamedRange(_)
+                ) =>
+            {
+                return Ok(scalar(non_reference_error(&args[1])?));
+            }
+            Err(error) => return Ok(scalar(LiteralValue::Error(error))),
+        };
+        // The sheet as the workbook spells it, whatever case the reference
+        // was written or computed in (`INDIRECT("other!B2")` is on `Other`).
+        let sheet = reference_info
+            .as_ref()
+            .and_then(|info| info.first_cell)
+            .and_then(|cell| ctx.workbook_sheet_name(cell.sheet_id))
+            .or_else(|| reference_sheet(&reference).map(str::to_owned));
+
+        // `C:\Reports\[Book.xlsx]Sheet` for the reference's sheet, never
+        // quoted; empty text while the workbook has never been saved to a
+        // file.
         if info_type == "filename" {
-            let sheet = reference_sheet(&reference).unwrap_or(ctx.current_sheet());
+            let sheet = sheet.as_deref().unwrap_or(ctx.current_sheet());
             return Ok(scalar(LiteralValue::Text(match ctx.workbook_file_name() {
                 Some(name) => {
                     let directory = ctx.workbook_directory().unwrap_or_default();
@@ -2021,7 +2045,7 @@ impl Function for CellFn {
             })));
         }
 
-        let Some(reference_info) = ctx.inspect_reference(&reference)? else {
+        let Some(reference_info) = reference_info else {
             return Ok(scalar(LiteralValue::Error(ExcelError::new_value())));
         };
         let Some(cell) = reference_info.first_cell else {
@@ -2037,7 +2061,7 @@ impl Function for CellFn {
                 // Excel qualifies the address only when the reference targets
                 // a different sheet than the formula's own, with the file's
                 // name before the sheet's: `[Book.xlsx]Other!$B$2`.
-                let qualified = match reference_sheet(&reference) {
+                let qualified = match sheet.as_deref() {
                     Some(sheet) if !sheet.eq_ignore_ascii_case(ctx.current_sheet()) => {
                         match ctx.workbook_file_name() {
                             Some(file) => format!("{}!{address}", book_sheet(&file, sheet)),

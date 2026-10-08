@@ -2458,6 +2458,12 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
         None
     }
 
+    /// A sheet's name as the workbook spells it, whatever case a reference
+    /// to it was written in (`INDIRECT("other!B2")` is on `Other`).
+    fn workbook_sheet_name(&self, _sheet: crate::reference::SheetId) -> Option<String> {
+        None
+    }
+
     /// A formula read a reference from text that names a workbook
     /// (`INDIRECT("'[Book.xlsx]Sheet1'!A1")`). Excel reads it from that
     /// workbook when it is open, this one included under the name it was
@@ -2727,6 +2733,10 @@ pub trait FunctionContext<'ctx> {
         None
     }
 
+    fn workbook_sheet_name(&self, _sheet: crate::reference::SheetId) -> Option<String> {
+        None
+    }
+
     fn sheet_index_by_name(&self, _sheet: &str) -> Option<usize> {
         None
     }
@@ -2917,6 +2927,10 @@ impl<'a> FunctionContext<'a> for DefaultFunctionContext<'a> {
 
     fn workbook_directory(&self) -> Option<String> {
         self.base.workbook_directory()
+    }
+
+    fn workbook_sheet_name(&self, sheet: crate::reference::SheetId) -> Option<String> {
+        self.base.workbook_sheet_name(sheet)
     }
 
     fn sheet_index_by_name(&self, sheet: &str) -> Option<usize> {

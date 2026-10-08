@@ -254,6 +254,10 @@ impl<'a, R: EvaluationContext> EvaluationContext for DynamicRefCollector<'a, R> 
         self.engine.workbook_directory()
     }
 
+    fn workbook_sheet_name(&self, sheet: crate::reference::SheetId) -> Option<String> {
+        self.engine.workbook_sheet_name(sheet)
+    }
+
     fn note_workbook_text_reference(&self) {
         self.engine.note_workbook_text_reference()
     }

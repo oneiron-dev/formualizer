@@ -1,15 +1,17 @@
 #![cfg(feature = "xlsx-recalc")]
 //! Workbooks whose formulas read where the workbook was opened from,
 //! recalculated at that place and compared cell by cell with Excel for
-//! Windows 16.0.20430: probes 1 to 3 of ops/excel-hostinfo-probe-20261008.md,
+//! Windows 16.0.20430: probes 1 to 4 of ops/excel-hostinfo-probe-20261008.md,
 //! kept to the rows the fork computes as Excel did (`excel-values.tsv`).
 //! Excel opened each workbook from `C:\oracle\jobs\<job>\corpus\...`, so its
 //! CELL("filename") is that folder and file name before the sheet's name, and
 //! its CELL("address") of another sheet's cell names that file. The rows
 //! cover sheet and file names with spaces, quotes, digits, punctuation and
 //! characters beyond ASCII, the reference's sheet against the formula's,
-//! defined names, the usual MID/FIND/RIGHT/LEFT/TEXTAFTER extractions, and
-//! the INFO types that do not read the host.
+//! defined names, the usual MID/FIND/RIGHT/LEFT/TEXTAFTER extractions, the
+//! INFO types that do not read the host, and references INDIRECT, OFFSET,
+//! INDEX, CHOOSE and names return: the sheet as the workbook spells it, #REF!
+//! for a sheet it lacks and #NAME? for a name it does not define.
 use calamine::{Data, Reader, Xlsx};
 use formualizer_workbook::{XlsxRecalculateOptions, recalculate_xlsx_bytes};
 use std::collections::BTreeMap;
@@ -64,7 +66,7 @@ fn host_information_probes_match_excel_for_windows() {
         misses.len(),
         misses.join("\n")
     );
-    assert_eq!(checked, 166);
+    assert_eq!(checked, 196);
 }
 
 /// The 1-based row and column of an A1 cell address.

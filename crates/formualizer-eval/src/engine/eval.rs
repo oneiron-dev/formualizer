@@ -28500,6 +28500,11 @@ where
         self.config.workbook_directory.clone()
     }
 
+    fn workbook_sheet_name(&self, sheet: SheetId) -> Option<String> {
+        let name = self.graph.sheet_reg().name(sheet);
+        (!name.is_empty()).then(|| name.to_owned())
+    }
+
     fn note_workbook_text_reference(&self) {
         self.text_named_workbook
             .store(true, std::sync::atomic::Ordering::Relaxed);
