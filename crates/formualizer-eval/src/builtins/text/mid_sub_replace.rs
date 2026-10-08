@@ -314,8 +314,17 @@ impl Function for ReplaceFn {
         }
         let end_idx = (start_idx + num as usize).min(len);
         chars.splice(start_idx..end_idx, new.chars());
+        let replaced: String = chars.into_iter().collect();
+        // A result past 32,767 characters (UTF-16 units) is #VALUE! in Excel
+        // for Windows 16.0.20430 (REPLACE(REPT("a",32767),1,0,"a"), probes
+        // RP01-RP03 of ops/excel-parse-probe-20261008.md).
+        if replaced.encode_utf16().count() > 32_767 {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                ExcelError::new_value(),
+            )));
+        }
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(
-            chars.into_iter().collect(),
+            replaced,
         )))
     }
 }

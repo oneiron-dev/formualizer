@@ -261,6 +261,9 @@ impl<'a, R: EvaluationContext> EvaluationContext for DynamicRefCollector<'a, R> 
     fn note_workbook_text_reference(&self) {
         self.engine.note_workbook_text_reference()
     }
+    fn note_split_character(&self) {
+        self.engine.note_split_character()
+    }
 
     fn workbook_sheet_count(&self) -> Option<usize> {
         self.engine.workbook_sheet_count()

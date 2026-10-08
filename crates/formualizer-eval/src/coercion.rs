@@ -420,8 +420,13 @@ fn equals_decimal(a: f64, digits: u64, exponent: i32) -> bool {
 /// `RIGHT(REPT("a",32766)&"bc",1)` is "b", probes CL and TX of
 /// ops/excel-parse-probe-20261008.md). A cut through a character outside the
 /// Basic Multilingual Plane would keep half of it, which no Rust string holds:
-/// `#N/IMPL!`.
-pub(crate) fn truncated_join(mut text: String) -> Result<String, ExcelError> {
+/// `#N/IMPL!`, noted on `context` ([`crate::traits::EvaluationContext::note_split_character`])
+/// so that a host refuses the result even where IFERROR or ISERROR hides the
+/// error.
+pub(crate) fn truncated_join(
+    mut text: String,
+    context: &dyn crate::traits::EvaluationContext,
+) -> Result<String, ExcelError> {
     const MAX_UNITS: usize = 32_767;
     // A character takes at least as many UTF-8 bytes as UTF-16 units.
     if text.len() <= MAX_UNITS {
@@ -432,6 +437,7 @@ pub(crate) fn truncated_join(mut text: String) -> Result<String, ExcelError> {
         let next = units + ch.len_utf16();
         if next > MAX_UNITS {
             if units < MAX_UNITS {
+                context.note_split_character();
                 return Err(ExcelError::new(ExcelErrorKind::NImpl)
                     .with_message("Excel keeps half of a character past 32,767"));
             }

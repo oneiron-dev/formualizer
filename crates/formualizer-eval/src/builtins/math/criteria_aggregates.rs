@@ -317,7 +317,7 @@ fn eval_if_family<'a, 'b>(
                 )),
             )));
         }
-        let pred = crate::args::parse_criteria(&args[1].value()?.into_literal())?;
+        let pred = crate::args::parse_if_criteria(&args[1].value()?.into_literal())?;
         let (crit_rv, crit_val) = if agg_type == AggregationType::Count {
             let (argument, logical_cells) = resolve_count_argument(&args[0], ctx)?;
             logical_count_cells = logical_cells;
@@ -396,7 +396,7 @@ fn eval_if_family<'a, 'b>(
                     }
                 }
 
-                let pred = crate::args::parse_criteria(&args[i + 1].value()?.into_literal())?;
+                let pred = crate::args::parse_if_criteria(&args[i + 1].value()?.into_literal())?;
                 crit_specs.push((rv, pred, val));
             }
             logical_count_cells = Some(logical.0 * logical.1);
@@ -426,7 +426,7 @@ fn eval_if_family<'a, 'b>(
                     }
                 }
 
-                let pred = crate::args::parse_criteria(&args[i + 1].value()?.into_literal())?;
+                let pred = crate::args::parse_if_criteria(&args[i + 1].value()?.into_literal())?;
                 crit_specs.push((rv, pred, val));
             }
         }

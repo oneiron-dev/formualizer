@@ -149,6 +149,23 @@ fn is_criteria_pattern(text: &str) -> bool {
     text.contains(['*', '?'])
 }
 
+/// The criterion of COUNTIF, SUMIF, AVERAGEIF and the IFS functions, as
+/// [`parse_criteria`] reads it, except that a text longer than 255 characters
+/// (UTF-16 units, its operator included) is #VALUE! in Excel for Windows
+/// 16.0.20430: COUNTIF(J3,REPT("a",256)) and COUNTIF(J3,"="&REPT("a",255))
+/// are #VALUE!, COUNTIF(J3,REPT("a",255)) counts. The database functions
+/// take a longer criterion cell (probes CI and CR of
+/// ops/excel-parse-probe-20261008.md).
+pub fn parse_if_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError> {
+    if let LiteralValue::Text(text) = v
+        && text.len() > 255
+        && text.encode_utf16().nth(255).is_some()
+    {
+        return Err(ExcelError::new_value());
+    }
+    parse_criteria(v)
+}
+
 /// Parse a criteria value (`">=5"`, `"<5/3/2011"`, `"a*"`, `7`) into a
 /// predicate. Operands that read as numbers, dates or times are numeric.
 pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError> {

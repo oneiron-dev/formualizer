@@ -2491,7 +2491,7 @@ fn eval_maxminifs<'a, 'b>(
             let mut all_match = true;
             for i in (1..args.len()).step_by(2) {
                 let crit_val = args[i].value()?.into_literal();
-                let pred = crate::args::parse_criteria(&args[i + 1].value()?.into_literal())?;
+                let pred = crate::args::parse_if_criteria(&args[i + 1].value()?.into_literal())?;
                 if !criteria_match(&pred, &crit_val) {
                     all_match = false;
                     break;
@@ -2514,7 +2514,7 @@ fn eval_maxminifs<'a, 'b>(
     let mut predicates = Vec::new();
     for i in (1..args.len()).step_by(2) {
         let crit_view = args[i].range_view().ok();
-        let pred = crate::args::parse_criteria(&args[i + 1].value()?.into_literal())?;
+        let pred = crate::args::parse_if_criteria(&args[i + 1].value()?.into_literal())?;
         criteria_ranges.push(crit_view);
         predicates.push(pred);
     }

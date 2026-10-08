@@ -683,6 +683,21 @@ fn a_circular_reference_through_a_spill_reference_is_unsupported() {
     }
 }
 #[test]
+fn a_join_cut_through_a_character_is_unsupported() {
+    // Review of oneiron feat/xlsx-parse: 32,766 units and an emoji join past
+    // 32,767 with the cut inside the emoji, which the engine cannot keep half
+    // of (#N/IMPL!); IFERROR caught that and cached 42 natively.
+    let p = parts(
+        "<row r=\"1\"><c r=\"A1\"><f>IFERROR(LEN(B1&amp;UNICHAR(128512)),42)</f><v>0</v></c><c r=\"B1\" t=\"str\"><f>REPT(&quot;a&quot;,32766)</f><v></v></c></row>",
+    );
+    let error = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap_err();
+    assert!(
+        matches!(&error, formualizer_workbook::IoError::Unsupported { feature, .. }
+            if feature == "a join cut through a character outside the Basic Multilingual Plane"),
+        "{error:?}"
+    );
+}
+#[test]
 fn a_circular_reference_through_a_name_keeps_its_cache() {
     // Review of oneiron #1295: Loop = INDIRECT("RC",FALSE)+1 used in B2 reads
     // B2. With iteration off Excel leaves the circular formula uncalculated,

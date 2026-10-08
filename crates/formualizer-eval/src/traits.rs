@@ -2471,6 +2471,13 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
     /// engine records the read for a host that cannot vouch for it.
     fn note_workbook_text_reference(&self) {}
 
+    /// A join kept the first 32,767 UTF-16 units of a longer text and the cut
+    /// fell inside a character outside the Basic Multilingual Plane: Excel
+    /// keeps half of it, the engine gives `#N/IMPL!`, which a formula can
+    /// catch (IFERROR, ISERROR); an engine records it for a host that cannot
+    /// vouch for the result.
+    fn note_split_character(&self) {}
+
     /// Excel-style 1-based active-sheet index for a sheet name, if known.
     fn sheet_index_by_name(&self, _sheet: &str) -> Option<usize> {
         None

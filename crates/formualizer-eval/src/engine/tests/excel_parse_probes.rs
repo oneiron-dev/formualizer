@@ -1280,7 +1280,8 @@ const SETUP_CL: &[(&str, Set)] = &[
 ];
 
 /// `&` and CONCATENATE keep the first 32,767 characters (UTF-16 units) of a longer join, without
-/// an error; CONCAT and TEXTJOIN are #CALC! past it, SUBSTITUTE #VALUE! (CL and TX).
+/// an error; CONCAT and TEXTJOIN are #CALC! past it, SUBSTITUTE and REPLACE #VALUE! (CL, TX, CU
+/// and RP).
 #[test]
 fn joins_past_32767_characters() {
     const KEPT: &[&[V]] = &[&[V::N(32767.0)]];
@@ -1344,6 +1345,51 @@ fn joins_past_32767_characters() {
                 "F1",
                 &[&[V::E(ExcelErrorKind::Value)]],
             ),
+            // CU01-CU04: CONCAT and TEXTJOIN count UTF-16 units (H4 is 32,766 of them)
+            (
+                "=ERROR.TYPE(CONCAT(H4,\"ab\"))",
+                SETUP_CL,
+                &[],
+                "F1",
+                CALC_CODE,
+            ),
+            (
+                "=LEN(CONCAT(H4,\"a\"))",
+                SETUP_CL,
+                &[],
+                "F1",
+                &[&[V::N(16384.0)]],
+            ),
+            (
+                "=ERROR.TYPE(TEXTJOIN(\"\",TRUE,H4,\"ab\"))",
+                SETUP_CL,
+                &[],
+                "F1",
+                CALC_CODE,
+            ),
+            (
+                "=LEN(TEXTJOIN(\"\",TRUE,H4,\"a\"))",
+                SETUP_CL,
+                &[],
+                "F1",
+                &[&[V::N(16384.0)]],
+            ),
+            // RP01-RP03: REPLACE past it is #VALUE!
+            (
+                "=LEN(REPLACE(H1,1,0,H1))",
+                SETUP_CL,
+                &[],
+                "F1",
+                &[&[V::E(ExcelErrorKind::Value)]],
+            ),
+            (
+                "=ERROR.TYPE(REPLACE(H1,1,0,\"a\"))",
+                SETUP_CL,
+                &[],
+                "F1",
+                &[&[V::N(3.0)]],
+            ),
+            ("=LEN(REPLACE(H1,1,1,\"b\"))", SETUP_CL, &[], "F1", KEPT),
             // TX15-TX17
             (
                 "=ERROR.TYPE(CONCAT(H1,\"a\"))",
@@ -1514,6 +1560,85 @@ fn long_text_in_error_type_and_type() {
             ("=ERROR.TYPE(H1&\"\")", SETUP_CL, &[], "F1", VALUE_CODE),
             ("=ERROR.TYPE(H4&\"a\")", SETUP_CL, &[], "F1", VALUE_CODE),
             ("=TYPE(H1&\"a\")", SETUP_CL, &[], "F1", ARRAY),
+        ],
+        None,
+    );
+}
+
+/// The criteria probes' sheet: H1 and J1 = REPT("a",32767), J2 = REPT("a",32766), H8 and J3 =
+/// REPT("a",256), H9 = REPT("a",255), K3 = 5, and the database ranges L1:L2 ("crit" over 256
+/// characters) and M1:M2 ("crit" over 255).
+const SETUP_CR: &[(&str, Set)] = &[
+    ("H1", Set::F("=REPT(\"a\",32767)")),
+    ("J1", Set::F("=REPT(\"a\",32767)")),
+    ("J2", Set::F("=REPT(\"a\",32766)")),
+    ("J3", Set::F("=REPT(\"a\",256)")),
+    ("H8", Set::F("=REPT(\"a\",256)")),
+    ("H9", Set::F("=REPT(\"a\",255)")),
+    ("K3", Set::N(5.0)),
+    ("L1", Set::T("crit")),
+    ("L2", Set::F("=REPT(\"a\",256)")),
+    ("M1", Set::T("crit")),
+    ("M2", Set::F("=REPT(\"a\",255)")),
+];
+
+/// A criterion text longer than 255 UTF-16 units, its operator included, is #VALUE! to COUNTIF,
+/// SUMIF, AVERAGEIF and the IFS functions; the database functions take it (CI and CR).
+#[test]
+fn criteria_past_255_characters() {
+    const VALUE: &[&[V]] = &[&[V::E(ExcelErrorKind::Value)]];
+    check(
+        &[
+            ("=COUNTIF(J1:J2,H1&\"a\")", SETUP_CR, &[], "F1", VALUE),
+            ("=COUNTIF(J1:J2,H1)", SETUP_CR, &[], "F1", VALUE),
+            ("=COUNTIF(J3,H8)", SETUP_CR, &[], "F1", VALUE),
+            (
+                "=COUNTIF(J3,REPT(\"a\",255))",
+                SETUP_CR,
+                &[],
+                "F1",
+                &[&[V::N(0.0)]],
+            ),
+            ("=SUMIF(J3,H8,J3)", SETUP_CR, &[], "F1", VALUE),
+            ("=AVERAGEIF(J3,H8,K3)", SETUP_CR, &[], "F1", VALUE),
+            ("=COUNTIFS(J3,H8)", SETUP_CR, &[], "F1", VALUE),
+            ("=SUMIFS(K3,J3,H8)", SETUP_CR, &[], "F1", VALUE),
+            ("=AVERAGEIFS(K3,J3,H8)", SETUP_CR, &[], "F1", VALUE),
+            ("=MAXIFS(K3,J3,H8)", SETUP_CR, &[], "F1", VALUE),
+            ("=MINIFS(K3,J3,H8)", SETUP_CR, &[], "F1", VALUE),
+            ("=COUNTIFS(J3,H9)", SETUP_CR, &[], "F1", &[&[V::N(0.0)]]),
+            ("=COUNTIF(J3,\"=\"&H9)", SETUP_CR, &[], "F1", VALUE),
+            ("=COUNTIF(J3,\"<>\"&H9)", SETUP_CR, &[], "F1", VALUE),
+            (
+                "=SUM(COUNTIF(J3,{\"a\",\"b\"}&H9))",
+                SETUP_CR,
+                &[],
+                "F1",
+                VALUE,
+            ),
+            ("=COUNTIF(J3,\"*\"&H9)", SETUP_CR, &[], "F1", VALUE),
+            (
+                "=DCOUNTA(L1:L2,1,L1:L2)",
+                SETUP_CR,
+                &[],
+                "F1",
+                &[&[V::N(1.0)]],
+            ),
+            (
+                "=DCOUNTA(M1:M2,1,M1:M2)",
+                SETUP_CR,
+                &[],
+                "F1",
+                &[&[V::N(1.0)]],
+            ),
+            ("=COUNTIFS(J3,H8,J3,\"a*\")", SETUP_CR, &[], "F1", VALUE),
+            (
+                "=COUNTIF(J3,REPT(\"b\",128)&REPT(UNICHAR(128512),64))",
+                SETUP_CR,
+                &[],
+                "F1",
+                VALUE,
+            ),
         ],
         None,
     );

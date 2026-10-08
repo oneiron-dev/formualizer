@@ -705,6 +705,14 @@ fn recalculate_xlsx_bytes_here(
     if let Some(reason) = engine.displayed_precision_unknown() {
         return Err(unsupported("precision as displayed", reason));
     }
+    // Excel keeps half of a character a join past 32,767 units cuts through;
+    // the engine's #N/IMPL! may have been caught by IFERROR or ISERROR.
+    if engine.split_character() {
+        return Err(unsupported(
+            "a join cut through a character outside the Basic Multilingual Plane",
+            "workbook",
+        ));
+    }
     // Excel finds some circular references through a spill reference's
     // anchor and not others (`ROWS(F1#)+1` in F1 calculates to 2).
     if engine.spill_reference_cycle() {

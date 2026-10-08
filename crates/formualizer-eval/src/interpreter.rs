@@ -2787,7 +2787,8 @@ impl<'a> Interpreter<'a> {
     /// first 32,767 characters ([`crate::coercion::truncated_join`]), so a
     /// chain of joins copies no more than that at each step.
     fn concat(&self, left: LiteralValue, right: LiteralValue) -> Result<LiteralValue, ExcelError> {
-        fn join(left: LiteralValue, right: LiteralValue) -> Result<LiteralValue, ExcelError> {
+        let context = self.context;
+        let join = move |left: LiteralValue, right: LiteralValue| {
             Ok(match (left, right) {
                 (LiteralValue::Error(error), _) | (_, LiteralValue::Error(error)) => {
                     LiteralValue::Error(error)
@@ -2798,13 +2799,13 @@ impl<'a> Interpreter<'a> {
                         left => crate::coercion::to_text_invariant(&left),
                     };
                     text.push_str(&crate::coercion::to_text_invariant(&right));
-                    match crate::coercion::truncated_join(text) {
+                    match crate::coercion::truncated_join(text, context) {
                         Ok(text) => LiteralValue::Text(text),
                         Err(error) => LiteralValue::Error(error),
                     }
                 }
             })
-        }
+        };
         self.broadcast_apply(left, right, join)
     }
 

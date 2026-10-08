@@ -33,7 +33,7 @@ static TEXTJOIN_ARGS: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
     ]
 });
 
-const MAX_CONCAT_RESULT_CHARS: usize = 32_767;
+const MAX_CONCAT_RESULT_UNITS: usize = 32_767;
 
 fn scalar_like_value(arg: &ArgumentHandle<'_, '_>) -> Result<LiteralValue, ExcelError> {
     Ok(match arg.value()? {
@@ -103,21 +103,25 @@ fn legacy_scalar_value(arg: &ArgumentHandle<'_, '_>) -> Result<LiteralValue, Exc
     })
 }
 
+/// Append `text`, keeping the result within Excel's 32,767 characters, which
+/// count UTF-16 units: CONCAT of 16,383 characters outside the Basic
+/// Multilingual Plane and "ab" is #CALC!, with "a" 32,767 units long (probes
+/// CU01-CU04 of ops/excel-parse-probe-20261008.md).
 fn append_with_limit(
     out: &mut String,
-    current_chars: &mut usize,
+    current_units: &mut usize,
     text: &str,
 ) -> Result<(), ExcelError> {
-    let next_chars = current_chars
-        .checked_add(text.chars().count())
+    let next_units = current_units
+        .checked_add(text.encode_utf16().count())
         .ok_or_else(ExcelError::new_value)?;
     // Excel for Windows 16.0.20430: #CALC! (probes CL17 and TX15-TX17 of
     // ops/excel-parse-probe-20261008.md).
-    if next_chars > MAX_CONCAT_RESULT_CHARS {
+    if next_units > MAX_CONCAT_RESULT_UNITS {
         return Err(ExcelError::new(ExcelErrorKind::Calc));
     }
     out.push_str(text);
-    *current_chars = next_chars;
+    *current_units = next_units;
     Ok(())
 }
 
@@ -551,10 +555,10 @@ impl Function for ConcatFn {
         _: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         let mut out = String::new();
-        let mut out_chars = 0;
+        let mut out_units = 0;
         for arg in args {
             for_each_expanded_value(arg, &mut |value| {
-                append_with_limit(&mut out, &mut out_chars, &literal_to_text(value)?)
+                append_with_limit(&mut out, &mut out_units, &literal_to_text(value)?)
             })?;
         }
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(out)))
@@ -626,7 +630,7 @@ impl Function for ConcatenateFn {
         let mut out = String::new();
         for arg in args {
             out.push_str(&literal_to_text(&legacy_scalar_value(arg)?)?);
-            out = crate::coercion::truncated_join(out)?;
+            out = crate::coercion::truncated_join(out, arg.interpreter().context)?;
         }
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(out)))
     }
@@ -732,7 +736,7 @@ impl Function for TextJoinFn {
             };
 
         let mut out = String::new();
-        let mut out_chars = 0;
+        let mut out_units = 0;
         // Items joined so far; the n-th delimiter goes before item n + 1.
         let mut joined = 0usize;
         for arg in args.iter().skip(2) {
@@ -760,9 +764,9 @@ impl Function for TextJoinFn {
                     return Ok(());
                 }
                 if joined > 0 {
-                    append_with_limit(&mut out, &mut out_chars, delimiters.nth(joined - 1))?;
+                    append_with_limit(&mut out, &mut out_units, delimiters.nth(joined - 1))?;
                 }
-                append_with_limit(&mut out, &mut out_chars, &text)?;
+                append_with_limit(&mut out, &mut out_units, &text)?;
                 joined += 1;
                 Ok(())
             });
@@ -1035,7 +1039,7 @@ mod tests {
         let ctx = wb.interpreter();
 
         let concat = ctx.context.get_function("", "CONCAT").unwrap();
-        let concat_exact = lit(LiteralValue::Text("é".repeat(MAX_CONCAT_RESULT_CHARS)));
+        let concat_exact = lit(LiteralValue::Text("é".repeat(MAX_CONCAT_RESULT_UNITS)));
         let concat_out = concat
             .dispatch(
                 &[ArgumentHandle::new(&concat_exact, &ctx)],
@@ -1045,7 +1049,7 @@ mod tests {
             .into_literal();
         assert_eq!(
             concat_out,
-            LiteralValue::Text("é".repeat(MAX_CONCAT_RESULT_CHARS))
+            LiteralValue::Text("é".repeat(MAX_CONCAT_RESULT_UNITS))
         );
 
         let one_more = lit(LiteralValue::Text("x".into()));
@@ -1082,7 +1086,7 @@ mod tests {
                 let LiteralValue::Text(text) = value else {
                     panic!("expected text result, got {value:?}");
                 };
-                assert_eq!(text.chars().count(), MAX_CONCAT_RESULT_CHARS);
+                assert_eq!(text.chars().count(), MAX_CONCAT_RESULT_UNITS);
                 assert!(text.ends_with("|z"));
             }
         }

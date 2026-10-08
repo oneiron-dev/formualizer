@@ -1514,6 +1514,9 @@ pub struct Engine<R> {
     /// (`INDIRECT("'[Book.xlsx]Sheet1'!A1")`); see
     /// [`Self::text_named_workbook`].
     text_named_workbook: std::sync::atomic::AtomicBool,
+    /// A join cut through a character outside the Basic Multilingual Plane;
+    /// see [`Self::split_character`].
+    split_character: std::sync::atomic::AtomicBool,
     /// A live circular reference needed the read of a spill reference's
     /// anchor; see [`Self::spill_reference_cycle`]. Cleared when a request
     /// begins.
@@ -3605,6 +3608,7 @@ where
             clock: crate::timezone::SnapshotClock::new(clock),
             rng_draws: std::sync::Mutex::new(FxHashMap::default()),
             text_named_workbook: std::sync::atomic::AtomicBool::new(false),
+            split_character: std::sync::atomic::AtomicBool::new(false),
             spill_reference_cycle: false,
             displayed_precision_unknown: std::sync::atomic::AtomicU8::new(0),
             thread_pool,
@@ -3787,6 +3791,7 @@ where
             clock: crate::timezone::SnapshotClock::new(clock),
             rng_draws: std::sync::Mutex::new(FxHashMap::default()),
             text_named_workbook: std::sync::atomic::AtomicBool::new(false),
+            split_character: std::sync::atomic::AtomicBool::new(false),
             spill_reference_cycle: false,
             displayed_precision_unknown: std::sync::atomic::AtomicU8::new(0),
             thread_pool: Some(thread_pool),
@@ -5980,6 +5985,16 @@ where
     /// workbook's #REF!. A host that cannot vouch for that result refuses it.
     pub fn text_named_workbook(&self) -> bool {
         self.text_named_workbook
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether a formula evaluated by this engine joined texts past 32,767
+    /// UTF-16 units with the cut inside a character outside the Basic
+    /// Multilingual Plane. Excel keeps half of that character; the engine
+    /// gave `#N/IMPL!`, which a formula may have caught, so a host that
+    /// cannot vouch for the result refuses it.
+    pub fn split_character(&self) -> bool {
+        self.split_character
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -28531,6 +28546,11 @@ where
 
     fn note_workbook_text_reference(&self) {
         self.text_named_workbook
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn note_split_character(&self) {
+        self.split_character
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 

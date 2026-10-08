@@ -554,6 +554,9 @@ impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
     fn note_workbook_text_reference(&self) {
         self.engine.note_workbook_text_reference()
     }
+    fn note_split_character(&self) {
+        self.engine.note_split_character()
+    }
     fn sheet_index_by_name(&self, sheet: &str) -> Option<usize> {
         self.engine.sheet_index_by_name(sheet)
     }
