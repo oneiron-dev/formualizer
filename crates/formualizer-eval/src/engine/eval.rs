@@ -28241,6 +28241,10 @@ where
         self.config.workbook_file_name.clone()
     }
 
+    fn workbook_directory(&self) -> Option<String> {
+        self.config.workbook_directory.clone()
+    }
+
     fn note_workbook_text_reference(&self) {
         self.text_named_workbook
             .store(true, std::sync::atomic::Ordering::Relaxed);

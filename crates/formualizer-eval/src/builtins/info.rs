@@ -1825,13 +1825,14 @@ pub struct CellFn;
 ///
 /// Supported `info_type` values (case-insensitive):
 /// - `"contents"` — the value of the upper-left cell of the reference
-/// - `"address"`  — the absolute A1 address of the upper-left cell (e.g. `$A$1`)
+/// - `"address"`  — the absolute A1 address of the upper-left cell (e.g. `$A$1`), after
+///   `[Book.xlsx]Other!` for a cell on another sheet of a workbook read from a file
 /// - `"col"`      — the 1-based column of the upper-left cell
 /// - `"row"`      — the 1-based row of the upper-left cell
 /// - `"type"`     — `"b"` for a blank cell, `"l"` for text, `"v"` for any value
 ///   (an error value in the cell included)
-/// - `"filename"` — `[Book.xlsx]Sheet` for the reference's sheet in a workbook read from a
-///   file, else `""`
+/// - `"filename"` — `C:\Reports\[Book.xlsx]Sheet` for the reference's sheet in a workbook read
+///   from a file (its folder from `EvalConfig::workbook_directory`), else `""`
 ///
 /// A structured reference is the cells it selects on its table's sheet (`Table1[Qty]` is
 /// its first data cell), `#This Row` at the formula's row.
@@ -1866,7 +1867,7 @@ pub struct CellFn;
 ///   - ISREF
 /// faq:
 ///   - q: "Which info types does CELL support?"
-///     a: "contents, address, col, row and type. Unsupported info types return #VALUE!."
+///     a: "contents, address, col, row, type and filename. The formatting info types return #VALUE!."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: CELL
@@ -1998,12 +1999,16 @@ impl Function for CellFn {
             return Ok(scalar(non_reference_error(&args[1])?));
         };
 
-        // `[Book.xlsx]Sheet` for the reference's sheet; empty text while the
+        // `C:\Reports\[Book.xlsx]Sheet` for the reference's sheet, its name
+        // as the workbook spells it and never quoted; empty text while the
         // workbook has never been saved to a file.
         if info_type == "filename" {
             let sheet = reference_sheet(&reference).unwrap_or(ctx.current_sheet());
             return Ok(scalar(LiteralValue::Text(match ctx.workbook_file_name() {
-                Some(name) => format!("[{name}]{sheet}"),
+                Some(name) => {
+                    let directory = ctx.workbook_directory().unwrap_or_default();
+                    format!("{directory}[{name}]{sheet}")
+                }
                 None => String::new(),
             })));
         }
@@ -2021,11 +2026,15 @@ impl Function for CellFn {
             "address" => {
                 let letters = crate::reference::Coord::col_to_letters(cell.coord.col());
                 let address = format!("${letters}${row}");
-                // Excel qualifies the address with the sheet name only when the
-                // reference targets a different sheet than the formula's own.
+                // Excel qualifies the address only when the reference targets
+                // a different sheet than the formula's own, with the file's
+                // name before the sheet's: `[Book.xlsx]Other!$B$2`.
                 let qualified = match reference_sheet(&reference) {
                     Some(sheet) if !sheet.eq_ignore_ascii_case(ctx.current_sheet()) => {
-                        format!("{}!{address}", format_a1_sheet_name(sheet))
+                        match ctx.workbook_file_name() {
+                            Some(file) => format!("{}!{address}", book_sheet(&file, sheet)),
+                            None => format!("{}!{address}", format_a1_sheet_name(sheet)),
+                        }
                     }
                     _ => address,
                 };
@@ -2035,6 +2044,28 @@ impl Function for CellFn {
             "row" => Ok(scalar(LiteralValue::Int(row as i64))),
             _ => Ok(scalar(LiteralValue::Error(ExcelError::new_value()))),
         }
+    }
+}
+
+/// `[file]sheet` as CELL("address") names another sheet of a saved workbook,
+/// quoted as Excel for Windows 16.0.20430 quotes it
+/// (ops/excel-hostinfo-probe-20261008.md): when either name holds an ASCII
+/// character other than a letter, a digit, `_` or `.`, or the sheet's name
+/// starts with a digit or `.`. Any other character is plain (`[数据.xlsx]x–y`,
+/// `📊x`), and the brackets already mark where the reference starts, so a
+/// name that reads as a cell or a constant (`A1`, `R1C1`, `TRUE`) is not
+/// quoted, nor is a file name starting with a digit or `.`
+/// (`[1Book.xlsx]Other`). A quote inside is doubled.
+fn book_sheet(file: &str, sheet: &str) -> String {
+    let plain = |c: char| !c.is_ascii() || c.is_ascii_alphanumeric() || c == '_' || c == '.';
+    let text = format!("[{file}]{sheet}");
+    if file.chars().all(plain)
+        && sheet.chars().all(plain)
+        && !sheet.starts_with(|c: char| c.is_ascii_digit() || c == '.')
+    {
+        text
+    } else {
+        format!("'{}'", text.replace('\'', "''"))
     }
 }
 
@@ -2124,9 +2155,76 @@ fn reference_sheet(reference: &formualizer_parse::parser::ReferenceType) -> Opti
     }
 }
 
+#[derive(Debug)]
+pub struct InfoFn;
+
+/// Returns information about the environment the workbook is calculated in.
+///
+/// `type_text` reads as Excel for Windows 16.0.20430 reads it
+/// (ops/excel-hostinfo-probe-20261008.md), without case: `"memavail"`,
+/// `"memused"` and `"totmem"` are `#N/A` (Excel no longer reports memory);
+/// other text that is not one of Excel's types (`"bogus"`, `""`,
+/// `"system "`) and a number, logical or blank are `#VALUE!`; an error
+/// propagates. The types describing the application that calculates
+/// (`"directory"`, `"numfile"`, `"origin"`, `"osversion"`, `"recalc"`,
+/// `"release"`, `"system"`) read a host the engine does not model and
+/// return `#VALUE!`, as CELL's formatting types do.
+///
+/// ```yaml,sandbox
+/// title: "INFO of a retired memory type"
+/// formula: '=INFO("memavail")'
+/// expected: "#N/A"
+/// ```
+///
+/// ```yaml,docs
+/// related:
+///   - CELL
+/// faq:
+///   - q: "Which INFO types does the engine compute?"
+///     a: "The ones that do not depend on the host: memavail, memused and totmem are #N/A, and any other text Excel does not know is #VALUE!."
+/// ```
+/// [formualizer-docgen:schema:start]
+/// Name: INFO
+/// Type: InfoFn
+/// Min args: 1
+/// Max args: 1
+/// Variadic: false
+/// Signature: INFO(arg1: any@scalar)
+/// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
+/// Caps: PURE
+/// [formualizer-docgen:schema:end]
+impl Function for InfoFn {
+    func_caps!(PURE);
+    fn name(&self) -> &'static str {
+        "INFO"
+    }
+    fn min_args(&self) -> usize {
+        1
+    }
+    fn arg_schema(&self) -> &'static [ArgSchema] {
+        &ARG_ANY_ONE[..]
+    }
+    fn eval<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        _ctx: &dyn FunctionContext<'b>,
+    ) -> Result<CalcValue<'b>, ExcelError> {
+        let kind = match args[0].value()?.into_literal() {
+            LiteralValue::Error(e) => return Ok(scalar(LiteralValue::Error(e))),
+            LiteralValue::Text(t) => t.to_ascii_lowercase(),
+            _ => return Ok(scalar(LiteralValue::Error(ExcelError::new_value()))),
+        };
+        Ok(scalar(LiteralValue::Error(match kind.as_str() {
+            "memavail" | "memused" | "totmem" => ExcelError::new_na(),
+            _ => ExcelError::new_value(),
+        })))
+    }
+}
+
 pub fn register_builtins() {
     use std::sync::Arc;
     crate::function_registry::register_builtin(Arc::new(CellFn));
+    crate::function_registry::register_builtin(Arc::new(InfoFn));
     crate::function_registry::register_builtin(Arc::new(IsNumberFn));
     crate::function_registry::register_builtin(Arc::new(IsTextFn));
     crate::function_registry::register_builtin(Arc::new(IsNonTextFn));

@@ -719,7 +719,9 @@ fn runtime_this_row_references_use_the_formula_row() {
 }
 
 /// CELL describes the reference it is given: a table on another sheet is
-/// addressed with that sheet's name, and "filename" names that sheet.
+/// addressed with the file's and that sheet's names, as Excel addresses any
+/// cell on another sheet (ops/excel-hostinfo-probe-20261008.md), and
+/// "filename" names that sheet.
 #[test]
 fn cell_names_the_sheet_of_a_table_on_another_sheet() {
     let config = EvalConfig {
@@ -744,9 +746,13 @@ fn cell_names_the_sheet_of_a_table_on_another_sheet() {
         .unwrap();
     let text = |s: &str| LiteralValue::Text(s.into());
     for (row, formula, expected) in [
-        (1, r#"=CELL("address",F[Qty])"#, "Data!$B$2"),
+        (1, r#"=CELL("address",F[Qty])"#, "[Book.xlsx]Data!$B$2"),
         (2, r#"=CELL("filename",F[Qty])"#, "[Book.xlsx]Data"),
-        (3, r#"=CELL("address",F[[#Data],[Qty]])"#, "Data!$B$2"),
+        (
+            3,
+            r#"=CELL("address",F[[#Data],[Qty]])"#,
+            "[Book.xlsx]Data!$B$2",
+        ),
         (4, r#"=CELL("filename",A1)"#, "[Book.xlsx]Sheet1"),
     ] {
         assert_eq!(

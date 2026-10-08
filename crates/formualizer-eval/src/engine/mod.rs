@@ -771,13 +771,21 @@ pub struct EvalConfig {
     /// Ranges with size <= this limit are expanded into individual Cell dependencies
     pub range_expansion_limit: usize,
 
+    /// File name of the workbook (`Budget.xlsx`) when it was read from a file:
+    /// `CELL("filename")` reports `[name]Sheet` after `workbook_directory`, and
+    /// `CELL("address")` of another sheet's cell `[name]Sheet!$B$2`. `None` is
+    /// an unsaved workbook, for which `CELL("filename")` is empty text.
+    pub workbook_file_name: Option<String>,
+
+    /// The folder of the workbook's file as Excel for Windows prints it before
+    /// the bracketed file name, with its trailing separator (`C:\Reports\`):
+    /// `CELL("filename")` is `C:\Reports\[Budget.xlsx]Sheet1`. `None` prints
+    /// none.
+    pub workbook_directory: Option<String>,
+
     /// Fallback maximum row bound for open-ended references (e.g. `A:A`, `A1:A`).
     ///
     /// This is only used when used-bounds cannot be determined.
-    /// File name of the workbook (`Budget.xlsx`) when it was read from a file:
-    /// `CELL("filename")` reports `[name]Sheet`. `None` is an unsaved workbook,
-    /// for which it is empty text.
-    pub workbook_file_name: Option<String>,
     pub max_open_ended_rows: u32,
 
     /// Fallback maximum column bound for open-ended references (e.g. `1:1`, `A1:1`).
@@ -897,6 +905,7 @@ impl Default for EvalConfig {
             // Open-ended reference defaults (Excel max dimensions).
             // Lower these to cap `A:A` / `1:1` when used-bounds are unknown.
             workbook_file_name: None,
+            workbook_directory: None,
             max_open_ended_rows: 1_048_576,
             max_open_ended_cols: 16_384,
             stripe_height: 256,

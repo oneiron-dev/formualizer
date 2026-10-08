@@ -2420,6 +2420,12 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
         None
     }
 
+    /// The folder of the workbook's file as Excel prints it before the
+    /// bracketed file name, with its trailing separator (`C:\Reports\`).
+    fn workbook_directory(&self) -> Option<String> {
+        None
+    }
+
     /// A formula read a reference from text that names a workbook
     /// (`INDIRECT("'[Book.xlsx]Sheet1'!A1")`). Excel reads it from that
     /// workbook when it is open, this one included under the name it was
@@ -2671,6 +2677,10 @@ pub trait FunctionContext<'ctx> {
         None
     }
 
+    fn workbook_directory(&self) -> Option<String> {
+        None
+    }
+
     fn sheet_index_by_name(&self, _sheet: &str) -> Option<usize> {
         None
     }
@@ -2849,6 +2859,10 @@ impl<'a> FunctionContext<'a> for DefaultFunctionContext<'a> {
 
     fn workbook_file_name(&self) -> Option<String> {
         self.base.workbook_file_name()
+    }
+
+    fn workbook_directory(&self) -> Option<String> {
+        self.base.workbook_directory()
     }
 
     fn sheet_index_by_name(&self, sheet: &str) -> Option<usize> {

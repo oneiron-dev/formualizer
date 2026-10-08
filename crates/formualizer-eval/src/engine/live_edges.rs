@@ -512,6 +512,9 @@ impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
     fn workbook_file_name(&self) -> Option<String> {
         self.engine.workbook_file_name()
     }
+    fn workbook_directory(&self) -> Option<String> {
+        self.engine.workbook_directory()
+    }
     fn note_workbook_text_reference(&self) {
         self.engine.note_workbook_text_reference()
     }

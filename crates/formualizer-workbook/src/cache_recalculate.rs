@@ -1007,8 +1007,9 @@ fn define_tables(
 /// Native bounded snapshot + same-directory temporary + atomic replace. This
 /// is not CAS against unrelated writers; callers retain their source authority.
 /// Symlink destinations are rejected. No failure/cancellation publishes bytes.
-/// CELL("filename") names the input file (`[Budget.xlsm]Sheet1`) unless
-/// `eval_config.workbook_file_name` gives another name.
+/// CELL("filename") names the input file in its folder
+/// (`/data/[Budget.xlsm]Sheet1`) unless `eval_config.workbook_file_name`
+/// gives another name (with `workbook_directory` its folder, if any).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn recalculate_xlsx_file(
     input: &Path,
@@ -1021,6 +1022,17 @@ pub fn recalculate_xlsx_file(
             .file_name()
             .and_then(|name| name.to_str())
             .map(str::to_owned);
+        // The absolute folder with its trailing separator, as Excel prints
+        // the folder it opened the file from.
+        options.eval_config.workbook_directory = std::path::absolute(input)
+            .ok()
+            .and_then(|path| Some(path.parent()?.to_str()?.to_owned()))
+            .map(|mut folder| {
+                if !folder.ends_with(std::path::MAIN_SEPARATOR) {
+                    folder.push(std::path::MAIN_SEPARATOR);
+                }
+                folder
+            });
     }
     let mut source = Vec::new();
     std::fs::File::open(input)?

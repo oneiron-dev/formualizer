@@ -449,7 +449,16 @@ fn cell_filename_names_the_input_file() {
         .unwrap();
         recalculate_xlsx_file(&input, Some(&output), Default::default()).unwrap();
         let sheet = member(&std::fs::read(&output).unwrap(), SHEET);
-        assert!(sheet.contains(&format!("<v>[{file}]Sheet1</v>")), "{sheet}");
+        // The folder the file was read from, with its trailing separator.
+        let folder = format!(
+            "{}{}",
+            std::path::absolute(dir.path()).unwrap().display(),
+            std::path::MAIN_SEPARATOR
+        );
+        assert!(
+            sheet.contains(&format!("<v>{folder}[{file}]Sheet1</v>")),
+            "{sheet}"
+        );
         // A name the host gives wins over the file's.
         let mut options = XlsxRecalculateOptions::default();
         options.eval_config.workbook_file_name = Some(format!("Host {file}"));
