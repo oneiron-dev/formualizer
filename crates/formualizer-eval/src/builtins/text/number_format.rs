@@ -914,7 +914,7 @@ fn format_fraction(toks: &[Tok], slash: usize, value: f64) -> String {
         ((frac * d as f64).round() as u64, d.max(1))
     } else {
         let max_den = 10u64.pow(den_kinds.len().max(1) as u32) - 1;
-        best_fraction(frac, max_den)
+        convergent(frac, max_den)
     };
     let mut whole = whole as u64;
     if has_int && num == den && num != 0 {
@@ -992,19 +992,34 @@ fn format_fraction(toks: &[Tok], slash: usize, value: f64) -> String {
     out
 }
 
-/// Closest fraction with denominator at most `max_den`.
-pub(crate) fn best_fraction(value: f64, max_den: u64) -> (u64, u64) {
-    let mut best = (value.round() as u64, 1u64);
-    let mut best_err = (value - best.0 as f64).abs();
-    for den in 1..=max_den {
-        let num = (value * den as f64).round();
-        let err = (value - num / den as f64).abs();
-        if err < best_err - 1e-12 {
-            best = (num as u64, den);
-            best_err = err;
+/// The fraction Excel shows for `value` (non-negative) with a denominator of
+/// at most `max_den`: the last continued-fraction convergent whose
+/// denominator fits, expanded in doubles as Excel does (Excel for Windows
+/// 16.0.20430, job probe-w2-precision-4). It is not always the closest such
+/// fraction: 13/17 is 3/4 (7/9 is closer) and 0.0625 is 0/1 under `?/?`;
+/// 0.29 expands as 0; 3, 2, 4, 2 (2.999999999999787) and is 20/69 under
+/// `??/??`, where the fraction of 1.29 (0; 3, 2, 4, 3) is 9/31.
+pub(crate) fn convergent(value: f64, max_den: u64) -> (u64, u64) {
+    let limit = max_den as f64;
+    // h(-2)/k(-2) = 0/1 and h(-1)/k(-1) = 1/0.
+    let (mut h0, mut h1, mut k0, mut k1) = (0.0f64, 1.0f64, 1.0f64, 0.0f64);
+    let mut best = (0.0, 1.0);
+    let mut rest = value;
+    for _ in 0..64 {
+        let a = rest.floor();
+        (h0, h1) = (h1, a * h1 + h0);
+        (k0, k1) = (k1, a * k1 + k0);
+        if k1 > limit {
+            break;
         }
+        best = (h1, k1);
+        let fraction = rest - a;
+        if fraction < 1e-12 {
+            break;
+        }
+        rest = 1.0 / fraction;
     }
-    best
+    (best.0 as u64, best.1 as u64)
 }
 
 fn format_scientific(toks: &[Tok], value: f64) -> String {
@@ -1350,6 +1365,44 @@ mod tests {
         assert_eq!(fmt(0.75, "?/?"), "3/4");
         assert_eq!(fmt(0.3, "# ??/??"), "  3/10");
         assert_eq!(fmt(2.625, "# ?/8"), "2 5/8");
+    }
+
+    /// TEXT shows the continued-fraction convergents cells show (Excel for
+    /// Windows 16.0.20430, job probe-w2-precision-4), not the closest
+    /// fraction.
+    #[test]
+    fn fractions_are_excels_convergents() {
+        for (value, code, excel) in [
+            (13.0 / 17.0, "# ?/?", " 3/4"),
+            (13.0 / 17.0, "# ??/??", " 13/17"),
+            (13.0 / 17.0, "?/?", "3/4"),
+            (0.0625, "# ?/?", "0    "),
+            (0.0625, "# ??/??", "  1/16"),
+            (0.0625, "?/?", "0/1"),
+            (0.29, "# ?/?", " 2/7"),
+            (0.29, "# ??/??", " 20/69"),
+            (0.29, "?/?", "2/7"),
+            (1.29, "# ?/?", "1 2/7"),
+            (1.29, "# ??/??", "1  9/31"),
+            (1.29, "?/?", "9/7"),
+            (0.43, "# ?/?", " 3/7"),
+            (0.43, "# ??/??", "  3/7 "),
+            (0.43, "?/?", "3/7"),
+            (0.7142, "# ?/?", " 5/7"),
+            (0.7142, "# ??/??", "  5/7 "),
+            (0.7142, "?/?", "5/7"),
+            (13.301254, "# ?/?", "13 1/3"),
+            (13.301254, "# ??/??", "13 25/83"),
+            (13.301254, "?/?", "40/3"),
+            (14.942914, "# ?/?", "15    "),
+            (14.942914, "# ??/??", "14 33/35"),
+            (14.942914, "?/?", "15/1"),
+            (0.7647, "# ?/?", " 3/4"),
+            (0.7647, "# ??/??", " 13/17"),
+            (0.7647, "?/?", "3/4"),
+        ] {
+            assert_eq!(fmt(value, code), excel, "TEXT({value},{code:?})");
+        }
         assert_eq!(fmt(1.0 / 3.0, "General"), "0.333333333");
         assert_eq!(fmt(1234.5, "General"), "1234.5");
         assert_eq!(fmt(123456789012.0, "General"), "1.23457E+11");

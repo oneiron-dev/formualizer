@@ -122,38 +122,17 @@ impl Section {
                 let part = magnitude - integer;
                 let (numerator, denominator) = match denominator {
                     Some(denominator) => ((part * denominator as f64).round(), denominator as f64),
-                    None => convergent(part, 10u64.pow(places) - 1),
+                    None => {
+                        let (numerator, denominator) =
+                            number_format::convergent(part, 10u64.pow(places) - 1);
+                        (numerator as f64, denominator as f64)
+                    }
                 };
                 integer + numerator / denominator
             }
             Section::Unknown => return None,
         })
     }
-}
-
-/// The last continued-fraction convergent of `value` (non-negative) whose
-/// denominator is at most `max_denominator`, as (numerator, denominator).
-fn convergent(value: f64, max_denominator: u64) -> (f64, f64) {
-    let limit = max_denominator as f64;
-    // h(-2)/k(-2) = 0/1 and h(-1)/k(-1) = 1/0.
-    let (mut h0, mut h1, mut k0, mut k1) = (0.0f64, 1.0f64, 1.0f64, 0.0f64);
-    let mut best = (0.0, 1.0);
-    let mut rest = value;
-    for _ in 0..64 {
-        let a = rest.floor();
-        (h0, h1) = (h1, a * h1 + h0);
-        (k0, k1) = (k1, a * k1 + k0);
-        if k1 > limit {
-            break;
-        }
-        best = (h1, k1);
-        let fraction = rest - a;
-        if fraction < 1e-12 {
-            break;
-        }
-        rest = 1.0 / fraction;
-    }
-    best
 }
 
 /// The double nearest `magnitude` to 15 significant digits, times 10^`shift`,
@@ -226,16 +205,6 @@ mod tests {
         assert_eq!(decimal(1.0 / 3.0, 0, |_| 15), 0.333333333333333);
         assert_eq!(decimal(1.0 / 3.0, 2, |e| e + 1), 0.33);
         assert_eq!(decimal(1234.5678, -3, |e| e + 1), 1000.0);
-    }
-
-    #[test]
-    fn convergents_stop_at_the_denominator_limit() {
-        assert_eq!(convergent(13.0 / 17.0, 9), (3.0, 4.0));
-        assert_eq!(convergent(0.0625, 9), (0.0, 1.0));
-        // In doubles, as Excel computes them: 0.29 expands as 0; 3, 2, 4, 2
-        // (2.999999999999787), the fraction of 1.29 as 0; 3, 2, 4, 3.
-        assert_eq!(convergent(0.29, 99), (20.0, 69.0));
-        assert_eq!(convergent(1.29 - 1.0, 99), (9.0, 31.0));
     }
 
     #[test]
