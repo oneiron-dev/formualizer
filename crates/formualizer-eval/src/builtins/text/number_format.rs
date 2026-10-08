@@ -475,7 +475,8 @@ pub(crate) fn displayed_sections(code: &str) -> Result<Vec<DisplayedSection>, St
     };
     let mut displayed = sections[..numeric]
         .iter()
-        .map(|section| displayed_section(section, code))
+        .zip(split_sections(code))
+        .map(|(section, text)| displayed_section(section, text, code))
         .collect::<Result<Vec<_>, _>>()?;
     if sections.len() == 1 && sections[0].condition.is_some() {
         displayed.push(DisplayedSection::Significant);
@@ -483,7 +484,11 @@ pub(crate) fn displayed_sections(code: &str) -> Result<Vec<DisplayedSection>, St
     Ok(displayed)
 }
 
-fn displayed_section(section: &Section, code: &str) -> Result<DisplayedSection, String> {
+fn displayed_section(
+    section: &Section,
+    text: &str,
+    code: &str,
+) -> Result<DisplayedSection, String> {
     let toks = &section.toks;
     if toks.is_empty() {
         return Ok(DisplayedSection::Empty);
@@ -515,24 +520,27 @@ fn displayed_section(section: &Section, code: &str) -> Result<DisplayedSection, 
             digits: 1 + digits(decimals) as i32 + 2 * percents,
         });
     }
-    if let Some(slash) = fraction_slash(toks) {
+    if fraction_slash(toks).is_some() {
         // As shown: a fixed denominator, else up to as many digits as the
-        // denominator has placeholders.
-        let (mut places, mut fixed, end) = fraction_denominator(toks, slash);
-        // Zeros before a number are part of it: `# ?/05` and `# ?/005` store
-        // fifths, while `# ?/0` and `# ?/00` take one and two digits.
-        if let Some(Tok::Lit(text)) = toks.get(end)
-            && !places.is_empty()
-            && text.starts_with(|c: char| c.is_ascii_digit())
-        {
-            if places.iter().any(|k| *k != '0') {
+        // denominator has placeholders. The denominator is what is typed
+        // bare after the slash: quoted or escaped digits are text (`# ?/0"5"`
+        // takes one digit, `# ?/05"0"` stores fifths), zeros before a digit
+        // are part of the number (`# ?/05` and `# ?/005` store fifths, `# ?/0`
+        // and `# ?/00` take one and two digits), and Excel will not open a
+        // placeholder beside a digit (`# ?/5?`, `# ?/05#`).
+        let run = denominator_run(text);
+        let (places, fixed) = if run.contains(|c: char| matches!(c, '1'..='9')) {
+            if run.contains(['#', '?']) {
                 return Err(format!(
                     "a fraction denominator of placeholders and digits: {code:?}"
                 ));
             }
-            places.clear();
-            fixed = text.chars().take_while(char::is_ascii_digit).collect();
-        }
+            (1, run)
+        } else if run.is_empty() {
+            return Err(format!("a fraction without a denominator: {code:?}"));
+        } else {
+            (run.len(), String::new())
+        };
         // Excel rounds to a fixed denominator up to 32768 and stores larger
         // ones unrounded or by another rule (`# ?/65535` keeps one digit).
         let denominator = if fixed.is_empty() {
@@ -547,7 +555,7 @@ fn displayed_section(section: &Section, code: &str) -> Result<DisplayedSection, 
                     .max(1),
             )
         };
-        let places = u32::try_from(places.len().max(1))
+        let places = u32::try_from(places)
             .ok()
             .filter(|places| *places <= 15)
             .ok_or_else(|| format!("a fraction denominator out of range: {code:?}"))?;
@@ -564,12 +572,38 @@ fn displayed_section(section: &Section, code: &str) -> Result<DisplayedSection, 
     })
 }
 
+/// The placeholders and digits typed bare after the first `/` of a section's
+/// `text` (outside quotes, brackets and the character after `\`, `_` or `*`).
+fn denominator_run(text: &str) -> String {
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                chars.by_ref().find(|&q| q == '"');
+            }
+            '[' => {
+                chars.by_ref().find(|&q| q == ']');
+            }
+            '\\' | '_' | '*' => {
+                chars.next();
+            }
+            '/' => {
+                return chars
+                    .take_while(|c| c.is_ascii_digit() || matches!(c, '#' | '?'))
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+    String::new()
+}
+
 /// Why Excel for Windows 16.0.20430 will not open a workbook that formats a
 /// cell with `code`, as far as jobs probe-w2-precision-6 to -8 measured
 /// (`Workbooks.Open` fails); `None` when it opens or was not seen to fail.
 fn unopenable(code: &str, sections: &[Section]) -> Option<&'static str> {
-    // 123 characters open, 129 do not.
-    if code.chars().count() > 123 {
+    // 126 characters open, 127 do not.
+    if code.chars().count() > 126 {
         return Some("a number format longer than Excel opens");
     }
     let last = sections.len() - 1;
@@ -668,7 +702,9 @@ fn unopenable_brackets(text: &str) -> Option<&'static str> {
                 } else if COLORS.contains(&lower.as_str())
                     || lower
                         .strip_prefix("color")
-                        .and_then(|n| n.trim().parse::<u8>().ok())
+                        .map(str::trim)
+                        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                        .and_then(|n| n.parse::<u8>().ok())
                         .is_some_and(|n| (1..=56).contains(&n))
                 {
                     colors += 1;

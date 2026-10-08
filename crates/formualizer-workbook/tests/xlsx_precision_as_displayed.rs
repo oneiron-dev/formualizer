@@ -3674,6 +3674,90 @@ fn j7_fmt_074() {
     check("7 fmt-074", &owned(J7_FMT_074), true);
 }
 
+/// Job probe-w2-precision-sol3-1, case fmt-04.
+#[rustfmt::skip]
+const SOL3_1_FMT_04: &[Cell] = &[
+    ("A1", "#\\ ?/05\"0\"", "=1234.5678", "1234.6"),
+    ("B1", "General", "=A1*1", "1234.6"),
+    ("A2", "#\\ ?/05\"0\"", "=1/3", "0.4"),
+    ("B2", "General", "=A2*1", "0.4"),
+    ("A3", "#\\ ?/05\"0\"", "=-2/3", "-0.6"),
+    ("B3", "General", "=A3*1", "-0.6"),
+    ("A4", "#\\ ?/05\"0\"", "=0.0625", "0"),
+    ("B4", "General", "=A4*1", "0"),
+];
+
+#[test]
+fn sol3_1_fmt_04() {
+    check("sol3-1 fmt-04", &owned(SOL3_1_FMT_04), true);
+}
+
+/// Job probe-w2-precision-sol3-1, case fmt-05.
+#[rustfmt::skip]
+const SOL3_1_FMT_05: &[Cell] = &[
+    ("A1", "#\\ ?/0\"5\"", "=1234.5678", "1234.5714285714287"),
+    ("B1", "General", "=A1*1", "1234.57142857143"),
+    ("A2", "#\\ ?/0\"5\"", "=1/3", "0.3333333333333333"),
+    ("B2", "General", "=A2*1", "0.333333333333333"),
+    ("A3", "#\\ ?/0\"5\"", "=-2/3", "-0.6666666666666666"),
+    ("B3", "General", "=A3*1", "-0.666666666666667"),
+    ("A4", "#\\ ?/0\"5\"", "=0.0625", "0"),
+    ("B4", "General", "=A4*1", "0"),
+];
+
+#[test]
+fn sol3_1_fmt_05() {
+    check("sol3-1 fmt-05", &owned(SOL3_1_FMT_05), true);
+}
+
+/// Job probe-w2-precision-sol3-1, case fmt-06.
+#[rustfmt::skip]
+const SOL3_1_FMT_06: &[Cell] = &[
+    ("A1", "#\\ ?/0\\5", "=1234.5678", "1234.5714285714287"),
+    ("B1", "General", "=A1*1", "1234.57142857143"),
+    ("A2", "#\\ ?/0\\5", "=1/3", "0.3333333333333333"),
+    ("B2", "General", "=A2*1", "0.333333333333333"),
+    ("A3", "#\\ ?/0\\5", "=-2/3", "-0.6666666666666666"),
+    ("B3", "General", "=A3*1", "-0.666666666666667"),
+    ("A4", "#\\ ?/0\\5", "=0.0625", "0"),
+    ("B4", "General", "=A4*1", "0"),
+];
+
+#[test]
+fn sol3_1_fmt_06() {
+    check("sol3-1 fmt-06", &owned(SOL3_1_FMT_06), true);
+}
+
+/// Job probe-w2-precision-sol3-1, case fmt-11.
+#[rustfmt::skip]
+const SOL3_1_FMT_11: &[Cell] = &[
+    ("A1", "#\\ ?/0\"100000\"", "=1234.5678", "1234.5714285714287"),
+    ("B1", "General", "=A1*1", "1234.57142857143"),
+    ("A2", "#\\ ?/0\"100000\"", "=1/3", "0.3333333333333333"),
+    ("B2", "General", "=A2*1", "0.333333333333333"),
+    ("A3", "#\\ ?/0\"100000\"", "=-2/3", "-0.6666666666666666"),
+    ("B3", "General", "=A3*1", "-0.666666666666667"),
+    ("A4", "#\\ ?/0\"100000\"", "=0.0625", "0"),
+    ("B4", "General", "=A4*1", "0"),
+];
+
+#[test]
+fn sol3_1_fmt_11() {
+    check("sol3-1 fmt-11", &owned(SOL3_1_FMT_11), true);
+}
+
+/// Job probe-w2-precision-sol3-3, case len-126.
+#[rustfmt::skip]
+const SOL3_3_LEN_126: &[Cell] = &[
+    ("A1", "0.0\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"", "=1/3", "0.3"),
+    ("B1", "General", "=A1*1", "0.3"),
+];
+
+#[test]
+fn sol3_3_len_126() {
+    check("sol3-3 len-126", &owned(SOL3_3_LEN_126), true);
+}
+
 /// A scientific format scaled by a comma (`0.0,E+0`, which Excel saves for `0.0E+0,`) stores
 /// every number as 0 in Excel; the fork does not reproduce it and refuses the workbook (it
 /// stored 0.33 for =1/3).
@@ -3923,7 +4007,8 @@ fn a_fixed_denominator_past_32768_is_refused() {
 /// a decimal point or an exponent, two fractions or a lone `/`; an exponent without digits
 /// on both sides or twice; unknown brackets, colors past 56, two colors or conditions in a
 /// section, three conditions or one past the largest double; digits in the fourth section;
-/// a bare `g`; more than 123 characters. The fork refuses them.
+/// a bare `g`; a signed color index; placeholders beside a denominator's digits; more than 126
+/// characters. The fork refuses them.
 #[rustfmt::skip]
 const UNOPENABLE: &[(&str, &str)] = &[
     ("probe-w2-precision-6 fmt-000", "0.0@"),
@@ -3957,8 +4042,11 @@ const UNOPENABLE: &[(&str, &str)] = &[
     ("probe-w2-precision-7 fmt-099", "[ENG]0"),
     ("probe-w2-precision-7 fmt-100", "[~]0"),
     ("probe-w2-precision-7 fmt-102", "[>1e400]0"),
-    ("probe-w2-precision-8 fmt-002", "0.0\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""),
     ("probe-w2-precision-8 fmt-011", "0.0\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x\\x"),
+    ("probe-w2-precision-sol3-1 fmt-00", "# ?/05?"),
+    ("probe-w2-precision-sol3-1 fmt-01", "# ?/5?"),
+    ("probe-w2-precision-sol3-1 fmt-12", "[Color+5]0.00"),
+    ("probe-w2-precision-sol3-2 len-127", "0.0\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""),
 ];
 
 #[test]

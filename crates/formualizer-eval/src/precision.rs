@@ -26,8 +26,9 @@
 //!   shows (also when it shows an improper fraction), computed in doubles:
 //!   `?/?` stores 1.66 as 1 + 2/3 (shown `5/3`). A fixed denominator up to
 //!   32768 rounds to it (`# ?/8` stores 2.675 as 2 5/8; `# ?/05` stores
-//!   fifths, `# ?/0` takes one digit); a larger one is stored unrounded or by
-//!   another rule and is refused. Otherwise the fraction is the last continued
+//!   fifths, `# ?/0` takes one digit and so does `# ?/0"5"`, whose quoted 5
+//!   is text); a larger one is stored unrounded or by another rule and is
+//!   refused. Otherwise the fraction is the last continued
 //!   fraction convergent whose denominator has at most as many digits as
 //!   the format's (`# ?/?` stores 13/17 as 3/4, not the closer 7/9).
 //! - Conditions are not consulted: a positive value takes the first section
@@ -44,9 +45,9 @@
 //!   (2^1023*(2-2^-52) under General, 1.79E+308 under `0.0E+0`) Excel saves
 //!   #NUM!, yet compares the cell as a number (=A1=0 is FALSE, =A1*1 #NUM!).
 //! - Excel will not open a workbook with a format such as `0.0@`, `@;0`,
-//!   `0;0;0;0`, `# ?/100000`, `0.0 ?/?`, `E+0`, `[Foo]0`, `[Red][Blue]0`,
-//!   three conditions, a bare `g` or more than 123 characters; such formats
-//!   are refused.
+//!   `0;0;0;0`, `# ?/100000`, `# ?/5?`, `0.0 ?/?`, `E+0`, `[Foo]0`,
+//!   `[Color+5]0`, `[Red][Blue]0`, three conditions, a bare `g` or more than
+//!   126 characters; such formats are refused.
 
 use crate::builtins::text::number_format;
 
