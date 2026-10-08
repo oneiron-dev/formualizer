@@ -12,11 +12,13 @@ use std::{borrow::Cow, sync::Arc};
 use crate::engine::arena::ast::SheetKey;
 use crate::engine::arena::{AstNodeData, AstNodeId, CompactRefType, DataStore};
 use crate::engine::sheet_registry::SheetRegistry;
+#[cfg(test)]
 use crate::engine::used_extent::{
     ExtentPolicy, OpenRangeBounds, resolve_used_extent_with_fallback,
 };
 use crate::formula_plane::template_canonical::LiteralSlotId;
 
+#[cfg(test)]
 pub(crate) fn probe_range_dimensions<C: EvaluationContext + ?Sized>(
     context: &C,
     current_sheet: &str,
@@ -294,7 +296,6 @@ pub struct Interpreter<'a> {
     local_env: LocalEnv,
     reference_row_delta: i64,
     reference_col_delta: i64,
-    disable_ast_planner: bool,
     parameter_bindings: Option<InterpreterParameterBindings<'a>>,
     /// Set while evaluating a formula entered without the array flag (see
     /// [`LegacyContext`]); `None` evaluates every expression as an array.
@@ -352,7 +353,6 @@ impl<'a> Interpreter<'a> {
             local_env: LocalEnv::default(),
             reference_row_delta: 0,
             reference_col_delta: 0,
-            disable_ast_planner: false,
             parameter_bindings: None,
             legacy: None,
         }
@@ -371,7 +371,6 @@ impl<'a> Interpreter<'a> {
             local_env: LocalEnv::default(),
             reference_row_delta: 0,
             reference_col_delta: 0,
-            disable_ast_planner: false,
             parameter_bindings: None,
             legacy: None,
         }
@@ -391,7 +390,6 @@ impl<'a> Interpreter<'a> {
             local_env: LocalEnv::default(),
             reference_row_delta: 0,
             reference_col_delta: 0,
-            disable_ast_planner: false,
             parameter_bindings: None,
             legacy: None,
         }
@@ -506,7 +504,6 @@ impl<'a> Interpreter<'a> {
             local_env: self.local_env.clone(),
             reference_row_delta: self.reference_row_delta,
             reference_col_delta: self.reference_col_delta,
-            disable_ast_planner: self.disable_ast_planner,
             parameter_bindings: self.parameter_bindings,
             legacy: self.legacy,
         }
@@ -520,7 +517,6 @@ impl<'a> Interpreter<'a> {
             local_env: env,
             reference_row_delta: self.reference_row_delta,
             reference_col_delta: self.reference_col_delta,
-            disable_ast_planner: self.disable_ast_planner,
             parameter_bindings: self.parameter_bindings,
             legacy: self.legacy,
         }
@@ -537,7 +533,6 @@ impl<'a> Interpreter<'a> {
             local_env: self.local_env.clone(),
             reference_row_delta: self.reference_row_delta,
             reference_col_delta: self.reference_col_delta,
-            disable_ast_planner: self.disable_ast_planner,
             parameter_bindings: Some(bindings),
             legacy: self.legacy,
         }
@@ -557,7 +552,6 @@ impl<'a> Interpreter<'a> {
             local_env: self.local_env.clone(),
             reference_row_delta: self.reference_row_delta,
             reference_col_delta: self.reference_col_delta,
-            disable_ast_planner: self.disable_ast_planner,
             parameter_bindings: self.parameter_bindings,
             legacy,
         }
@@ -1471,7 +1465,6 @@ impl<'a> Interpreter<'a> {
             local_env: self.local_env.clone(),
             reference_row_delta: row_delta,
             reference_col_delta: col_delta,
-            disable_ast_planner: true,
             parameter_bindings: self.parameter_bindings,
             legacy: self.legacy,
         };
@@ -1518,7 +1511,6 @@ impl<'a> Interpreter<'a> {
             local_env: self.local_env.clone(),
             reference_row_delta: row_delta,
             reference_col_delta: col_delta,
-            disable_ast_planner: true,
             parameter_bindings: self.parameter_bindings,
             legacy: self.legacy,
         };
@@ -1936,24 +1928,13 @@ impl<'a> Interpreter<'a> {
         if self.legacy.is_some() {
             return self.with_legacy_context(None).evaluate_ast_uncached(node);
         }
-        if self.disable_ast_planner {
-            return self.eval_tree_uncached(node);
-        }
-
-        // Plan-aware evaluation: build a plan for this node and execute accordingly.
-        // Provide the planner with a lightweight range-dimension probe and function lookup
-        // so it can select chunked reduction and arg-parallel strategies where appropriate.
-        let current_sheet = self.current_sheet.to_string();
-        let range_probe = |reference: &ReferenceType| {
-            probe_range_dimensions(self.context, &current_sheet, reference)
-        };
-        let fn_lookup = |ns: &str, name: &str| self.context.get_function(ns, name);
-
-        let mut planner = crate::planner::Planner::new(crate::planner::PlanConfig::default())
-            .with_range_probe(&range_probe)
-            .with_function_lookup(&fn_lookup);
-        let plan = planner.plan(node);
-        self.eval_with_plan(node, &plan.root)
+        // Evaluated as the tree reads, without the planner: every operand of
+        // every operator came back here and planned its whole subtree again,
+        // so a name or LAMBDA body of n chained terms cost about n^3 (400
+        // terms took 30 s, a cell's 4,000 terms on the arena take 0.2 s), and
+        // a plan changed no value (its one effect, ArgParallel, evaluated a
+        // function's arguments once more and dropped them).
+        self.eval_tree_uncached(node)
     }
 
     fn eval_tree_uncached(
@@ -1973,71 +1954,6 @@ impl<'a> Interpreter<'a> {
                 .map(crate::traits::CalcValue::Scalar),
             ASTNodeType::BinaryOp { op, left, right } => self.eval_binary(op, left, right, false),
             ASTNodeType::Function { name, args } => self.eval_function_to_calc(name, args),
-            ASTNodeType::Call { callee, args } => self.eval_call_to_calc(callee, args),
-            ASTNodeType::Array(rows) => self.eval_array_literal_to_calc(rows),
-        }
-    }
-
-    fn eval_with_plan(
-        &self,
-        node: &ASTNode,
-        plan_node: &crate::planner::PlanNode,
-    ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
-        match &node.node_type {
-            ASTNodeType::Literal(v) => Ok(crate::traits::CalcValue::Scalar(v.clone())),
-            ASTNodeType::Omitted => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(0.0))),
-            ASTNodeType::Reference { reference, .. } => self.eval_ast_reference_to_calc(reference),
-            ASTNodeType::UnaryOp { op, expr } if op == "#" => {
-                self.range_value(self.spill_reference(self.evaluate_ast_as_reference(expr)))
-            }
-            ASTNodeType::UnaryOp { op, expr } => {
-                // For now, reuse existing unary implementation (which recurses).
-                // In a later phase, we can map plan_node.children[0].
-                self.eval_unary(op, expr)
-                    .map(crate::traits::CalcValue::Scalar)
-            }
-            ASTNodeType::BinaryOp { op, left, right } => self.eval_binary(op, left, right, false),
-            ASTNodeType::Function { name, args } => {
-                let strategy = plan_node.strategy;
-                if let Some(fun) = self.context.get_function("", name) {
-                    use crate::function::FnCaps;
-                    use crate::planner::ExecStrategy;
-                    let caps = fun.caps();
-
-                    // Short-circuit or volatile: always sequential
-                    if caps.contains(FnCaps::SHORT_CIRCUIT) || caps.contains(FnCaps::VOLATILE) {
-                        return self.eval_function_to_calc(name, args);
-                    }
-
-                    // Windowed/chunked strategies are handled by the unified `eval()` path.
-
-                    // Arg-parallel: prewarm subexpressions and then dispatch
-                    if matches!(strategy, ExecStrategy::ArgParallel)
-                        && caps.contains(FnCaps::PARALLEL_ARGS)
-                    {
-                        // Sequential prewarm of subexpressions (safe without Sync bounds)
-                        for arg in args {
-                            match &arg.node_type {
-                                ASTNodeType::Reference { reference, .. } => {
-                                    if let Ok(reference) = self.effective_reference(reference) {
-                                        let _ = self
-                                            .context
-                                            .resolve_range_view(&reference, self.current_sheet);
-                                    }
-                                }
-                                _ => {
-                                    let _ = self.evaluate_ast(arg);
-                                }
-                            }
-                        }
-                        return self.eval_function_to_calc(name, args);
-                    }
-
-                    // Default path
-                    return self.eval_function_to_calc(name, args);
-                }
-                self.eval_function_to_calc(name, args)
-            }
             ASTNodeType::Call { callee, args } => self.eval_call_to_calc(callee, args),
             ASTNodeType::Array(rows) => self.eval_array_literal_to_calc(rows),
         }

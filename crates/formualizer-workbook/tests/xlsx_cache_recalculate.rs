@@ -2941,3 +2941,30 @@ fn a_deep_formula_evaluates_on_the_configured_stack() {
         4
     );
 }
+/// A defined name and a LAMBDA body evaluate as a tree, where every operand of every operator
+/// planned its whole subtree again: a name of 400 chained terms took 13 s and a LAMBDA body of 400
+/// took 30 s in a release build, 800 more than a minute (a review's workbook of three such names
+/// ran for 45 minutes). 1,000 of each evaluate at once now.
+#[test]
+fn long_names_and_lambda_bodies_evaluate_without_replanning() {
+    let chain = vec!["Sheet1!$A$1"; 1000].join("+");
+    let body = vec!["_xlpm.x"; 1000].join("+");
+    let rows = format!(
+        "<row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"B1\"><f>Chain</f><v>0</v></c>\
+         <c r=\"C1\"><f>_xlfn.LAMBDA(_xlpm.x,{body})(A1)</f><v>0</v></c></row>"
+    );
+    let mut p = parts(&rows);
+    let wb = p.get_mut("xl/workbook.xml").unwrap();
+    *wb = wb.replace(
+        "</workbook>",
+        &format!(
+            "<definedNames><definedName name=\"Chain\">{chain}</definedName></definedNames></workbook>"
+        ),
+    );
+    let mut options = XlsxRecalculateOptions::default();
+    options.eval_config.worker_stack_bytes = Some(256 << 20);
+    let out = recalculate_xlsx_bytes(&pack(&p), options).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    assert!(sheet.contains("<f>Chain</f><v>1000</v>"), "{sheet}");
+    assert!(sheet.contains("(A1)</f><v>1000</v>"), "{sheet}");
+}
