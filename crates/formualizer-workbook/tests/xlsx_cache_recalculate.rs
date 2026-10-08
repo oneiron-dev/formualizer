@@ -662,6 +662,27 @@ fn indirect_text_naming_a_workbook_is_unsupported() {
     assert_eq!(data(&out.bytes, 1), Data::Float(42.0));
 }
 #[test]
+fn a_circular_reference_through_a_spill_reference_is_unsupported() {
+    // Review of oneiron feat/xlsx-parse: ROWS(A1#)+1 in A1 kept its cached
+    // 77 as a circular formula, and ROWS((A1:A1)#)+1 calculated 2. Excel for
+    // Windows 16.0.20430 calculates both to 2 but SEQUENCE(ROWS(A1#)+1) in A1
+    // to 0 (probes OC and SR of ops/excel-parse-probe-20261008.md): which
+    // reads of the anchor are circular is not known, so the result is refused.
+    for formula in [
+        "ROWS(_xlfn.ANCHORARRAY(A1))+1",
+        "ROWS(_xlfn.ANCHORARRAY(A1:A1))+1",
+        "ROWS(_xlfn.ANCHORARRAY(INDIRECT(&quot;A1:A1&quot;)))+1",
+    ] {
+        let error =
+            recalculate_xlsx_bytes(&fixture(formula, "77"), Default::default()).unwrap_err();
+        assert!(
+            matches!(&error, formualizer_workbook::IoError::Unsupported { feature, .. }
+                if feature == "a circular reference through a spill reference"),
+            "{formula}: {error:?}"
+        );
+    }
+}
+#[test]
 fn a_circular_reference_through_a_name_keeps_its_cache() {
     // Review of oneiron #1295: Loop = INDIRECT("RC",FALSE)+1 used in B2 reads
     // B2. With iteration off Excel leaves the circular formula uncalculated,

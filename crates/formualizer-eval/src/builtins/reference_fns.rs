@@ -1271,39 +1271,65 @@ fn indirect_text_reference(
         return Err(ExcelError::new(ExcelErrorKind::Ref));
     }
 
-    if !a1_style {
-        // The A1/R1C1 flag does not apply to defined names or tables (they are
-        // neither A1 nor R1C1 syntax): Excel resolves `INDIRECT(name, FALSE)`
-        // exactly like `INDIRECT(name)`. No name can spell R1C1 text.
-        // No name holds a space, and `R` and `C` name no table
-        // (`R[1048576]` is R1C1 text off the grid).
-        return ReferenceType::parse_r1c1(&ref_text, origin).or_else(|_| {
-            let name = ref_text.trim_end_matches(' ');
-            if name.contains(char::is_whitespace) {
-                return Err(ExcelError::new(ExcelErrorKind::Ref));
-            }
-            match ReferenceType::from_string(name) {
-                Ok(reference @ ReferenceType::NamedRange(_)) => Ok(reference),
-                Ok(ReferenceType::Table(table))
-                    if !table.name.eq_ignore_ascii_case("R")
-                        && !table.name.eq_ignore_ascii_case("C") =>
-                {
-                    Ok(ReferenceType::Table(table))
-                }
-                _ => Err(ExcelError::new(ExcelErrorKind::Ref)),
-            }
-        });
-    }
     // `A1#` is the spill reference, the cells the formula at A1 fills:
     // INDIRECT("A1#") spills A1's result and SUM(INDIRECT("Sheet1!A1#")) sums
-    // it in Excel for Windows 16.0.20430 (probes T37-T39 of
+    // it in Excel for Windows 16.0.20430, and so does R1C1 text
+    // (SUM(INDIRECT("R1C1#",FALSE)) is 6 over =SEQUENCE(3)). The `#` follows
+    // one cell or a name (INDIRECT("A1:A1#") is #REF!), and text that names
+    // no anchor is #REF! like any other INDIRECT text: an undefined name, a
+    // name holding a value, `A0#`, `A1##` (probes T37-T39, IS and IR of
     // ops/excel-parse-probe-20261008.md).
     if let Some(anchor) = ref_text.trim_end_matches(' ').strip_suffix('#') {
+        let anchor = if a1_style {
+            a1_text_reference(&a1_text(anchor))
+        } else {
+            r1c1_text_reference(anchor, origin)
+        };
+        let Ok(anchor @ (ReferenceType::Cell { .. } | ReferenceType::NamedRange(_))) = anchor
+        else {
+            return Err(ExcelError::new(ExcelErrorKind::Ref));
+        };
         return args[0]
             .interpreter()
-            .spill_reference(a1_text_reference(&a1_text(anchor)));
+            .spill_reference(Ok(anchor))
+            .map_err(|error| match error.kind {
+                ExcelErrorKind::NImpl => error,
+                _ => ExcelError::new(ExcelErrorKind::Ref),
+            });
     }
-    a1_text_reference(&a1_text(&ref_text))
+    if a1_style {
+        a1_text_reference(&a1_text(&ref_text))
+    } else {
+        r1c1_text_reference(&ref_text, origin)
+    }
+}
+
+/// The reference R1C1 text names, relative to `origin`, or the name or table
+/// it spells, `#REF!` for any other text. The A1/R1C1 flag does not apply to
+/// defined names or tables (they are neither A1 nor R1C1 syntax): Excel
+/// resolves `INDIRECT(name, FALSE)` exactly like `INDIRECT(name)`. No name can
+/// spell R1C1 text. No name holds a space, and `R` and `C` name no table
+/// (`R[1048576]` is R1C1 text off the grid).
+fn r1c1_text_reference(
+    ref_text: &str,
+    origin: Option<(u32, u32)>,
+) -> Result<ReferenceType, ExcelError> {
+    ReferenceType::parse_r1c1(ref_text, origin).or_else(|_| {
+        let name = ref_text.trim_end_matches(' ');
+        if name.contains(char::is_whitespace) {
+            return Err(ExcelError::new(ExcelErrorKind::Ref));
+        }
+        match ReferenceType::from_string(name) {
+            Ok(reference @ ReferenceType::NamedRange(_)) => Ok(reference),
+            Ok(ReferenceType::Table(table))
+                if !table.name.eq_ignore_ascii_case("R")
+                    && !table.name.eq_ignore_ascii_case("C") =>
+            {
+                Ok(ReferenceType::Table(table))
+            }
+            _ => Err(ExcelError::new(ExcelErrorKind::Ref)),
+        }
+    })
 }
 
 /// The reference A1 text (`A1`, `Sheet1!$A$1:$B$2`, a name or a table)

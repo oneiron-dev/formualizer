@@ -1153,6 +1153,7 @@ impl Function for TypeFn {
             | LiteralValue::DateTime(_)
             | LiteralValue::Time(_)
             | LiteralValue::Duration(_) => 1,
+            LiteralValue::Text(text) if past_255_units(&text) => 64,
             LiteralValue::Text(_) => 2,
             LiteralValue::Boolean(_) => 4,
             LiteralValue::Array(_) => 64,
@@ -1733,11 +1734,25 @@ impl Function for ErrorTypeFn {
                     None => LiteralValue::Error(e),
                 },
             )),
+            LiteralValue::Text(text) if past_255_units(&text) => {
+                Ok(crate::traits::CalcValue::Scalar(LiteralValue::Int(3)))
+            }
             _ => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_na(),
             ))),
         }
     }
+}
+
+/// Whether `text` is longer than 255 characters (UTF-16 code units). Excel
+/// for Windows 16.0.20430 reads such a text as #VALUE! in ERROR.TYPE (3) and
+/// as an array in TYPE (64): `ERROR.TYPE(REPT("a",256))` is 3,
+/// `TYPE(REPT("a",256))` 64, both as before at 255 units, and 128 characters
+/// outside the Basic Multilingual Plane count 256 (probes ET, TY, EC and TC
+/// of ops/excel-parse-probe-20261008.md).
+fn past_255_units(text: &str) -> bool {
+    // A character takes at least as many UTF-8 bytes as UTF-16 units.
+    text.len() > 255 && text.encode_utf16().nth(255).is_some()
 }
 
 /// Returns TRUE when the value is anything other than text.

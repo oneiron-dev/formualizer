@@ -705,6 +705,14 @@ fn recalculate_xlsx_bytes_here(
     if let Some(reason) = engine.displayed_precision_unknown() {
         return Err(unsupported("precision as displayed", reason));
     }
+    // Excel finds some circular references through a spill reference's
+    // anchor and not others (`ROWS(F1#)+1` in F1 calculates to 2).
+    if engine.spill_reference_cycle() {
+        return Err(unsupported(
+            "a circular reference through a spill reference",
+            "workbook",
+        ));
+    }
     // Excel keeps the saved value of a formula on a live circular reference
     // and of the formulas that read it (=A1*2 over a circular A1 stays 99);
     // the engine calculates the readers again from the kept value. Under

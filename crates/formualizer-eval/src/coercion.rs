@@ -414,6 +414,35 @@ fn equals_decimal(a: f64, digits: u64, exponent: i32) -> bool {
     }
 }
 
+/// The text `&` and CONCATENATE make of a longer join: Excel for Windows
+/// 16.0.20430 keeps its first 32,767 characters (UTF-16 code units) and drops
+/// the rest without an error (`LEN(REPT("a",32767)&"a")` is 32767 and
+/// `RIGHT(REPT("a",32766)&"bc",1)` is "b", probes CL and TX of
+/// ops/excel-parse-probe-20261008.md). A cut through a character outside the
+/// Basic Multilingual Plane would keep half of it, which no Rust string holds:
+/// `#N/IMPL!`.
+pub(crate) fn truncated_join(mut text: String) -> Result<String, ExcelError> {
+    const MAX_UNITS: usize = 32_767;
+    // A character takes at least as many UTF-8 bytes as UTF-16 units.
+    if text.len() <= MAX_UNITS {
+        return Ok(text);
+    }
+    let mut units = 0;
+    for (index, ch) in text.char_indices() {
+        let next = units + ch.len_utf16();
+        if next > MAX_UNITS {
+            if units < MAX_UNITS {
+                return Err(ExcelError::new(ExcelErrorKind::NImpl)
+                    .with_message("Excel keeps half of a character past 32,767"));
+            }
+            text.truncate(index);
+            return Ok(text);
+        }
+        units = next;
+    }
+    Ok(text)
+}
+
 /// Invariant textification for comparisons/concatenation.
 pub fn to_text_invariant(value: &LiteralValue) -> String {
     match value {

@@ -2,9 +2,8 @@
 //! (RFC #112/#113, spec §6 type rules).
 //!
 //! Text never "converges" while it keeps changing (exact-equality rule), so
-//! string-growth cycles always run to the cap — including on every later
-//! recalc (perf note for the report: O(cap² · seed) bytes copied per recalc
-//! for a self-concat with a long seed).
+//! string-growth cycles run to the cap — including on every later recalc —
+//! unless the text stops at the 32,767 characters `&` keeps.
 
 use crate::engine::{CycleConfig, Engine, EvalConfig};
 use crate::test_workbook::TestWorkbook;
@@ -68,10 +67,12 @@ fn self_concat_grows_one_char_per_pass_and_always_caps() {
 }
 
 #[test]
-fn self_concat_with_long_seed_allocates_linearly_per_pass_and_survives() {
-    // A1 = A1 & B1 with an 8 KiB seed: pass k holds k·8 KiB; at cap 64 the
-    // final string is 512 KiB and total bytes copied ≈ cap²/2 · seed
-    // (~16 MiB) — memory-sane, but quadratic in the cap (report flag).
+fn self_concat_with_long_seed_stops_at_32767_characters_and_converges() {
+    // A1 = A1 & B1 with an 8 KiB seed: `&` keeps the first 32,767
+    // characters of a longer join, as Excel for Windows 16.0.20430's does
+    // (probes CL and TX of ops/excel-parse-probe-20261008.md), so the fourth
+    // pass reaches 32,767 and the fifth repeats it: the cycle converges
+    // before the cap instead of growing to 512 KiB.
     let seed = "s".repeat(8 * 1024);
     let cap = 64u32;
     let mut engine = iterate_engine(cap, 0.001);
@@ -84,12 +85,10 @@ fn self_concat_with_long_seed_allocates_linearly_per_pass_and_survives() {
     );
     set_formula(&mut engine, "Sheet1", 1, 1, "=A1&B1");
     engine.evaluate_all().unwrap();
-    let got = text(&engine, "Sheet1", 1, 1);
-    assert_eq!(got.len(), cap as usize * seed.len());
-    assert!(got.starts_with(&seed) && got.ends_with(&seed));
+    assert_eq!(text(&engine, "Sheet1", 1, 1), "s".repeat(32_767));
     let t = engine.last_cycle_telemetry();
-    assert_eq!(t.capped_sccs, 1);
-    assert_eq!(t.settle_passes_total, cap as usize);
+    assert_eq!(t.converged_sccs, 1);
+    assert_eq!(t.capped_sccs, 0);
 }
 
 #[test]

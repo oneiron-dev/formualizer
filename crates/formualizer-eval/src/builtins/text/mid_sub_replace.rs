@@ -178,6 +178,17 @@ impl Function for SubstituteFn {
         if old.is_empty() {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(text)));
         }
+        // A result past 32,767 characters (UTF-16 units) is #VALUE! in Excel
+        // for Windows 16.0.20430 (LEN(SUBSTITUTE(REPT("a",32767),"a","bb")),
+        // probe TX18 of ops/excel-parse-probe-20261008.md).
+        let units = |text: &str| text.encode_utf16().count();
+        let limited = |text: String| {
+            crate::traits::CalcValue::Scalar(if units(&text) > 32_767 {
+                LiteralValue::Error(ExcelError::new_value())
+            } else {
+                LiteralValue::Text(text)
+            })
+        };
         if args.len() == 4 {
             let instance = number_like(&args[3])?;
             if instance <= 0 {
@@ -194,7 +205,7 @@ impl Function for SubstituteFn {
                 if count == instance {
                     out.push_str(&new);
                     out.push_str(&text[idx + pos + old.len()..]);
-                    return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(out)));
+                    return Ok(limited(out));
                 } else {
                     out.push_str(&old);
                     idx += pos + old.len();
@@ -202,6 +213,16 @@ impl Function for SubstituteFn {
             }
             Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(text)))
         } else {
+            // Every occurrence: the length is known before the text is built.
+            let replaced = text.matches(&old).count();
+            let length = replaced
+                .checked_mul(units(&new))
+                .and_then(|added| (units(&text) - replaced * units(&old)).checked_add(added));
+            if length.is_none_or(|length| length > 32_767) {
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                    ExcelError::new_value(),
+                )));
+            }
             Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(
                 text.replace(&old, &new),
             )))

@@ -291,12 +291,9 @@ impl<'a, R: EvaluationContext> EvaluationContext for DynamicRefCollector<'a, R> 
         anchor: &ReferenceType,
         current_sheet: &str,
     ) -> Option<Result<ReferenceType, ExcelError>> {
-        if let ReferenceType::Cell {
-            sheet, row, col, ..
-        } = anchor
-        {
+        if let Some((sheet, row, col)) = crate::engine::eval::spill_anchor_cell(anchor) {
             let sheet_name = sheet.as_deref().unwrap_or(current_sheet);
-            self.collect_formula_vertices_in_rect(sheet_name, *row, *col, *row, *col);
+            self.collect_formula_vertices_in_rect(sheet_name, row, col, row, col);
         }
         self.engine.spill_reference(anchor, current_sheet)
     }

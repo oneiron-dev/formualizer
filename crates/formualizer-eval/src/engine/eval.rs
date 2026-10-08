@@ -1514,6 +1514,10 @@ pub struct Engine<R> {
     /// (`INDIRECT("'[Book.xlsx]Sheet1'!A1")`); see
     /// [`Self::text_named_workbook`].
     text_named_workbook: std::sync::atomic::AtomicBool,
+    /// A live circular reference needed the read of a spill reference's
+    /// anchor; see [`Self::spill_reference_cycle`]. Cleared when a request
+    /// begins.
+    spill_reference_cycle: bool,
     /// Some formula published a number whose stored value under precision
     /// as displayed is not known, a bit per [`DisplayedUnknown`]; see
     /// [`Self::displayed_precision_unknown`].
@@ -3510,6 +3514,27 @@ pub struct EvalPlan {
     pub target_cells: Vec<String>,
 }
 
+/// The one cell a spill reference's anchor names, as a sheet and 1-based row
+/// and column: a cell, or a range whose two corners are the same cell
+/// (`(A1:A1)#`). `None` for anything else.
+pub(crate) fn spill_anchor_cell(anchor: &ReferenceType) -> Option<(&Option<String>, u32, u32)> {
+    let (sheet, row, col) = match anchor {
+        ReferenceType::Cell {
+            sheet, row, col, ..
+        } => (sheet, *row, *col),
+        ReferenceType::Range {
+            sheet,
+            start_row: Some(row),
+            start_col: Some(col),
+            end_row: Some(end_row),
+            end_col: Some(end_col),
+            ..
+        } if row == end_row && col == end_col => (sheet, *row, *col),
+        _ => return None,
+    };
+    (row != 0 && col != 0).then_some((sheet, row, col))
+}
+
 impl<R> Engine<R>
 where
     R: EvaluationContext,
@@ -3580,6 +3605,7 @@ where
             clock: crate::timezone::SnapshotClock::new(clock),
             rng_draws: std::sync::Mutex::new(FxHashMap::default()),
             text_named_workbook: std::sync::atomic::AtomicBool::new(false),
+            spill_reference_cycle: false,
             displayed_precision_unknown: std::sync::atomic::AtomicU8::new(0),
             thread_pool,
             recalc_epoch: 0,
@@ -3761,6 +3787,7 @@ where
             clock: crate::timezone::SnapshotClock::new(clock),
             rng_draws: std::sync::Mutex::new(FxHashMap::default()),
             text_named_workbook: std::sync::atomic::AtomicBool::new(false),
+            spill_reference_cycle: false,
             displayed_precision_unknown: std::sync::atomic::AtomicU8::new(0),
             thread_pool: Some(thread_pool),
             recalc_epoch: 0,
@@ -4628,6 +4655,7 @@ where
         self.pending_iterative_redirty.clear();
         self.request_prior_values = FxHashMap::default();
         self.kept_last_values.clear();
+        self.spill_reference_cycle = false;
         self.reconcile_retained_sccs_at_request_begin();
         // Spec §7.11: NOW()/TODAY() sample the clock ONCE per recalc; every
         // read within this request (including SCC iteration passes) observes
@@ -5955,6 +5983,16 @@ where
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Whether the latest evaluation request found a circular reference
+    /// that only the read of a spill reference's anchor closes (`ROWS(F1#)`
+    /// in F1). Excel for Windows 16.0.20430 calculates some such formulas
+    /// (`ROWS(F1#)+1` in F1 is 2) and finds others circular
+    /// (`SEQUENCE(ROWS(F1#)+1)` in F1), so a host that cannot vouch for the
+    /// result refuses it.
+    pub fn spill_reference_cycle(&self) -> bool {
+        self.spill_reference_cycle
+    }
+
     /// Why a formula evaluated under [`Self::use_precision_as_displayed`]
     /// published a number whose stored value Excel's behaviour is not known
     /// for, if one did: a section of literal text only showing a number, or
@@ -6030,23 +6068,9 @@ where
             ExcelError::new(ExcelErrorKind::Ref)
                 .with_message("A spill reference names one cell holding a formula")
         };
-        let (sheet, row, col) = match anchor {
-            ReferenceType::Cell {
-                sheet, row, col, ..
-            } => (sheet, *row, *col),
-            ReferenceType::Range {
-                sheet,
-                start_row: Some(row),
-                start_col: Some(col),
-                end_row: Some(end_row),
-                end_col: Some(end_col),
-                ..
-            } if row == end_row && col == end_col => (sheet, *row, *col),
-            _ => return Err(no_formula()),
-        };
-        if row == 0 || col == 0 {
+        let Some((sheet, row, col)) = spill_anchor_cell(anchor) else {
             return Err(no_formula());
-        }
+        };
         let sheet_name = sheet.as_deref().unwrap_or(current_sheet);
         let sheet_id = self.graph.sheet_id(sheet_name).ok_or_else(no_formula)?;
         let cell = CellRef::new(sheet_id, Coord::new(row - 1, col - 1, true, true));
@@ -29995,6 +30019,8 @@ where
 
         // Per-member live out-edges, refreshed whenever a member re-runs.
         let mut out_edges: Vec<Vec<u32>> = vec![Vec::new(); n];
+        // The edges of `out_edges` only a spill reference's anchor made.
+        let mut anchor_only_out: Vec<Vec<u32>> = vec![Vec::new(); n];
         // Position of each member in the most recent pass (-1 = did not run).
         let mut pos: Vec<i64> = vec![-1; n];
         // Whether each member's committed value changed in the most recent pass.
@@ -30188,7 +30214,11 @@ where
             for i in 0..n {
                 if pos[i] >= 0 {
                     out_edges[i].clear();
+                    anchor_only_out[i].clear();
                 }
+            }
+            for (from, to) in collector.take_anchor_only_edges() {
+                anchor_only_out[from as usize].push(to);
             }
             for (from, to) in drained {
                 debug_assert!(
@@ -30314,6 +30344,24 @@ where
                 }
             }
 
+            // Excel for Windows 16.0.20430 does not find every read of a
+            // spill reference's anchor circular: `ROWS(F1#)+1` in F1 is 2 and
+            // `ROWS(G1#)+1` in F1 over `ROWS(F1#)+1` in G1 2, while
+            // `SEQUENCE(ROWS(F1#)+1)` and `CELL("address",F1#)` in F1 are 0
+            // (probes SR of ops/excel-parse-probe-20261008.md). A live cycle
+            // that needs such a read is reported to the host, which refuses
+            // the result.
+            if analysis.cycle_count > 0 && anchor_only_out.iter().any(|outs| !outs.is_empty()) {
+                let read_edges: Vec<(u32, u32)> = edges
+                    .iter()
+                    .copied()
+                    .filter(|&(from, to)| !anchor_only_out[from as usize].contains(&to))
+                    .collect();
+                let by_reads = analyze_live_graph(n, &read_edges);
+                if (0..n).any(|i| analysis.in_cycle[i] && !by_reads.in_cycle[i]) {
+                    self.spill_reference_cycle = true;
+                }
+            }
             if analysis.cycle_count > 0 {
                 // Classification repeats every iteration pass under
                 // `Iterate`; record the widest single witness instead of

@@ -1,5 +1,5 @@
 //! Excel for Windows 16.0.20430's values for the parsing lane of oneiron's wave 2
-//! (ops/excel-parse-probe-20261008.md, jobs probe-w2-parse-1 and -2): `#REF!`, the deleted
+//! (ops/excel-parse-probe-20261008.md, jobs probe-w2-parse-1 to -5): `#REF!`, the deleted
 //! reference Excel writes in a formula, as an operand of the range and intersection operators;
 //! the spill reference operator `A1#` (stored `_xlfn.ANCHORARRAY(A1)`) wherever a reference
 //! goes, in names too; and ERROR.TYPE's codes. Each formula as typed in F1 (or the first cell of
@@ -1263,6 +1263,257 @@ fn error_type_of_sequence_sizes() {
                 "F1",
                 &[&[V::N(3.0)]],
             ),
+        ],
+        None,
+    );
+}
+
+/// The text-limit probes' sheet: H1 = REPT("a",32767), H3 = REPT("a",256), H4 = 16,383 characters
+/// outside the Basic Multilingual Plane (32,766 UTF-16 units), H7 = REPT("a",32766), and the
+/// column spill A1.
+const SETUP_CL: &[(&str, Set)] = &[
+    ("A1", Set::F("=SEQUENCE(3)")),
+    ("H1", Set::F("=REPT(\"a\",32767)")),
+    ("H3", Set::F("=REPT(\"a\",256)")),
+    ("H4", Set::F("=REPT(UNICHAR(128512),16383)")),
+    ("H7", Set::F("=REPT(\"a\",32766)")),
+];
+
+/// `&` and CONCATENATE keep the first 32,767 characters (UTF-16 units) of a longer join, without
+/// an error; CONCAT and TEXTJOIN are #CALC! past it, SUBSTITUTE #VALUE! (CL and TX).
+#[test]
+fn joins_past_32767_characters() {
+    const KEPT: &[&[V]] = &[&[V::N(32767.0)]];
+    const CALC: &[&[V]] = &[&[V::E(ExcelErrorKind::Calc)]];
+    const CALC_CODE: &[&[V]] = &[&[V::N(14.0)]];
+    let big: &[(&str, &str)] = &[("big", "=Sheet1!$H$1&\"a\"")];
+    check(
+        &[
+            // CL02, CL04, CL06, CL09-CL11, CL15
+            ("=LEN(H1&\"a\")", SETUP_CL, &[], "F1", KEPT),
+            ("=LEN(H1&H1)", SETUP_CL, &[], "F1", KEPT),
+            (
+                "=LEN(REPT(\"a\",16384)&REPT(\"b\",16384))",
+                SETUP_CL,
+                &[],
+                "F1",
+                KEPT,
+            ),
+            ("=IFERROR(LEN(H1&\"a\"),-1)", SETUP_CL, &[], "F1", KEPT),
+            ("=LEN(H1&1)", SETUP_CL, &[], "F1", KEPT),
+            ("=LEN(\"a\"&H1)", SETUP_CL, &[], "F1", KEPT),
+            ("=LEN(H1&TRUE)", SETUP_CL, &[], "F1", KEPT),
+            // CL14: 32,768 units keep 32,767, the astral characters whole and the "a"
+            ("=LEN(H4&\"ab\")", SETUP_CL, &[], "F1", &[&[V::N(16384.0)]]),
+            // CL16, CL17
+            ("=LEN(CONCATENATE(H1,\"a\"))", SETUP_CL, &[], "F1", KEPT),
+            ("=LEN(CONCAT(H1,\"a\"))", SETUP_CL, &[], "F1", CALC),
+            // CL20: element by element
+            (
+                "=SUM(LEN(H1&{\"\",\"a\"}))",
+                SETUP_CL,
+                &[],
+                "F1",
+                &[&[V::N(65534.0)]],
+            ),
+            // TX04-TX07: the first 32,767 are kept
+            ("=(H1&\"a\")=H1", SETUP_CL, &[], "F1", &[&[V::B(true)]]),
+            ("=EXACT(H1&\"a\",H1)", SETUP_CL, &[], "F1", &[&[V::B(true)]]),
+            ("=RIGHT(H1&\"b\",1)", SETUP_CL, &[], "F1", &[&[V::T("a")]]),
+            ("=RIGHT(H7&\"bc\",1)", SETUP_CL, &[], "F1", &[&[V::T("b")]]),
+            // TX09, TX19-TX21, TX25, TX27, TX29, TX38
+            ("=LEN(IFERROR(H1&\"a\",\"e\"))", SETUP_CL, &[], "F1", KEPT),
+            (
+                "=FIND(\"b\",H1&\"b\")",
+                SETUP_CL,
+                &[],
+                "F1",
+                &[&[V::E(ExcelErrorKind::Value)]],
+            ),
+            ("=LEN(UPPER(H1&\"a\"))", SETUP_CL, &[], "F1", KEPT),
+            ("=LEN(H1&\"a\"&\"b\")", SETUP_CL, &[], "F1", KEPT),
+            ("=LEN(big)", SETUP_CL, big, "F1", KEPT),
+            ("=LET(x,H1&\"a\",LEN(x))", SETUP_CL, &[], "F1", KEPT),
+            ("=LEN(H1&H1&H1)", SETUP_CL, &[], "F1", KEPT),
+            ("=LEN(REPT(\"a\",32767)&\"a\")", SETUP_CL, &[], "F1", KEPT),
+            // TX18: SUBSTITUTE past it is #VALUE!
+            (
+                "=LEN(SUBSTITUTE(H1,\"a\",\"bb\"))",
+                SETUP_CL,
+                &[],
+                "F1",
+                &[&[V::E(ExcelErrorKind::Value)]],
+            ),
+            // TX15-TX17
+            (
+                "=ERROR.TYPE(CONCAT(H1,\"a\"))",
+                SETUP_CL,
+                &[],
+                "F1",
+                CALC_CODE,
+            ),
+            (
+                "=LEN(TEXTJOIN(\"\",TRUE,H1,\"a\"))",
+                SETUP_CL,
+                &[],
+                "F1",
+                CALC,
+            ),
+            (
+                "=ERROR.TYPE(TEXTJOIN(\"\",TRUE,H1,\"a\"))",
+                SETUP_CL,
+                &[],
+                "F1",
+                CALC_CODE,
+            ),
+        ],
+        None,
+    );
+}
+
+/// INDIRECT text ending in `#`: R1C1 text spills too, the `#` follows one cell or a name, and
+/// text naming no anchor is #REF! like any INDIRECT text (IS and IR; A1 = SEQUENCE(3), F1 the
+/// formula's cell).
+#[test]
+fn indirect_spill_text() {
+    let names: &[(&str, &str)] = &[("anc", "=Sheet1!$A$1"), ("k", "=5")];
+    let r: &[&[V]] = &[&[V::N(4.0)]];
+    check(
+        &[
+            // IS01-IS04, IS10, IS11
+            (
+                "=ERROR.TYPE(INDIRECT(\"missing#\"))",
+                SETUP_CL,
+                names,
+                "F1",
+                r,
+            ),
+            ("=ERROR.TYPE(INDIRECT(\"k#\"))", SETUP_CL, names, "F1", r),
+            (
+                "=ERROR.TYPE(INDIRECT(\"#REF!#\"))",
+                SETUP_CL,
+                names,
+                "F1",
+                r,
+            ),
+            ("=ERROR.TYPE(INDIRECT(\"A0#\"))", SETUP_CL, names, "F1", r),
+            ("=ERROR.TYPE(INDIRECT(\"A1##\"))", SETUP_CL, names, "F1", r),
+            ("=ERROR.TYPE(INDIRECT(\"#\"))", SETUP_CL, names, "F1", r),
+            // IS14: a range before the `#`
+            (
+                "=SUM(INDIRECT(\"A1:A1#\"))",
+                SETUP_CL,
+                names,
+                "F1",
+                &[&[V::E(ExcelErrorKind::Ref)]],
+            ),
+            // IR01-IR03, IR05, IR07
+            (
+                "=ROWS(INDIRECT(\"R1C1#\",FALSE))",
+                SETUP_CL,
+                names,
+                "F1",
+                &[&[V::N(3.0)]],
+            ),
+            (
+                "=SUM(INDIRECT(\"R1C1#\",FALSE))",
+                SETUP_CL,
+                names,
+                "F1",
+                &[&[V::N(6.0)]],
+            ),
+            (
+                "=SUM(INDIRECT(\"Sheet1!R1C1#\",FALSE))",
+                SETUP_CL,
+                names,
+                "F1",
+                &[&[V::N(6.0)]],
+            ),
+            (
+                "=SUM(INDIRECT(\"RC[-5]#\",FALSE))",
+                SETUP_CL,
+                names,
+                "F1",
+                &[&[V::N(6.0)]],
+            ),
+            (
+                "=SUM(INDIRECT(\"anc#\",FALSE))",
+                SETUP_CL,
+                names,
+                "F1",
+                &[&[V::N(6.0)]],
+            ),
+            // IR04: the spill is no error
+            (
+                "=ERROR.TYPE(INDIRECT(\"R1C1#\",FALSE))",
+                SETUP_CL,
+                names,
+                "F1",
+                &[&[V::E(ExcelErrorKind::Na)]],
+            ),
+        ],
+        None,
+    );
+}
+
+/// A text longer than 255 characters (UTF-16 units) is #VALUE! to ERROR.TYPE and an array to TYPE,
+/// a join past 32,767 included (ET, TY, EC, TC, CL03, TX10, TX31).
+#[test]
+fn long_text_in_error_type_and_type() {
+    const VALUE_CODE: &[&[V]] = &[&[V::N(3.0)]];
+    const NOT_AN_ERROR: &[&[V]] = &[&[V::E(ExcelErrorKind::Na)]];
+    const ARRAY: &[&[V]] = &[&[V::N(64.0)]];
+    const TEXT: &[&[V]] = &[&[V::N(2.0)]];
+    check(
+        &[
+            (
+                "=ERROR.TYPE(REPT(\"a\",255))",
+                SETUP_CL,
+                &[],
+                "F1",
+                NOT_AN_ERROR,
+            ),
+            (
+                "=ERROR.TYPE(REPT(\"a\",256))",
+                SETUP_CL,
+                &[],
+                "F1",
+                VALUE_CODE,
+            ),
+            ("=TYPE(REPT(\"a\",255))", SETUP_CL, &[], "F1", TEXT),
+            ("=TYPE(REPT(\"a\",256))", SETUP_CL, &[], "F1", ARRAY),
+            (
+                "=ERROR.TYPE(REPT(UNICHAR(128512),128))",
+                SETUP_CL,
+                &[],
+                "F1",
+                VALUE_CODE,
+            ),
+            (
+                "=ERROR.TYPE(REPT(UNICHAR(128512),127)&\"a\")",
+                SETUP_CL,
+                &[],
+                "F1",
+                NOT_AN_ERROR,
+            ),
+            (
+                "=TYPE(REPT(UNICHAR(128512),128))",
+                SETUP_CL,
+                &[],
+                "F1",
+                ARRAY,
+            ),
+            (
+                "=ISERROR(ERROR.TYPE(H3))",
+                SETUP_CL,
+                &[],
+                "F1",
+                &[&[V::B(false)]],
+            ),
+            ("=ERROR.TYPE(H1&\"a\")", SETUP_CL, &[], "F1", VALUE_CODE),
+            ("=ERROR.TYPE(H1&\"\")", SETUP_CL, &[], "F1", VALUE_CODE),
+            ("=ERROR.TYPE(H4&\"a\")", SETUP_CL, &[], "F1", VALUE_CODE),
+            ("=TYPE(H1&\"a\")", SETUP_CL, &[], "F1", ARRAY),
         ],
         None,
     );

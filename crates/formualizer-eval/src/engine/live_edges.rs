@@ -75,6 +75,11 @@ struct CollectorState {
     /// Live edges as `(from_member_idx, to_member_idx)`. Self-edges `(i, i)`
     /// are recorded (e.g. a member whose range argument includes itself).
     edges: FxHashSet<(u32, u32)>,
+    /// The edges a spill reference's anchor made (`ROWS(A1#)` reads the
+    /// formula at A1 for its result's shape), and the edges any other read
+    /// made: see [`LiveEdgeCollector::take_anchor_only_edges`].
+    anchor_edges: FxHashSet<(u32, u32)>,
+    value_edges: FxHashSet<(u32, u32)>,
 }
 
 /// Records which reads actually occurred targeting SCC members during a
@@ -169,6 +174,21 @@ impl LiveEdgeCollector {
         let mut st = self.state.lock().unwrap();
         if let Some(from) = st.current {
             st.edges.insert((from, to));
+            st.value_edges.insert((from, to));
+        }
+    }
+
+    /// Record the read of a spill reference's anchor `(sheet_id, row, col)`
+    /// (0-based): an edge like a scalar read's, which
+    /// [`Self::take_anchor_only_edges`] tells apart.
+    pub fn record_anchor(&self, sheet_id: SheetId, row: u32, col: u32) {
+        let Some(&to) = self.index.get(&(sheet_id, row, col)) else {
+            return;
+        };
+        let mut st = self.state.lock().unwrap();
+        if let Some(from) = st.current {
+            st.edges.insert((from, to));
+            st.anchor_edges.insert((from, to));
         }
     }
 
@@ -183,6 +203,7 @@ impl LiveEdgeCollector {
         for (i, m) in self.members.iter().enumerate() {
             if m.sheet_id == sheet_id && m.row >= sr && m.row <= er && m.col >= sc && m.col <= ec {
                 st.edges.insert((from, i as u32));
+                st.value_edges.insert((from, i as u32));
             }
         }
     }
@@ -196,7 +217,19 @@ impl LiveEdgeCollector {
         let mut st = self.state.lock().unwrap();
         if let Some(from) = st.current {
             st.edges.insert((from, to));
+            st.value_edges.insert((from, to));
         }
+    }
+
+    /// Drain the edges only a spill reference's anchor made, no other read
+    /// of the same member (the anchor and value reads collected since the
+    /// last call; independent of [`Self::take_edges`]).
+    pub fn take_anchor_only_edges(&self) -> FxHashSet<(u32, u32)> {
+        let mut st = self.state.lock().unwrap();
+        let value_edges = std::mem::take(&mut st.value_edges);
+        let mut anchor_edges = std::mem::take(&mut st.anchor_edges);
+        anchor_edges.retain(|edge| !value_edges.contains(edge));
+        anchor_edges
     }
 
     /// Drain the collected edges, leaving the collector empty (current member
@@ -554,11 +587,12 @@ impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
         anchor: &ReferenceType,
         current_sheet: &str,
     ) -> Option<Result<ReferenceType, ExcelError>> {
-        if let ReferenceType::Cell {
-            sheet, row, col, ..
-        } = anchor
+        if let Some((sheet, row, col)) = crate::engine::eval::spill_anchor_cell(anchor)
+            && let Some(sid) = self
+                .engine
+                .sheet_id(sheet.as_deref().unwrap_or(current_sheet))
         {
-            self.record_cell_1based(sheet.as_deref().unwrap_or(current_sheet), *row, *col);
+            self.collector.record_anchor(sid, row - 1, col - 1);
         }
         self.engine.spill_reference(anchor, current_sheet)
     }

@@ -2783,18 +2783,26 @@ impl<'a> Interpreter<'a> {
     }
 
     /// `&`: text concatenation, element-wise over arrays. An error operand
-    /// (element) propagates, before any text coercion.
+    /// (element) propagates, before any text coercion. The result keeps its
+    /// first 32,767 characters ([`crate::coercion::truncated_join`]), so a
+    /// chain of joins copies no more than that at each step.
     fn concat(&self, left: LiteralValue, right: LiteralValue) -> Result<LiteralValue, ExcelError> {
         fn join(left: LiteralValue, right: LiteralValue) -> Result<LiteralValue, ExcelError> {
             Ok(match (left, right) {
                 (LiteralValue::Error(error), _) | (_, LiteralValue::Error(error)) => {
                     LiteralValue::Error(error)
                 }
-                (left, right) => LiteralValue::Text(format!(
-                    "{}{}",
-                    crate::coercion::to_text_invariant(&left),
-                    crate::coercion::to_text_invariant(&right)
-                )),
+                (left, right) => {
+                    let mut text = match left {
+                        LiteralValue::Text(text) => text,
+                        left => crate::coercion::to_text_invariant(&left),
+                    };
+                    text.push_str(&crate::coercion::to_text_invariant(&right));
+                    match crate::coercion::truncated_join(text) {
+                        Ok(text) => LiteralValue::Text(text),
+                        Err(error) => LiteralValue::Error(error),
+                    }
+                }
             })
         }
         self.broadcast_apply(left, right, join)

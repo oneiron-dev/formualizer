@@ -111,8 +111,10 @@ fn append_with_limit(
     let next_chars = current_chars
         .checked_add(text.chars().count())
         .ok_or_else(ExcelError::new_value)?;
+    // Excel for Windows 16.0.20430: #CALC! (probes CL17 and TX15-TX17 of
+    // ops/excel-parse-probe-20261008.md).
     if next_chars > MAX_CONCAT_RESULT_CHARS {
-        return Err(ExcelError::new_value());
+        return Err(ExcelError::new(ExcelErrorKind::Calc));
     }
     out.push_str(text);
     *current_chars = next_chars;
@@ -494,7 +496,7 @@ pub struct ConcatFn;
 /// - Blank values contribute an empty string.
 /// - Numbers and booleans are coerced to text.
 /// - Errors are propagated as soon as encountered.
-/// - Results longer than 32,767 characters return `#VALUE!`.
+/// - Results longer than 32,767 characters return `#CALC!`.
 ///
 /// # Examples
 ///
@@ -624,6 +626,7 @@ impl Function for ConcatenateFn {
         let mut out = String::new();
         for arg in args {
             out.push_str(&literal_to_text(&legacy_scalar_value(arg)?)?);
+            out = crate::coercion::truncated_join(out)?;
         }
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Text(out)))
     }
@@ -644,7 +647,7 @@ pub struct TextJoinFn;
 ///   used in turn between the joined items, starting over when they run out.
 /// - Delimiter and values are coerced to text.
 /// - Any error in inputs propagates immediately.
-/// - Results longer than 32,767 characters return `#VALUE!`.
+/// - Results longer than 32,767 characters return `#CALC!`.
 ///
 /// # Examples
 ///
@@ -1055,7 +1058,7 @@ mod tests {
                 &ctx.function_context(None),
             )
             .unwrap_err();
-        assert_eq!(concat_error, ExcelError::new_value());
+        assert_eq!(concat_error.kind, ExcelErrorKind::Calc);
 
         let textjoin = ctx.context.get_function("", "TEXTJOIN").unwrap();
         let delimiter = lit(LiteralValue::Text("|".into()));
@@ -1073,7 +1076,7 @@ mod tests {
                 &ctx.function_context(None),
             );
             if expect_error {
-                assert_eq!(result.unwrap_err(), ExcelError::new_value());
+                assert_eq!(result.unwrap_err().kind, ExcelErrorKind::Calc);
             } else {
                 let value = result.unwrap().into_literal();
                 let LiteralValue::Text(text) = value else {
