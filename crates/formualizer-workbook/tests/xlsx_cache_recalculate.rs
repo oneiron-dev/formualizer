@@ -2875,3 +2875,69 @@ fn cell_filename_names_the_workbook_and_sheet() {
     let out = recalculate_xlsx_bytes(&pack(&p), options).unwrap();
     assert!(member(&out.bytes, SHEET).contains("<v>[Budget.xlsx]Sheet1</v>"));
 }
+/// Spill references as a file stores them, `_xlfn.ANCHORARRAY(A1)` for `A1#`, in cells and in a
+/// defined name: the cells the anchor's result fills, a dynamic array's spill or a legacy array's
+/// extent; #REF! for an empty cell. Excel for Windows 16.0.20430 reads them so (probes S01, S02,
+/// S24, S45, SN01 and S69 of ops/excel-parse-probe-20261008.md).
+#[test]
+fn spill_references_read_the_anchors_result() {
+    let rows = "<row r=\"1\"><c r=\"A1\" cm=\"1\"><f t=\"array\" ref=\"A1:A3\">_xlfn.SEQUENCE(3)</f><v>0</v></c>\
+        <c r=\"B1\"><f>SUM(_xlfn.ANCHORARRAY(A1))</f><v>0</v></c>\
+        <c r=\"C1\" cm=\"1\"><f t=\"array\" ref=\"C1:C3\">_xlfn.ANCHORARRAY(A1)*10</f><v>0</v></c>\
+        <c r=\"L1\"><f t=\"array\" ref=\"L1:L3\">ROW(1:3)</f><v>0</v></c></row>\
+        <row r=\"2\"><c r=\"A2\"><v>0</v></c><c r=\"B2\"><f>ROWS(_xlfn.ANCHORARRAY(A1))</f><v>0</v></c><c r=\"C2\"><v>0</v></c><c r=\"L2\"><v>0</v></c></row>\
+        <row r=\"3\"><c r=\"A3\"><v>0</v></c><c r=\"B3\"><f>SUM(_xlfn.ANCHORARRAY(L1))</f><v>0</v></c><c r=\"C3\"><v>0</v></c><c r=\"L3\"><v>0</v></c></row>\
+        <row r=\"4\"><c r=\"B4\"><f>SUM(Spilled)</f><v>0</v></c></row>\
+        <row r=\"5\"><c r=\"B5\"><f>ERROR.TYPE(_xlfn.ANCHORARRAY(D9))</f><v>0</v></c></row>";
+    let mut p = with_metadata(parts(rows), XLDAPR);
+    let wb = p.get_mut("xl/workbook.xml").unwrap();
+    *wb = wb.replace(
+        "</workbook>",
+        "<definedNames><definedName name=\"Spilled\">_xlfn.ANCHORARRAY(Sheet1!$A$1)</definedName></definedNames></workbook>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    let sheet = member(&out.bytes, SHEET);
+    for expected in [
+        "SUM(_xlfn.ANCHORARRAY(A1))</f><v>6</v>",
+        "ROWS(_xlfn.ANCHORARRAY(A1))</f><v>3</v>",
+        "_xlfn.ANCHORARRAY(A1)*10</f><v>10</v>",
+        "<c r=\"C2\"><v>20</v>",
+        "<c r=\"C3\"><v>30</v>",
+        "SUM(_xlfn.ANCHORARRAY(L1))</f><v>6</v>",
+        "SUM(Spilled)</f><v>6</v>",
+        "ERROR.TYPE(_xlfn.ANCHORARRAY(D9))</f><v>4</v>",
+    ] {
+        assert!(sheet.contains(expected), "{expected} in {sheet}");
+    }
+}
+/// The evaluator recurses through a formula's operators. With `worker_stack_bytes`, a workbook
+/// evaluates on threads with that stack whatever the caller's: 1,000 chained additions (a debug
+/// build overflows a 2 MiB stack at about 100) evaluate from a 2 MiB thread.
+#[test]
+fn a_deep_formula_evaluates_on_the_configured_stack() {
+    let formula = vec!["A1"; 1000].join("+");
+    let rows: String = (1..=4)
+        .map(|r| {
+            let a = if r == 1 {
+                "<c r=\"A1\"><v>1</v></c>"
+            } else {
+                ""
+            };
+            format!("<row r=\"{r}\">{a}<c r=\"B{r}\"><f>{formula}</f><v>0</v></c></row>")
+        })
+        .collect();
+    let input = pack(&parts(&rows));
+    let mut options = XlsxRecalculateOptions::default();
+    options.eval_config.worker_stack_bytes = Some(64 << 20);
+    let out = std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || recalculate_xlsx_bytes(&input, options))
+        .unwrap()
+        .join()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        member(&out.bytes, SHEET).matches("</f><v>1000</v>").count(),
+        4
+    );
+}

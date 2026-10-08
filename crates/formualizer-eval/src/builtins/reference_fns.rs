@@ -1294,14 +1294,27 @@ fn indirect_text_reference(
             }
         });
     }
-    let ref_text = a1_text(&ref_text);
+    // `A1#` is the spill reference, the cells the formula at A1 fills:
+    // INDIRECT("A1#") spills A1's result and SUM(INDIRECT("Sheet1!A1#")) sums
+    // it in Excel for Windows 16.0.20430 (probes T37-T39 of
+    // ops/excel-parse-probe-20261008.md).
+    if let Some(anchor) = ref_text.trim_end_matches(' ').strip_suffix('#') {
+        return args[0]
+            .interpreter()
+            .spill_reference(a1_text_reference(&a1_text(anchor)));
+    }
+    a1_text_reference(&a1_text(&ref_text))
+}
 
+/// The reference A1 text (`A1`, `Sheet1!$A$1:$B$2`, a name or a table)
+/// names, `#REF!` for any other text.
+fn a1_text_reference(ref_text: &str) -> Result<ReferenceType, ExcelError> {
     let sheet_name = |sheet: formualizer_common::SheetLocator<'_>| match sheet {
         formualizer_common::SheetLocator::Current => None,
         formualizer_common::SheetLocator::Name(name) => Some(name.to_string()),
         formualizer_common::SheetLocator::Id(_) => None,
     };
-    match ReferenceType::parse_sheet_ref(&ref_text) {
+    match ReferenceType::parse_sheet_ref(ref_text) {
         Ok(formualizer_common::SheetRef::Cell(cell)) => Ok(ReferenceType::Cell {
             sheet: sheet_name(cell.sheet),
             row: cell.coord.row() + 1,
@@ -1320,7 +1333,7 @@ fn indirect_text_reference(
             end_row_abs: range.end_row.map(|b| b.abs).unwrap_or(false),
             end_col_abs: range.end_col.map(|b| b.abs).unwrap_or(false),
         }),
-        Err(_) => match ReferenceType::from_string(&ref_text) {
+        Err(_) => match ReferenceType::from_string(ref_text) {
             Ok(reference @ (ReferenceType::NamedRange(_) | ReferenceType::Table(_))) => {
                 Ok(reference)
             }
@@ -1568,9 +1581,118 @@ fn hyperlink_value<'a, 'b>(
     }))
 }
 
+#[derive(Debug)]
+pub struct AnchorArrayFn;
+
+/// The spill reference: the cells a dynamic-array formula's result fills.
+///
+/// `ANCHORARRAY` is how a file stores the spill reference operator: `A1#` is
+/// saved as `_xlfn.ANCHORARRAY(A1)`, and a defined name holding one keeps the
+/// same text. Typed in a cell, Excel only takes the `#` form.
+///
+/// # Remarks
+/// - The reference is the rectangle the formula at `anchor` spilled its last
+///   result to, or the extent of a legacy (Ctrl+Shift+Enter) array formula.
+/// - A formula whose result fills only its own cell (a single value, or an
+///   error such as `#SPILL!` or `#CALC!`) gives the anchor cell alone.
+/// - `#REF!` for an anchor that is not one cell holding a formula: an empty
+///   cell, a constant, a cell another formula spilled to, a range of several
+///   cells, or a cell of another workbook.
+/// - It is a reference wherever one is taken: `ROWS(A1#)`, `INDEX(A1#,2)`,
+///   `OFFSET(A1#,1,0)`, `A1#:B9`, `SUMIF(A1#,">1")` and a defined name over it.
+///
+/// # Examples
+/// ```yaml,sandbox
+/// title: "Sum a spilled range"
+/// grid:
+///   A1: "=SEQUENCE(3)"
+/// formula: '=SUM(A1#)'
+/// expected: 6
+/// ```
+///
+/// ```yaml,docs
+/// related:
+///   - INDEX
+///   - OFFSET
+///   - SEQUENCE
+/// faq:
+///   - q: "What does a spill reference to a cell without a spilling formula give?"
+///     a: "A formula that returns a single value gives its own cell; an empty cell or a constant gives #REF!."
+/// ```
+/// [formualizer-docgen:schema:start]
+/// Name: ANCHORARRAY
+/// Type: AnchorArrayFn
+/// Min args: 1
+/// Max args: 1
+/// Variadic: false
+/// Signature: ANCHORARRAY(arg1: range@range)
+/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}
+/// Caps: PURE, RETURNS_REFERENCE
+/// [formualizer-docgen:schema:end]
+impl Function for AnchorArrayFn {
+    fn caps(&self) -> FnCaps {
+        // Not volatile: the anchor is a written argument, so the formula is
+        // evaluated after the anchor's formula and its spill.
+        FnCaps::PURE | FnCaps::RETURNS_REFERENCE
+    }
+    fn name(&self) -> &'static str {
+        "ANCHORARRAY"
+    }
+    fn min_args(&self) -> usize {
+        1
+    }
+    fn arg_schema(&self) -> &'static [ArgSchema] {
+        use once_cell::sync::Lazy;
+        static SCHEMA: Lazy<Vec<ArgSchema>> =
+            Lazy::new(|| arg_byref_reference().into_iter().take(1).collect());
+        &SCHEMA
+    }
+
+    fn eval_reference<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        _ctx: &dyn FunctionContext<'b>,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        let [anchor] = args else {
+            return Some(Err(ExcelError::new(ExcelErrorKind::Value)));
+        };
+        Some(
+            anchor
+                .interpreter()
+                .spill_reference(anchor.as_reference_or_eval()),
+        )
+    }
+
+    fn eval<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+    ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        let reference = match self.eval_reference(args, ctx) {
+            Some(Ok(reference)) => reference,
+            Some(Err(e)) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+            None => {
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                    ExcelError::new(ExcelErrorKind::Ref),
+                )));
+            }
+        };
+        match ctx.resolve_range_view(&reference, ctx.current_sheet()) {
+            Ok(rv) if rv.dims() == (1, 1) => Ok(crate::traits::CalcValue::Scalar(
+                rv.as_1x1().unwrap_or(LiteralValue::Empty),
+            )),
+            Ok(rv) => Ok(crate::traits::CalcValue::Range(
+                rv.with_reference_extent(&reference),
+            )),
+            Err(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+        }
+    }
+}
+
 pub fn register_builtins() {
     crate::function_registry::register_builtin(std::sync::Arc::new(IndexFn));
     crate::function_registry::register_builtin(std::sync::Arc::new(OffsetFn));
+    crate::function_registry::register_builtin(std::sync::Arc::new(AnchorArrayFn));
     crate::function_registry::register_builtin(std::sync::Arc::new(IndirectFn));
     crate::function_registry::register_builtin(std::sync::Arc::new(HyperlinkFn));
 }

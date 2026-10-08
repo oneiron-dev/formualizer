@@ -3541,6 +3541,9 @@ where
             if let Some(max_threads) = config.max_threads {
                 builder = builder.num_threads(max_threads);
             }
+            if let Some(bytes) = config.worker_stack_bytes {
+                builder = builder.stack_size(bytes);
+            }
 
             match builder.build() {
                 Ok(pool) => Some(Arc::new(pool)),
@@ -5824,6 +5827,7 @@ where
         match &ast.node_type {
             ASTNodeType::Reference { .. } => true,
             ASTNodeType::BinaryOp { op, .. } => op == ":",
+            ASTNodeType::UnaryOp { op, .. } => op == "#",
             ASTNodeType::Function { name, .. } => self
                 .function_capabilities("", name)
                 .is_some_and(|caps| caps.contains(crate::function::FnCaps::RETURNS_REFERENCE)),
@@ -5983,6 +5987,110 @@ where
         );
         let vertex = self.graph.get_vertex_for_cell(&cell)?;
         self.blocked_spill_extents.get(&vertex).copied()
+    }
+
+    /// The reference `anchor#` (stored `_xlfn.ANCHORARRAY(anchor)`) is, as
+    /// Excel for Windows 16.0.20430 resolves it (probes S and SN of
+    /// ops/excel-parse-probe-20261008.md): the cells the formula at `anchor`
+    /// fills with its last result, the rectangle it spilled to or a legacy
+    /// array's extent (`SUM(A1#)` is 6 over `=SEQUENCE(3)`, `ROWS(L1#)` 3 over
+    /// a Ctrl+Shift+Enter `=ROW(1:3)` in L1:L3), else the anchor alone: a
+    /// single value (`SUM(A11#)` is 2 over `=1+1`), a #SPILL! that could not
+    /// spill (`ROWS(A20#)` is 1) or a #CALC!. `#REF!` for anything but one
+    /// cell holding a formula: an empty cell, a constant, a cell another
+    /// formula spilled to, a range of several cells, another workbook's cell.
+    pub(crate) fn spill_reference_of(
+        &self,
+        anchor: &ReferenceType,
+        current_sheet: &str,
+    ) -> Result<ReferenceType, ExcelError> {
+        let no_formula = || {
+            ExcelError::new(ExcelErrorKind::Ref)
+                .with_message("A spill reference names one cell holding a formula")
+        };
+        let (sheet, row, col) = match anchor {
+            ReferenceType::Cell {
+                sheet, row, col, ..
+            } => (sheet, *row, *col),
+            ReferenceType::Range {
+                sheet,
+                start_row: Some(row),
+                start_col: Some(col),
+                end_row: Some(end_row),
+                end_col: Some(end_col),
+                ..
+            } if row == end_row && col == end_col => (sheet, *row, *col),
+            _ => return Err(no_formula()),
+        };
+        if row == 0 || col == 0 {
+            return Err(no_formula());
+        }
+        let sheet_name = sheet.as_deref().unwrap_or(current_sheet);
+        let sheet_id = self.graph.sheet_id(sheet_name).ok_or_else(no_formula)?;
+        let cell = CellRef::new(sheet_id, Coord::new(row - 1, col - 1, true, true));
+        if !self.holds_formula(sheet_name, cell) {
+            return Err(no_formula());
+        }
+        let area = self
+            .graph
+            .get_vertex_for_cell(&cell)
+            .and_then(|vertex| self.graph.spill_cells_for_anchor(vertex))
+            .and_then(|cells| {
+                let mut cells = cells
+                    .iter()
+                    .map(|cell| (cell.coord.row(), cell.coord.col()));
+                let first = cells.next()?;
+                Some(
+                    cells.fold((first.0, first.1, first.0, first.1), |area, (r, c)| {
+                        (area.0.min(r), area.1.min(c), area.2.max(r), area.3.max(c))
+                    }),
+                )
+            })
+            .map_or((row, col, row, col), |(r1, c1, r2, c2)| {
+                (r1 + 1, c1 + 1, r2 + 1, c2 + 1)
+            });
+        Ok(crate::engine::graph::tables::area_reference(
+            sheet.clone(),
+            area,
+        ))
+    }
+
+    /// Whether `cell` (on `sheet`) holds a formula: one a span of the formula
+    /// plane places there, an overlay's or the graph's formula, or one staged
+    /// for the graph.
+    fn holds_formula(&self, sheet: &str, cell: CellRef) -> bool {
+        use crate::formula_plane::runtime::{FormulaOverlayEntryKind, FormulaResolution};
+        let placement = crate::formula_plane::runtime::PlacementCoord::new(
+            cell.sheet_id,
+            cell.coord.row(),
+            cell.coord.col(),
+        );
+        let plane = &self.graph.formula_authority().plane;
+        match plane.resolve_formula_at(placement, None).resolution {
+            FormulaResolution::SpanPlacement { .. } | FormulaResolution::StagedFormula { .. } => {
+                return true;
+            }
+            FormulaResolution::Overlay(overlay) => {
+                match plane.formula_overlay.get(overlay).map(|entry| &entry.kind) {
+                    Some(FormulaOverlayEntryKind::FormulaOverride(_)) => return true,
+                    Some(FormulaOverlayEntryKind::LegacyOwned(vertex)) => {
+                        return self.graph.get_formula_id(*vertex).is_some();
+                    }
+                    _ => return false,
+                }
+            }
+            _ => {}
+        }
+        if self.staged_formulas.get(sheet).is_some_and(|entries| {
+            entries
+                .get(cell.coord.row() + 1, cell.coord.col() + 1)
+                .is_some()
+        }) {
+            return true;
+        }
+        self.graph
+            .get_vertex_for_cell(&cell)
+            .is_some_and(|vertex| self.graph.get_formula_id(vertex).is_some())
     }
 
     /// A formula is being evaluated again: its spill is no longer blocked,
@@ -28573,6 +28681,14 @@ where
                 (r1 + 1, c1 + 1, r2 + 1, c2 + 1),
             )
         }))
+    }
+
+    fn spill_reference(
+        &self,
+        anchor: &ReferenceType,
+        current_sheet: &str,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        Some(self.spill_reference_of(anchor, current_sheet))
     }
 
     fn formula_text_at_cell(&self, cell: CellRef) -> Result<Option<String>, ExcelError> {

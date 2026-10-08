@@ -17,7 +17,7 @@ use formualizer_common::{ExcelErrorKind, LiteralValue};
 use formualizer_parse::parser::{ReferenceType, parse};
 
 /// An expected cell.
-enum V {
+pub(super) enum V {
     N(f64),
     T(&'static str),
     B(bool),
@@ -61,7 +61,7 @@ const GRID: &[(&str, f64)] = &[
     ("D9", 40.0),
 ];
 
-fn cell(address: &str) -> (u32, u32) {
+pub(super) fn cell(address: &str) -> (u32, u32) {
     let letters: String = address
         .chars()
         .take_while(|c| c.is_ascii_alphabetic())
@@ -73,7 +73,7 @@ fn cell(address: &str) -> (u32, u32) {
     (row, col)
 }
 
-fn matches(actual: Option<&LiteralValue>, expected: &V) -> bool {
+pub(super) fn matches(actual: Option<&LiteralValue>, expected: &V) -> bool {
     match (actual, expected) {
         (None | Some(LiteralValue::Empty), V::Blank) => true,
         (Some(LiteralValue::Number(a)), V::N(b)) => a == b || (a - b).abs() <= 1e-12 * b.abs(),
@@ -88,7 +88,7 @@ fn matches(actual: Option<&LiteralValue>, expected: &V) -> bool {
 /// A name over a cell or range address is a cell or range name, as `convert_defined_name` in
 /// the Calamine backend loads it (`Sheet1!$A:$A` is rows 1 to 1,048,576); anything else is a
 /// formula name.
-fn define(
+pub(super) fn define(
     engine: &mut Engine<TestWorkbook>,
     name: &str,
     refers: &str,

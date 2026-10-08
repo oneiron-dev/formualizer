@@ -1620,18 +1620,21 @@ impl Function for IsOddFn {
 ///   5 = #NAME?
 ///   6 = #NUM!
 ///   7 = #N/A
-///   8 = #GETTING_DATA (not commonly used)
+///   9 = #SPILL!
+///   14 = #CALC!
 ///   #N/A if the value is not an error
 ///
-/// NOTE: Error codes 9-13 are non-standard extensions for internal error types.
+/// An engine error Excel does not have (#N/IMPL!, a circular-reference or
+/// cancellation marker, #ERROR!) is the result itself, not a code.
 #[derive(Debug)]
 pub struct ErrorTypeFn;
 /// Returns the numeric code for a specific error value.
 ///
 /// # Remarks
-/// - Standard mappings include: `#NULL!`=1, `#DIV/0!`=2, `#VALUE!`=3, `#REF!`=4, `#NAME?`=5, `#NUM!`=6, `#N/A`=7.
+/// - Standard mappings include: `#NULL!`=1, `#DIV/0!`=2, `#VALUE!`=3, `#REF!`=4, `#NAME?`=5, `#NUM!`=6, `#N/A`=7,
+///   `#SPILL!`=9 and `#CALC!`=14 (Excel for Windows 16.0.20430).
 /// - Non-error inputs return `#N/A`.
-/// - Additional internal error kinds may map to extended non-standard codes.
+/// - An engine error Excel does not have is returned as it is.
 ///
 /// # Examples
 ///
@@ -1666,22 +1669,21 @@ pub struct ErrorTypeFn;
 /// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
 /// Caps: PURE
 /// [formualizer-docgen:schema:end]
-fn error_type_code(kind: ExcelErrorKind) -> i64 {
+fn error_type_code(kind: ExcelErrorKind) -> Option<i64> {
+    // Excel for Windows 16.0.20430: ERROR.TYPE of a blocked spill is 9 and
+    // of an empty FILTER's #CALC! 14 (probes S67, S68 and SN12 of
+    // ops/excel-parse-probe-20261008.md).
     match kind {
-        ExcelErrorKind::Null => 1,
-        ExcelErrorKind::Div => 2,
-        ExcelErrorKind::Value => 3,
-        ExcelErrorKind::Ref => 4,
-        ExcelErrorKind::Name => 5,
-        ExcelErrorKind::Num => 6,
-        ExcelErrorKind::Na => 7,
-        ExcelErrorKind::Error => 8,
-        ExcelErrorKind::NImpl => 9,
-        ExcelErrorKind::Spill => 10,
-        ExcelErrorKind::Calc => 11,
-        ExcelErrorKind::Circ => 12,
-        ExcelErrorKind::Cancelled => 13,
-        _ => 8,
+        ExcelErrorKind::Null => Some(1),
+        ExcelErrorKind::Div => Some(2),
+        ExcelErrorKind::Value => Some(3),
+        ExcelErrorKind::Ref => Some(4),
+        ExcelErrorKind::Name => Some(5),
+        ExcelErrorKind::Num => Some(6),
+        ExcelErrorKind::Na => Some(7),
+        ExcelErrorKind::Spill => Some(9),
+        ExcelErrorKind::Calc => Some(14),
+        _ => None,
     }
 }
 
@@ -1717,14 +1719,20 @@ impl Function for ErrorTypeFn {
             )));
         }
         let v = match args[0].value() {
+            // A LAMBDA passed uncalled is a value, not an error:
+            // ERROR.TYPE(LAMBDA(x,x)) is #N/A in Excel for Windows 16.0.20430
+            // (probe E10 of ops/excel-parse-probe-20261008.md).
+            Ok(crate::traits::CalcValue::Callable(_)) => LiteralValue::Empty,
             Ok(v) => v.into_literal(),
             Err(e) => LiteralValue::Error(e),
         };
         match v {
-            LiteralValue::Error(e) => {
-                let code = error_type_code(e.kind);
-                Ok(crate::traits::CalcValue::Scalar(LiteralValue::Int(code)))
-            }
+            LiteralValue::Error(e) => Ok(crate::traits::CalcValue::Scalar(
+                match error_type_code(e.kind) {
+                    Some(code) => LiteralValue::Int(code),
+                    None => LiteralValue::Error(e),
+                },
+            )),
             _ => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_na(),
             ))),
@@ -2259,19 +2267,19 @@ mod tests {
     #[test]
     fn error_type_known_mappings_are_stable() {
         let cases = [
-            (ExcelErrorKind::Null, 1),
-            (ExcelErrorKind::Div, 2),
-            (ExcelErrorKind::Value, 3),
-            (ExcelErrorKind::Ref, 4),
-            (ExcelErrorKind::Name, 5),
-            (ExcelErrorKind::Num, 6),
-            (ExcelErrorKind::Na, 7),
-            (ExcelErrorKind::Error, 8),
-            (ExcelErrorKind::NImpl, 9),
-            (ExcelErrorKind::Spill, 10),
-            (ExcelErrorKind::Calc, 11),
-            (ExcelErrorKind::Circ, 12),
-            (ExcelErrorKind::Cancelled, 13),
+            (ExcelErrorKind::Null, Some(1)),
+            (ExcelErrorKind::Div, Some(2)),
+            (ExcelErrorKind::Value, Some(3)),
+            (ExcelErrorKind::Ref, Some(4)),
+            (ExcelErrorKind::Name, Some(5)),
+            (ExcelErrorKind::Num, Some(6)),
+            (ExcelErrorKind::Na, Some(7)),
+            (ExcelErrorKind::Spill, Some(9)),
+            (ExcelErrorKind::Calc, Some(14)),
+            (ExcelErrorKind::Error, None),
+            (ExcelErrorKind::NImpl, None),
+            (ExcelErrorKind::Circ, None),
+            (ExcelErrorKind::Cancelled, None),
         ];
         for (kind, expected) in cases {
             assert_eq!(error_type_code(kind), expected, "{kind:?}");

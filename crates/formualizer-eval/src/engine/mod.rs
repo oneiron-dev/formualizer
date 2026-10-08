@@ -730,6 +730,12 @@ pub enum TemporalEgress {
 pub struct EvalConfig {
     pub enable_parallel: bool,
     pub max_threads: Option<usize>,
+    /// The stack each parallel evaluation thread gets, in bytes (`None`:
+    /// rayon's default, 2 MiB). The evaluator recurses through a formula's
+    /// operators and calls, so the stack bounds the deepest formula a worker
+    /// evaluates; a host that admits long formulas (Excel takes 8,192
+    /// characters) gives its workers, and the thread it evaluates on, more.
+    pub worker_stack_bytes: Option<usize>,
     /// Deprecated. Maps to `evaluation_budgets.admission.graph_vertex_hard_limit` only when that
     /// explicit field is unset.
     pub max_vertices: Option<usize>,
@@ -881,6 +887,7 @@ impl Default for EvalConfig {
         Self {
             enable_parallel: true,
             max_threads: None,
+            worker_stack_bytes: None,
             max_vertices: None,
             max_eval_time: None,
             max_memory_mb: None,

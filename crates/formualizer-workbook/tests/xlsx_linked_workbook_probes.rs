@@ -1,11 +1,14 @@
 #![cfg(feature = "xlsx-recalc")]
 //! Workbooks whose formulas read closed linked workbooks, recalculated and
 //! compared cell by cell with Excel for Windows 16.0.20430: probes 1 to 5 of
-//! ops/excel-extlinks-probe-20261006.md and the links2 probes of
-//! ops/excel-links2-probe-20261008.md, each kept to the rows the fork
-//! computes as Excel did (`excel-values.tsv`, `excel-values-links2.tsv`).
-//! Excel saw the links closed (UpdateLinks=0, CalculateFullRebuild), so it
-//! read the values the externalLink parts save, as the fork does.
+//! ops/excel-extlinks-probe-20261006.md, the links2 probes of
+//! ops/excel-links2-probe-20261008.md and probe-w2-parse-L1 of
+//! ops/excel-parse-probe-20261008.md (spill references to a closed linked
+//! workbook's cells and to legacy formulas, a name over a deleted range), each
+//! kept to the rows the fork computes as Excel did (`excel-values.tsv`,
+//! `excel-values-links2.tsv`, `excel-values-parse.tsv`). Excel saw the links
+//! closed (UpdateLinks=0, CalculateFullRebuild), so it read the values the
+//! externalLink parts save, as the fork does.
 use calamine::{Data, Reader, Xlsx};
 use formualizer_workbook::{XlsxRecalculateOptions, recalculate_xlsx_bytes};
 use std::{io::Cursor, path::Path};
@@ -66,4 +69,12 @@ fn linked_workbook_probes_match_excel_for_windows() {
 #[test]
 fn links2_probes_match_excel_for_windows() {
     assert_eq!(check_against_excel("excel-values-links2.tsv"), 155);
+}
+
+/// Spill references (`_xlfn.ANCHORARRAY`) to a closed linked workbook's cells
+/// (#REF!) and to legacy formulas (the anchor alone), and a name over a
+/// deleted range (`Sheet1!#REF!:INDEX(Sheet1!#REF!,COUNTA(Sheet1!#REF!))`).
+#[test]
+fn parse_probes_match_excel_for_windows() {
+    assert_eq!(check_against_excel("excel-values-parse.tsv"), 31);
 }

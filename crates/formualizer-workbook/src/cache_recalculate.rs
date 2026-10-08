@@ -455,6 +455,29 @@ pub fn recalculate_xlsx_bytes(
     bytes: &[u8],
     options: XlsxRecalculateOptions,
 ) -> Result<XlsxRecalculateResult, IoError> {
+    // The evaluator recurses through a formula's operators and calls. With
+    // `worker_stack_bytes` set, the workbook evaluates on a thread with that
+    // stack, as the engine's parallel workers do, whatever stack the caller's
+    // thread has.
+    let Some(stack) = options.eval_config.worker_stack_bytes else {
+        return recalculate_xlsx_bytes_here(bytes, options);
+    };
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("xlsx-recalc".into())
+            .stack_size(stack)
+            .spawn_scoped(scope, || recalculate_xlsx_bytes_here(bytes, options))
+            .map_err(|error| unsupported("evaluation thread", error.to_string()))?;
+        worker
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+fn recalculate_xlsx_bytes_here(
+    bytes: &[u8],
+    options: XlsxRecalculateOptions,
+) -> Result<XlsxRecalculateResult, IoError> {
     let (mut archive, mut tags) = package::admit(bytes, &options)?;
     let package::Discovered {
         sheets,

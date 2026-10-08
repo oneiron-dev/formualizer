@@ -544,6 +544,21 @@ impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
     fn formula_text_at_cell(&self, cell: CellRef) -> Result<Option<String>, ExcelError> {
         self.engine.formula_text_at_cell(cell)
     }
+    // The extent is the anchor formula's result: the anchor is read; the
+    // extent's cells are read (and recorded) where the reference is.
+    fn spill_reference(
+        &self,
+        anchor: &ReferenceType,
+        current_sheet: &str,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        if let ReferenceType::Cell {
+            sheet, row, col, ..
+        } = anchor
+        {
+            self.record_cell_1based(sheet.as_deref().unwrap_or(current_sheet), *row, *col);
+        }
+        self.engine.spill_reference(anchor, current_sheet)
+    }
     fn clock(&self) -> &dyn crate::timezone::ClockProvider {
         self.engine.clock()
     }

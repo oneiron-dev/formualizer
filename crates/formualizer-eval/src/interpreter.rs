@@ -433,6 +433,53 @@ impl<'a> Interpreter<'a> {
         )
     }
 
+    /// The spill reference operator `anchor#` (stored
+    /// `_xlfn.ANCHORARRAY(anchor)`): the cells the formula at `anchor` fills
+    /// with its result (see [`EvaluationContext::spill_reference`]), or the
+    /// error that kept `anchor` from being a reference.
+    pub(crate) fn spill_reference(
+        &self,
+        anchor: Result<ReferenceType, ExcelError>,
+    ) -> Result<ReferenceType, ExcelError> {
+        let anchor = match anchor? {
+            // A name read from text (INDIRECT) is the reference it holds.
+            ReferenceType::NamedRange(name) if self.resolve_local_name(&name).is_none() => self
+                .context
+                .resolve_name_reference(&name, self.current_sheet)
+                .unwrap_or(Ok(ReferenceType::NamedRange(name)))?,
+            anchor => anchor,
+        };
+        let anchor = self.reference_as_area(anchor)?;
+        // A name that holds no reference has no cell to spill from: its error
+        // (`SUM(nosuch#)` is #NAME? for a name defined nowhere), else #VALUE!
+        // (`SUM(k#)` with k defined as =5), as in Excel for Windows 16.0.20430
+        // (probes T04 and T05 of ops/excel-parse-probe-20261008.md).
+        if let ReferenceType::NamedRange(name) = &anchor {
+            use crate::traits::CalcValue;
+            let error = match self.resolve_local_name(name) {
+                Some(_) => None,
+                None => match self.eval_reference_to_calc(&anchor) {
+                    Err(error)
+                    | Ok(
+                        CalcValue::Scalar(LiteralValue::Error(error))
+                        | CalcValue::AnnotatedScalar(LiteralValue::Error(error), _),
+                    ) => Some(error),
+                    Ok(_) => None,
+                },
+            };
+            return Err(error.unwrap_or_else(|| {
+                ExcelError::new(ExcelErrorKind::Value)
+                    .with_message("A spill reference names a cell, not a value")
+            }));
+        }
+        self.context
+            .spill_reference(&anchor, self.current_sheet)
+            .unwrap_or_else(|| {
+                Err(ExcelError::new(ExcelErrorKind::NImpl)
+                    .with_message("Spill references read the engine's formula results"))
+            })
+    }
+
     /// The intersection operator `a b`: the cells both references hold.
     fn intersect_reference_areas(
         &self,
@@ -649,6 +696,9 @@ impl<'a> Interpreter<'a> {
                 let lref = self.range_operand_reference(left)?;
                 let rref = self.range_operand_reference(right)?;
                 self.combine_reference_areas(lref, rref)
+            }
+            ASTNodeType::UnaryOp { op, expr } if op == "#" => {
+                self.spill_reference(self.evaluate_ast_as_reference(expr))
             }
             ASTNodeType::Array(_)
             | ASTNodeType::UnaryOp { .. }
@@ -1076,6 +1126,15 @@ impl<'a> Interpreter<'a> {
                 let rref =
                     self.arena_range_operand_reference(*right_id, data_store, sheet_registry)?;
                 self.combine_reference_areas(lref, rref)
+            }
+            AstNodeData::UnaryOp { op_id, expr_id }
+                if data_store.resolve_ast_string(*op_id) == "#" =>
+            {
+                self.spill_reference(self.evaluate_arena_ast_as_reference(
+                    *expr_id,
+                    data_store,
+                    sheet_registry,
+                ))
             }
             _ => Err(ExcelError::new(ExcelErrorKind::Ref)
                 .with_message("Expression cannot be used as a reference")),
@@ -1640,6 +1699,12 @@ impl<'a> Interpreter<'a> {
             }
             AstNodeData::UnaryOp { op_id, expr_id } => {
                 let op = data_store.resolve_ast_string(*op_id);
+                // A spill reference reads like the range it names.
+                if op == "#" {
+                    return self.range_value(self.spill_reference(
+                        self.evaluate_arena_ast_as_reference(*expr_id, data_store, sheet_registry),
+                    ));
+                }
                 let expr = if op == "@" {
                     self.evaluate_arena_ast(*expr_id, data_store, sheet_registry)?
                 } else {
@@ -1899,6 +1964,10 @@ impl<'a> Interpreter<'a> {
             ASTNodeType::Literal(v) => Ok(crate::traits::CalcValue::Scalar(v.clone())),
             ASTNodeType::Omitted => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(0.0))),
             ASTNodeType::Reference { reference, .. } => self.eval_ast_reference_to_calc(reference),
+            // A spill reference reads like the range it names.
+            ASTNodeType::UnaryOp { op, expr } if op == "#" => {
+                self.range_value(self.spill_reference(self.evaluate_ast_as_reference(expr)))
+            }
             ASTNodeType::UnaryOp { op, expr } => self
                 .eval_unary(op, expr)
                 .map(crate::traits::CalcValue::Scalar),
@@ -1918,6 +1987,9 @@ impl<'a> Interpreter<'a> {
             ASTNodeType::Literal(v) => Ok(crate::traits::CalcValue::Scalar(v.clone())),
             ASTNodeType::Omitted => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(0.0))),
             ASTNodeType::Reference { reference, .. } => self.eval_ast_reference_to_calc(reference),
+            ASTNodeType::UnaryOp { op, expr } if op == "#" => {
+                self.range_value(self.spill_reference(self.evaluate_ast_as_reference(expr)))
+            }
             ASTNodeType::UnaryOp { op, expr } => {
                 // For now, reuse existing unary implementation (which recurses).
                 // In a later phase, we can map plan_node.children[0].

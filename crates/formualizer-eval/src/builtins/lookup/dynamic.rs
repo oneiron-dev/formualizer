@@ -2451,9 +2451,17 @@ impl Function for SequenceFn {
         let cols = crate::coercion::snapped_whole_number(num(1)?) as i64;
         let start = num(2)?;
         let step = num(3)?;
-        if rows <= 0 || cols <= 0 {
+        // No rows or no columns is an empty array, #CALC! (Excel for Windows
+        // 16.0.20430: ERROR.TYPE of SEQUENCE(0)'s cell is 14, probe E11 of
+        // ops/excel-parse-probe-20261008.md); fewer is #VALUE!.
+        if rows < 0 || cols < 0 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new(ExcelErrorKind::Value),
+            )));
+        }
+        if rows == 0 || cols == 0 {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                ExcelError::new(ExcelErrorKind::Calc),
             )));
         }
         if let Some(e) = generated_array_too_large(rows, cols) {
@@ -3858,11 +3866,19 @@ mod tests {
     }
 
     #[test]
-    fn sequence_negative_and_zero_dims_keep_value_error() {
+    fn sequence_negative_dims_are_value_and_zero_dims_calc() {
+        // Excel for Windows 16.0.20430: SEQUENCE(0,5) and SEQUENCE(5,0) are
+        // #CALC!, SEQUENCE(-3,5) and SEQUENCE(5,-1) #VALUE! (probe Q of
+        // ops/excel-parse-probe-20261008.md).
         let wb = TestWorkbook::new().with_function(Arc::new(SequenceFn));
         let ctx = wb.interpreter();
         let f = ctx.context.get_function("", "SEQUENCE").unwrap();
-        for (r, c) in [(0i64, 5i64), (-3, 5), (5, 0), (5, -1)] {
+        for (r, c, kind) in [
+            (0i64, 5i64, formualizer_common::ExcelErrorKind::Calc),
+            (-3, 5, formualizer_common::ExcelErrorKind::Value),
+            (5, 0, formualizer_common::ExcelErrorKind::Calc),
+            (5, -1, formualizer_common::ExcelErrorKind::Value),
+        ] {
             let rows = lit(LiteralValue::Int(r));
             let cols = lit(LiteralValue::Int(c));
             let args = vec![
@@ -3874,14 +3890,8 @@ mod tests {
                 .unwrap()
                 .into_literal()
             {
-                LiteralValue::Error(e) => {
-                    assert_eq!(
-                        e.kind,
-                        formualizer_common::ExcelErrorKind::Value,
-                        "SEQUENCE({r},{c})"
-                    )
-                }
-                other => panic!("expected #VALUE! for SEQUENCE({r},{c}), got {other:?}"),
+                LiteralValue::Error(e) => assert_eq!(e.kind, kind, "SEQUENCE({r},{c})"),
+                other => panic!("expected {kind} for SEQUENCE({r},{c}), got {other:?}"),
             }
         }
     }

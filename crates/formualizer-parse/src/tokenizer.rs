@@ -719,6 +719,22 @@ fn reference_value_contains_range_colon(value: &str) -> bool {
     value_part.contains(':')
 }
 
+/// `#REF!` is a reference as well as an error: Excel writes a deleted
+/// reference so (`Sheet1!#REF!`, `#REF!:INDEX(#REF!,5)` after the column a
+/// range ended on is deleted), and the range and intersection operators take
+/// it as an operand.
+fn is_reference_error(value: &str) -> bool {
+    value.eq_ignore_ascii_case("#REF!")
+}
+
+/// Whether `#REF!` starts at `offset`: `B2:#REF!` is a range to a deleted
+/// reference.
+fn next_is_reference_error(formula: &str, offset: usize) -> bool {
+    formula
+        .get(offset..offset + 5)
+        .is_some_and(is_reference_error)
+}
+
 fn is_reference_operand_value(value: &str) -> bool {
     operand_subtype(value) == TokenSubType::Range
         && (reference_value_contains_range_colon(value)
@@ -1365,6 +1381,10 @@ impl<'a> SpanTokenizer<'a> {
                     .formula
                     .get(prev.start..prev.end)
                     .is_some_and(is_reference_operand_value),
+                TokenType::Operand if prev.subtype == TokenSubType::Error => self
+                    .formula
+                    .get(prev.start..prev.end)
+                    .is_some_and(is_reference_error),
                 _ => false,
             },
             None => false,
@@ -1380,7 +1400,9 @@ impl<'a> SpanTokenizer<'a> {
             return reference_value_contains_range_colon(value)
                 || (value.contains('[') && !is_external_book_prefixed(value))
                 || (value.contains('!')
-                    && next_reference_has_sheet_qualifier(self.formula, self.offset + 1));
+                    && next_reference_has_sheet_qualifier(self.formula, self.offset + 1))
+                || (is_reference_operand_value(value)
+                    && next_is_reference_error(self.formula, self.offset + 1));
         }
         self.prev_is_reference_producing()
     }
@@ -2179,6 +2201,9 @@ impl Tokenizer {
                 TokenType::Operand if prev.subtype == TokenSubType::Range => {
                     is_reference_operand_value(&prev.value)
                 }
+                TokenType::Operand if prev.subtype == TokenSubType::Error => {
+                    is_reference_error(&prev.value)
+                }
                 _ => false,
             },
             None => false,
@@ -2194,7 +2219,9 @@ impl Tokenizer {
             return reference_value_contains_range_colon(value)
                 || (value.contains('[') && !is_external_book_prefixed(value))
                 || (value.contains('!')
-                    && next_reference_has_sheet_qualifier(&self.formula, self.offset + 1));
+                    && next_reference_has_sheet_qualifier(&self.formula, self.offset + 1))
+                || (is_reference_operand_value(value)
+                    && next_is_reference_error(&self.formula, self.offset + 1));
         }
         self.prev_is_reference_producing()
     }

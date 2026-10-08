@@ -113,6 +113,71 @@ mod tests {
             assert_error_kind("=[1]Sheet1!#REF!", ExcelErrorKind::Ref);
         }
 
+        /// Excel writes a deleted reference as `#REF!`, also where it was an
+        /// operand of the range or intersection operator: deleting the column
+        /// a range ended on turns `A1:INDEX(B:B,5)` into `#REF!:INDEX(#REF!,5)`
+        /// (the defined names of SpreadsheetBench 14207 hold
+        /// `Sheet1!#REF!:INDEX(Sheet1!#REF!,COUNTA(Sheet1!#REF!))`). Excel for
+        /// Windows 16.0.20430 takes `#REF!` on either side of `:` and before
+        /// ` `, and no other error literal (`=#N/A:B2` is not a formula):
+        /// probes P01-P32 of ops/excel-parse-probe-20261008.md.
+        #[test]
+        fn reference_error_is_a_reference_operand() {
+            let ref_error = |node: &ASTNode| {
+                matches!(
+                    &node.node_type,
+                    ASTNodeType::Literal(LiteralValue::Error(e)) if e.kind == ExcelErrorKind::Ref
+                )
+            };
+            for (formula, operator, error_left, error_right) in [
+                ("=#REF!:B2", ":", true, false),
+                ("=B2:#REF!", ":", false, true),
+                ("=#REF!:#REF!", ":", true, true),
+                ("=#ref!:B2", ":", true, false),
+                ("=Sheet1!#REF!:B2", ":", true, false),
+                ("=#REF!:INDEX(#REF!,COUNTA(#REF!))", ":", true, false),
+                (
+                    "=Sheet1!#REF!:INDEX(Sheet1!#REF!,COUNTA(Sheet1!#REF!))",
+                    ":",
+                    true,
+                    false,
+                ),
+                ("=#REF! B2", " ", true, false),
+            ] {
+                match parse_span(formula)
+                    .unwrap_or_else(|e| panic!("{formula}: {e:?}"))
+                    .node_type
+                {
+                    ASTNodeType::BinaryOp { op, left, right } => {
+                        assert_eq!(op, operator, "{formula}");
+                        assert_eq!(ref_error(&left), error_left, "{formula}");
+                        assert_eq!(ref_error(&right), error_right, "{formula}");
+                    }
+                    other => panic!("{formula}: expected {operator}, got {other:?}"),
+                }
+                // The token-list tokenizer splits the operator out the same way.
+                let tokens = crate::tokenizer::Tokenizer::new(formula)
+                    .unwrap_or_else(|e| panic!("{formula}: {e:?}"))
+                    .items;
+                assert!(
+                    tokens.iter().any(|token| token.token_type
+                        == crate::tokenizer::TokenType::OpInfix
+                        && token.value == operator),
+                    "{formula}: {tokens:?}"
+                );
+            }
+            for formula in [
+                "=#N/A:B2",
+                "=#DIV/0!:B2",
+                "=#VALUE!:B2",
+                "=#NAME?:B2",
+                "=#NULL!:B2",
+                "=#NUM!:B2",
+            ] {
+                assert!(parse_span(formula).is_err(), "{formula} is not a formula");
+            }
+        }
+
         #[test]
         fn negative_unknown_error_code_with_sheet_prefix() {
             // Classic and span parsers must both reject unknown error codes.

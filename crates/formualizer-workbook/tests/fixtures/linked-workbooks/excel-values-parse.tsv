@@ -1,0 +1,34 @@
+# Excel for Windows 16.0.20430 values of probe-w2-parse-L1 (ops/excel-parse-probe-20261008.md, job probe-w2-parse-L1): spill
+# references to a closed linked workbook's cells and to legacy formulas, and the defined name SpreadsheetBench 14207 keeps
+# for a deleted range; workbook, cell, cached type (n, str, b, e), value, formula.
+probe-w2-parse-L1.xlsx	E1	e	#REF!	=SUM(_xlfn.ANCHORARRAY([1]Ref!$F$2))
+probe-w2-parse-L1.xlsx	E2	e	#REF!	=ROWS(_xlfn.ANCHORARRAY([1]Ref!$F$2))
+probe-w2-parse-L1.xlsx	E3	n	4	=ERROR.TYPE(_xlfn.ANCHORARRAY([1]Ref!$F$2))
+probe-w2-parse-L1.xlsx	E4	b	0	=ISREF(_xlfn.ANCHORARRAY([1]Ref!$F$2))
+probe-w2-parse-L1.xlsx	E5	str	e	=IFERROR(SUM(_xlfn.ANCHORARRAY([1]Ref!$F$2)),"e")
+probe-w2-parse-L1.xlsx	E6	e	#REF!	=_xlfn.ANCHORARRAY([1]Ref!$F$2)
+probe-w2-parse-L1.xlsx	E7	e	#REF!	=_xlfn.ANCHORARRAY([1]Ref!$F$2)
+probe-w2-parse-L1.xlsx	E8	e	#REF!	=SUM(_xlfn.ANCHORARRAY([1]Empty!$F$2))
+probe-w2-parse-L1.xlsx	E9	n	4	=ERROR.TYPE(_xlfn.ANCHORARRAY([1]Empty!$F$2))
+probe-w2-parse-L1.xlsx	E10	e	#REF!	=SUM(_xlfn.ANCHORARRAY([1]Err!$F$2))
+probe-w2-parse-L1.xlsx	E11	n	4	=ERROR.TYPE(_xlfn.ANCHORARRAY([1]Err!$F$2))
+probe-w2-parse-L1.xlsx	E12	e	#REF!	=SUM(All)
+probe-w2-parse-L1.xlsx	E13	e	#REF!	=ROWS(All)
+probe-w2-parse-L1.xlsx	E14	n	4	=ERROR.TYPE(All)
+probe-w2-parse-L1.xlsx	E15	n	1	=COUNTA(All)
+probe-w2-parse-L1.xlsx	E16	n	1	=[1]Ref!$F$2
+probe-w2-parse-L1.xlsx	E17	b	1	=ISERROR(Gone)
+probe-w2-parse-L1.xlsx	E18	n	4	=ERROR.TYPE(Gone)
+probe-w2-parse-L1.xlsx	E19	n	1	=COUNTA(Gone)
+probe-w2-parse-L1.xlsx	E20	e	#REF!	=Sheet1!#REF!:INDEX(Sheet1!#REF!,COUNTA(Sheet1!#REF!))
+probe-w2-parse-L1.xlsx	E21	str	e	=IFERROR(ROWS(Sheet1!#REF!:INDEX(Sheet1!#REF!,COUNTA(Sheet1!#REF!))),"e")
+probe-w2-parse-L1.xlsx	E22	n	2	=SUM(_xlfn.ANCHORARRAY(E30))
+probe-w2-parse-L1.xlsx	E23	n	1	=SUM(_xlfn.ANCHORARRAY(E31))
+probe-w2-parse-L1.xlsx	E24	n	1	=SUM(_xlfn.ANCHORARRAY(E32))
+probe-w2-parse-L1.xlsx	E25	n	1	=ROWS(_xlfn.ANCHORARRAY(E31))
+probe-w2-parse-L1.xlsx	E26	n	4	=ERROR.TYPE(_xlfn.ANCHORARRAY(E40))
+probe-w2-parse-L1.xlsx	E27	e	#N/A	=ERROR.TYPE(_xlfn.ANCHORARRAY(E33))
+probe-w2-parse-L1.xlsx	E30	n	2	=1+1
+probe-w2-parse-L1.xlsx	E31	n	1	=_xlfn.SEQUENCE(3)
+probe-w2-parse-L1.xlsx	E32	n	1	=ROW(1:3)
+probe-w2-parse-L1.xlsx	E33	str	x	="x"
