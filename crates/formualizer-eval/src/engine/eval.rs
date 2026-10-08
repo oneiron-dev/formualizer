@@ -1104,6 +1104,34 @@ enum ArrayFormulaShape {
 /// Fit an array formula's result to the cells it was entered over: a single
 /// row or column repeats, positions beyond the result are #N/A and the rest
 /// of a larger result is dropped.
+/// A number (or a date, time or duration, as its serial) stored under
+/// `format`; any other value as it is. A value the format leaves unchanged
+/// keeps its kind. `Err` hands the value back unchanged where the stored
+/// value is not known.
+fn displayed_value(
+    value: LiteralValue,
+    format: &crate::precision::DisplayedFormat,
+    system: formualizer_common::DateSystem,
+) -> Result<LiteralValue, LiteralValue> {
+    let number = match &value {
+        LiteralValue::Number(n) => *n,
+        LiteralValue::Int(i) => *i as f64,
+        LiteralValue::Date(_)
+        | LiteralValue::DateTime(_)
+        | LiteralValue::Time(_)
+        | LiteralValue::Duration(_) => match value.as_serial_number_for(system) {
+            Some(serial) => serial,
+            None => return Ok(value),
+        },
+        _ => return Ok(value),
+    };
+    match format.round(number) {
+        Some(stored) if stored.to_bits() == number.to_bits() => Ok(value),
+        Some(stored) => Ok(LiteralValue::Number(stored)),
+        None => Err(value),
+    }
+}
+
 fn fit_array_formula_result(value: LiteralValue, rows: u32, cols: u32) -> LiteralValue {
     let source = match value {
         LiteralValue::Array(source) if !source.is_empty() && !source[0].is_empty() => source,
@@ -1474,6 +1502,9 @@ pub struct Engine<R> {
     /// (`INDIRECT("'[Book.xlsx]Sheet1'!A1")`); see
     /// [`Self::text_named_workbook`].
     text_named_workbook: std::sync::atomic::AtomicBool,
+    /// Some formula published a number whose stored value under precision
+    /// as displayed is not known; see [`Self::displayed_precision_unknown`].
+    displayed_precision_unknown: std::sync::atomic::AtomicBool,
     thread_pool: Option<Arc<rayon::ThreadPool>>,
     pub recalc_epoch: u64,
     snapshot_id: std::sync::atomic::AtomicU64,
@@ -1547,6 +1578,12 @@ pub struct Engine<R> {
     /// fits declared legacy (CSE) arrays to their extent and takes the
     /// implicit intersection of any other formula's array or range result.
     array_formula_shapes: Option<FxHashMap<(SheetId, u32, u32), ArrayFormulaShape>>,
+    /// "Set precision as displayed": `None` stores formula results at full
+    /// precision. `Some` stores each numeric result as its cell's number
+    /// format shows it, General for a cell not listed (sheet, row, col;
+    /// 0-based).
+    displayed_formats:
+        Option<FxHashMap<(SheetId, u32, u32), Arc<crate::precision::DisplayedFormat>>>,
     /// Areas (sheet, rows, cols; 0-based) whose values an array formula's
     /// spill changed during the current pass, with the anchor that wrote them.
     spill_writes: Vec<(VertexId, SheetId, u32, u32, u32, u32)>,
@@ -3527,6 +3564,7 @@ where
             clock: crate::timezone::SnapshotClock::new(clock),
             rng_draws: std::sync::Mutex::new(FxHashMap::default()),
             text_named_workbook: std::sync::atomic::AtomicBool::new(false),
+            displayed_precision_unknown: std::sync::atomic::AtomicBool::new(false),
             thread_pool,
             recalc_epoch: 0,
             snapshot_id: std::sync::atomic::AtomicU64::new(1),
@@ -3572,6 +3610,7 @@ where
             blocked_pending_spills: Vec::new(),
             blocked_spill_extents: FxHashMap::default(),
             array_formula_shapes: None,
+            displayed_formats: None,
             spill_writes: Vec::new(),
             row_visibility: FxHashMap::default(),
             row_visibility_mask_cache: std::sync::RwLock::new(FxHashMap::default()),
@@ -3706,6 +3745,7 @@ where
             clock: crate::timezone::SnapshotClock::new(clock),
             rng_draws: std::sync::Mutex::new(FxHashMap::default()),
             text_named_workbook: std::sync::atomic::AtomicBool::new(false),
+            displayed_precision_unknown: std::sync::atomic::AtomicBool::new(false),
             thread_pool: Some(thread_pool),
             recalc_epoch: 0,
             snapshot_id: std::sync::atomic::AtomicU64::new(1),
@@ -3751,6 +3791,7 @@ where
             blocked_pending_spills: Vec::new(),
             blocked_spill_extents: FxHashMap::default(),
             array_formula_shapes: None,
+            displayed_formats: None,
             spill_writes: Vec::new(),
             row_visibility: FxHashMap::default(),
             row_visibility_mask_cache: std::sync::RwLock::new(FxHashMap::default()),
@@ -5626,6 +5667,79 @@ where
             );
     }
 
+    /// Store formula results as their cells show them: Excel's "Set precision
+    /// as displayed" (`<calcPr fullPrecision="0"/>`). Each numeric result a
+    /// formula publishes to a cell, including every cell an array formula
+    /// fills or spills into, is rounded by that cell's number format (see
+    /// [`crate::precision`]; [`Self::set_displayed_format`], General
+    /// otherwise), and formulas that read the cell read the rounded value.
+    /// Constants keep their values. Formula-plane spans do not round their
+    /// results, so the formula plane must be off.
+    pub fn use_precision_as_displayed(&mut self) {
+        self.displayed_formats
+            .get_or_insert_with(FxHashMap::default);
+    }
+
+    /// The number format of the cell at `row`/`col` (1-based) under
+    /// [`Self::use_precision_as_displayed`].
+    pub fn set_displayed_format(
+        &mut self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+        format: Arc<crate::precision::DisplayedFormat>,
+    ) {
+        let Some(sheet_id) = self.graph.sheet_id(sheet) else {
+            return;
+        };
+        self.displayed_formats
+            .get_or_insert_with(FxHashMap::default)
+            .insert(
+                (sheet_id, row.saturating_sub(1), col.saturating_sub(1)),
+                format,
+            );
+    }
+
+    /// The result a formula at `cell` publishes: finalized
+    /// ([`crate::engine::result_finalization::finalize_formula_result`]) and,
+    /// under precision as displayed, each number rounded by the format of the
+    /// cell it goes to (an array's element (i, j) goes to the cell i rows
+    /// down and j columns right of `cell`).
+    fn published_formula_result(&self, cell: CellRef, value: LiteralValue) -> LiteralValue {
+        let value = crate::engine::result_finalization::finalize_formula_result(value);
+        let Some(formats) = &self.displayed_formats else {
+            return value;
+        };
+        let general = crate::precision::DisplayedFormat::general();
+        let system = self.config.date_system;
+        let displayed = |value: LiteralValue, row: u32, col: u32| {
+            let format = formats
+                .get(&(cell.sheet_id, row, col))
+                .map_or(&general, |format| format.as_ref());
+            displayed_value(value, format, system).unwrap_or_else(|value| {
+                self.displayed_precision_unknown
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                value
+            })
+        };
+        let (row, col) = (cell.coord.row(), cell.coord.col());
+        match value {
+            LiteralValue::Array(rows) => LiteralValue::Array(
+                rows.into_iter()
+                    .enumerate()
+                    .map(|(i, values)| {
+                        values
+                            .into_iter()
+                            .enumerate()
+                            .map(|(j, value)| displayed(value, row + i as u32, col + j as u32))
+                            .collect()
+                    })
+                    .collect(),
+            ),
+            value => displayed(value, row, col),
+        }
+    }
+
     /// The value a formula at `cell` produces from its evaluated result under
     /// the declared array semantics.
     fn shape_formula_result<'c>(
@@ -5821,6 +5935,15 @@ where
     /// workbook's #REF!. A host that cannot vouch for that result refuses it.
     pub fn text_named_workbook(&self) -> bool {
         self.text_named_workbook
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether a formula evaluated under [`Self::use_precision_as_displayed`]
+    /// published a number whose cell format Excel's stored value is not known
+    /// for (a section of literal text only showing a number); the number was
+    /// published unrounded, so a host refuses the result.
+    pub fn displayed_precision_unknown(&self) -> bool {
+        self.displayed_precision_unknown
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -21068,7 +21191,8 @@ where
             Ok(cv) => {
                 let derived_format = cv.format_id();
                 self.record_derived_format(vertex_id, derived_format);
-                let result_literal = crate::engine::result_finalization::finalize_formula_result(
+                let result_literal = self.published_formula_result(
+                    cell_ref,
                     self.shape_formula_result(&interpreter, cell_ref, ast_id, cv),
                 );
                 let output_sheet_name = sheet_name.to_string();
@@ -27200,7 +27324,8 @@ where
                     .unwrap()
                     .insert(vertex_id, format);
                 self.record_derived_format(vertex_id, format);
-                crate::engine::result_finalization::finalize_formula_result(
+                self.published_formula_result(
+                    cell_ref,
                     self.shape_formula_result(&interpreter, cell_ref, ast_id, cv),
                 )
             })
@@ -30453,7 +30578,8 @@ where
                             .unwrap()
                             .insert(vertex_id, format);
                         self.record_derived_format(vertex_id, format);
-                        crate::engine::result_finalization::finalize_formula_result(
+                        self.published_formula_result(
+                            cell_ref,
                             self.shape_formula_result(&interpreter, cell_ref, ast_id, cv),
                         )
                     })

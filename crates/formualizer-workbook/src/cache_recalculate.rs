@@ -456,8 +456,13 @@ pub fn recalculate_xlsx_bytes(
     options: XlsxRecalculateOptions,
 ) -> Result<XlsxRecalculateResult, IoError> {
     let (mut archive, mut tags) = package::admit(bytes, &options)?;
-    let (sheets, date_system, extension, defined_names) =
-        package::discover(&mut archive, &options)?;
+    let package::Discovered {
+        sheets,
+        date_system,
+        extension,
+        defined_names,
+        precision_as_displayed,
+    } = package::discover(&mut archive, &options)?;
     let mut plans = Vec::new();
     let mut observed = 0;
     let mut logical_cells = 0u64;
@@ -574,6 +579,14 @@ pub fn recalculate_xlsx_bytes(
     // XLSX dates are serial caches. Native chrono materialization cannot retain
     // Excel-1900 phantom serial 60 and can discard fractional duration precision.
     config.temporal_egress = formualizer_eval::engine::TemporalEgress::Serial;
+    // Formula-plane spans publish results unrounded; under precision as
+    // displayed every formula evaluates on its own.
+    let cell_formats = if precision_as_displayed {
+        config.formula_plane_mode = formualizer_eval::engine::FormulaPlaneMode::Off;
+        Some(package::cell_formats(&mut archive, &options)?)
+    } else {
+        None
+    };
     let mut engine: Engine<WBResolver> = Engine::new(WBResolver::default(), config);
     let mut load_limits = engine.workbook_load_limits().clone();
     load_limits.max_sheet_cols = load_limits.max_sheet_cols.min(options.limits.max_columns);
@@ -657,12 +670,21 @@ pub fn recalculate_xlsx_bytes(
             }
         }
     }
+    if let Some(formats) = &cell_formats {
+        displayed_formats(&mut engine, &sheets, &plans, formats)?;
+    }
     if let Some(cancel) = options.cancel.clone() {
         engine.evaluate_all_cancellable(cancel)?;
     } else {
         engine.evaluate_all()?;
     }
     checkpoint(&options.cancel)?;
+    if engine.displayed_precision_unknown() {
+        return Err(unsupported(
+            "precision as displayed",
+            "a number shown by a format section of literal text only",
+        ));
+    }
     let calc_always = calc_always::calc_always(&engine, &sheets, &plans, &defined_names)?;
     checkpoint(&options.cancel)?;
     // INDIRECT text that names a workbook ('[Book.xlsx]Sheet1'!A1) reads this
@@ -864,6 +886,64 @@ pub fn recalculate_xlsx_bytes(
         cache_cells_changed: changed,
         worksheet_parts_changed,
     })
+}
+
+/// "Set precision as displayed" (`<calcPr fullPrecision="0"/>`): Excel stores
+/// each formula result, and each value an array formula fills or spills into
+/// a cell, as the cell's number format shows it (see
+/// [`formualizer_eval::precision`]). Give the engine the format of every
+/// formula cell and array member that is not General; a format whose stored
+/// values are not known is refused before anything is evaluated.
+fn displayed_formats(
+    engine: &mut Engine<WBResolver>,
+    sheets: &[package::Sheet],
+    plans: &[(Vec<u8>, sheet::Scan)],
+    formats: &[Result<String, u16>],
+) -> Result<(), IoError> {
+    use formualizer_eval::precision::DisplayedFormat;
+    use std::sync::Arc;
+    engine.use_precision_as_displayed();
+    let general = DisplayedFormat::general();
+    let mut by_style: BTreeMap<usize, Arc<DisplayedFormat>> = BTreeMap::new();
+    for (sheet, (_, scan)) in sheets.iter().zip(plans) {
+        let members = scan.members.iter().map(|member| &member.cell);
+        for cell in scan.cells.iter().chain(members) {
+            let style = match cell.style.as_deref().map(str::trim) {
+                None => 0,
+                Some(style) => style
+                    .parse::<usize>()
+                    .map_err(|_| unsupported("invalid cell style index", &sheet.name))?,
+            };
+            let format = match by_style.get(&style) {
+                Some(format) => format.clone(),
+                None => {
+                    let parsed = match formats.get(style) {
+                        // A package without styles formats every cell General.
+                        None if formats.is_empty() => general.clone(),
+                        None => {
+                            return Err(unsupported(
+                                "precision as displayed",
+                                format!("cell style {style} past the style table"),
+                            ));
+                        }
+                        Some(Err(id)) => {
+                            return Err(unsupported(
+                                "precision as displayed",
+                                format!("number format id {id} is not defined"),
+                            ));
+                        }
+                        Some(Ok(code)) => DisplayedFormat::parse(code)
+                            .map_err(|reason| unsupported("precision as displayed", reason))?,
+                    };
+                    by_style.entry(style).or_insert(Arc::new(parsed)).clone()
+                }
+            };
+            if *format != general {
+                engine.set_displayed_format(&sheet.name, cell.row, cell.col, format);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Flag a formula calculated always. Excel writes `ca="1"` after the

@@ -636,14 +636,17 @@ pub(super) fn relationships(
     })?;
     Ok(result)
 }
-/// The sheets, the date system, the file extension of the workbook's kind
-/// (`xlsx`, `xltx`, `xlsm`, `xltm` or `xlam`) and the defined names.
-pub(super) type Discovered = (
-    Vec<Sheet>,
-    formualizer_common::DateSystem,
-    &'static str,
-    Vec<DefinedName>,
-);
+/// What the workbook part declares and relates.
+pub(super) struct Discovered {
+    pub sheets: Vec<Sheet>,
+    pub date_system: formualizer_common::DateSystem,
+    /// The file extension of the workbook's kind (`xlsx`, `xltx`, `xlsm`,
+    /// `xltm` or `xlam`).
+    pub extension: &'static str,
+    pub defined_names: Vec<DefinedName>,
+    /// "Set precision as displayed" is on (`<calcPr fullPrecision="0"/>`).
+    pub precision_as_displayed: bool,
+}
 /// Read and validate the workbook part and the parts it relates.
 pub(super) fn discover(
     archive: &mut Archive<'_>,
@@ -697,6 +700,7 @@ pub(super) fn discover(
     let mut defined_names = HashSet::new();
     let mut formulas: Vec<DefinedName> = Vec::new();
     let mut sheet_ids = HashSet::new();
+    let mut precision_as_displayed = false;
     xml::walk(&data, options, |path, node| {
         if let xml::Kind::Text(text) = &node.kind {
             if xml::path_is(
@@ -774,6 +778,13 @@ pub(super) fn discover(
                 sheet: scope,
                 formula: String::new(),
             });
+        }
+        if e.local == "calcPr" {
+            // An XML Schema boolean: surrounding whitespace collapses.
+            precision_as_displayed = matches!(
+                node.value("fullPrecision").map(str::trim),
+                Some("0" | "false")
+            );
         }
         if e.local == "workbookPr" {
             if workbook_pr || !xml::path_is(path, xml::MAIN, &["workbook", "workbookPr"]) {
@@ -882,7 +893,95 @@ pub(super) fn discover(
         }
     }
     let extension = content_types::validate(archive, &sheets, options)?;
-    Ok((sheets, epoch, extension, formulas))
+    Ok(Discovered {
+        sheets,
+        date_system: epoch,
+        extension,
+        defined_names: formulas,
+        precision_as_displayed,
+    })
+}
+
+/// The number-format code of each cell style (`cellXfs`, by index): the
+/// style's `numFmt` definition, else the built-in format of its id. `Err`
+/// holds an id that is neither.
+pub(super) fn cell_formats(
+    archive: &mut Archive<'_>,
+    options: &XlsxRecalculateOptions,
+) -> Result<Vec<Result<String, u16>>, IoError> {
+    const STYLES: &str = "xl/styles.xml";
+    if !archive.file_names().any(|name| name == STYLES) {
+        return Ok(Vec::new());
+    }
+    let data = read_part(archive, STYLES, options.limits.max_worksheet_bytes)?;
+    let mut codes = BTreeMap::new();
+    let mut ids = Vec::new();
+    let id = |value: Option<&str>| {
+        value
+            .map_or(Ok(0), |id| id.trim().parse::<u16>())
+            .map_err(|_| unsupported("invalid number format id", STYLES))
+    };
+    xml::walk(&data, options, |path, node| {
+        if !matches!(node.kind, xml::Kind::Open { .. }) {
+            return Ok(());
+        }
+        if xml::path_is(path, xml::MAIN, &["styleSheet", "numFmts", "numFmt"]) {
+            let code = node.required("formatCode")?.to_owned();
+            if codes.insert(id(node.value("numFmtId"))?, code).is_some() {
+                return Err(unsupported("duplicate number format id", STYLES));
+            }
+        } else if xml::path_is(path, xml::MAIN, &["styleSheet", "cellXfs", "xf"]) {
+            ids.push(id(node.value("numFmtId"))?);
+        }
+        Ok(())
+    })?;
+    Ok(ids
+        .into_iter()
+        .map(|id| {
+            codes
+                .get(&id)
+                .cloned()
+                .or_else(|| {
+                    formualizer_common::numfmt::builtin_code(id)
+                        .or_else(|| locale_builtin_code(id))
+                        .map(str::to_owned)
+                })
+                .ok_or(id)
+        })
+        .collect())
+}
+
+/// How en-US Excel for Windows 16.0.20430 reads a cell style whose format
+/// id has no definition and is outside the OOXML built-in formats (job
+/// probe-w2-precision-3): its Thai and East Asian built-ins show as these
+/// codes, and every other id below 164 as General.
+fn locale_builtin_code(id: u16) -> Option<&'static str> {
+    Some(match id {
+        23..=26 | 82..=163 => "General",
+        27..=31 | 36 | 50..=58 | 71 | 72 => "m/d/yyyy",
+        32..=35 | 77 => "h:mm:ss",
+        59 => "0",
+        60 => "0.00",
+        61 => "#,##0",
+        62 => "#,##0.00",
+        63 => "$#,##0_);($#,##0)",
+        64 => "$#,##0_);[Red]($#,##0)",
+        65 => "$#,##0.00_);($#,##0.00)",
+        66 => "$#,##0.00_);[Red]($#,##0.00)",
+        67 => "0%",
+        68 => "0.00%",
+        69 => "# ?/?",
+        70 => "# ??/??",
+        73 => "d-mmm-yy",
+        74 => "d-mmm",
+        75 => "mmm-yy",
+        76 => "h:mm",
+        78 => "m/d/yyyy h:mm",
+        79 => "mm:ss",
+        80 => "[h]:mm:ss",
+        81 => "mm:ss.0",
+        _ => return None,
+    })
 }
 fn cell_coordinate(value: &str, part: &str) -> Result<(u32, u32), IoError> {
     let (row, col, _, _) = formualizer_common::coord::parse_a1_1based(value)

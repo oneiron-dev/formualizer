@@ -35,6 +35,7 @@ pub mod test_workbook;
 
 pub mod engine;
 pub mod planner;
+pub mod precision;
 pub mod telemetry;
 
 // Arrow-backed storage (Phase A)

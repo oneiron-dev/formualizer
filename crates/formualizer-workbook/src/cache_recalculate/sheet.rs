@@ -49,6 +49,9 @@ pub(super) struct Cell {
     /// The cell's `vm` (1-based value-metadata index tagging its cached error
     /// with a rich error) and the attribute's span.
     pub value_metadata: Option<(usize, Range<usize>)>,
+    /// The cell's style (`s`, an index into the styles' `cellXfs`), as
+    /// written; absent is style 0.
+    pub style: Option<String>,
 }
 /// A value cell inside a multi-cell array formula's extent; `anchor` indexes
 /// the formula cell in [`Scan::cells`]. `marked`: the member holds the empty
@@ -302,6 +305,7 @@ pub(super) fn scan(
                             formula_attrs_end: 0,
                             shared_master: None,
                             value_metadata,
+                            style: node.value("s").map(str::to_owned),
                         });
                     }
                 }

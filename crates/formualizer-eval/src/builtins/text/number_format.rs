@@ -14,6 +14,7 @@
 //! codes mixed with digit placeholders, `%` or `@`.
 
 use crate::engine::DateSystem;
+use crate::precision::Section as DisplayedSection;
 use formualizer_common::{ExcelError, try_serial_to_display_date_parts_for};
 
 const MONTHS: [&str; 12] = [
@@ -456,6 +457,80 @@ pub(crate) fn format_number(
     Ok(if negative { format!("-{body}") } else { body })
 }
 
+/// What "Set precision as displayed" keeps of a number under each of the
+/// positive, negative and zero sections of `code` (see [`crate::precision`]);
+/// a fourth section formats text only. Excel reads a lone conditional
+/// section as that section and General.
+pub(crate) fn displayed_sections(code: &str) -> Result<Vec<DisplayedSection>, String> {
+    let sections =
+        parse_sections(code).map_err(|_| format!("a number format Excel cannot read: {code:?}"))?;
+    let mut displayed = sections
+        .iter()
+        .take(3)
+        .map(|section| displayed_section(section, code))
+        .collect::<Result<Vec<_>, _>>()?;
+    if sections.len() == 1 && sections[0].condition.is_some() {
+        displayed.push(DisplayedSection::Significant);
+    }
+    Ok(displayed)
+}
+
+fn displayed_section(section: &Section, code: &str) -> Result<DisplayedSection, String> {
+    let toks = &section.toks;
+    if toks.is_empty() {
+        return Ok(DisplayedSection::Empty);
+    }
+    if section.has(&Tok::General) || section.has(&Tok::At) || section.is_date() {
+        return Ok(DisplayedSection::Significant);
+    }
+    let digits = |toks: &[Tok]| toks.iter().filter(|t| matches!(t, Tok::Digit(_))).count();
+    // A section of literal text only (`"none"`) shows no number at all.
+    if digits(toks) == 0 {
+        return Ok(DisplayedSection::Unknown);
+    }
+    if let Some(e) = toks.iter().position(|t| matches!(t, Tok::Exp { .. })) {
+        // Excel for Windows will not take `e+` as a cell format.
+        if matches!(toks[e], Tok::Exp { upper: false, .. }) {
+            return Err(format!(
+                "a lowercase exponent Excel does not format cells with: {code:?}"
+            ));
+        }
+        let (_, decimals, _) = split_point(&toks[..e]);
+        return Ok(DisplayedSection::Scientific {
+            digits: 1 + digits(decimals) as i32,
+        });
+    }
+    if let Some(slash) = fraction_slash(toks) {
+        // As shown: a fixed denominator, else up to as many digits as the
+        // denominator has placeholders.
+        let (places, fixed, _) = fraction_denominator(toks, slash);
+        let denominator = if fixed.is_empty() {
+            None
+        } else {
+            Some(
+                fixed
+                    .parse::<u64>()
+                    .map_err(|_| format!("a fraction denominator out of range: {code:?}"))?
+                    .max(1),
+            )
+        };
+        let places = u32::try_from(places.len().max(1))
+            .ok()
+            .filter(|places| *places <= 15)
+            .ok_or_else(|| format!("a fraction denominator out of range: {code:?}"))?;
+        return Ok(DisplayedSection::Fraction {
+            denominator,
+            places,
+        });
+    }
+    let (int_toks, frac_toks, _) = split_point(toks);
+    let percents = toks.iter().filter(|t| **t == Tok::Percent).count() as i32;
+    Ok(DisplayedSection::Fixed {
+        decimals: digits(frac_toks) as i32,
+        shift: 2 * percents - 3 * comma_roles(int_toks, frac_toks).scale,
+    })
+}
+
 /// Render text with the text section (the fourth, or one containing `@`).
 /// Without one, Excel returns the text unchanged.
 pub(crate) fn format_text(text: &str, code: &str) -> Result<String, ExcelError> {
@@ -591,25 +666,33 @@ fn group(digits: &str) -> String {
     out
 }
 
-fn format_numeric(section: &Section, value: f64) -> Result<String, ExcelError> {
-    let toks = &section.toks;
-    if toks.iter().any(|t| matches!(t, Tok::Exp { .. })) {
-        return Ok(format_scientific(toks, value));
-    }
-    if let Some(slash) = fraction_slash(toks) {
-        return Ok(format_fraction(toks, slash, value));
-    }
+/// The integer and fraction tokens of a number section, split at its first
+/// `.`.
+fn split_point(toks: &[Tok]) -> (&[Tok], &[Tok], Option<usize>) {
     let point = toks.iter().position(|t| *t == Tok::Point);
-    let (int_toks, frac_toks) = match point {
-        Some(p) => (&toks[..p], &toks[p + 1..]),
-        None => (&toks[..], &toks[..0]),
-    };
-    let digit_at = |ts: &[Tok], i: usize| matches!(ts.get(i), Some(Tok::Digit(_)));
+    match point {
+        Some(p) => (&toks[..p], &toks[p + 1..], point),
+        None => (toks, &toks[..0], None),
+    }
+}
+
+/// What each `,` of a number section does: a comma between integer digit
+/// placeholders groups thousands; a run of commas right after the last
+/// integer or fraction placeholder divides by 1000 each (`scale`); any other
+/// comma is shown as written (`commas`, `frac_commas`).
+struct CommaRoles {
+    grouping: bool,
+    scale: i32,
+    commas: Vec<bool>,
+    frac_commas: Vec<bool>,
+}
+
+fn comma_roles(int_toks: &[Tok], frac_toks: &[Tok]) -> CommaRoles {
     let last_int_digit = int_toks.iter().rposition(|t| matches!(t, Tok::Digit(_)));
     let first_int_digit = int_toks.iter().position(|t| matches!(t, Tok::Digit(_)));
     let mut grouping = false;
     let mut scale = 0i32;
-    let mut commas = vec![false; int_toks.len()]; // literal commas
+    let mut commas = vec![false; int_toks.len()];
     for (i, t) in int_toks.iter().enumerate() {
         if *t != Tok::Comma {
             continue;
@@ -638,6 +721,32 @@ fn format_numeric(section: &Section, value: f64) -> Result<String, ExcelError> {
             }
         }
     }
+    CommaRoles {
+        grouping,
+        scale,
+        commas,
+        frac_commas,
+    }
+}
+
+fn format_numeric(section: &Section, value: f64) -> Result<String, ExcelError> {
+    let toks = &section.toks;
+    if toks.iter().any(|t| matches!(t, Tok::Exp { .. })) {
+        return Ok(format_scientific(toks, value));
+    }
+    if let Some(slash) = fraction_slash(toks) {
+        return Ok(format_fraction(toks, slash, value));
+    }
+    let (int_toks, frac_toks, point) = split_point(toks);
+    let digit_at = |ts: &[Tok], i: usize| matches!(ts.get(i), Some(Tok::Digit(_)));
+    let last_int_digit = int_toks.iter().rposition(|t| matches!(t, Tok::Digit(_)));
+    let first_int_digit = int_toks.iter().position(|t| matches!(t, Tok::Digit(_)));
+    let CommaRoles {
+        grouping,
+        scale,
+        commas,
+        frac_commas,
+    } = comma_roles(int_toks, frac_toks);
     let percents = toks.iter().filter(|t| **t == Tok::Percent).count() as i32;
     let scaled = value * 100f64.powi(percents) / 1000f64.powi(scale);
     let decimals = frac_toks
@@ -755,22 +864,10 @@ fn fraction_slash(toks: &[Tok]) -> Option<usize> {
     (before && after).then_some(slash)
 }
 
-fn format_fraction(toks: &[Tok], slash: usize, value: f64) -> String {
-    // Numerator placeholders: the digit run ending right before the slash.
-    let mut num_start = slash;
-    while num_start > 0 && matches!(toks[num_start - 1], Tok::Digit(_)) {
-        num_start -= 1;
-    }
-    let num_kinds: Vec<char> = toks[num_start..slash]
-        .iter()
-        .filter_map(|t| match t {
-            Tok::Digit(k) => Some(*k),
-            _ => None,
-        })
-        .collect();
-    let int_toks = &toks[..num_start];
-    let has_int = int_toks.iter().any(|t| matches!(t, Tok::Digit(_)));
-    // Denominator: placeholders, or a fixed number made of digits.
+/// The denominator of a fraction section after its `slash`: its digit
+/// placeholders, or the fixed number written in digits (a placeholder after
+/// one adds a `0`), and the index of the token after it.
+fn fraction_denominator(toks: &[Tok], slash: usize) -> (Vec<char>, String, usize) {
     let mut den_end = slash + 1;
     let mut fixed = String::new();
     let mut den_kinds = Vec::new();
@@ -789,6 +886,25 @@ fn format_fraction(toks: &[Tok], slash: usize, value: f64) -> String {
         }
         den_end += 1;
     }
+    (den_kinds, fixed, den_end)
+}
+
+fn format_fraction(toks: &[Tok], slash: usize, value: f64) -> String {
+    // Numerator placeholders: the digit run ending right before the slash.
+    let mut num_start = slash;
+    while num_start > 0 && matches!(toks[num_start - 1], Tok::Digit(_)) {
+        num_start -= 1;
+    }
+    let num_kinds: Vec<char> = toks[num_start..slash]
+        .iter()
+        .filter_map(|t| match t {
+            Tok::Digit(k) => Some(*k),
+            _ => None,
+        })
+        .collect();
+    let int_toks = &toks[..num_start];
+    let has_int = int_toks.iter().any(|t| matches!(t, Tok::Digit(_)));
+    let (den_kinds, fixed, den_end) = fraction_denominator(toks, slash);
     let (whole, frac) = if has_int {
         (value.trunc(), value.fract())
     } else {
@@ -877,7 +993,7 @@ fn format_fraction(toks: &[Tok], slash: usize, value: f64) -> String {
 }
 
 /// Closest fraction with denominator at most `max_den`.
-fn best_fraction(value: f64, max_den: u64) -> (u64, u64) {
+pub(crate) fn best_fraction(value: f64, max_den: u64) -> (u64, u64) {
     let mut best = (value.round() as u64, 1u64);
     let mut best_err = (value - best.0 as f64).abs();
     for den in 1..=max_den {
