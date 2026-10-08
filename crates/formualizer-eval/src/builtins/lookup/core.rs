@@ -11,7 +11,7 @@
 //!   value only with entries of its own type (number, text or logical); the others are skipped.
 
 use super::lookup_utils::{
-    SearchedVector, excel_approximate_search, find_exact_index, reference_extent,
+    SearchedVector, excel_approximate_search, find_exact_index, reference_extent, table_cell,
 };
 use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
 use crate::engine::{DateSystem, lookup_index_cache::LookupAxis};
@@ -670,7 +670,7 @@ impl Function for VLookupFn {
                     // formula cell still shows it as 0 (formula result finalization).
                     Some(i) => Ok(crate::traits::CalcValue::Scalar(
                         match found_index(col_index, width) {
-                            Ok(col) => rv.get_cell(i, col),
+                            Ok(col) => table_cell(ctx, &rv, i, col),
                             Err(error) => LiteralValue::Error(error),
                         },
                     )),
@@ -928,7 +928,7 @@ impl Function for HLookupFn {
                     // An empty target cell stays empty, as in VLOOKUP.
                     Some(i) => Ok(crate::traits::CalcValue::Scalar(
                         match found_index(row_index, height) {
-                            Ok(row) => rv.get_cell(row, i),
+                            Ok(row) => table_cell(ctx, &rv, row, i),
                             Err(error) => LiteralValue::Error(error),
                         },
                     )),

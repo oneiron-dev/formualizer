@@ -497,6 +497,36 @@ fn a_linked_range_a_function_returns_intersects_a_legacy_formula() {
     assert_ref_error(value(9, 4), "=INDEX([2]Failed!A1:B9,0,1) in row 9");
 }
 
+/// A lookup table of a closed linked workbook is read up to the last row and
+/// column the link saved (plus one #REF! on a sheet Excel could not refresh);
+/// the cell VLOOKUP or HLOOKUP returns past them is read from the link, #REF!
+/// on such a sheet and blank otherwise, as in Excel for Windows 16.0.20430
+/// (job probe-w2-links2-3, ops/excel-links2-probe-20261008.md), where the
+/// fork gave a blank (0).
+#[test]
+fn a_lookup_reads_a_table_cell_past_the_saved_ones_from_the_link() {
+    let mut engine = engine_with_failed_sheet();
+    for formula in [
+        "=VLOOKUP(1,[2]Failed!$1:$2,5,FALSE)",
+        "=VLOOKUP(1,[2]Failed!$1:$2,5,TRUE)",
+        "=HLOOKUP(1,[2]Failed!$A:$B,8,TRUE)",
+        "=VLOOKUP(1,[2]Failed!$A:$XFD,9,TRUE)",
+    ] {
+        assert_ref_error(eval(&mut engine, formula), formula);
+    }
+    assert_eq!(
+        eval(
+            &mut engine,
+            "=VLOOKUP(\"apple\",[1]Rates!$1:$2,6,FALSE)&\"x\""
+        ),
+        Some(LiteralValue::Text("x".into()))
+    );
+    assert_eq!(
+        number_like(eval(&mut engine, "=VLOOKUP(2,[2]Failed!$A:$B,2,TRUE)")),
+        Some(LiteralValue::Number(20.0))
+    );
+}
+
 /// Whole numbers as numbers, whatever integer type the engine keeps.
 fn number_like(value: Option<LiteralValue>) -> Option<LiteralValue> {
     match value {

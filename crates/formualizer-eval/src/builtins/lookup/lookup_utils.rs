@@ -376,6 +376,60 @@ pub fn excel_approximate_search(
     nearest
 }
 
+/// The cell at `row`, `col` (0-based) of a lookup table read into `view`. A
+/// closed linked workbook's range is read only up to the last row and column
+/// the link saved (plus one #REF! on a sheet Excel could not refresh), so a
+/// cell of the table past them is read from the link: blank, or #REF! on such
+/// a sheet (`HLOOKUP(1,[1]S!$A:$B,4,TRUE)` reads the unsaved A4), where the
+/// view gives a blank. Any other view gives its own cell.
+pub(crate) fn table_cell(
+    ctx: &dyn crate::traits::FunctionContext<'_>,
+    view: &RangeView<'_>,
+    row: usize,
+    col: usize,
+) -> LiteralValue {
+    let (rows, cols) = view.dims();
+    let Some(linked) = view
+        .linked_reference()
+        .filter(|_| row >= rows || col >= cols)
+    else {
+        return view.get_cell(row, col);
+    };
+    let (start_row, start_col) = match linked.kind {
+        ExternalRefKind::Cell { row, col, .. } => (row, col),
+        ExternalRefKind::Range {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            ..
+        } => (
+            crate::engine::external_book::in_order(start_row, end_row)
+                .0
+                .unwrap_or(1),
+            crate::engine::external_book::in_order(start_col, end_col)
+                .0
+                .unwrap_or(1),
+        ),
+    };
+    let at = |start: u32, offset: usize| {
+        u32::try_from(offset)
+            .ok()
+            .and_then(|offset| start.checked_add(offset))
+    };
+    let (Some(row), Some(col)) = (at(start_row, row), at(start_col, col)) else {
+        return LiteralValue::Error(ExcelError::new(ExcelErrorKind::Ref));
+    };
+    let cell = ReferenceType::External(formualizer_parse::parser::ExternalReference {
+        kind: ExternalRefKind::cell(row, col),
+        ..linked.clone()
+    });
+    match ctx.resolve_range_view(&cell, ctx.current_sheet()) {
+        Ok(view) => view.as_1x1().unwrap_or(LiteralValue::Empty),
+        Err(error) => LiteralValue::Error(error),
+    }
+}
+
 /// The rows and columns a reference spans as written. A whole column or row
 /// (`A:A`, `1:1`) reaches the sheet edge, although the range view resolved
 /// from it stops at the last used cell. `None` for references whose extent is

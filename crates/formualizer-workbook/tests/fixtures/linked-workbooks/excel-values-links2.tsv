@@ -1,4 +1,4 @@
-# Excel for Windows 16.0.20430 values of the links2 probes (ops/excel-links2-probe-20261008.md, jobs probe-w2-links2-1 and -2),
+# Excel for Windows 16.0.20430 values of the links2 probes (ops/excel-links2-probe-20261008.md, jobs probe-w2-links2-1 to -3),
 # the rows the fork computes as Excel did: workbook, cell, cached type (n, str, b, e), value, formula.
 probe-links2-1.xlsx	E1	n	15	=SUM(INDEX([1]Idx!$A$1:$A$5,SMALL({0,1},1)))
 probe-links2-1.xlsx	E2	n	2	=IF(TRUE,INDEX([1]Idx!$A$1:$A$5,SMALL({0,1},1)))
@@ -155,3 +155,23 @@ probe-links2-4.xlsx	E23	n	150	=SUM(INDEX([1]Idx!$A$1:$B$5,0,SMALL({2,1},2)))
 probe-links2-4.xlsx	E24	str	r15	=VLOOKUP(135,[1]Err!$A:$B,2)
 probe-links2-4.xlsx	E25	e	#N/A	=MATCH("c",[1]Err!$A:$A,1)
 probe-links2-4.xlsx	E26	str	c11	=HLOOKUP("hdr",[1]RowErr!$1:$2,2,TRUE)
+probe-links2-5.xlsx	E1	e	#REF!	=HLOOKUP(1,[1]Failed!$A:$B,4,TRUE)
+probe-links2-5.xlsx	E2	e	#REF!	=HLOOKUP(1,[1]Failed!$A:$B,4,FALSE)
+probe-links2-5.xlsx	E3	e	#REF!	=VLOOKUP(1,[1]Failed!$1:$2,4,TRUE)
+probe-links2-5.xlsx	E4	e	#REF!	=VLOOKUP(1,[1]Failed!$1:$2,4,FALSE)
+probe-links2-5.xlsx	E5	e	#REF!	=VLOOKUP(1,[1]Failed!$A:$XFD,4,TRUE)
+probe-links2-5.xlsx	E6	e	#REF!	=VLOOKUP(1,[1]Failed!$A:$XFD,4,FALSE)
+probe-links2-5.xlsx	E7	n	0	=HLOOKUP(1,[1]Ok!$A:$B,4,TRUE)
+probe-links2-5.xlsx	E8	n	0	=VLOOKUP(1,[1]Ok!$1:$2,4,TRUE)
+probe-links2-5.xlsx	E9	n	0	=VLOOKUP(1,[1]Ok!$A:$XFD,4,TRUE)
+probe-links2-5.xlsx	E10	e	#REF!	=HLOOKUP(1,[1]Failed!$A:$B,3,TRUE)
+probe-links2-5.xlsx	E11	e	#REF!	=VLOOKUP(2,[1]Failed!$A:$B,2,TRUE)
+probe-links2-5.xlsx	E13	n	1048576	=COUNTA([1]Failed!$A$1:$A$1048576)
+probe-links2-5.xlsx	E14	n	2	=COUNTA(INDEX([1]Ok!$A$1:$A$1048576,0,1))
+probe-links2-5.xlsx	E17	n	30	=SUM(INDEX(INDEX([1]Idx!$A$1:$B$5,0,2),3))
+probe-links2-5.xlsx	E19	n	20	=Rate
+probe-links2-5.xlsx	E20	n	20	=[0]Sheet1!Rate
+probe-links2-5.xlsx	E21	n	5	=[0]!Other
+probe-links2-5.xlsx	E22	n	5	=_xlfn.LET(_xlpm.Other,20,[0]!Other)
+probe-links2-5.xlsx	E23	n	5	=_xlfn.LET(_xlpm.Other,20,Other)
+probe-links2-5.xlsx	E25	e	#NAME?	=[0]Sheet2!Third

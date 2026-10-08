@@ -63,12 +63,13 @@ fn linked_workbook_probes_match_excel_for_windows() {
 }
 
 /// Approximate lookups over open and bounded linked ranges (Excel bisects
-/// the range as written, past the saved cells), INDEX at a computed position
-/// (a range it returns intersects a legacy formula's cell), and `[0]`, the
-/// workbook itself.
+/// the range as written, past the saved cells), the cell a lookup returns
+/// past the saved ones (#REF! on a sheet Excel could not refresh), INDEX at a
+/// computed position (a range it returns intersects a legacy formula's cell),
+/// and `[0]`, the workbook itself.
 #[test]
 fn links2_probes_match_excel_for_windows() {
-    assert_eq!(check_against_excel("excel-values-links2.tsv"), 155);
+    assert_eq!(check_against_excel("excel-values-links2.tsv"), 175);
 }
 
 /// Spill references (`_xlfn.ANCHORARRAY`) to a closed linked workbook's cells
