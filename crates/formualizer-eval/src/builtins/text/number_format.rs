@@ -400,7 +400,7 @@ fn resolve_minutes(toks: &mut [Tok]) {
 }
 
 /// Render a number with an Excel format code.
-pub(crate) fn format_number(
+pub fn format_number(
     value: f64,
     code: &str,
     system: DateSystem,
@@ -727,7 +727,7 @@ fn unopenable_brackets(text: &str) -> Option<&'static str> {
 
 /// Render text with the text section (the fourth, or one containing `@`).
 /// Without one, Excel returns the text unchanged.
-pub(crate) fn format_text(text: &str, code: &str) -> Result<String, ExcelError> {
+pub fn format_text(text: &str, code: &str) -> Result<String, ExcelError> {
     let sections = parse_sections(code)?;
     let section = if sections.len() >= 4 {
         Some(&sections[3])

@@ -3,6 +3,7 @@
 mod calc_always;
 pub use calc_always::is_excel_function;
 mod package;
+pub use package::number_format_code;
 mod rich;
 mod sheet;
 mod xml;

@@ -941,14 +941,17 @@ pub(super) fn cell_formats(
             codes
                 .get(&id)
                 .cloned()
-                .or_else(|| {
-                    formualizer_common::numfmt::builtin_code(id)
-                        .or_else(|| locale_builtin_code(id))
-                        .map(str::to_owned)
-                })
+                .or_else(|| number_format_code(id).map(str::to_owned))
                 .ok_or(id)
         })
         .collect())
+}
+
+/// The format code en-US Excel for Windows reads for a style's format id
+/// with no definition in the workbook: an OOXML built-in format, else the
+/// code it shows for a Thai or East Asian built-in (General below 164).
+pub fn number_format_code(id: u16) -> Option<&'static str> {
+    formualizer_common::numfmt::builtin_code(id).or_else(|| locale_builtin_code(id))
 }
 
 /// How en-US Excel for Windows 16.0.20430 reads a cell style whose format

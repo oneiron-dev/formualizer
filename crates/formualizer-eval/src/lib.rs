@@ -19,6 +19,8 @@ pub mod timezone;
 pub mod traits;
 
 pub mod builtins;
+/// Excel number-format rendering, as `TEXT` renders: for a cell's displayed text.
+pub use builtins::text::number_format::{format_number, format_text};
 pub mod reference;
 
 pub use reference::CellRef;

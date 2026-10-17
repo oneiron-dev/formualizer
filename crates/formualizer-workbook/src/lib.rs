@@ -48,7 +48,7 @@ pub use cache_recalculate::recalculate_xlsx_file;
 #[cfg(feature = "xlsx-recalc")]
 pub use cache_recalculate::{
     XlsxRecalculateLimits, XlsxRecalculateOptions, XlsxRecalculateResult, is_excel_function,
-    recalculate_xlsx_bytes,
+    number_format_code, recalculate_xlsx_bytes,
 };
 pub use error::{IoError, with_cell_context};
 #[cfg(any(feature = "umya", feature = "xlsx-recalc"))]
