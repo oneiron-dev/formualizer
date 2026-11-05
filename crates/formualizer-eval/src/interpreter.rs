@@ -654,6 +654,7 @@ impl<'a> Interpreter<'a> {
     /// and spill planning. Functions that can return references must set
     /// `FnCaps::RETURNS_REFERENCE` and override `eval_reference`.
     pub fn evaluate_ast_as_reference(&self, node: &ASTNode) -> Result<ReferenceType, ExcelError> {
+        self.cancellation_checkpoint()?;
         match &node.node_type {
             ASTNodeType::Reference { reference, .. } => {
                 self.reference_for_current_offset(reference)
@@ -1052,6 +1053,7 @@ impl<'a> Interpreter<'a> {
         data_store: &DataStore,
         sheet_registry: &SheetRegistry,
     ) -> Result<ReferenceType, ExcelError> {
+        self.cancellation_checkpoint()?;
         let node = data_store.get_node(node_id).ok_or_else(|| {
             ExcelError::new(ExcelErrorKind::Value).with_message("Missing AST node")
         })?;
@@ -1423,6 +1425,17 @@ impl<'a> Interpreter<'a> {
         }
     }
 
+    fn cancellation_checkpoint(&self) -> Result<(), ExcelError> {
+        if self
+            .context
+            .cancellation_token()
+            .is_some_and(|cancel| cancel.is_cancelled())
+        {
+            return Err(ExcelError::new(ExcelErrorKind::Cancelled));
+        }
+        Ok(())
+    }
+
     /* ===================  public  =================== */
     pub fn evaluate_ast(&self, node: &ASTNode) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
         self.evaluate_ast_uncached(node)
@@ -1438,6 +1451,7 @@ impl<'a> Interpreter<'a> {
         &self,
         node: &ASTNode,
     ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        self.cancellation_checkpoint()?;
         let _formula = self.current_cell.map(EvaluationScope::formula);
         if self.legacy.is_some() {
             return self.with_legacy_context(None).evaluate_formula_ast(node);
@@ -1634,6 +1648,7 @@ impl<'a> Interpreter<'a> {
         sheet_registry: &SheetRegistry,
         final_step: bool,
     ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        self.cancellation_checkpoint()?;
         let node = data_store.get_node(node_id).ok_or_else(|| {
             ExcelError::new(ExcelErrorKind::Value).with_message("Missing AST node")
         })?;
@@ -1923,6 +1938,7 @@ impl<'a> Interpreter<'a> {
         &self,
         node: &ASTNode,
     ) -> Result<crate::traits::CalcValue<'a>, ExcelError> {
+        self.cancellation_checkpoint()?;
         // Tree formulas (LAMBDA bodies, names) are not cell formulas: they keep
         // array evaluation even when invoked from a legacy formula.
         if self.legacy.is_some() {
