@@ -1650,8 +1650,10 @@ impl Function for CountAFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
         let mut cnt = 0i64;
         for a in args {
+            cancellation_checkpoint(cancel.as_ref())?;
             // COUNTA counts error values, however the error reaches it: as a
             // value, from a reference that fails (INDIRECT("x")) or from the
             // evaluation itself.
@@ -1667,8 +1669,11 @@ impl Function for CountAFn {
                 AggregateArgument::Range(view) => {
                     for res in view.type_tags_slices() {
                         let (_, _, tag_cols) = res?;
+                        cancellation_checkpoint(cancel.as_ref())?;
                         for col in tag_cols {
+                            cancellation_checkpoint(cancel.as_ref())?;
                             for i in 0..col.len() {
+                                cancellation_checkpoint(cancel.as_ref())?;
                                 if col.value(i) != crate::arrow_store::TypeTag::Empty as u8 {
                                     cnt += 1;
                                 }
@@ -1684,6 +1689,7 @@ impl Function for CountAFn {
                 }
             }
         }
+        cancellation_checkpoint(cancel.as_ref())?;
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
             cnt as f64,
         )))
@@ -1771,8 +1777,10 @@ impl Function for CountBlankFn {
                 ExcelError::new_value(),
             )));
         }
+        let cancel = ctx.cancellation_token();
         let mut cnt = 0i64;
         for a in args {
+            cancellation_checkpoint(cancel.as_ref())?;
             let (argument, logical_cells) = resolve_count_argument(a, ctx)?;
             match argument {
                 AggregateArgument::Range(view) => {
@@ -1783,14 +1791,17 @@ impl Function for CountBlankFn {
                     while let (Some(tag_res), Some(text_res)) = (tag_it.next(), text_it.next()) {
                         let (_, _, tag_cols) = tag_res?;
                         let (_, _, text_cols) = text_res?;
+                        cancellation_checkpoint(cancel.as_ref())?;
 
                         for (tc, xc) in tag_cols.into_iter().zip(text_cols.into_iter()) {
+                            cancellation_checkpoint(cancel.as_ref())?;
                             visited_cells += tc.len() as u64;
                             let text_arr = xc
                                 .as_any()
                                 .downcast_ref::<arrow_array::StringArray>()
                                 .unwrap();
                             for i in 0..tc.len() {
+                                cancellation_checkpoint(cancel.as_ref())?;
                                 let is_blank = tc.value(i)
                                     == crate::arrow_store::TypeTag::Empty as u8
                                     || (tc.value(i) == crate::arrow_store::TypeTag::Text as u8
@@ -1802,6 +1813,7 @@ impl Function for CountBlankFn {
                             }
                         }
                     }
+                    cancellation_checkpoint(cancel.as_ref())?;
                     let (rows, cols) = view.dims();
                     cnt += logical_cells
                         .unwrap_or(rows as u64 * cols as u64)
@@ -1822,6 +1834,7 @@ impl Function for CountBlankFn {
                 },
             }
         }
+        cancellation_checkpoint(cancel.as_ref())?;
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
             cnt as f64,
         )))
