@@ -27,6 +27,14 @@ impl From<ExcelError> for GroupFailure {
     }
 }
 
+fn raw_argument_failure(error: ExcelError) -> GroupFailure {
+    if error.kind == ExcelErrorKind::Cancelled {
+        GroupFailure::Native(error)
+    } else {
+        GroupFailure::Value(error)
+    }
+}
+
 fn value_error(msg: &str) -> ExcelError {
     ExcelError::new(ExcelErrorKind::Value).with_message(msg.to_string())
 }
@@ -35,8 +43,14 @@ fn blank() -> LiteralValue {
     LiteralValue::Text(String::new())
 }
 
-fn grid_arg(arg: &ArgumentHandle<'_, '_>) -> Result<Grid, ExcelError> {
-    let view = arg.range_view_or_scalar()?;
+fn grid_arg(arg: &ArgumentHandle<'_, '_>) -> Result<Grid, GroupFailure> {
+    let view = arg.range_view_or_scalar().map_err(|error| {
+        if error.kind == ExcelErrorKind::Cancelled && !arg.resolved_as_scalar_error() {
+            GroupFailure::Native(error)
+        } else {
+            GroupFailure::Value(error)
+        }
+    })?;
     let mut rows = Vec::new();
     view.for_each_row(&mut |row| {
         rows.push(row.to_vec());
@@ -60,19 +74,28 @@ fn cell(grid: &Grid, r: usize, c: usize) -> LiteralValue {
 fn optional_arg(
     args: &[ArgumentHandle<'_, '_>],
     index: usize,
-) -> Result<Option<LiteralValue>, ExcelError> {
+) -> Result<Option<LiteralValue>, GroupFailure> {
     match args.get(index) {
-        Some(arg) if !arg.is_omitted() => match arg.value()?.into_literal() {
-            LiteralValue::Error(e) => Err(e),
-            v => Ok(Some(v)),
-        },
+        Some(arg) if !arg.is_omitted() => {
+            match arg.value().map_err(raw_argument_failure)?.into_literal() {
+                LiteralValue::Error(error) => Err(GroupFailure::Value(error)),
+                value => Ok(Some(value)),
+            }
+        }
         _ => Ok(None),
     }
 }
 
-fn optional_int(args: &[ArgumentHandle<'_, '_>], index: usize) -> Result<Option<i64>, ExcelError> {
+fn optional_int(
+    args: &[ArgumentHandle<'_, '_>],
+    index: usize,
+) -> Result<Option<i64>, GroupFailure> {
     optional_arg(args, index)?
-        .map(|v| crate::coercion::to_number_argument(&v).map(|n| n.trunc() as i64))
+        .map(|value| {
+            crate::coercion::to_number_argument(&value)
+                .map(|number| number.trunc() as i64)
+                .map_err(GroupFailure::Value)
+        })
         .transpose()
 }
 
@@ -81,7 +104,7 @@ fn optional_int(args: &[ArgumentHandle<'_, '_>], index: usize) -> Result<Option<
 fn sort_spec(
     args: &[ArgumentHandle<'_, '_>],
     index: usize,
-) -> Result<Option<Vec<i64>>, ExcelError> {
+) -> Result<Option<Vec<i64>>, GroupFailure> {
     let Some(value) = optional_arg(args, index)? else {
         return Ok(None);
     };
@@ -92,8 +115,10 @@ fn sort_spec(
     items
         .iter()
         .map(|v| match v {
-            LiteralValue::Error(e) => Err(e.clone()),
-            v => crate::coercion::to_number_argument(v).map(|n| n.trunc() as i64),
+            LiteralValue::Error(error) => Err(GroupFailure::Value(error.clone())),
+            value => crate::coercion::to_number_argument(value)
+                .map(|number| number.trunc() as i64)
+                .map_err(GroupFailure::Value),
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Some)
@@ -390,12 +415,14 @@ fn kept_rows(
 
 /// The function argument, which takes the group's values (and, for
 /// PERCENTOF-style functions, the values it is relative to).
-fn aggregator(arg: &ArgumentHandle<'_, '_>) -> Result<Arc<dyn CustomCallable>, ExcelError> {
-    match function_arg(arg)? {
+fn aggregator(arg: &ArgumentHandle<'_, '_>) -> Result<Arc<dyn CustomCallable>, GroupFailure> {
+    match function_arg(arg).map_err(raw_argument_failure)? {
         Ok(callable) if callable.accepts(1) || callable.accepts(2) => Ok(callable),
-        Ok(_) => Err(value_error("The function must take one or two arguments")),
-        Err(LiteralValue::Error(e)) => Err(e),
-        Err(_) => Err(value_error("Expected a function")),
+        Ok(_) => Err(GroupFailure::Value(value_error(
+            "The function must take one or two arguments",
+        ))),
+        Err(LiteralValue::Error(error)) => Err(GroupFailure::Value(error)),
+        Err(_) => Err(GroupFailure::Value(value_error("Expected a function"))),
     }
 }
 
