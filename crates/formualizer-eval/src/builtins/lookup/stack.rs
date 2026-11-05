@@ -12,6 +12,7 @@
 
 use super::super::utils::collapse_if_scalar;
 use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
+use crate::engine::CancelToken;
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, FunctionContext};
 use formualizer_common::{ArgKind, ExcelError, ExcelErrorKind, LiteralValue};
@@ -21,6 +22,13 @@ use formualizer_macros::func_caps;
 pub struct HStackFn;
 #[derive(Debug)]
 pub struct VStackFn;
+
+fn cancellation_checkpoint(cancel: Option<&CancelToken>) -> Result<(), ExcelError> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        return Err(ExcelError::new(ExcelErrorKind::Cancelled));
+    }
+    Ok(())
+}
 
 fn materialize_arg<'b>(
     arg: &ArgumentHandle<'_, 'b>,
@@ -134,12 +142,21 @@ impl Function for HStackFn {
             ));
         }
 
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
+
         let mut entries = Vec::with_capacity(args.len());
         let mut target_rows: Option<usize> = None;
         let mut total_cols = 0;
 
         for a in args {
-            if let Ok(v) = a.range_view() {
+            cancellation_checkpoint(cancel.as_ref())?;
+            let view = match a.range_view() {
+                Ok(view) => Some(view),
+                Err(error) if error.kind == ExcelErrorKind::Cancelled => return Err(error),
+                Err(_) => None,
+            };
+            if let Some(v) = view {
                 let (rows, cols) = v.dims();
                 if rows == 0 || cols == 0 {
                     continue;
@@ -177,18 +194,23 @@ impl Function for HStackFn {
             ));
         }
 
+        cancellation_checkpoint(cancel.as_ref())?;
         let row_count = target_rows.unwrap();
         let mut result: Vec<Vec<LiteralValue>> = Vec::with_capacity(row_count);
         for _ in 0..row_count {
+            cancellation_checkpoint(cancel.as_ref())?;
             result.push(Vec::with_capacity(total_cols));
         }
 
         for entry in entries {
+            cancellation_checkpoint(cancel.as_ref())?;
             match entry {
                 HStackEntry::View(v) => {
                     let (v_rows, v_cols) = v.dims();
                     for (r, row) in result.iter_mut().enumerate().take(v_rows) {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         for c in 0..v_cols {
+                            cancellation_checkpoint(cancel.as_ref())?;
                             row.push(v.get_cell(r, c));
                         }
                     }
@@ -199,6 +221,7 @@ impl Function for HStackFn {
             }
         }
 
+        cancellation_checkpoint(cancel.as_ref())?;
         Ok(collapse_if_scalar(result, ctx.date_system()))
     }
 }
@@ -295,12 +318,21 @@ impl Function for VStackFn {
             ));
         }
 
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
+
         let mut target_width: Option<usize> = None;
         let mut total_rows = 0;
         let mut entries = Vec::with_capacity(args.len());
 
         for a in args {
-            if let Ok(v) = a.range_view() {
+            cancellation_checkpoint(cancel.as_ref())?;
+            let view = match a.range_view() {
+                Ok(view) => Some(view),
+                Err(error) if error.kind == ExcelErrorKind::Cancelled => return Err(error),
+                Err(_) => None,
+            };
+            if let Some(v) = view {
                 let (rows, cols) = v.dims();
                 if rows == 0 || cols == 0 {
                     continue;
@@ -338,14 +370,17 @@ impl Function for VStackFn {
             ));
         }
 
+        cancellation_checkpoint(cancel.as_ref())?;
         let mut result: Vec<Vec<LiteralValue>> = Vec::with_capacity(total_rows);
         for entry in entries {
+            cancellation_checkpoint(cancel.as_ref())?;
             match entry {
                 VStackEntry::View(v) => {
-                    let _ = v.for_each_row(&mut |row| {
+                    v.for_each_row(&mut |row| {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         result.push(row.to_vec());
                         Ok(())
-                    });
+                    })?;
                 }
                 VStackEntry::Scalar(s) => {
                     result.push(vec![s]);
@@ -353,6 +388,7 @@ impl Function for VStackFn {
             }
         }
 
+        cancellation_checkpoint(cancel.as_ref())?;
         Ok(collapse_if_scalar(result, ctx.date_system()))
     }
 }
