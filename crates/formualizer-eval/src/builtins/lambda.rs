@@ -1,3 +1,4 @@
+use crate::engine::CancelToken;
 use crate::function::{FnCaps, Function};
 use crate::function_contract::{
     FunctionArgumentDependencyContract, FunctionArityRule, FunctionDependencyClass,
@@ -9,6 +10,14 @@ use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_parse::parser::{ASTNode, ASTNodeType, ReferenceType};
 use std::collections::HashSet;
 use std::sync::Arc;
+
+fn cancellation_checkpoint(cancel: Option<&CancelToken>) -> Result<(), ExcelError> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        Err(ExcelError::new(ExcelErrorKind::Cancelled))
+    } else {
+        Ok(())
+    }
+}
 
 fn value_error(msg: impl Into<String>) -> ExcelError {
     ExcelError::new(ExcelErrorKind::Value).with_message(msg.into())
@@ -788,10 +797,11 @@ fn invoke_bound(
     arg: &ArgumentHandle<'_, '_>,
     callable: &Arc<dyn CustomCallable>,
     bindings: Vec<LocalBinding>,
-) -> LiteralValue {
+) -> Result<LiteralValue, ExcelError> {
     match callable.invoke_bindings(arg.interpreter(), bindings) {
-        Ok(result) => result.into_literal(),
-        Err(error) => LiteralValue::Error(error),
+        Ok(result) => Ok(result.into_literal()),
+        Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+        Err(error) => Ok(LiteralValue::Error(error)),
     }
 }
 
@@ -905,9 +915,14 @@ fn eval_map<'a, 'b>(
         Ok(callable) => callable,
         Err(value) => return Ok(scalar(value)),
     };
+    let cancel = ctx.cancellation_token();
+    cancellation_checkpoint(cancel.as_ref())?;
     let grids = arrays
         .iter()
-        .map(grid_with_origin)
+        .map(|arg| {
+            cancellation_checkpoint(cancel.as_ref())?;
+            grid_with_origin(arg)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let height = grids.iter().map(|(g, _)| g.len()).max().unwrap_or(0);
     let width = grids
@@ -917,23 +932,29 @@ fn eval_map<'a, 'b>(
         .unwrap_or(0);
     let mut out = Vec::with_capacity(height);
     for r in 0..height {
+        cancellation_checkpoint(cancel.as_ref())?;
         let mut row = Vec::with_capacity(width);
         for c in 0..width {
+            cancellation_checkpoint(cancel.as_ref())?;
             // A range passes a reference to each of its cells.
             let bindings: Vec<LocalBinding> = grids
                 .iter()
-                .map(|(g, origin)| match broadcast_get(g, r, c) {
-                    (value, Some((r, c))) => GridOrigin::bind(origin.as_ref(), (r, c, 1, 1), value),
-                    (value, None) => LocalBinding::Value(value),
+                .map(|(g, origin)| {
+                    cancellation_checkpoint(cancel.as_ref())?;
+                    Ok(match broadcast_get(g, r, c) {
+                        (value, Some((r, c))) => GridOrigin::bind(origin.as_ref(), (r, c, 1, 1), value),
+                        (value, None) => LocalBinding::Value(value),
+                    })
                 })
-                .collect();
-            match element_value(invoke_bound(lambda, &callable, bindings)) {
+                .collect::<Result<_, ExcelError>>()?;
+            match element_value(invoke_bound(lambda, &callable, bindings)?) {
                 Some(value) => row.push(value),
                 None => return Ok(scalar(nested_array_error())),
             }
         }
         out.push(row);
     }
+    cancellation_checkpoint(cancel.as_ref())?;
     Ok(array_result(out, ctx))
 }
 
@@ -1008,17 +1029,21 @@ fn eval_byrow<'a, 'b>(
         Ok(callable) => callable,
         Err(value) => return Ok(scalar(value)),
     };
+    let cancel = ctx.cancellation_token();
+    cancellation_checkpoint(cancel.as_ref())?;
     let (grid, origin) = grid_with_origin(&args[0])?;
     let width = grid.first().map_or(0, Vec::len);
     let mut out = Vec::new();
     for (r, row) in grid.into_iter().enumerate() {
+        cancellation_checkpoint(cancel.as_ref())?;
         // A range passes a reference to each of its rows.
         let binding = GridOrigin::bind(origin.as_ref(), (r, 0, 1, width), array_value(vec![row]));
-        match element_value(invoke_bound(&args[1], &callable, vec![binding])) {
+        match element_value(invoke_bound(&args[1], &callable, vec![binding])?) {
             Some(value) => out.push(vec![value]),
             None => return Ok(scalar(nested_array_error())),
         }
     }
+    cancellation_checkpoint(cancel.as_ref())?;
     Ok(array_result(out, ctx))
 }
 
@@ -1031,21 +1056,28 @@ fn eval_bycol<'a, 'b>(
         Ok(callable) => callable,
         Err(value) => return Ok(scalar(value)),
     };
+    let cancel = ctx.cancellation_token();
+    cancellation_checkpoint(cancel.as_ref())?;
     let (grid, origin) = grid_with_origin(&args[0])?;
     let width = grid.first().map_or(0, Vec::len);
     let mut out = Vec::with_capacity(width);
     for c in 0..width {
+        cancellation_checkpoint(cancel.as_ref())?;
         let column: Grid = grid
             .iter()
-            .map(|row| vec![row.get(c).cloned().unwrap_or(LiteralValue::Empty)])
-            .collect();
+            .map(|row| {
+                cancellation_checkpoint(cancel.as_ref())?;
+                Ok(vec![row.get(c).cloned().unwrap_or(LiteralValue::Empty)])
+            })
+            .collect::<Result<_, ExcelError>>()?;
         // A range passes a reference to each of its columns.
         let binding = GridOrigin::bind(origin.as_ref(), (0, c, grid.len(), 1), array_value(column));
-        match element_value(invoke_bound(&args[1], &callable, vec![binding])) {
+        match element_value(invoke_bound(&args[1], &callable, vec![binding])?) {
             Some(value) => out.push(value),
             None => return Ok(scalar(nested_array_error())),
         }
     }
+    cancellation_checkpoint(cancel.as_ref())?;
     Ok(array_result(vec![out], ctx))
 }
 
