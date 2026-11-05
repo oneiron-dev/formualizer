@@ -43,7 +43,10 @@ fn blank() -> LiteralValue {
     LiteralValue::Text(String::new())
 }
 
-fn grid_arg(arg: &ArgumentHandle<'_, '_>) -> Result<Grid, GroupFailure> {
+fn grid_arg(
+    arg: &ArgumentHandle<'_, '_>,
+    cancel: Option<&CancelToken>,
+) -> Result<Grid, GroupFailure> {
     let view = arg.range_view_or_scalar().map_err(|error| {
         if error.kind == ExcelErrorKind::Cancelled && !arg.resolved_as_scalar_error() {
             GroupFailure::Native(error)
@@ -51,11 +54,14 @@ fn grid_arg(arg: &ArgumentHandle<'_, '_>) -> Result<Grid, GroupFailure> {
             GroupFailure::Value(error)
         }
     })?;
+    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
     let mut rows = Vec::new();
     view.for_each_row(&mut |row| {
+        cancellation_checkpoint(cancel)?;
         rows.push(row.to_vec());
         Ok(())
-    })?;
+    })
+    .map_err(raw_argument_failure)?;
     Ok(rows)
 }
 
@@ -535,8 +541,8 @@ fn groupby(
     args: &[ArgumentHandle<'_, '_>],
     cancel: Option<&CancelToken>,
 ) -> Result<Grid, GroupFailure> {
-    let fields = grid_arg(&args[0])?;
-    let values = grid_arg(&args[1])?;
+    let fields = grid_arg(&args[0], cancel)?;
+    let values = grid_arg(&args[1], cancel)?;
     if fields.len() != values.len() {
         return Err(value_error("row_fields and values must have the same rows").into());
     }
@@ -646,9 +652,9 @@ fn pivotby(
     args: &[ArgumentHandle<'_, '_>],
     cancel: Option<&CancelToken>,
 ) -> Result<Grid, GroupFailure> {
-    let row_fields = grid_arg(&args[0])?;
-    let col_fields = grid_arg(&args[1])?;
-    let values = grid_arg(&args[2])?;
+    let row_fields = grid_arg(&args[0], cancel)?;
+    let col_fields = grid_arg(&args[1], cancel)?;
+    let values = grid_arg(&args[2], cancel)?;
     if row_fields.len() != values.len() || col_fields.len() != values.len() {
         return Err(
             value_error("row_fields, col_fields and values must have the same rows").into(),
