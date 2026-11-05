@@ -432,19 +432,45 @@ impl Aggregate<'_, '_, '_> {
         })
     }
 
+    fn column_cancellable(
+        &self,
+        rows: &[usize],
+        col: usize,
+        cancel: Option<&CancelToken>,
+    ) -> Result<LiteralValue, ExcelError> {
+        cancellation_checkpoint(cancel)?;
+        let values = rows
+            .iter()
+            .map(|&r| {
+                cancellation_checkpoint(cancel)?;
+                Ok(vec![cell(self.values, r, col)])
+            })
+            .collect::<Result<Vec<_>, ExcelError>>()?;
+        cancellation_checkpoint(cancel)?;
+        Ok(LiteralValue::Array(values))
+    }
+
     fn apply_cancellable(
         &self,
         rows: &[usize],
         relative: &[usize],
         col: usize,
+        cancel: Option<&CancelToken>,
     ) -> Result<LiteralValue, ExcelError> {
         let result = if self.callable.accepts(1) {
-            invoke_cancellable(self.arg, &self.callable, &[self.column(rows, col)])?
+            invoke_cancellable(
+                self.arg,
+                &self.callable,
+                &[self.column_cancellable(rows, col, cancel)?],
+            )?
         } else {
             invoke_cancellable(
                 self.arg,
                 &self.callable,
-                &[self.column(rows, col), self.column(relative, col)],
+                &[
+                    self.column_cancellable(rows, col, cancel)?,
+                    self.column_cancellable(relative, col, cancel)?,
+                ],
             )?
         };
         Ok(element_value(result).unwrap_or_else(|| {
@@ -531,7 +557,7 @@ fn groupby(
                 .map(|c| {
                     cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
                     aggregate
-                        .apply_cancellable(&rows_by_key[k], &rows, c)
+                        .apply_cancellable(&rows_by_key[k], &rows, c, cancel)
                         .map_err(GroupFailure::Native)
                 })
                 .collect::<Result<Vec<_>, GroupFailure>>()
@@ -575,7 +601,7 @@ fn groupby(
                 cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
                 line.push(
                     aggregate
-                        .apply_cancellable(&members, &rows, c)
+                        .apply_cancellable(&members, &rows, c, cancel)
                         .map_err(GroupFailure::Native)?,
                 );
             }
@@ -725,7 +751,7 @@ fn pivotby(
                     blank()
                 } else {
                     aggregate
-                        .apply_cancellable(&both, &relative, v)
+                        .apply_cancellable(&both, &relative, v, cancel)
                         .map_err(GroupFailure::Native)?
                 });
             }
