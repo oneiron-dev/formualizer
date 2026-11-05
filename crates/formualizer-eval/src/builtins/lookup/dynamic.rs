@@ -25,6 +25,7 @@ use super::lookup_utils::{
 };
 use super::sort_collation::cmp_text_for_sort;
 use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
+use crate::engine::CancelToken;
 use crate::engine::lookup_index_cache::LookupAxis;
 use crate::function::Function; // FnCaps imported via macro
 use crate::traits::{ArgumentHandle, FunctionContext};
@@ -118,12 +119,20 @@ pub fn super_wildcard_match(pattern: &str, text: &str) -> bool {
     super::lookup_utils::wildcard_pattern_match(pattern, text)
 }
 
+fn cancellation_checkpoint(cancel: Option<&CancelToken>) -> Result<(), ExcelError> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        return Err(ExcelError::new(ExcelErrorKind::Cancelled));
+    }
+    Ok(())
+}
+
 fn find_semantic_empty(
     view: &crate::engine::range_view::RangeView<'_>,
     len: usize,
     vertical: bool,
     reverse: bool,
-) -> Option<usize> {
+    cancel: Option<&CancelToken>,
+) -> Result<Option<usize>, ExcelError> {
     let is_empty = |i| {
         let value = if vertical {
             view.get_cell(i, 0)
@@ -134,10 +143,22 @@ fn find_semantic_empty(
     };
 
     if reverse {
-        (0..len).rev().find(|&i| is_empty(i))
+        for i in (0..len).rev() {
+            cancellation_checkpoint(cancel)?;
+            if is_empty(i) {
+                return Ok(Some(i));
+            }
+        }
     } else {
-        (0..len).find(|&i| is_empty(i))
+        for i in 0..len {
+            cancellation_checkpoint(cancel)?;
+            if is_empty(i) {
+                return Ok(Some(i));
+            }
+        }
     }
+    cancellation_checkpoint(cancel)?;
+    Ok(None)
 }
 
 /// `XLOOKUP`/`XMATCH` with `match_mode` -1 or 1 (exact or next smaller /
@@ -166,7 +187,8 @@ fn linear_approximate_match(
     match_mode: i64,
     reverse: bool,
     date_system: crate::engine::DateSystem,
-) -> Option<usize> {
+    cancel: Option<&CancelToken>,
+) -> Result<Option<usize>, ExcelError> {
     let side = match_mode.signum() as i32;
     let blank_tail = (written_len > len).then(|| if reverse { written_len - 1 } else { len });
     let order: Box<dyn Iterator<Item = usize>> = if reverse {
@@ -193,13 +215,14 @@ fn linear_approximate_match(
         _ => cmp_for_approximate(cand, best, date_system) == Some(-side),
     };
     for i in order {
+        cancellation_checkpoint(cancel)?;
         let cand = if i < len {
             cell(i)
         } else {
             LiteralValue::Empty
         };
         if matches!(needle, LiteralValue::Empty) && matches!(cand, LiteralValue::Empty) {
-            return Some(i);
+            return Ok(Some(i));
         }
         let Some(c) = cmp_for_approximate(&cand, needle, date_system) else {
             if blank_ranks_above && first_blank.is_none() && matches!(cand, LiteralValue::Empty) {
@@ -208,13 +231,14 @@ fn linear_approximate_match(
             continue;
         };
         if c == 0 {
-            return Some(i);
+            return Ok(Some(i));
         }
         if c == side && best.as_ref().is_none_or(|(_, b)| nearer(&cand, b)) {
             best = Some((i, cand));
         }
     }
-    best.map(|(i, _)| i).or(first_blank)
+    cancellation_checkpoint(cancel)?;
+    Ok(best.map(|(i, _)| i).or(first_blank))
 }
 
 /// A lookup array as written, when it is a one-row or one-column reference
@@ -428,7 +452,7 @@ impl Function for XLookupFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         if args.len() < 3 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -441,7 +465,8 @@ impl Function for XLookupFn {
                 e.clone(),
             )));
         }
-        let found = match XLookupFn::find_match(args, _ctx, lookup_value)? {
+        let cancel = ctx.cancellation_token();
+        let found = match XLookupFn::find_match(args, ctx, lookup_value, cancel.as_ref())? {
             XlookupMatch::Settled(value) => return Ok(value),
             XlookupMatch::Found {
                 index,
@@ -451,6 +476,7 @@ impl Function for XLookupFn {
             XlookupMatch::NotFound => None,
         };
 
+        cancellation_checkpoint(cancel.as_ref())?;
         if let Some((idx, vertical, ret_view)) = found {
             let (ret_rows, ret_cols) = ret_view.dims();
             if ret_rows == 0 || ret_cols == 0 {
@@ -459,38 +485,48 @@ impl Function for XLookupFn {
 
             if vertical {
                 if ret_cols == 1 {
-                    return Ok(crate::traits::CalcValue::Scalar(ret_view.get_cell(idx, 0)));
+                    let value = ret_view.get_cell(idx, 0);
+                    cancellation_checkpoint(cancel.as_ref())?;
+                    return Ok(crate::traits::CalcValue::Scalar(value));
                 }
                 let mut row_out: Vec<LiteralValue> = Vec::with_capacity(ret_cols);
                 for c in 0..ret_cols {
+                    cancellation_checkpoint(cancel.as_ref())?;
                     row_out.push(ret_view.get_cell(idx, c));
                 }
+                cancellation_checkpoint(cancel.as_ref())?;
                 return Ok(crate::traits::CalcValue::Range(
                     crate::engine::range_view::RangeView::from_owned_rows(
                         vec![row_out],
-                        _ctx.date_system(),
+                        ctx.date_system(),
                     ),
                 ));
             }
 
             // Horizontal orientation: treat idx as column.
             if ret_rows == 1 {
-                return Ok(crate::traits::CalcValue::Scalar(ret_view.get_cell(0, idx)));
+                let value = ret_view.get_cell(0, idx);
+                cancellation_checkpoint(cancel.as_ref())?;
+                return Ok(crate::traits::CalcValue::Scalar(value));
             }
 
             let mut col_out: Vec<Vec<LiteralValue>> = Vec::with_capacity(ret_rows);
             for r in 0..ret_rows {
+                cancellation_checkpoint(cancel.as_ref())?;
                 col_out.push(vec![ret_view.get_cell(r, idx)]);
             }
+            cancellation_checkpoint(cancel.as_ref())?;
             return Ok(crate::traits::CalcValue::Range(
-                crate::engine::range_view::RangeView::from_owned_rows(col_out, _ctx.date_system()),
+                crate::engine::range_view::RangeView::from_owned_rows(col_out, ctx.date_system()),
             ));
         }
 
         // An omitted-in-place slot (`XLOOKUP(v,l,r,,mode)`) is not a supplied
         // if_not_found; Excel returns #N/A, not the omitted slot's 0.
         if args.len() >= 4 && !args[3].is_omitted() {
-            return args[3].value();
+            let value = args[3].value()?;
+            cancellation_checkpoint(cancel.as_ref())?;
+            return Ok(value);
         }
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
             ExcelError::new(ExcelErrorKind::Na),
@@ -516,11 +552,13 @@ enum XlookupMatch<'b> {
 impl XLookupFn {
     fn find_match<'a, 'b>(
         args: &[ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
         lookup_value: LiteralValue,
+        cancel: Option<&CancelToken>,
     ) -> Result<XlookupMatch<'b>, ExcelError> {
         let lookup_view = match args[1].range_view_or_scalar() {
             Ok(v) => v,
+            Err(e) if e.kind == ExcelErrorKind::Cancelled => return Err(e),
             Err(e) => {
                 return Ok(XlookupMatch::Settled(crate::traits::CalcValue::Scalar(
                     LiteralValue::Error(e),
@@ -529,6 +567,7 @@ impl XLookupFn {
         };
         let ret_view = match args[2].range_view_or_scalar() {
             Ok(v) => v,
+            Err(e) if e.kind == ExcelErrorKind::Cancelled => return Err(e),
             Err(e) => {
                 return Ok(XlookupMatch::Settled(crate::traits::CalcValue::Scalar(
                     LiteralValue::Error(e),
@@ -635,22 +674,29 @@ impl XLookupFn {
         let mut found: Option<usize> = None;
         let needle = lookup_value;
         if match_mode == 0 || wildcard {
+            cancellation_checkpoint(cancel)?;
             if matches!(needle, LiteralValue::Empty) {
-                found = find_semantic_empty(&lookup_view, lookup_len, vertical, search_mode == -1);
+                found = find_semantic_empty(
+                    &lookup_view,
+                    lookup_len,
+                    vertical,
+                    search_mode == -1,
+                    cancel,
+                )?;
             } else if match_mode == 0 && search_mode == 1 && lookup_rows > 0 && lookup_cols > 0 {
                 let axis = if vertical {
                     LookupAxis::ColumnInView(0)
                 } else {
                     LookupAxis::RowInView(0)
                 };
-                if let Some(index) = _ctx.get_lookup_index(&lookup_view, axis) {
+                if let Some(index) = ctx.get_lookup_index(&lookup_view, axis) {
                     found = index.find_first_exact(&needle);
                 } else {
                     found = super::lookup_utils::find_exact_index_in_view(
                         &lookup_view,
                         &needle,
                         false,
-                        _ctx.date_system(),
+                        ctx.date_system(),
                     )?;
                 }
             } else if search_mode == 1 && lookup_rows > 0 && lookup_cols > 0 {
@@ -658,12 +704,13 @@ impl XLookupFn {
                     &lookup_view,
                     &needle,
                     wildcard,
-                    _ctx.date_system(),
+                    ctx.date_system(),
                 )?;
             } else if search_mode == -1 {
                 let prepared_matcher =
-                    PreparedLookupMatcher::new(&needle, wildcard, _ctx.date_system());
+                    PreparedLookupMatcher::new(&needle, wildcard, ctx.date_system());
                 for i in (0..lookup_len).rev() {
+                    cancellation_checkpoint(cancel)?;
                     let cand = if vertical {
                         lookup_view.get_cell(i, 0)
                     } else {
@@ -678,8 +725,9 @@ impl XLookupFn {
                 // Fallback linear scan (also used when the lookup view is empty and
                 // we are treating missing cells as Empty).
                 let prepared_matcher =
-                    PreparedLookupMatcher::new(&needle, wildcard, _ctx.date_system());
+                    PreparedLookupMatcher::new(&needle, wildcard, ctx.date_system());
                 for i in 0..lookup_len {
+                    cancellation_checkpoint(cancel)?;
                     let cand = if vertical {
                         lookup_view.get_cell(i, 0)
                     } else {
@@ -692,6 +740,7 @@ impl XLookupFn {
                 }
             }
         } else if match_mode == -1 || match_mode == 1 {
+            cancellation_checkpoint(cancel)?;
             // A linear scan: unsorted data is searched, not rejected. A
             // linear search mode searches the lookup array as written,
             // blank cells past its used range included. A single cell keeps
@@ -722,14 +771,16 @@ impl XLookupFn {
                 &needle,
                 match_mode,
                 search_mode == -1 || search_mode == -2,
-                _ctx.date_system(),
-            );
+                ctx.date_system(),
+                cancel,
+            )?;
         } else {
             return Ok(XlookupMatch::Settled(crate::traits::CalcValue::Scalar(
                 LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)),
             )));
         }
 
+        cancellation_checkpoint(cancel)?;
         Ok(match found {
             Some(index) => XlookupMatch::Found {
                 index,
@@ -776,7 +827,8 @@ fn xlookup_reference<'a, 'b>(
     if let LiteralValue::Error(error) = lookup_value {
         return Err(error);
     }
-    match XLookupFn::find_match(args, ctx, lookup_value)? {
+    let cancel = ctx.cancellation_token();
+    match XLookupFn::find_match(args, ctx, lookup_value, cancel.as_ref())? {
         XlookupMatch::Found {
             index, vertical, ..
         } => Ok(matched_reference(return_reference, index, vertical)),
@@ -982,7 +1034,7 @@ impl Function for XMatchFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         if args.len() < 2 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -997,6 +1049,7 @@ impl Function for XMatchFn {
         }
         let lookup_view = match args[1].range_view_or_scalar() {
             Ok(v) => v,
+            Err(e) if e.kind == ExcelErrorKind::Cancelled => return Err(e),
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
 
@@ -1056,12 +1109,14 @@ impl Function for XMatchFn {
             1
         };
 
+        let cancel = ctx.cancellation_token();
         let wildcard = match_mode == 2;
         let needle = lookup_value;
 
         let mut found: Option<usize> = None;
 
         if match_mode == 0 || wildcard {
+            cancellation_checkpoint(cancel.as_ref())?;
             // Exact match or wildcard match
             if matches!(needle, LiteralValue::Empty) {
                 found = find_semantic_empty(
@@ -1069,7 +1124,8 @@ impl Function for XMatchFn {
                     lookup_len,
                     vertical,
                     search_mode == -1 || search_mode == -2,
-                );
+                    cancel.as_ref(),
+                )?;
             } else if search_mode == 1 || search_mode == 2 {
                 // Forward search (first to last) or binary ascending (treated as forward for exact)
                 if lookup_rows > 0 && lookup_cols > 0 {
@@ -1077,14 +1133,15 @@ impl Function for XMatchFn {
                         &lookup_view,
                         &needle,
                         wildcard,
-                        _ctx.date_system(),
+                        ctx.date_system(),
                     )?;
                 }
             } else if search_mode == -1 || search_mode == -2 {
                 // Reverse search (last to first) or binary descending (treated as reverse for exact)
                 let prepared_matcher =
-                    PreparedLookupMatcher::new(&needle, wildcard, _ctx.date_system());
+                    PreparedLookupMatcher::new(&needle, wildcard, ctx.date_system());
                 for i in (0..lookup_len).rev() {
+                    cancellation_checkpoint(cancel.as_ref())?;
                     let cand = if vertical {
                         lookup_view.get_cell(i, 0)
                     } else {
@@ -1098,8 +1155,9 @@ impl Function for XMatchFn {
             } else {
                 // Fallback linear scan
                 let prepared_matcher =
-                    PreparedLookupMatcher::new(&needle, wildcard, _ctx.date_system());
+                    PreparedLookupMatcher::new(&needle, wildcard, ctx.date_system());
                 for i in 0..lookup_len {
+                    cancellation_checkpoint(cancel.as_ref())?;
                     let cand = if vertical {
                         lookup_view.get_cell(i, 0)
                     } else {
@@ -1112,6 +1170,7 @@ impl Function for XMatchFn {
                 }
             }
         } else if match_mode == -1 || match_mode == 1 {
+            cancellation_checkpoint(cancel.as_ref())?;
             // Approximate match: -1 = exact or next smaller, 1 = exact or next larger
             // For binary search modes (2, -2), data should be sorted
             // We verify sorting for approximate modes
@@ -1119,6 +1178,7 @@ impl Function for XMatchFn {
                 let ascending = search_mode == 2;
                 let mut prev: Option<LiteralValue> = None;
                 for i in 0..lookup_len {
+                    cancellation_checkpoint(cancel.as_ref())?;
                     let cand = if vertical {
                         lookup_view.get_cell(i, 0)
                     } else {
@@ -1126,11 +1186,12 @@ impl Function for XMatchFn {
                     };
                     if let Some(p) = prev.as_ref() {
                         let sorted_ok = if ascending {
-                            cmp_for_lookup(p, &cand, _ctx.date_system()).is_some_and(|o| o <= 0)
+                            cmp_for_lookup(p, &cand, ctx.date_system()).is_some_and(|o| o <= 0)
                         } else {
-                            cmp_for_lookup(p, &cand, _ctx.date_system()).is_some_and(|o| o >= 0)
+                            cmp_for_lookup(p, &cand, ctx.date_system()).is_some_and(|o| o >= 0)
                         };
                         if !sorted_ok {
+                            cancellation_checkpoint(cancel.as_ref())?;
                             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                                 ExcelError::new(ExcelErrorKind::Na),
                             )));
@@ -1167,14 +1228,16 @@ impl Function for XMatchFn {
                 &needle,
                 match_mode,
                 search_mode == -1 || search_mode == -2,
-                _ctx.date_system(),
-            );
+                ctx.date_system(),
+                cancel.as_ref(),
+            )?;
         } else {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new(ExcelErrorKind::Value),
             )));
         }
 
+        cancellation_checkpoint(cancel.as_ref())?;
         match found {
             Some(idx) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Int(
                 (idx + 1) as i64,
