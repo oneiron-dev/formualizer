@@ -2659,8 +2659,9 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
         _view: &RangeView<'_>,
         _col_in_view: usize,
         _pred: &crate::args::CriteriaPredicate,
-    ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
-        None
+        _cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Option<std::sync::Arc<arrow_array::BooleanArray>>, ExcelError> {
+        Ok(None)
     }
 
     /// Optional: Build row-visibility mask aligned to `view` rows.
@@ -2845,8 +2846,9 @@ pub trait FunctionContext<'ctx> {
         _view: &RangeView<'_>,
         _col_in_view: usize,
         _pred: &crate::args::CriteriaPredicate,
-    ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
-        None
+        _cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Option<std::sync::Arc<arrow_array::BooleanArray>>, ExcelError> {
+        Ok(None)
     }
 
     /// Optional: Build row-visibility mask aligned to `view` rows.
@@ -3031,8 +3033,9 @@ impl<'a> FunctionContext<'a> for DefaultFunctionContext<'a> {
         view: &RangeView<'_>,
         col_in_view: usize,
         pred: &crate::args::CriteriaPredicate,
-    ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
-        self.base.build_criteria_mask(view, col_in_view, pred)
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Option<std::sync::Arc<arrow_array::BooleanArray>>, ExcelError> {
+        self.base.build_criteria_mask(view, col_in_view, pred, cancel)
     }
 
     fn get_row_visibility_mask(

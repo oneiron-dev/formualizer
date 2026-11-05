@@ -213,12 +213,12 @@ impl CriteriaMaskMemo {
     fn get_or_build(
         &mut self,
         key: (usize, usize),
-        build: impl FnOnce() -> Option<std::sync::Arc<BooleanArray>>,
-    ) -> Option<std::sync::Arc<BooleanArray>> {
+        build: impl FnOnce() -> Result<Option<std::sync::Arc<BooleanArray>>, ExcelError>,
+    ) -> Result<Option<std::sync::Arc<BooleanArray>>, ExcelError> {
         if let Some(mask) = self.masks.get(&key) {
-            return mask.clone();
+            return Ok(mask.clone());
         }
-        let mask = build();
+        let mask = build()?;
         // Include the BooleanArray allocation and full backing buffers. The extra
         // 512 bytes conservatively cover its Arc header, two Arrow buffer owners,
         // allocator overhead, and hash buckets (including growth slack). Charge
@@ -231,7 +231,7 @@ impl CriteriaMaskMemo {
             self.bytes += bytes;
             self.masks.insert(key, mask.clone());
         }
-        mask
+        Ok(mask)
     }
 }
 
@@ -544,7 +544,9 @@ fn eval_if_family<'a, 'b>(
                     // Try cache
                     let cur_cached = if let Some(ref view) = crit_specs[j].0 {
                         criteria_masks
-                            .get_or_build((j, c), || ctx.get_criteria_mask(view, c, pred))
+                            .get_or_build((j, c), || {
+                                ctx.get_criteria_mask(view, c, pred, cancel.as_ref())
+                            })?
                             .map(|m| {
                                 let fill = criteria_match(pred, &LiteralValue::Empty);
                                 let m_len = m.len();

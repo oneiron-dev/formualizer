@@ -655,8 +655,9 @@ impl<'a, R: EvaluationContext> EvaluationContext for RecordingContext<'a, R> {
         view: &RangeView<'_>,
         col_in_view: usize,
         pred: &crate::args::CriteriaPredicate,
-    ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
-        self.engine.build_criteria_mask(view, col_in_view, pred)
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Option<std::sync::Arc<arrow_array::BooleanArray>>, ExcelError> {
+        self.engine.build_criteria_mask(view, col_in_view, pred, cancel)
     }
     fn build_row_visibility_mask(
         &self,

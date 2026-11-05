@@ -3211,15 +3211,25 @@ fn criteria_like_pattern(operand: &str, wildcards: bool) -> String {
     out
 }
 
+fn cancellation_checkpoint(cancel: Option<&crate::engine::CancelToken>) -> Result<(), ExcelError> {
+    if cancel.is_some_and(crate::engine::CancelToken::is_cancelled) {
+        Err(ExcelError::new(ExcelErrorKind::Cancelled))
+    } else {
+        Ok(())
+    }
+}
+
 fn compute_criteria_mask(
     view: &RangeView<'_>,
     col_in_view: usize,
     pred: &crate::args::CriteriaPredicate,
-) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
+    cancel: Option<&crate::engine::CancelToken>,
+) -> Result<Option<std::sync::Arc<arrow_array::BooleanArray>>, ExcelError> {
     use crate::compute_prelude::{boolean, concat_arrays};
     use arrow::compute::kernels::comparison::{like, nlike};
     use arrow_array::{Array as _, ArrayRef, BooleanArray, StringArray, builder::BooleanBuilder};
 
+    cancellation_checkpoint(cancel)?;
     // Check if this is a numeric predicate that can be applied per-chunk
     let is_numeric_pred = matches!(
         pred,
@@ -3246,24 +3256,37 @@ fn compute_criteria_mask(
     );
     if numeric_equality {
         for tags in view.type_tags_slices() {
-            let (_, _, cols) = tags.ok()?;
-            let tags = cols.get(col_in_view)?;
-            if tags
-                .values()
-                .iter()
-                .any(|tag| *tag == crate::arrow_store::TypeTag::Text as u8)
-            {
+            cancellation_checkpoint(cancel)?;
+            let Ok((_, _, cols)) = tags else {
+                return Ok(None);
+            };
+            let Some(tags) = cols.get(col_in_view) else {
+                return Ok(None);
+            };
+            let mut has_text = false;
+            for tag in tags.values().iter() {
+                cancellation_checkpoint(cancel)?;
+                if *tag == crate::arrow_store::TypeTag::Text as u8 {
+                    has_text = true;
+                    break;
+                }
+            }
+            if has_text {
                 let mut mask = BooleanBuilder::new();
                 for chunk in view.iter_row_chunks() {
-                    let chunk = chunk.ok()?;
+                    cancellation_checkpoint(cancel)?;
+                    let Ok(chunk) = chunk else {
+                        return Ok(None);
+                    };
                     for row in chunk.row_start..chunk.row_start + chunk.row_len {
+                        cancellation_checkpoint(cancel)?;
                         mask.append_value(crate::builtins::criteria_match(
                             pred,
                             &view.get_cell(row, col_in_view),
                         ));
                     }
                 }
-                return Some(std::sync::Arc::new(mask.finish()));
+                return Ok(Some(std::sync::Arc::new(mask.finish())));
             }
         }
     }
@@ -3278,42 +3301,54 @@ fn compute_criteria_mask(
         let fill_nulls = matches!(pred, crate::args::CriteriaPredicate::Ne(_));
         let mut bool_parts: Vec<BooleanArray> = Vec::new();
         for res in view.numbers_slices() {
-            let (rs, _rl, cols_seg) = res.ok()?;
+            cancellation_checkpoint(cancel)?;
+            let Ok((rs, _rl, cols_seg)) = res else {
+                return Ok(None);
+            };
             if col_in_view < cols_seg.len() {
                 let chunk = cols_seg[col_in_view].as_ref();
                 // Numbers compare to 15 significant digits, as in the scalar matcher.
-                let mut mask = crate::builtins::numeric_criteria_mask(chunk, pred)?;
+                let Some(mut mask) = crate::builtins::numeric_criteria_mask(chunk, pred) else {
+                    return Ok(None);
+                };
                 if fill_nulls && mask.null_count() > 0 {
                     mask = (0..mask.len())
                         .map(|i| {
-                            Some(if mask.is_valid(i) {
+                            cancellation_checkpoint(cancel)?;
+                            Ok(Some(if mask.is_valid(i) {
                                 mask.value(i)
                             } else {
                                 crate::builtins::criteria_match(
                                     pred,
                                     &view.get_cell(rs + i, col_in_view),
                                 )
-                            })
+                            }))
                         })
-                        .collect();
+                        .collect::<Result<BooleanArray, ExcelError>>()?;
                 }
                 bool_parts.push(mask);
             }
         }
 
         if bool_parts.is_empty() {
-            return None;
+            return Ok(None);
         } else if bool_parts.len() == 1 {
-            return Some(std::sync::Arc::new(bool_parts.remove(0)));
+            return Ok(Some(std::sync::Arc::new(bool_parts.remove(0))));
         } else {
             // Concatenate boolean masks (much cheaper than concatenating Float64 arrays)
             let anys: Vec<&dyn arrow_array::Array> = bool_parts
                 .iter()
                 .map(|a| a as &dyn arrow_array::Array)
                 .collect();
-            let conc: ArrayRef = concat_arrays(&anys).ok()?;
-            let ba = conc.as_any().downcast_ref::<BooleanArray>()?.clone();
-            return Some(std::sync::Arc::new(ba));
+            let conc: ArrayRef = match concat_arrays(&anys) {
+                Ok(conc) => conc,
+                Err(_) => return Ok(None),
+            };
+            let ba = match conc.as_any().downcast_ref::<BooleanArray>() {
+                Some(ba) => ba.clone(),
+                None => return Ok(None),
+            };
+            return Ok(Some(std::sync::Arc::new(ba)));
         }
     }
 
@@ -3330,26 +3365,42 @@ fn compute_criteria_mask(
             | crate::args::CriteriaPredicate::NotTextLike { .. }
     ) {
         for tags in view.type_tags_slices() {
-            let (_, _, cols) = tags.ok()?;
-            let tags = cols.get(col_in_view)?;
-            if tags.values().iter().any(|tag| {
-                *tag == crate::arrow_store::TypeTag::Empty as u8
+            cancellation_checkpoint(cancel)?;
+            let Ok((_, _, cols)) = tags else {
+                return Ok(None);
+            };
+            let Some(tags) = cols.get(col_in_view) else {
+                return Ok(None);
+            };
+            let mut needs_scalar_mask = false;
+            for tag in tags.values().iter() {
+                cancellation_checkpoint(cancel)?;
+                if *tag == crate::arrow_store::TypeTag::Empty as u8
                     || *tag == crate::arrow_store::TypeTag::Number as u8
                     || *tag == crate::arrow_store::TypeTag::Boolean as u8
                     || *tag == crate::arrow_store::TypeTag::DateTime as u8
                     || *tag == crate::arrow_store::TypeTag::Duration as u8
-            }) {
+                {
+                    needs_scalar_mask = true;
+                    break;
+                }
+            }
+            if needs_scalar_mask {
                 let mut mask = BooleanBuilder::new();
                 for chunk in view.iter_row_chunks() {
-                    let chunk = chunk.ok()?;
+                    cancellation_checkpoint(cancel)?;
+                    let Ok(chunk) = chunk else {
+                        return Ok(None);
+                    };
                     for row in chunk.row_start..chunk.row_start + chunk.row_len {
+                        cancellation_checkpoint(cancel)?;
                         mask.append_value(crate::builtins::criteria_match(
                             pred,
                             &view.get_cell(row, col_in_view),
                         ));
                     }
                 }
-                return Some(std::sync::Arc::new(mask.finish()));
+                return Ok(Some(std::sync::Arc::new(mask.finish())));
             }
         }
     }
@@ -3390,7 +3441,7 @@ fn compute_criteria_mask(
             criteria_like_pattern(&crate::locale::fold_text_case(pattern), true),
             false,
         ),
-        _ => return None,
+        _ => return Ok(None),
     };
 
     let text_pat_is_empty = text_pat.is_empty();
@@ -3403,7 +3454,10 @@ fn compute_criteria_mask(
 
     let mut tag_slices = view.type_tags_slices();
     for res in view.iter_row_chunks() {
-        let cs = res.ok()?;
+        cancellation_checkpoint(cancel)?;
+        let Ok(cs) = res else {
+            return Ok(None);
+        };
         if cs.row_len == 0 {
             continue;
         }
@@ -3412,22 +3466,30 @@ fn compute_criteria_mask(
 
         let slices = view.slice_lowered_text(cs.row_start, cs.row_len);
         if col_in_view >= slices.len() {
-            return None;
+            return Ok(None);
         }
 
         let seg_opt = slices[col_in_view].as_ref().map(|a| a.as_ref());
         if empty_special || (text_kind == 1 && text_pat_is_empty) {
-            let (tag_start, tag_len, tags) = tag_slices.next()?.ok()?;
+            let Some(tag_res) = tag_slices.next() else {
+                return Ok(None);
+            };
+            let Ok((tag_start, tag_len, tags)) = tag_res else {
+                return Ok(None);
+            };
             if tag_start != cs.row_start || tag_len != cs.row_len {
-                return None;
+                return Ok(None);
             }
-            let tags = tags.get(col_in_view)?;
+            let Some(tags) = tags.get(col_in_view) else {
+                return Ok(None);
+            };
             // A null text lane is not a blank cell: base numeric/boolean/error
             // cells also have null text. Consult the overlay-aware type tags,
             // and inspect strings only to distinguish empty text from text.
             let strings = seg_opt.and_then(|a| a.as_any().downcast_ref::<StringArray>());
             let mut bb = BooleanBuilder::with_capacity(cs.row_len);
             for i in 0..cs.row_len {
+                cancellation_checkpoint(cancel)?;
                 let blank = tags.value(i) == crate::arrow_store::TypeTag::Empty as u8
                     || (tags.value(i) == crate::arrow_store::TypeTag::Text as u8
                         && strings.is_some_and(|s| s.is_valid(i) && s.value(i).is_empty()));
@@ -3458,11 +3520,23 @@ fn compute_criteria_mask(
             }
         };
 
-        let seg_sa = seg.as_any().downcast_ref::<StringArray>()?;
+        let Some(seg_sa) = seg.as_any().downcast_ref::<StringArray>() else {
+            return Ok(None);
+        };
         let mut m = match text_kind {
-            0 | 2 => like(seg_sa, &pat).ok()?,
-            1 | 3 => nlike(seg_sa, &pat).ok()?,
-            _ => return None,
+            0 | 2 => {
+                let Ok(matched) = like(seg_sa, &pat) else {
+                    return Ok(None);
+                };
+                matched
+            }
+            1 | 3 => {
+                let Ok(matched) = nlike(seg_sa, &pat) else {
+                    return Ok(None);
+                };
+                matched
+            }
+            _ => return Ok(None),
         };
 
         // Only fold blank/Empty (null) cells into the mask when the segment
@@ -3474,27 +3548,37 @@ fn compute_criteria_mask(
             // Treat nulls as equal to empty string
             let mut bb = BooleanBuilder::with_capacity(seg_sa.len());
             for i in 0..seg_sa.len() {
+                cancellation_checkpoint(cancel)?;
                 bb.append_value(seg_sa.is_null(i));
             }
             let nulls = bb.finish();
-            m = boolean::or_kleene(&m, &nulls).ok()?;
+            let Ok(merged) = boolean::or_kleene(&m, &nulls) else {
+                return Ok(None);
+            };
+            m = merged;
         }
 
         bool_parts.push(m);
     }
 
     if bool_parts.is_empty() {
-        None
+        Ok(None)
     } else if bool_parts.len() == 1 {
-        Some(std::sync::Arc::new(bool_parts.remove(0)))
+        Ok(Some(std::sync::Arc::new(bool_parts.remove(0))))
     } else {
         let anys: Vec<&dyn arrow_array::Array> = bool_parts
             .iter()
             .map(|a| a as &dyn arrow_array::Array)
             .collect();
-        let conc: ArrayRef = concat_arrays(&anys).ok()?;
-        let ba = conc.as_any().downcast_ref::<BooleanArray>()?.clone();
-        Some(std::sync::Arc::new(ba))
+        let conc: ArrayRef = match concat_arrays(&anys) {
+            Ok(conc) => conc,
+            Err(_) => return Ok(None),
+        };
+        let ba = match conc.as_any().downcast_ref::<BooleanArray>() {
+            Some(ba) => ba.clone(),
+            None => return Ok(None),
+        };
+        Ok(Some(std::sync::Arc::new(ba)))
     }
 }
 
@@ -29416,19 +29500,21 @@ where
         view: &RangeView<'_>,
         col_in_view: usize,
         pred: &crate::args::CriteriaPredicate,
-    ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Option<std::sync::Arc<arrow_array::BooleanArray>>, ExcelError> {
         #[cfg(any(test, feature = "test-support"))]
         criteria_mask_test_hooks::note_mask(view.dims().0);
+        cancellation_checkpoint(cancel)?;
         if view.dims().1 == 0 {
-            return None;
+            return Ok(None);
         }
         // If the view is logically open-ended but the backing sheet has no physical rows,
         // treat the mask as empty (0-len) rather than attempting to build a huge mask.
         let sheet_rows = view.sheet().nrows as usize;
         if sheet_rows == 0 || view.start_row() >= sheet_rows {
-            return Some(std::sync::Arc::new(arrow_array::BooleanArray::new_null(0)));
+            return Ok(Some(std::sync::Arc::new(arrow_array::BooleanArray::new_null(0))));
         }
-        compute_criteria_mask(view, col_in_view, pred)
+        compute_criteria_mask(view, col_in_view, pred, cancel)
     }
 
     fn build_row_visibility_mask(
