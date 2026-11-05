@@ -826,8 +826,11 @@ fn eval_if_family<'a, 'b>(
                     Some(mask) => {
                         if agg_type == AggregationType::Count {
                             total_count += (0..mask.len())
-                                .filter(|&i| mask.is_valid(i) && mask.value(i))
-                                .count() as i64;
+                                .map(|i| {
+                                    cancellation_checkpoint(cancel.as_ref())?;
+                                    Ok(usize::from(mask.is_valid(i) && mask.value(i)))
+                                })
+                                .sum::<Result<usize, ExcelError>>()? as i64;
                         } else {
                             let target_col = sum_slices
                                 .as_ref()
@@ -844,8 +847,11 @@ fn eval_if_family<'a, 'b>(
                                 && let Ok(n) = crate::coercion::to_number_lenient(s)
                             {
                                 let count = (0..mask.len())
-                                    .filter(|&i| mask.is_valid(i) && mask.value(i))
-                                    .count() as i64;
+                                    .map(|i| {
+                                        cancellation_checkpoint(cancel.as_ref())?;
+                                        Ok(usize::from(mask.is_valid(i) && mask.value(i)))
+                                    })
+                                    .sum::<Result<usize, ExcelError>>()? as i64;
                                 total_sum += n * count as f64;
                                 total_count += count;
                             }
@@ -880,13 +886,21 @@ fn eval_if_family<'a, 'b>(
         // keeps its one value): account for it arithmetically, without
         // allocating masks or iterating a million empty cells.
         if agg_type == AggregationType::Count
-            && crit_specs.iter().all(|(rv, pred, scalar_val)| {
-                let tail_value = match (rv, scalar_val) {
-                    (None, Some(value)) => value,
-                    _ => &LiteralValue::Empty,
-                };
-                criteria_match(pred, tail_value)
-            })
+            && {
+                let mut all_match = true;
+                for (rv, pred, scalar_val) in &crit_specs {
+                    cancellation_checkpoint(cancel.as_ref())?;
+                    let tail_value = match (rv, scalar_val) {
+                        (None, Some(value)) => value,
+                        _ => &LiteralValue::Empty,
+                    };
+                    if !criteria_match(pred, tail_value) {
+                        all_match = false;
+                        break;
+                    }
+                }
+                all_match
+            }
         {
             let logical_cells = logical_count_cells.unwrap_or(dims.0 as u64 * dims.1 as u64);
             total_count += logical_cells.saturating_sub(visited_rows as u64 * dims.1 as u64) as i64;
@@ -895,6 +909,7 @@ fn eval_if_family<'a, 'b>(
         // Scalar driver fallback
         let mut all_match = true;
         for (_, pred, scalar_val) in &crit_specs {
+            cancellation_checkpoint(cancel.as_ref())?;
             let val = scalar_val.as_ref().unwrap_or(&LiteralValue::Empty);
             if !criteria_match(pred, val) {
                 all_match = false;
