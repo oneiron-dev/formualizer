@@ -53,7 +53,9 @@ fn accrued_interest(
     frequency: u32,
     basis: Basis,
     from_issue: bool,
-) -> f64 {
+    cancel: Option<&CancelToken>,
+) -> Result<f64, ExcelError> {
+    cancellation_checkpoint(cancel)?;
     let months = 12 / frequency as i32;
     let mut k = if settlement > first_interest && from_issue {
         periods_back(first_interest, settlement, months)
@@ -70,6 +72,7 @@ fn accrued_interest(
 
     let mut end = pcd;
     while end > issue {
+        cancellation_checkpoint(cancel)?;
         k += 1;
         let begin = coupon_date(first_interest, k * months);
         periods += if issue <= begin {
@@ -90,7 +93,7 @@ fn accrued_interest(
         };
         end = begin;
     }
-    periods
+    Ok(periods)
 }
 
 /// The coupon period holding `date` on `anchor`'s schedule; the period ending
@@ -172,6 +175,8 @@ impl Function for AccrintFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let system = ctx.date_system();
         let value = (|| {
             let [issue, first_interest, settlement, rate, par, freq, basis] =
@@ -193,10 +198,14 @@ impl Function for AccrintFn {
                 frequency,
                 basis,
                 from_issue,
-            );
+                cancel.as_ref(),
+            )?;
             Ok(par * rate / frequency as f64 * periods)
         })();
-        Ok(number_value(value))
+        match value {
+            Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+            value => Ok(number_value(value)),
+        }
     }
 }
 
@@ -280,22 +289,25 @@ pub(crate) fn bond_price(
     redemption: f64,
     frequency: u32,
     basis: Basis,
-) -> f64 {
+    cancel: Option<&CancelToken>,
+) -> Result<f64, ExcelError> {
+    cancellation_checkpoint(cancel)?;
     let f = frequency as f64;
     let e = basis.period_days(period, frequency);
     let a = basis.days_before(period, settlement);
     let dsc = e - a;
     let coupon = 100.0 * rate / f;
     if coupons == 1 {
-        return (redemption + coupon) / (1.0 + dsc / e * yld / f) - a / e * coupon;
+        return Ok((redemption + coupon) / (1.0 + dsc / e * yld / f) - a / e * coupon);
     }
     let x = 1.0 + yld / f;
     let t = dsc / e;
     let mut value = redemption / x.powf(coupons as f64 - 1.0 + t);
     for k in 1..=coupons {
+        cancellation_checkpoint(cancel)?;
         value += coupon / x.powf(k as f64 - 1.0 + t);
     }
-    value - a / e * coupon
+    Ok(value - a / e * coupon)
 }
 
 /// The settlement and coupon arguments PRICE, YIELD and DURATION share:
@@ -387,6 +399,8 @@ impl Function for PriceFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let value = (|| {
             let [settlement, maturity, rate, yld, redemption, freq, basis] =
                 numbers(args, [0.0; 7])?;
@@ -394,7 +408,7 @@ impl Function for PriceFn {
             if rate < 0.0 || yld < 0.0 || redemption <= 0.0 {
                 return Err(ExcelError::new_num());
             }
-            Ok(bond_price(
+            bond_price(
                 b.settlement,
                 &b.period,
                 b.coupons,
@@ -403,9 +417,13 @@ impl Function for PriceFn {
                 redemption,
                 b.frequency,
                 b.basis,
-            ))
+                cancel.as_ref(),
+            )
         })();
-        Ok(number_value(value))
+        match value {
+            Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+            value => Ok(number_value(value)),
+        }
     }
 }
 
@@ -446,30 +464,32 @@ fn solve_yield(
             redemption,
             b.frequency,
             b.basis,
+            cancel,
         )
     };
     let e = b.basis.period_days(&b.period, b.frequency);
     let t = (e - b.basis.days_before(&b.period, b.settlement)) / e;
     let coupon = 100.0 * rate / f;
-    let slope = |y: f64| {
+    let slope = |y: f64| -> Result<f64, ExcelError> {
         let x = 1.0 + y / f;
         let n = b.coupons as f64;
         let mut d = -(n - 1.0 + t) * redemption / x.powf(n + t) / f;
         for k in 1..=b.coupons {
+            cancellation_checkpoint(cancel)?;
             let p = k as f64 - 1.0 + t;
             d -= p * coupon / x.powf(p + 1.0) / f;
         }
-        d
+        Ok(d)
     };
     let floor = -f;
     let mut y = 0.05_f64.max(rate);
     for _ in 0..200 {
         cancellation_checkpoint(cancel)?;
-        let d = slope(y);
+        let d = slope(y)?;
         if !d.is_finite() || d == 0.0 {
             return Ok(None);
         }
-        let mut next = y - (at(y) - price) / d;
+        let mut next = y - (at(y)? - price) / d;
         if next <= floor {
             next = (y + floor) / 2.0;
         }
@@ -479,7 +499,7 @@ fn solve_yield(
         y = next;
     }
     cancellation_checkpoint(cancel)?;
-    Ok(((at(y) - price).abs() <= 1e-9 * price).then_some(y))
+    Ok(((at(y)? - price).abs() <= 1e-9 * price).then_some(y))
 }
 
 /// Returns the yield of a security that pays periodic interest.
@@ -533,6 +553,7 @@ impl Function for YieldFn {
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
         let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let value = (|| {
             let [settlement, maturity, rate, price, redemption, freq, basis] =
                 numbers(args, [0.0; 7])?;
@@ -556,7 +577,13 @@ impl Function for YieldFn {
 /// Macaulay duration in years: the cash flows' times, from settlement in
 /// coupon periods (the first one COUPDAYS - COUPDAYBS over COUPDAYS),
 /// weighted by their discounted values.
-fn macaulay_duration(b: &Bond, coupon_rate: f64, yld: f64) -> f64 {
+fn macaulay_duration(
+    b: &Bond,
+    coupon_rate: f64,
+    yld: f64,
+    cancel: Option<&CancelToken>,
+) -> Result<f64, ExcelError> {
+    cancellation_checkpoint(cancel)?;
     let f = b.frequency as f64;
     let e = b.basis.period_days(&b.period, b.frequency);
     let dsc = e - b.basis.days_before(&b.period, b.settlement);
@@ -568,12 +595,13 @@ fn macaulay_duration(b: &Bond, coupon_rate: f64, yld: f64) -> f64 {
     let mut weighted = x2 * 100.0 / x4;
     let mut value = 100.0 / x4;
     for k in 1..=b.coupons {
+        cancellation_checkpoint(cancel)?;
         let t = k as f64 - 1.0 + x1;
         let cash = (100.0 * coupon_rate / f) / x3.powf(t);
         weighted += cash * t;
         value += cash;
     }
-    weighted / value / f
+    Ok(weighted / value / f)
 }
 
 fn duration_args(
@@ -637,9 +665,14 @@ impl Function for DurationFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
-        let value =
-            duration_args(args, ctx).map(|(b, coupon, yld)| macaulay_duration(&b, coupon, yld));
-        Ok(number_value(value))
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
+        let value = duration_args(args, ctx)
+            .and_then(|(b, coupon, yld)| macaulay_duration(&b, coupon, yld, cancel.as_ref()));
+        match value {
+            Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+            value => Ok(number_value(value)),
+        }
     }
 }
 
@@ -689,10 +722,16 @@ impl Function for MdurationFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
-        let value = duration_args(args, ctx).map(|(b, coupon, yld)| {
-            macaulay_duration(&b, coupon, yld) / (yld / b.frequency as f64 + 1.0)
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
+        let value = duration_args(args, ctx).and_then(|(b, coupon, yld)| {
+            Ok(macaulay_duration(&b, coupon, yld, cancel.as_ref())?
+                / (yld / b.frequency as f64 + 1.0))
         });
-        Ok(number_value(value))
+        match value {
+            Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+            value => Ok(number_value(value)),
+        }
     }
 }
 
