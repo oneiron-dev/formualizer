@@ -46,10 +46,15 @@ fn coerce_num(arg: &ArgumentHandle) -> Result<f64, ExcelError> {
 /// `2024-01-01 12:00` (serial 45292.5) discounts as day 45292. Documented in
 /// Microsoft's XNPV/XIRR remarks ("numbers in dates are truncated to
 /// integers") and reproduced by LibreOffice 24.2.7.
-fn truncate_date_serials(dates: &mut [f64]) {
+fn truncate_date_serials(
+    dates: &mut [f64],
+    cancel: Option<&CancelToken>,
+) -> Result<(), ExcelError> {
     for d in dates.iter_mut() {
+        cancellation_checkpoint(cancel)?;
         *d = d.trunc();
     }
+    Ok(())
 }
 
 /// Calculates the constant payment amount for a fixed-rate annuity or loan.
@@ -422,6 +427,8 @@ impl Function for NpvFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         if args.len() > 255 {
             return Err(ExcelError::new_value()
                 .with_message("NPV accepts at most 255 total arguments (rate plus 254 values)"));
@@ -433,6 +440,7 @@ impl Function for NpvFn {
         let mut period = 1;
 
         for arg in &args[1..] {
+            cancellation_checkpoint(cancel.as_ref())?;
             if arg.is_omitted() {
                 period += 1;
                 continue;
@@ -447,7 +455,9 @@ impl Function for NpvFn {
                 CalcValue::Range(range) => {
                     let (rows, cols) = range.dims();
                     for row in 0..rows {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         for col in 0..cols {
+                            cancellation_checkpoint(cancel.as_ref())?;
                             accumulate_npv_cash_flow(
                                 range.get_cell(row, col),
                                 true,
@@ -461,7 +471,9 @@ impl Function for NpvFn {
                 }
                 CalcValue::Scalar(LiteralValue::Array(arr)) => {
                     for row in arr {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         for cell in row {
+                            cancellation_checkpoint(cancel.as_ref())?;
                             accumulate_npv_cash_flow(
                                 cell,
                                 true,
@@ -1201,26 +1213,32 @@ impl Function for NominalFn {
 }
 
 /// Compute NPV at a given rate.
-fn irr_npv(cashflows: &[f64], rate: f64) -> f64 {
+fn irr_npv(cashflows: &[f64], rate: f64, cancel: Option<&CancelToken>) -> Result<f64, ExcelError> {
     let mut npv = 0.0;
     for (i, &cf) in cashflows.iter().enumerate() {
+        cancellation_checkpoint(cancel)?;
         npv += cf / (1.0 + rate).powi(i as i32);
     }
-    npv
+    Ok(npv)
 }
 
 /// Compute NPV and its derivative w.r.t. rate.
-fn irr_npv_deriv(cashflows: &[f64], rate: f64) -> (f64, f64) {
+fn irr_npv_deriv(
+    cashflows: &[f64],
+    rate: f64,
+    cancel: Option<&CancelToken>,
+) -> Result<(f64, f64), ExcelError> {
     let mut npv = 0.0;
     let mut d_npv = 0.0;
     for (i, &cf) in cashflows.iter().enumerate() {
+        cancellation_checkpoint(cancel)?;
         let factor = (1.0 + rate).powi(i as i32);
         npv += cf / factor;
         if i > 0 {
             d_npv -= (i as f64) * cf / (factor * (1.0 + rate));
         }
     }
-    (npv, d_npv)
+    Ok((npv, d_npv))
 }
 
 /// Solve for IRR using Newton-Raphson with Brent's method fallback.
@@ -1244,7 +1262,7 @@ fn irr_solve(
     let mut rate = guess;
     for _ in 0..MAX_NR {
         cancellation_checkpoint(cancel)?;
-        let (npv, d_npv) = irr_npv_deriv(cashflows, rate);
+        let (npv, d_npv) = irr_npv_deriv(cashflows, rate, cancel)?;
         if d_npv.abs() < TOL {
             break; // flat derivative, fall through to Brent
         }
@@ -1272,7 +1290,7 @@ fn irr_solve(
 
     for &r in probes {
         cancellation_checkpoint(cancel)?;
-        let npv = irr_npv(cashflows, r);
+        let npv = irr_npv(cashflows, r, cancel)?;
         if !npv.is_finite() {
             continue;
         }
@@ -1299,9 +1317,9 @@ fn irr_solve(
     let mut xpre = lo;
     let mut xcur = hi;
     cancellation_checkpoint(cancel)?;
-    let mut fpre = irr_npv(cashflows, xpre);
+    let mut fpre = irr_npv(cashflows, xpre, cancel)?;
     cancellation_checkpoint(cancel)?;
-    let mut fcur = irr_npv(cashflows, xcur);
+    let mut fcur = irr_npv(cashflows, xcur, cancel)?;
 
     if fpre == 0.0 {
         return Ok(Some(xpre));
@@ -1376,7 +1394,7 @@ fn irr_solve(
         } else {
             xcur += if sbis > 0.0 { delta } else { -delta };
         }
-        fcur = irr_npv(cashflows, xcur);
+        fcur = irr_npv(cashflows, xcur, cancel)?;
     }
     Ok(Some(xcur))
 }
@@ -1444,6 +1462,8 @@ impl Function for IrrFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let date_system = ctx.date_system();
         // Collect cash flows
         let mut cashflows = Vec::new();
@@ -1453,7 +1473,9 @@ impl Function for IrrFn {
                 LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
                 LiteralValue::Array(arr) => {
                     for row in arr {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         for cell in row {
+                            cancellation_checkpoint(cancel.as_ref())?;
                             if let Ok(n) = to_serial_strict(&cell, date_system) {
                                 cashflows.push(n);
                             }
@@ -1465,7 +1487,9 @@ impl Function for IrrFn {
             CalcValue::Range(range) => {
                 let (rows, cols) = range.dims();
                 for r in 0..rows {
+                    cancellation_checkpoint(cancel.as_ref())?;
                     for c in 0..cols {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         let cell = range.get_cell(r, c);
                         if let Ok(n) = to_serial_strict(&cell, date_system) {
                             cashflows.push(n);
@@ -1494,7 +1518,6 @@ impl Function for IrrFn {
             0.1
         };
 
-        let cancel = ctx.cancellation_token();
         match irr_solve(&cashflows, guess, cancel.as_ref())? {
             Some(rate) => Ok(CalcValue::Scalar(LiteralValue::Number(rate))),
             None => Ok(CalcValue::Scalar(
@@ -1939,6 +1962,8 @@ impl Function for XnpvFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let date_system = ctx.date_system();
         let rate = coerce_num(&args[0])?;
 
@@ -1950,7 +1975,9 @@ impl Function for XnpvFn {
                 LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
                 LiteralValue::Array(arr) => {
                     for row in arr {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         for cell in row {
+                            cancellation_checkpoint(cancel.as_ref())?;
                             if let Ok(n) = to_serial_strict(&cell, date_system) {
                                 values.push(n);
                             }
@@ -1962,7 +1989,9 @@ impl Function for XnpvFn {
             CalcValue::Range(range) => {
                 let (rows, cols) = range.dims();
                 for r in 0..rows {
+                    cancellation_checkpoint(cancel.as_ref())?;
                     for c in 0..cols {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         let cell = range.get_cell(r, c);
                         if let Ok(n) = to_serial_strict(&cell, date_system) {
                             values.push(n);
@@ -1986,7 +2015,9 @@ impl Function for XnpvFn {
                 LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
                 LiteralValue::Array(arr) => {
                     for row in arr {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         for cell in row {
+                            cancellation_checkpoint(cancel.as_ref())?;
                             if let Ok(n) = to_serial_strict(&cell, date_system) {
                                 dates.push(n);
                             }
@@ -1998,7 +2029,9 @@ impl Function for XnpvFn {
             CalcValue::Range(range) => {
                 let (rows, cols) = range.dims();
                 for r in 0..rows {
+                    cancellation_checkpoint(cancel.as_ref())?;
                     for c in 0..cols {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         let cell = range.get_cell(r, c);
                         if let Ok(n) = to_serial_strict(&cell, date_system) {
                             dates.push(n);
@@ -2014,7 +2047,7 @@ impl Function for XnpvFn {
             }
         }
 
-        truncate_date_serials(&mut dates);
+        truncate_date_serials(&mut dates, cancel.as_ref())?;
 
         // Validate that values and dates have the same length
         if values.len() != dates.len() || values.is_empty() {
@@ -2028,6 +2061,7 @@ impl Function for XnpvFn {
         let mut xnpv = 0.0;
 
         for (i, &value) in values.iter().enumerate() {
+            cancellation_checkpoint(cancel.as_ref())?;
             let days_from_start = dates[i] - first_date;
             let years = days_from_start / 365.0;
             xnpv += value / (1.0 + rate).powf(years);
@@ -2038,34 +2072,46 @@ impl Function for XnpvFn {
 }
 
 /// Helper function to calculate XNPV given rate, values, and dates
-fn calculate_xnpv(rate: f64, values: &[f64], dates: &[f64]) -> f64 {
+fn calculate_xnpv(
+    rate: f64,
+    values: &[f64],
+    dates: &[f64],
+    cancel: Option<&CancelToken>,
+) -> Result<f64, ExcelError> {
     if values.is_empty() || dates.is_empty() {
-        return 0.0;
+        return Ok(0.0);
     }
     let first_date = dates[0];
     let mut xnpv = 0.0;
     for (i, &value) in values.iter().enumerate() {
+        cancellation_checkpoint(cancel)?;
         let days_from_start = dates[i] - first_date;
         let years = days_from_start / 365.0;
         xnpv += value / (1.0 + rate).powf(years);
     }
-    xnpv
+    Ok(xnpv)
 }
 
 /// Helper function to calculate the derivative of XNPV with respect to rate
-fn calculate_xnpv_derivative(rate: f64, values: &[f64], dates: &[f64]) -> f64 {
+fn calculate_xnpv_derivative(
+    rate: f64,
+    values: &[f64],
+    dates: &[f64],
+    cancel: Option<&CancelToken>,
+) -> Result<f64, ExcelError> {
     if values.is_empty() || dates.is_empty() {
-        return 0.0;
+        return Ok(0.0);
     }
     let first_date = dates[0];
     let mut d_xnpv = 0.0;
     for (i, &value) in values.iter().enumerate() {
+        cancellation_checkpoint(cancel)?;
         let days_from_start = dates[i] - first_date;
         let years = days_from_start / 365.0;
         // d/dr [value / (1+r)^years] = -years * value / (1+r)^(years+1)
         d_xnpv -= years * value / (1.0 + rate).powf(years + 1.0);
     }
-    d_xnpv
+    Ok(d_xnpv)
 }
 
 /// Calculates annualized internal rate of return for irregularly dated cash flows.
@@ -2136,6 +2182,8 @@ impl Function for XirrFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let date_system = ctx.date_system();
         // Collect values
         let mut values = Vec::new();
@@ -2145,7 +2193,9 @@ impl Function for XirrFn {
                 LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
                 LiteralValue::Array(arr) => {
                     for row in arr {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         for cell in row {
+                            cancellation_checkpoint(cancel.as_ref())?;
                             if let Ok(n) = to_serial_strict(&cell, date_system) {
                                 values.push(n);
                             }
@@ -2157,7 +2207,9 @@ impl Function for XirrFn {
             CalcValue::Range(range) => {
                 let (rows, cols) = range.dims();
                 for r in 0..rows {
+                    cancellation_checkpoint(cancel.as_ref())?;
                     for c in 0..cols {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         let cell = range.get_cell(r, c);
                         if let Ok(n) = to_serial_strict(&cell, date_system) {
                             values.push(n);
@@ -2181,7 +2233,9 @@ impl Function for XirrFn {
                 LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
                 LiteralValue::Array(arr) => {
                     for row in arr {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         for cell in row {
+                            cancellation_checkpoint(cancel.as_ref())?;
                             if let Ok(n) = to_serial_strict(&cell, date_system) {
                                 dates.push(n);
                             }
@@ -2193,7 +2247,9 @@ impl Function for XirrFn {
             CalcValue::Range(range) => {
                 let (rows, cols) = range.dims();
                 for r in 0..rows {
+                    cancellation_checkpoint(cancel.as_ref())?;
                     for c in 0..cols {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         let cell = range.get_cell(r, c);
                         if let Ok(n) = to_serial_strict(&cell, date_system) {
                             dates.push(n);
@@ -2209,7 +2265,7 @@ impl Function for XirrFn {
             }
         }
 
-        truncate_date_serials(&mut dates);
+        truncate_date_serials(&mut dates, cancel.as_ref())?;
 
         // Validate
         if values.len() != dates.len() || values.len() < 2 {
@@ -2219,8 +2275,22 @@ impl Function for XirrFn {
         }
 
         // Check that we have at least one positive and one negative cash flow
-        let has_positive = values.iter().any(|&v| v > 0.0);
-        let has_negative = values.iter().any(|&v| v < 0.0);
+        let mut has_positive = false;
+        for &value in &values {
+            cancellation_checkpoint(cancel.as_ref())?;
+            if value > 0.0 {
+                has_positive = true;
+                break;
+            }
+        }
+        let mut has_negative = false;
+        for &value in &values {
+            cancellation_checkpoint(cancel.as_ref())?;
+            if value < 0.0 {
+                has_negative = true;
+                break;
+            }
+        }
         if !has_positive || !has_negative {
             return Ok(CalcValue::Scalar(
                 LiteralValue::Error(ExcelError::new_num()),
@@ -2239,11 +2309,10 @@ impl Function for XirrFn {
         const MAX_ITER: i32 = 100;
         const EPSILON: f64 = 1e-10;
 
-        let cancel = ctx.cancellation_token();
         for _ in 0..MAX_ITER {
             cancellation_checkpoint(cancel.as_ref())?;
-            let xnpv = calculate_xnpv(rate, &values, &dates);
-            let d_xnpv = calculate_xnpv_derivative(rate, &values, &dates);
+            let xnpv = calculate_xnpv(rate, &values, &dates, cancel.as_ref())?;
+            let d_xnpv = calculate_xnpv_derivative(rate, &values, &dates, cancel.as_ref())?;
 
             if d_xnpv.abs() < EPSILON {
                 return Ok(CalcValue::Scalar(
