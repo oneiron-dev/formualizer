@@ -792,6 +792,18 @@ pub(crate) fn invoke(
     }
 }
 
+fn invoke_cancellable(
+    arg: &ArgumentHandle<'_, '_>,
+    callable: &Arc<dyn CustomCallable>,
+    values: &[LiteralValue],
+) -> Result<LiteralValue, ExcelError> {
+    match callable.invoke(arg.interpreter(), values) {
+        Ok(result) => Ok(result.into_literal()),
+        Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+        Err(error) => Ok(LiteralValue::Error(error)),
+    }
+}
+
 /// [`invoke`] with arguments bound as a LAMBDA call binds them.
 fn invoke_bound(
     arg: &ArgumentHandle<'_, '_>,
@@ -980,11 +992,16 @@ fn eval_reduce<'a, 'b>(
         Err(value) => return Ok(scalar(value)),
     };
     let mut acc = initial_value(&args[0])?;
+    let cancel = ctx.cancellation_token();
+    cancellation_checkpoint(cancel.as_ref())?;
     for row in grid_arg(array_arg)? {
+        cancellation_checkpoint(cancel.as_ref())?;
         for value in row {
-            acc = invoke(lambda, &callable, &[acc, value]);
+            cancellation_checkpoint(cancel.as_ref())?;
+            acc = invoke_cancellable(lambda, &callable, &[acc, value])?;
         }
     }
+    cancellation_checkpoint(cancel.as_ref())?;
     Ok(match acc {
         LiteralValue::Array(rows) => array_result(rows, ctx),
         LiteralValue::Empty => scalar(LiteralValue::Number(0.0)),
@@ -1004,12 +1021,16 @@ fn eval_scan<'a, 'b>(
         Err(value) => return Ok(scalar(value)),
     };
     let mut acc = initial_value(&args[0])?;
+    let cancel = ctx.cancellation_token();
+    cancellation_checkpoint(cancel.as_ref())?;
     let grid = grid_arg(array_arg)?;
     let mut out = Vec::with_capacity(grid.len());
     for row in grid {
+        cancellation_checkpoint(cancel.as_ref())?;
         let mut out_row = Vec::with_capacity(row.len());
         for value in row {
-            acc = invoke(lambda, &callable, &[acc, value]);
+            cancellation_checkpoint(cancel.as_ref())?;
+            acc = invoke_cancellable(lambda, &callable, &[acc, value])?;
             match element_value(acc.clone()) {
                 Some(value) => out_row.push(value),
                 None => return Ok(scalar(nested_array_error())),
@@ -1017,6 +1038,7 @@ fn eval_scan<'a, 'b>(
         }
         out.push(out_row);
     }
+    cancellation_checkpoint(cancel.as_ref())?;
     Ok(array_result(out, ctx))
 }
 
@@ -1118,21 +1140,26 @@ fn eval_makearray<'a, 'b>(
         Ok(callable) => callable,
         Err(value) => return Ok(scalar(value)),
     };
+    let cancel = ctx.cancellation_token();
+    cancellation_checkpoint(cancel.as_ref())?;
     let mut out = Vec::with_capacity(height);
     for r in 1..=height {
+        cancellation_checkpoint(cancel.as_ref())?;
         let mut row = Vec::with_capacity(width);
         for c in 1..=width {
+            cancellation_checkpoint(cancel.as_ref())?;
             let values = [
                 LiteralValue::Number(r as f64),
                 LiteralValue::Number(c as f64),
             ];
-            match element_value(invoke(&args[2], &callable, &values)) {
+            match element_value(invoke_cancellable(&args[2], &callable, &values)?) {
                 Some(value) => row.push(value),
                 None => return Ok(scalar(nested_array_error())),
             }
         }
         out.push(row);
     }
+    cancellation_checkpoint(cancel.as_ref())?;
     Ok(array_result(out, ctx))
 }
 
