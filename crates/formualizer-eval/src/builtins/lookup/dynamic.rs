@@ -1298,6 +1298,80 @@ fn cmp_for_sort(
     if ascending { ord } else { ord.reverse() }
 }
 
+fn sort_cancellable<T>(
+    values: &mut [T],
+    cancel: &CancelToken,
+    mut compare: impl FnMut(&T, &T) -> Result<std::cmp::Ordering, ExcelError>,
+) -> Result<(), ExcelError> {
+    cancellation_checkpoint(Some(cancel))?;
+    let len = values.len();
+    if len < 2 {
+        return Ok(());
+    }
+    let mut order = Vec::with_capacity(len);
+    cancellation_checkpoint(Some(cancel))?;
+    let mut scratch = Vec::with_capacity(len);
+    for index in 0..len {
+        cancellation_checkpoint(Some(cancel))?;
+        order.push(index);
+        scratch.push(0);
+    }
+    let mut width = 1usize;
+    while width < len {
+        cancellation_checkpoint(Some(cancel))?;
+        let mut start = 0usize;
+        while start < len {
+            cancellation_checkpoint(Some(cancel))?;
+            let middle = start.saturating_add(width).min(len);
+            let end = middle.saturating_add(width).min(len);
+            let (mut left, mut right, mut output) = (start, middle, start);
+            while left < middle && right < end {
+                cancellation_checkpoint(Some(cancel))?;
+                if compare(&values[order[left]], &values[order[right]])?
+                    != std::cmp::Ordering::Greater
+                {
+                    scratch[output] = order[left];
+                    left += 1;
+                } else {
+                    scratch[output] = order[right];
+                    right += 1;
+                }
+                output += 1;
+            }
+            while left < middle {
+                cancellation_checkpoint(Some(cancel))?;
+                scratch[output] = order[left];
+                left += 1;
+                output += 1;
+            }
+            while right < end {
+                cancellation_checkpoint(Some(cancel))?;
+                scratch[output] = order[right];
+                right += 1;
+                output += 1;
+            }
+            start = end;
+        }
+        std::mem::swap(&mut order, &mut scratch);
+        width = width.saturating_mul(2);
+    }
+    // The sorted order maps destination to source; swaps need the inverse.
+    for (destination, source) in order.into_iter().enumerate() {
+        cancellation_checkpoint(Some(cancel))?;
+        scratch[source] = destination;
+    }
+    for index in 0..len {
+        cancellation_checkpoint(Some(cancel))?;
+        while scratch[index] != index {
+            cancellation_checkpoint(Some(cancel))?;
+            let destination = scratch[index];
+            values.swap(index, destination);
+            scratch.swap(index, destination);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct SortFn;
 /// Sorts an array by a selected row or column and returns a spilled result.
@@ -1432,6 +1506,7 @@ impl Function for SortFn {
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         let view = match args[0].range_view_or_scalar() {
             Ok(v) => v,
+            Err(e) if native_argument_cancellation(&args[0], &e) => return Err(e),
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
         let (rows, cols) = view.dims();
@@ -1468,6 +1543,7 @@ impl Function for SortFn {
         };
 
         let ascending = sort_order >= 0;
+        let cancel = _ctx.cancellation_token();
 
         if by_col {
             // Sort columns by the specified row
@@ -1478,34 +1554,52 @@ impl Function for SortFn {
                 )));
             }
 
+            cancellation_checkpoint(cancel.as_ref())?;
             // Extract columns as vectors
             let mut columns: Vec<(usize, Vec<LiteralValue>)> = Vec::with_capacity(cols);
             for c in 0..cols {
+                cancellation_checkpoint(cancel.as_ref())?;
                 let mut col_vals: Vec<LiteralValue> = Vec::with_capacity(rows);
                 for r in 0..rows {
+                    cancellation_checkpoint(cancel.as_ref())?;
                     col_vals.push(view.get_cell(r, c));
                 }
                 columns.push((c, col_vals));
             }
 
             // Sort columns by the value in sort_row_idx
-            columns.sort_by(|a, b| {
-                cmp_for_sort(
-                    &a.1[sort_row_idx],
-                    &b.1[sort_row_idx],
-                    ascending,
-                    _ctx.date_system(),
-                )
-            });
+            if let Some(cancel) = cancel.as_ref() {
+                sort_cancellable(&mut columns, cancel, |a, b| {
+                    Ok(cmp_for_sort(
+                        &a.1[sort_row_idx],
+                        &b.1[sort_row_idx],
+                        ascending,
+                        _ctx.date_system(),
+                    ))
+                })?;
+            } else {
+                columns.sort_by(|a, b| {
+                    cmp_for_sort(
+                        &a.1[sort_row_idx],
+                        &b.1[sort_row_idx],
+                        ascending,
+                        _ctx.date_system(),
+                    )
+                });
+            }
 
             // Reconstruct the array with sorted columns
+            cancellation_checkpoint(cancel.as_ref())?;
             let mut out: Vec<Vec<LiteralValue>> = vec![Vec::with_capacity(cols); rows];
             for (_orig_idx, col_vals) in columns {
+                cancellation_checkpoint(cancel.as_ref())?;
                 for (r, val) in col_vals.into_iter().enumerate() {
+                    cancellation_checkpoint(cancel.as_ref())?;
                     out[r].push(val);
                 }
             }
 
+            cancellation_checkpoint(cancel.as_ref())?;
             Ok(collapse_if_scalar(out, _ctx.date_system()))
         } else {
             // Sort rows by the specified column
@@ -1516,26 +1610,41 @@ impl Function for SortFn {
                 )));
             }
 
+            cancellation_checkpoint(cancel.as_ref())?;
             // Extract rows
             let mut row_data: Vec<Vec<LiteralValue>> = Vec::with_capacity(rows);
             for r in 0..rows {
+                cancellation_checkpoint(cancel.as_ref())?;
                 let mut row_vals: Vec<LiteralValue> = Vec::with_capacity(cols);
                 for c in 0..cols {
+                    cancellation_checkpoint(cancel.as_ref())?;
                     row_vals.push(view.get_cell(r, c));
                 }
                 row_data.push(row_vals);
             }
 
             // Sort rows by the value in sort_col_idx
-            row_data.sort_by(|a, b| {
-                cmp_for_sort(
-                    &a[sort_col_idx],
-                    &b[sort_col_idx],
-                    ascending,
-                    _ctx.date_system(),
-                )
-            });
+            if let Some(cancel) = cancel.as_ref() {
+                sort_cancellable(&mut row_data, cancel, |a, b| {
+                    Ok(cmp_for_sort(
+                        &a[sort_col_idx],
+                        &b[sort_col_idx],
+                        ascending,
+                        _ctx.date_system(),
+                    ))
+                })?;
+            } else {
+                row_data.sort_by(|a, b| {
+                    cmp_for_sort(
+                        &a[sort_col_idx],
+                        &b[sort_col_idx],
+                        ascending,
+                        _ctx.date_system(),
+                    )
+                });
+            }
 
+            cancellation_checkpoint(cancel.as_ref())?;
             Ok(collapse_if_scalar(row_data, _ctx.date_system()))
         }
     }
@@ -1547,9 +1656,9 @@ impl Function for SortFn {
 /// the sign of the number picks the direction. A range or array gives its
 /// top-left value; an error, or text that is not a number, is returned as the
 /// error.
-fn sortby_ascending(arg: &ArgumentHandle<'_, '_>) -> Result<bool, ExcelError> {
+fn sortby_ascending(arg: &ArgumentHandle<'_, '_>) -> Result<Result<bool, ExcelError>, ExcelError> {
     if arg.is_omitted() {
-        return Ok(true);
+        return Ok(Ok(true));
     }
     let value = match arg.value()?.into_literal() {
         LiteralValue::Array(rows) => rows
@@ -1559,7 +1668,7 @@ fn sortby_ascending(arg: &ArgumentHandle<'_, '_>) -> Result<bool, ExcelError> {
             .unwrap_or(LiteralValue::Empty),
         value => value,
     };
-    Ok(crate::coercion::to_number_argument(&value)? >= 0.0)
+    Ok(crate::coercion::to_number_argument(&value).map(|number| number >= 0.0))
 }
 
 #[derive(Debug)]
@@ -1682,6 +1791,7 @@ impl Function for SortByFn {
 
         let view = match args[0].range_view_or_scalar() {
             Ok(v) => v,
+            Err(e) if native_argument_cancellation(&args[0], &e) => return Err(e),
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
         let (rows, cols) = view.dims();
@@ -1691,15 +1801,20 @@ impl Function for SortByFn {
             ));
         }
 
+        let cancel = _ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
+
         // Parse sort criteria by position: after the array come
         // by_array1, [sort_order1], [by_array2, sort_order2], ...
         let mut sort_criteria: Vec<(Vec<LiteralValue>, bool)> = Vec::new();
         let mut arg_idx = 1;
 
         while arg_idx < args.len() {
+            cancellation_checkpoint(cancel.as_ref())?;
             // by_array
             let by_view = match args[arg_idx].range_view_or_scalar() {
                 Ok(v) => v,
+                Err(e) if native_argument_cancellation(&args[arg_idx], &e) => return Err(e),
                 Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
             };
             let (by_rows, by_cols) = by_view.dims();
@@ -1711,14 +1826,24 @@ impl Function for SortByFn {
                         ExcelError::new(ExcelErrorKind::Value),
                     )));
                 }
-                (0..by_rows).map(|r| by_view.get_cell(r, 0)).collect()
+                (0..by_rows)
+                    .map(|r| {
+                        cancellation_checkpoint(cancel.as_ref())?;
+                        Ok(by_view.get_cell(r, 0))
+                    })
+                    .collect::<Result<_, ExcelError>>()?
             } else if by_rows == 1 {
                 if by_cols != rows {
                     return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                         ExcelError::new(ExcelErrorKind::Value),
                     )));
                 }
-                (0..by_cols).map(|c| by_view.get_cell(0, c)).collect()
+                (0..by_cols)
+                    .map(|c| {
+                        cancellation_checkpoint(cancel.as_ref())?;
+                        Ok(by_view.get_cell(0, c))
+                    })
+                    .collect::<Result<_, ExcelError>>()?
             } else {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new(ExcelErrorKind::Value),
@@ -1728,8 +1853,11 @@ impl Function for SortByFn {
             // The sort_order after each by_array; omitted means ascending.
             let ascending = match args.get(arg_idx + 1) {
                 Some(order) => match sortby_ascending(order) {
-                    Ok(ascending) => ascending,
-                    Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+                    Ok(Ok(ascending)) => ascending,
+                    Err(e) if e.kind == ExcelErrorKind::Cancelled => return Err(e),
+                    Ok(Err(e)) | Err(e) => {
+                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
+                    }
                 },
                 None => true,
             };
@@ -1744,35 +1872,63 @@ impl Function for SortByFn {
             )));
         }
 
+        cancellation_checkpoint(cancel.as_ref())?;
         // Extract rows with their indices
         let mut indexed_rows: Vec<(usize, Vec<LiteralValue>)> = Vec::with_capacity(rows);
         for r in 0..rows {
+            cancellation_checkpoint(cancel.as_ref())?;
             let mut row_vals: Vec<LiteralValue> = Vec::with_capacity(cols);
             for c in 0..cols {
+                cancellation_checkpoint(cancel.as_ref())?;
                 row_vals.push(view.get_cell(r, c));
             }
             indexed_rows.push((r, row_vals));
         }
 
         // Sort using all criteria
-        indexed_rows.sort_by(|a, b| {
-            for (by_values, ascending) in &sort_criteria {
-                let ord = cmp_for_sort(
-                    &by_values[a.0],
-                    &by_values[b.0],
-                    *ascending,
-                    _ctx.date_system(),
-                );
-                if ord != std::cmp::Ordering::Equal {
-                    return ord;
+        if let Some(cancel) = cancel.as_ref() {
+            sort_cancellable(&mut indexed_rows, cancel, |a, b| {
+                for (by_values, ascending) in &sort_criteria {
+                    cancellation_checkpoint(Some(cancel))?;
+                    let ord = cmp_for_sort(
+                        &by_values[a.0],
+                        &by_values[b.0],
+                        *ascending,
+                        _ctx.date_system(),
+                    );
+                    if ord != std::cmp::Ordering::Equal {
+                        return Ok(ord);
+                    }
                 }
-            }
-            std::cmp::Ordering::Equal
-        });
+                Ok(std::cmp::Ordering::Equal)
+            })?;
+        } else {
+            indexed_rows.sort_by(|a, b| {
+                for (by_values, ascending) in &sort_criteria {
+                    let ord = cmp_for_sort(
+                        &by_values[a.0],
+                        &by_values[b.0],
+                        *ascending,
+                        _ctx.date_system(),
+                    );
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
 
         // Extract sorted rows
-        let out: Vec<Vec<LiteralValue>> = indexed_rows.into_iter().map(|(_, row)| row).collect();
+        let out: Vec<Vec<LiteralValue>> = indexed_rows
+            .into_iter()
+            .map(|(_, row)| {
+                cancellation_checkpoint(cancel.as_ref())?;
+                Ok(row)
+            })
+            .collect::<Result<_, ExcelError>>()?;
 
+        cancellation_checkpoint(cancel.as_ref())?;
         Ok(collapse_if_scalar(out, _ctx.date_system()))
     }
 }
