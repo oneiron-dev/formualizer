@@ -429,11 +429,6 @@ impl Function for NpvFn {
     ) -> Result<CalcValue<'b>, ExcelError> {
         let cancel = ctx.cancellation_token();
         cancellation_checkpoint(cancel.as_ref())?;
-        if args.len() > 255 {
-            return Err(ExcelError::new_value()
-                .with_message("NPV accepts at most 255 total arguments (rate plus 254 values)"));
-        }
-
         let date_system = ctx.date_system();
         let rate = coerce_num(&args[0])?;
         let mut npv = 0.0;
@@ -1593,6 +1588,8 @@ impl Function for MirrFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let date_system = ctx.date_system();
         // Collect cash flows
         let mut cashflows = Vec::new();
@@ -1602,7 +1599,9 @@ impl Function for MirrFn {
                 LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
                 LiteralValue::Array(arr) => {
                     for row in arr {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         for cell in row {
+                            cancellation_checkpoint(cancel.as_ref())?;
                             if let Ok(n) = to_serial_strict(&cell, date_system) {
                                 cashflows.push(n);
                             }
@@ -1614,7 +1613,9 @@ impl Function for MirrFn {
             CalcValue::Range(range) => {
                 let (rows, cols) = range.dims();
                 for r in 0..rows {
+                    cancellation_checkpoint(cancel.as_ref())?;
                     for c in 0..cols {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         let cell = range.get_cell(r, c);
                         if let Ok(n) = to_serial_strict(&cell, date_system) {
                             cashflows.push(n);
@@ -1647,6 +1648,7 @@ impl Function for MirrFn {
         let mut fv_pos = 0.0;
 
         for (i, &cf) in cashflows.iter().enumerate() {
+            cancellation_checkpoint(cancel.as_ref())?;
             if cf < 0.0 {
                 pv_neg += cf / (1.0 + finance_rate).powi(i as i32);
             } else {
@@ -1732,8 +1734,10 @@ impl Function for CumipmtFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let rate = coerce_num(&args[0])?;
         let nper = coerce_num(&args[1])?.trunc() as i32;
         let pv = coerce_num(&args[2])?;
@@ -1758,8 +1762,11 @@ impl Function for CumipmtFn {
         // Interest carries the payment's sign: negative for a positive loan.
         let pmt = cum_pmt(rate, nper as f64, pv, pay_type);
         let cum_int: f64 = (start..=end)
-            .map(|per| cum_ipmt(rate, per, pmt, pv, pay_type))
-            .sum();
+            .map(|per| {
+                cancellation_checkpoint(cancel.as_ref())?;
+                Ok(cum_ipmt(rate, per, pmt, pv, pay_type))
+            })
+            .sum::<Result<f64, ExcelError>>()?;
 
         Ok(CalcValue::Scalar(LiteralValue::Number(cum_int)))
     }
@@ -1865,8 +1872,10 @@ impl Function for CumprincFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let rate = coerce_num(&args[0])?;
         let nper = coerce_num(&args[1])?.trunc() as i32;
         let pv = coerce_num(&args[2])?;
@@ -1891,8 +1900,11 @@ impl Function for CumprincFn {
         // Principal is the payment less that period's interest.
         let pmt = cum_pmt(rate, nper as f64, pv, pay_type);
         let cum_princ: f64 = (start..=end)
-            .map(|per| pmt - cum_ipmt(rate, per, pmt, pv, pay_type))
-            .sum();
+            .map(|per| {
+                cancellation_checkpoint(cancel.as_ref())?;
+                Ok(pmt - cum_ipmt(rate, per, pmt, pv, pay_type))
+            })
+            .sum::<Result<f64, ExcelError>>()?;
         Ok(CalcValue::Scalar(LiteralValue::Number(cum_princ)))
     }
 }
@@ -2809,8 +2821,10 @@ impl Function for FvscheduleFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let value = (|| {
             let mut value = super::coupon::number(&args[0])?;
             let rate = |cell: &LiteralValue| -> Result<Option<f64>, ExcelError> {
@@ -2832,7 +2846,9 @@ impl Function for FvscheduleFn {
                 CalcValue::Range(range) => {
                     let (rows, cols) = range.dims();
                     for r in 0..rows {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         for c in 0..cols {
+                            cancellation_checkpoint(cancel.as_ref())?;
                             if let Some(r) = rate(&range.get_cell(r, c))? {
                                 value *= 1.0 + r;
                             }
@@ -2841,9 +2857,13 @@ impl Function for FvscheduleFn {
                 }
                 CalcValue::Scalar(LiteralValue::Array(rows))
                 | CalcValue::AnnotatedScalar(LiteralValue::Array(rows), _) => {
-                    for cell in rows.iter().flatten() {
-                        if let Some(r) = rate(cell)? {
-                            value *= 1.0 + r;
+                    for row in &rows {
+                        cancellation_checkpoint(cancel.as_ref())?;
+                        for cell in row {
+                            cancellation_checkpoint(cancel.as_ref())?;
+                            if let Some(r) = rate(cell)? {
+                                value *= 1.0 + r;
+                            }
                         }
                     }
                 }
@@ -2858,6 +2878,11 @@ impl Function for FvscheduleFn {
             // Excel reports a product past the largest number as 0.
             Ok(if value.is_finite() { value } else { 0.0 })
         })();
+        if let Err(error) = &value {
+            if error.kind == ExcelErrorKind::Cancelled {
+                return Err(error.clone());
+            }
+        }
         Ok(super::coupon::number_value(value))
     }
 }
