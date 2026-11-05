@@ -48,13 +48,21 @@ fn step(date: NaiveDate, months: i32, month_end: bool) -> NaiveDate {
 
 /// Walks from `from` by `months` (negative: back) until reaching or passing
 /// `to`; returns the date reached and the one before it.
-fn walk(from: NaiveDate, to: NaiveDate, months: i32, month_end: bool) -> (NaiveDate, NaiveDate) {
+fn walk(
+    from: NaiveDate,
+    to: NaiveDate,
+    months: i32,
+    month_end: bool,
+    cancel: Option<&CancelToken>,
+) -> Result<(NaiveDate, NaiveDate), ExcelError> {
+    cancellation_checkpoint(cancel)?;
     let (mut front, mut trailing) = (from, to);
     while if months > 0 { front < to } else { front > to } {
+        cancellation_checkpoint(cancel)?;
         trailing = front;
         front = step(front, months, month_end);
     }
-    (front, trailing)
+    Ok((front, trailing))
 }
 
 /// The coupon dates on or before and after `settlement`, walked back from
@@ -63,32 +71,47 @@ fn coupon_dates(
     settlement: NaiveDate,
     maturity: NaiveDate,
     frequency: u32,
-) -> (NaiveDate, NaiveDate) {
+    cancel: Option<&CancelToken>,
+) -> Result<(NaiveDate, NaiveDate), ExcelError> {
     walk(
         maturity,
         settlement,
         -(12 / frequency as i32),
         is_month_end(maturity),
+        cancel,
     )
 }
 
 /// The days of settlement's coupon period on the walked schedule.
-fn coupon_days(basis: Basis, settlement: NaiveDate, maturity: NaiveDate, frequency: u32) -> f64 {
-    match basis {
+fn coupon_days(
+    basis: Basis,
+    settlement: NaiveDate,
+    maturity: NaiveDate,
+    frequency: u32,
+    cancel: Option<&CancelToken>,
+) -> Result<f64, ExcelError> {
+    cancellation_checkpoint(cancel)?;
+    Ok(match basis {
         Basis::Actual => {
-            let (pcd, ncd) = coupon_dates(settlement, maturity, frequency);
+            let (pcd, ncd) = coupon_dates(settlement, maturity, frequency, cancel)?;
             (ncd - pcd).num_days() as f64
         }
         Basis::Actual365 => 365.0 / frequency as f64,
         _ => 360.0 / frequency as f64,
-    }
+    })
 }
 
 /// The coupons from settlement to maturity on the walked schedule.
-fn coupon_count(settlement: NaiveDate, maturity: NaiveDate, frequency: u32) -> f64 {
-    let (pcd, _) = coupon_dates(settlement, maturity, frequency);
+fn coupon_count(
+    settlement: NaiveDate,
+    maturity: NaiveDate,
+    frequency: u32,
+    cancel: Option<&CancelToken>,
+) -> Result<f64, ExcelError> {
+    cancellation_checkpoint(cancel)?;
+    let (pcd, _) = coupon_dates(settlement, maturity, frequency, cancel)?;
     let months = (maturity.year() - pcd.year()) * 12 + maturity.month() as i32 - pcd.month() as i32;
-    f64::from(months) * frequency as f64 / 12.0
+    Ok(f64::from(months) * frequency as f64 / 12.0)
 }
 
 /// Days from `start` to `end` by the basis, 0 when `end` is earlier.
@@ -99,7 +122,13 @@ fn days(basis: Basis, start: NaiveDate, end: NaiveDate) -> f64 {
 /// The whole quasi-coupon periods from settlement to the first coupon, as
 /// Excel counts them: from settlement (moved to its month's end when the
 /// first coupon is a month end, which counts one period), one step at a time.
-fn quasi_periods_to_first(first_coupon: NaiveDate, settlement: NaiveDate, months: i32) -> f64 {
+fn quasi_periods_to_first(
+    first_coupon: NaiveDate,
+    settlement: NaiveDate,
+    months: i32,
+    cancel: Option<&CancelToken>,
+) -> Result<f64, ExcelError> {
+    cancellation_checkpoint(cancel)?;
     let month_end =
         if !is_month_end(first_coupon) && first_coupon.month() != 2 && first_coupon.day() > 28 {
             is_month_end(settlement)
@@ -110,10 +139,11 @@ fn quasi_periods_to_first(first_coupon: NaiveDate, settlement: NaiveDate, months
     let mut count = if settlement < start { 1.0 } else { 0.0 };
     let mut front = step(start, months, month_end);
     while front < first_coupon {
+        cancellation_checkpoint(cancel)?;
         front = step(front, months, month_end);
         count += 1.0;
     }
-    count
+    Ok(count)
 }
 
 /// A bond with an odd first period: issue < settlement < first coupon <
@@ -132,7 +162,9 @@ fn odd_first(
     freq: f64,
     basis: f64,
     ctx: &dyn FunctionContext<'_>,
+    cancel: Option<&CancelToken>,
 ) -> Result<OddFirst, ExcelError> {
+    cancellation_checkpoint(cancel)?;
     let system = ctx.date_system();
     let settlement = date(settlement, system)?;
     let maturity = date(maturity, system)?;
@@ -150,7 +182,8 @@ fn odd_first(
         first_coupon,
         -months,
         month_end,
-    );
+        cancel,
+    )?;
     if on_schedule != first_coupon {
         return Err(ExcelError::new_num());
     }
@@ -168,30 +201,39 @@ fn odd_first(
 /// the odd first coupon, less the interest accrued since issue. A first
 /// period shorter than settlement's coupon period is one period; a longer one
 /// is counted in quasi-coupon periods walked back from the first coupon.
-fn odd_first_price(b: &OddFirst, rate: f64, yld: f64, redemption: f64) -> f64 {
+fn odd_first_price(
+    b: &OddFirst,
+    rate: f64,
+    yld: f64,
+    redemption: f64,
+    cancel: Option<&CancelToken>,
+) -> Result<f64, ExcelError> {
+    cancellation_checkpoint(cancel)?;
     let f = b.frequency as f64;
     let months = 12 / b.frequency as i32;
     let basis = b.basis;
     let x = yld / f + 1.0;
     let coupon = 100.0 * rate / f;
-    let e = coupon_days(basis, b.settlement, b.first_coupon, b.frequency);
+    let e = coupon_days(basis, b.settlement, b.first_coupon, b.frequency, cancel)?;
     let dfc = days(basis, b.issue, b.first_coupon);
     if dfc < e {
-        let n = coupon_count(b.settlement, b.maturity, b.frequency);
+        let n = coupon_count(b.settlement, b.maturity, b.frequency, cancel)?;
         let dsc = days(basis, b.settlement, b.first_coupon);
         let a = days(basis, b.issue, b.settlement);
         let y = dsc / e;
         let mut value = redemption / x.powf(n - 1.0 + y) + coupon * dfc / e / x.powf(y);
         for k in 2..=n as i64 {
+            cancellation_checkpoint(cancel)?;
             value += coupon / x.powf(k as f64 - 1.0 + y);
         }
-        return value - a / e * rate / f * 100.0;
+        return Ok(value - a / e * rate / f * 100.0);
     }
 
-    let quasi = coupon_count(b.issue, b.first_coupon, b.frequency) as i64;
+    let quasi = coupon_count(b.issue, b.first_coupon, b.frequency, cancel)? as i64;
     let (mut dc, mut accrued) = (0.0, 0.0);
     let mut late = b.first_coupon;
     for index in (1..=quasi).rev() {
+        cancellation_checkpoint(cancel)?;
         let early = step(late, -months, false);
         let nl = if basis == Basis::Actual {
             days(basis, early, late)
@@ -210,38 +252,39 @@ fn odd_first_price(b: &OddFirst, rate: f64, yld: f64, redemption: f64) -> f64 {
     }
     let dsc = match basis {
         Basis::Actual360 | Basis::Actual365 => {
-            let (_, ncd) = coupon_dates(b.settlement, b.first_coupon, b.frequency);
+            let (_, ncd) = coupon_dates(b.settlement, b.first_coupon, b.frequency, cancel)?;
             days(basis, b.settlement, ncd)
         }
         _ => {
-            let (pcd, _) = coupon_dates(b.settlement, b.first_coupon, b.frequency);
+            let (pcd, _) = coupon_dates(b.settlement, b.first_coupon, b.frequency, cancel)?;
             e - basis.days(pcd, b.settlement)
         }
     };
-    let nq = quasi_periods_to_first(b.first_coupon, b.settlement, months);
-    let n = coupon_count(b.first_coupon, b.maturity, b.frequency);
+    let nq = quasi_periods_to_first(b.first_coupon, b.settlement, months, cancel)?;
+    let n = coupon_count(b.first_coupon, b.maturity, b.frequency, cancel)?;
     let y = dsc / e;
     let mut value = redemption / x.powf(y + nq + n) + coupon * dc / x.powf(nq + y);
     for k in 1..=n as i64 {
+        cancellation_checkpoint(cancel)?;
         value += coupon / x.powf(k as f64 + nq + y);
     }
-    value - coupon * accrued
+    Ok(value - coupon * accrued)
 }
 
 /// The yield at which `price_at` gives `price`: Newton's method with a
 /// central-difference slope, from 5%, kept above -frequency.
 fn solve_rate(
     price: f64,
-    price_at: impl Fn(f64) -> f64,
+    price_at: impl Fn(f64) -> Result<f64, ExcelError>,
     floor: f64,
     cancel: Option<&CancelToken>,
 ) -> Result<Option<f64>, ExcelError> {
     let mut y = 0.05;
     for _ in 0..300 {
         cancellation_checkpoint(cancel)?;
-        let p = price_at(y);
+        let p = price_at(y)?;
         let h = 1e-7 * y.abs().max(1e-3);
-        let slope = (price_at(y + h) - price_at(y - h)) / (2.0 * h);
+        let slope = (price_at(y + h)? - price_at(y - h)?) / (2.0 * h);
         if !slope.is_finite() || slope == 0.0 {
             return Ok(None);
         }
@@ -255,7 +298,7 @@ fn solve_rate(
         y = next;
     }
     cancellation_checkpoint(cancel)?;
-    Ok(((price_at(y) - price).abs() <= 1e-9 * price).then_some(y))
+    Ok(((price_at(y)? - price).abs() <= 1e-9 * price).then_some(y))
 }
 
 /// Returns the price per 100 face value of a security with an odd first
@@ -308,15 +351,20 @@ impl Function for OddfpriceFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let value = (|| {
             let [s, m, i, fc, rate, yld, redemption, freq, basis] = numbers(args, [0.0; 9])?;
-            let b = odd_first([s, m, i, fc], freq, basis, ctx)?;
+            let b = odd_first([s, m, i, fc], freq, basis, ctx, cancel.as_ref())?;
             if rate < 0.0 || yld < 0.0 || redemption <= 0.0 {
                 return Err(ExcelError::new_num());
             }
-            Ok(odd_first_price(&b, rate, yld, redemption))
+            odd_first_price(&b, rate, yld, redemption, cancel.as_ref())
         })();
-        Ok(number_value(value))
+        match value {
+            Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+            value => Ok(number_value(value)),
+        }
     }
 }
 
@@ -372,16 +420,17 @@ impl Function for OddfyieldFn {
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
         let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let value = (|| {
             let [s, m, i, fc, rate, price, redemption, freq, basis] = numbers(args, [0.0; 9])?;
-            let b = odd_first([s, m, i, fc], freq, basis, ctx)?;
+            let b = odd_first([s, m, i, fc], freq, basis, ctx, cancel.as_ref())?;
             if rate < 0.0 || price <= 0.0 || redemption <= 0.0 {
                 return Err(ExcelError::new_num());
             }
             let floor = -(b.frequency as f64);
             solve_rate(
                 price,
-                |y| odd_first_price(&b, rate, y, redemption),
+                |y| odd_first_price(&b, rate, y, redemption, cancel.as_ref()),
                 floor,
                 cancel.as_ref(),
             )?
@@ -409,7 +458,9 @@ fn odd_last(
     freq: f64,
     basis: f64,
     ctx: &dyn FunctionContext<'_>,
+    cancel: Option<&CancelToken>,
 ) -> Result<(OddLast, f64), ExcelError> {
+    cancellation_checkpoint(cancel)?;
     let system = ctx.date_system();
     let settlement = date(settlement, system)?;
     let maturity = date(maturity, system)?;
@@ -425,7 +476,7 @@ fn odd_last(
         Basis::Us30 => (days_us_30_360(start, end, true) as f64).max(0.0),
         _ => days(basis, start, end),
     };
-    let quasi = coupon_count(last, maturity, frequency) as i64;
+    let quasi = coupon_count(last, maturity, frequency, cancel)? as i64;
     let mut odd = OddLast {
         covered: 0.0,
         accrued: 0.0,
@@ -433,6 +484,7 @@ fn odd_last(
     };
     let mut early = last;
     for index in 1..=quasi {
+        cancellation_checkpoint(cancel)?;
         let late = step(early, months, false);
         let nl = period_days(early, late);
         let dci = if index < quasi {
@@ -506,9 +558,11 @@ impl Function for OddlpriceFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let value = (|| {
             let [s, m, l, rate, yld, redemption, freq, basis] = numbers(args, [0.0; 8])?;
-            let (odd, f) = odd_last([s, m, l], freq, basis, ctx)?;
+            let (odd, f) = odd_last([s, m, l], freq, basis, ctx, cancel.as_ref())?;
             if rate < 0.0 || yld < 0.0 || redemption <= 0.0 {
                 return Err(ExcelError::new_num());
             }
@@ -518,7 +572,10 @@ impl Function for OddlpriceFn {
                     - odd.accrued * coupon,
             )
         })();
-        Ok(number_value(value))
+        match value {
+            Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+            value => Ok(number_value(value)),
+        }
     }
 }
 
@@ -570,9 +627,11 @@ impl Function for OddlyieldFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let value = (|| {
             let [s, m, l, rate, price, redemption, freq, basis] = numbers(args, [0.0; 8])?;
-            let (odd, f) = odd_last([s, m, l], freq, basis, ctx)?;
+            let (odd, f) = odd_last([s, m, l], freq, basis, ctx, cancel.as_ref())?;
             if rate < 0.0 || price <= 0.0 || redemption <= 0.0 {
                 return Err(ExcelError::new_num());
             }
@@ -581,7 +640,10 @@ impl Function for OddlyieldFn {
             let cost = odd.accrued * coupon + price;
             Ok((paid - cost) / cost * (f / odd.remaining))
         })();
-        Ok(number_value(value))
+        match value {
+            Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+            value => Ok(number_value(value)),
+        }
     }
 }
 

@@ -29,10 +29,19 @@
 
 use super::utils::{ARG_ANY_ONE, criteria_match};
 use crate::args::{ArgSchema, CriteriaPredicate, parse_criteria};
+use crate::engine::CancelToken;
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, CalcValue, FunctionContext};
-use formualizer_common::{ExcelError, LiteralValue};
+use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
+
+fn cancellation_checkpoint(cancel: Option<&CancelToken>) -> Result<(), ExcelError> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        Err(ExcelError::new(ExcelErrorKind::Cancelled))
+    } else {
+        Ok(())
+    }
+}
 
 /// Aggregation operation type for database functions
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,11 +61,14 @@ enum DAggregate {
 fn resolve_field_index(
     field: &LiteralValue,
     headers: &[LiteralValue],
+    cancel: Option<&CancelToken>,
 ) -> Result<usize, ExcelError> {
+    cancellation_checkpoint(cancel)?;
     match field {
         LiteralValue::Text(name) => {
             let name_lower = name.to_lowercase();
             for (i, h) in headers.iter().enumerate() {
+                cancellation_checkpoint(cancel)?;
                 if let LiteralValue::Text(hdr) = h
                     && hdr.to_lowercase() == name_lower
                 {
@@ -99,7 +111,9 @@ fn resolve_field_index(
 fn parse_criteria_range(
     criteria_view: &crate::engine::range_view::RangeView<'_>,
     db_headers: &[LiteralValue],
+    cancel: Option<&CancelToken>,
 ) -> Result<Vec<Vec<(usize, CriteriaPredicate)>>, ExcelError> {
+    cancellation_checkpoint(cancel)?;
     let (crit_rows, crit_cols) = criteria_view.dims();
     if crit_rows < 1 || crit_cols < 1 {
         return Ok(vec![]);
@@ -108,11 +122,13 @@ fn parse_criteria_range(
     // First row is criteria headers - map to database column indices
     let mut crit_col_map: Vec<Option<usize>> = Vec::with_capacity(crit_cols);
     for c in 0..crit_cols {
+        cancellation_checkpoint(cancel)?;
         let crit_header = criteria_view.get_cell(0, c);
         if let LiteralValue::Text(name) = &crit_header {
             let name_lower = name.to_lowercase();
             let mut found = None;
             for (i, h) in db_headers.iter().enumerate() {
+                cancellation_checkpoint(cancel)?;
                 if let LiteralValue::Text(hdr) = h
                     && hdr.to_lowercase() == name_lower
                 {
@@ -132,10 +148,12 @@ fn parse_criteria_range(
     // Parse criteria rows (starting from row 1)
     let mut criteria_rows = Vec::new();
     for r in 1..crit_rows {
+        cancellation_checkpoint(cancel)?;
         let mut row_criteria = Vec::new();
         let mut has_any_criteria = false;
 
         for (c, db_col) in crit_col_map.iter().enumerate() {
+            cancellation_checkpoint(cancel)?;
             let crit_val = criteria_view.get_cell(r, c);
             if matches!(crit_val, LiteralValue::Empty) {
                 continue;
@@ -205,17 +223,21 @@ fn row_matches_criteria(
     db_view: &crate::engine::range_view::RangeView<'_>,
     row: usize,
     criteria_rows: &[Vec<(usize, CriteriaPredicate)>],
-) -> bool {
+    cancel: Option<&CancelToken>,
+) -> Result<bool, ExcelError> {
+    cancellation_checkpoint(cancel)?;
     // If no criteria, all rows match
     if criteria_rows.is_empty() {
-        return true;
+        return Ok(true);
     }
 
     // OR relationship between criteria rows
     for crit_row in criteria_rows {
+        cancellation_checkpoint(cancel)?;
         let mut all_match = true;
         // AND relationship within a criteria row
         for (col_idx, pred) in crit_row {
+            cancellation_checkpoint(cancel)?;
             let cell_val = db_view.get_cell(row, *col_idx);
             if !criteria_match(pred, &cell_val) {
                 all_match = false;
@@ -223,19 +245,21 @@ fn row_matches_criteria(
             }
         }
         if all_match {
-            return true;
+            return Ok(true);
         }
     }
 
-    false
+    Ok(false)
 }
 
 /// Core evaluation function for all D-functions.
 fn eval_d_function<'a, 'b>(
     args: &[ArgumentHandle<'a, 'b>],
-    _ctx: &dyn FunctionContext<'b>,
+    ctx: &dyn FunctionContext<'b>,
     agg_type: DAggregate,
 ) -> Result<CalcValue<'b>, ExcelError> {
+    let cancel = ctx.cancellation_token();
+    cancellation_checkpoint(cancel.as_ref())?;
     if args.len() != 3 {
         return Ok(CalcValue::Scalar(LiteralValue::Error(
             ExcelError::new_value().with_message(format!(
@@ -277,11 +301,16 @@ fn eval_d_function<'a, 'b>(
     }
 
     // Get database headers (first row)
-    let headers: Vec<LiteralValue> = (0..db_cols).map(|c| db_view.get_cell(0, c)).collect();
+    let headers: Vec<LiteralValue> = (0..db_cols)
+        .map(|c| {
+            cancellation_checkpoint(cancel.as_ref())?;
+            Ok(db_view.get_cell(0, c))
+        })
+        .collect::<Result<_, ExcelError>>()?;
 
     // Get field argument and resolve to column index
     let field_val = args[1].value()?.into_literal();
-    let field_idx = resolve_field_index(&field_val, &headers)?;
+    let field_idx = resolve_field_index(&field_val, &headers, cancel.as_ref())?;
 
     // Get criteria range
     let crit_view = match args[2].range_view() {
@@ -306,14 +335,15 @@ fn eval_d_function<'a, 'b>(
     };
 
     // Parse criteria
-    let criteria_rows = parse_criteria_range(&crit_view, &headers)?;
+    let criteria_rows = parse_criteria_range(&crit_view, &headers, cancel.as_ref())?;
 
     // Collect matching values from the field column
     let mut values: Vec<f64> = Vec::new();
 
     // Iterate over data rows (starting from row 1, skipping header)
     for row in 1..db_rows {
-        if row_matches_criteria(&db_view, row, &criteria_rows) {
+        cancellation_checkpoint(cancel.as_ref())?;
+        if row_matches_criteria(&db_view, row, &criteria_rows, cancel.as_ref())? {
             let cell_val = db_view.get_cell(row, field_idx);
 
             // For DCOUNT, only count numeric cells
@@ -348,14 +378,20 @@ fn eval_d_function<'a, 'b>(
     // Compute aggregate result
     let result = match agg_type {
         DAggregate::Sum => {
-            let sum: f64 = values.iter().sum();
+            let sum: f64 = values.iter().map(|x| {
+                    cancellation_checkpoint(cancel.as_ref())?;
+                    Ok::<_, ExcelError>(*x)
+                }).sum::<Result<_, _>>()?;
             LiteralValue::Number(sum)
         }
         DAggregate::Average => {
             if values.is_empty() {
                 LiteralValue::Error(ExcelError::new_div())
             } else {
-                let sum: f64 = values.iter().sum();
+                let sum: f64 = values.iter().map(|x| {
+                    cancellation_checkpoint(cancel.as_ref())?;
+                    Ok::<_, ExcelError>(*x)
+                }).sum::<Result<_, _>>()?;
                 LiteralValue::Number(sum / values.len() as f64)
             }
         }
@@ -367,7 +403,10 @@ fn eval_d_function<'a, 'b>(
             if values.is_empty() {
                 LiteralValue::Number(0.0)
             } else {
-                let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let max = values.iter().try_fold(f64::NEG_INFINITY, |best, x| {
+                    cancellation_checkpoint(cancel.as_ref())?;
+                    Ok::<_, ExcelError>(f64::max(best, *x))
+                })?;
                 LiteralValue::Number(max)
             }
         }
@@ -375,7 +414,10 @@ fn eval_d_function<'a, 'b>(
             if values.is_empty() {
                 LiteralValue::Number(0.0)
             } else {
-                let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
+                let min = values.iter().try_fold(f64::INFINITY, |best, x| {
+                    cancellation_checkpoint(cancel.as_ref())?;
+                    Ok::<_, ExcelError>(f64::min(best, *x))
+                })?;
                 LiteralValue::Number(min)
             }
         }
@@ -383,7 +425,10 @@ fn eval_d_function<'a, 'b>(
             if values.is_empty() {
                 LiteralValue::Number(0.0)
             } else {
-                let product: f64 = values.iter().product();
+                let product: f64 = values.iter().map(|x| {
+                    cancellation_checkpoint(cancel.as_ref())?;
+                    Ok::<_, ExcelError>(*x)
+                }).product::<Result<_, _>>()?;
                 LiteralValue::Number(product)
             }
         }
@@ -404,9 +449,11 @@ enum DStatOp {
 /// Core evaluation function for database statistical functions (DVAR, DVARP, DSTDEV, DSTDEVP).
 fn eval_d_stat_function<'a, 'b>(
     args: &[ArgumentHandle<'a, 'b>],
-    _ctx: &dyn FunctionContext<'b>,
+    ctx: &dyn FunctionContext<'b>,
     stat_op: DStatOp,
 ) -> Result<CalcValue<'b>, ExcelError> {
+    let cancel = ctx.cancellation_token();
+    cancellation_checkpoint(cancel.as_ref())?;
     if args.len() != 3 {
         return Ok(CalcValue::Scalar(LiteralValue::Error(
             ExcelError::new_value().with_message(format!(
@@ -447,11 +494,16 @@ fn eval_d_stat_function<'a, 'b>(
     }
 
     // Get database headers (first row)
-    let headers: Vec<LiteralValue> = (0..db_cols).map(|c| db_view.get_cell(0, c)).collect();
+    let headers: Vec<LiteralValue> = (0..db_cols)
+        .map(|c| {
+            cancellation_checkpoint(cancel.as_ref())?;
+            Ok(db_view.get_cell(0, c))
+        })
+        .collect::<Result<_, ExcelError>>()?;
 
     // Get field argument and resolve to column index
     let field_val = args[1].value()?.into_literal();
-    let field_idx = resolve_field_index(&field_val, &headers)?;
+    let field_idx = resolve_field_index(&field_val, &headers, cancel.as_ref())?;
 
     // Get criteria range
     let crit_view = match args[2].range_view() {
@@ -476,13 +528,14 @@ fn eval_d_stat_function<'a, 'b>(
     };
 
     // Parse criteria
-    let criteria_rows = parse_criteria_range(&crit_view, &headers)?;
+    let criteria_rows = parse_criteria_range(&crit_view, &headers, cancel.as_ref())?;
 
     // Collect matching numeric values from the field column
     let mut values: Vec<f64> = Vec::new();
 
     for row in 1..db_rows {
-        if row_matches_criteria(&db_view, row, &criteria_rows) {
+        cancellation_checkpoint(cancel.as_ref())?;
+        if row_matches_criteria(&db_view, row, &criteria_rows, cancel.as_ref())? {
             let cell_val = db_view.get_cell(row, field_idx);
 
             match &cell_val {
@@ -509,8 +562,14 @@ fn eval_d_stat_function<'a, 'b>(
                 LiteralValue::Error(ExcelError::new_div())
             } else {
                 let n = values.len() as f64;
-                let mean = values.iter().sum::<f64>() / n;
-                let variance = values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+                let mean = values.iter().map(|x| {
+                    cancellation_checkpoint(cancel.as_ref())?;
+                    Ok::<_, ExcelError>(*x)
+                }).sum::<Result<f64, _>>()? / n;
+                let variance = values.iter().map(|x| {
+                    cancellation_checkpoint(cancel.as_ref())?;
+                    Ok::<_, ExcelError>((x - mean).powi(2))
+                }).sum::<Result<f64, _>>()? / (n - 1.0);
                 if matches!(stat_op, DStatOp::VarSample) {
                     LiteralValue::Number(variance)
                 } else {
@@ -524,8 +583,14 @@ fn eval_d_stat_function<'a, 'b>(
                 LiteralValue::Error(ExcelError::new_div())
             } else {
                 let n = values.len() as f64;
-                let mean = values.iter().sum::<f64>() / n;
-                let variance = values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+                let mean = values.iter().map(|x| {
+                    cancellation_checkpoint(cancel.as_ref())?;
+                    Ok::<_, ExcelError>(*x)
+                }).sum::<Result<f64, _>>()? / n;
+                let variance = values.iter().map(|x| {
+                    cancellation_checkpoint(cancel.as_ref())?;
+                    Ok::<_, ExcelError>((x - mean).powi(2))
+                }).sum::<Result<f64, _>>()? / n;
                 if matches!(stat_op, DStatOp::VarPop) {
                     LiteralValue::Number(variance)
                 } else {
@@ -541,8 +606,10 @@ fn eval_d_stat_function<'a, 'b>(
 /// Core evaluation function for DGET - returns single value matching criteria.
 fn eval_dget<'a, 'b>(
     args: &[ArgumentHandle<'a, 'b>],
-    _ctx: &dyn FunctionContext<'b>,
+    ctx: &dyn FunctionContext<'b>,
 ) -> Result<CalcValue<'b>, ExcelError> {
+    let cancel = ctx.cancellation_token();
+    cancellation_checkpoint(cancel.as_ref())?;
     if args.len() != 3 {
         return Ok(CalcValue::Scalar(LiteralValue::Error(
             ExcelError::new_value()
@@ -581,11 +648,16 @@ fn eval_dget<'a, 'b>(
     }
 
     // Get database headers (first row)
-    let headers: Vec<LiteralValue> = (0..db_cols).map(|c| db_view.get_cell(0, c)).collect();
+    let headers: Vec<LiteralValue> = (0..db_cols)
+        .map(|c| {
+            cancellation_checkpoint(cancel.as_ref())?;
+            Ok(db_view.get_cell(0, c))
+        })
+        .collect::<Result<_, ExcelError>>()?;
 
     // Get field argument and resolve to column index
     let field_val = args[1].value()?.into_literal();
-    let field_idx = resolve_field_index(&field_val, &headers)?;
+    let field_idx = resolve_field_index(&field_val, &headers, cancel.as_ref())?;
 
     // Get criteria range
     let crit_view = match args[2].range_view() {
@@ -610,13 +682,14 @@ fn eval_dget<'a, 'b>(
     };
 
     // Parse criteria
-    let criteria_rows = parse_criteria_range(&crit_view, &headers)?;
+    let criteria_rows = parse_criteria_range(&crit_view, &headers, cancel.as_ref())?;
 
     // Find matching values
     let mut matching_values: Vec<LiteralValue> = Vec::new();
 
     for row in 1..db_rows {
-        if row_matches_criteria(&db_view, row, &criteria_rows) {
+        cancellation_checkpoint(cancel.as_ref())?;
+        if row_matches_criteria(&db_view, row, &criteria_rows, cancel.as_ref())? {
             let field_value = db_view.get_cell(row, field_idx);
             // DGET ignores records whose selected field is genuinely blank.
             // An explicit empty string is still a value and must be retained.
@@ -646,8 +719,10 @@ fn eval_dget<'a, 'b>(
 /// Core evaluation function for DCOUNTA - counts non-blank cells matching criteria.
 fn eval_dcounta<'a, 'b>(
     args: &[ArgumentHandle<'a, 'b>],
-    _ctx: &dyn FunctionContext<'b>,
+    ctx: &dyn FunctionContext<'b>,
 ) -> Result<CalcValue<'b>, ExcelError> {
+    let cancel = ctx.cancellation_token();
+    cancellation_checkpoint(cancel.as_ref())?;
     if args.len() != 3 {
         return Ok(CalcValue::Scalar(LiteralValue::Error(
             ExcelError::new_value()
@@ -686,11 +761,16 @@ fn eval_dcounta<'a, 'b>(
     }
 
     // Get database headers (first row)
-    let headers: Vec<LiteralValue> = (0..db_cols).map(|c| db_view.get_cell(0, c)).collect();
+    let headers: Vec<LiteralValue> = (0..db_cols)
+        .map(|c| {
+            cancellation_checkpoint(cancel.as_ref())?;
+            Ok(db_view.get_cell(0, c))
+        })
+        .collect::<Result<_, ExcelError>>()?;
 
     // Get field argument and resolve to column index
     let field_val = args[1].value()?.into_literal();
-    let field_idx = resolve_field_index(&field_val, &headers)?;
+    let field_idx = resolve_field_index(&field_val, &headers, cancel.as_ref())?;
 
     // Get criteria range
     let crit_view = match args[2].range_view() {
@@ -715,13 +795,14 @@ fn eval_dcounta<'a, 'b>(
     };
 
     // Parse criteria
-    let criteria_rows = parse_criteria_range(&crit_view, &headers)?;
+    let criteria_rows = parse_criteria_range(&crit_view, &headers, cancel.as_ref())?;
 
     // Count non-blank cells in matching rows
     let mut count = 0;
 
     for row in 1..db_rows {
-        if row_matches_criteria(&db_view, row, &criteria_rows) {
+        cancellation_checkpoint(cancel.as_ref())?;
+        if row_matches_criteria(&db_view, row, &criteria_rows, cancel.as_ref())? {
             let cell_val = db_view.get_cell(row, field_idx);
 
             // DCOUNTA counts all non-blank cells (unlike DCOUNT which only counts numbers)
