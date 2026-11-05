@@ -1965,23 +1965,27 @@ impl Function for RandArrayFn {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
         }
 
+        let cancel = ctx.cancellation_token();
         let mut rng = ctx.rng_for_current(self.function_salt());
         let out: Vec<Vec<LiteralValue>> = (0..rows)
             .map(|_| {
+                cancellation_checkpoint(cancel.as_ref())?;
                 (0..cols)
                     .map(|_| {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         let r: f64 = rng.gen_range(0.0..1.0);
-                        LiteralValue::Number(if whole_number {
+                        Ok(LiteralValue::Number(if whole_number {
                             // An integer from min to max inclusive.
                             (min_val + (r * (max_val - min_val + 1.0)).floor()).min(max_val)
                         } else {
                             min_val + r * (max_val - min_val)
-                        })
+                        }))
                     })
-                    .collect()
+                    .collect::<Result<Vec<_>, ExcelError>>()
             })
-            .collect();
+            .collect::<Result<_, ExcelError>>()?;
 
+        cancellation_checkpoint(cancel.as_ref())?;
         Ok(collapse_if_scalar(out, ctx.date_system()))
     }
 }
@@ -2536,7 +2540,7 @@ impl Function for SequenceFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         // Extract numbers (allow float but coerce to i64 for dimensions)
         // An omitted argument (SEQUENCE(5,,10)) takes its default of 1.
@@ -2574,11 +2578,15 @@ impl Function for SequenceFn {
         if let Some(e) = generated_array_too_large(rows, cols) {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
         }
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let mut out: Vec<Vec<LiteralValue>> = Vec::with_capacity(rows as usize);
         let mut current = start;
         for _r in 0..rows {
+            cancellation_checkpoint(cancel.as_ref())?;
             let mut row_vec: Vec<LiteralValue> = Vec::with_capacity(cols as usize);
             for _c in 0..cols {
+                cancellation_checkpoint(cancel.as_ref())?;
                 // Use Int when value integral & within i64 range
                 if (current.fract().abs() < 1e-12) && current.abs() < (i64::MAX as f64) {
                     row_vec.push(LiteralValue::Int(current as i64));
@@ -2590,7 +2598,8 @@ impl Function for SequenceFn {
             out.push(row_vec);
         }
 
-        Ok(collapse_if_scalar(out, _ctx.date_system()))
+        cancellation_checkpoint(cancel.as_ref())?;
+        Ok(collapse_if_scalar(out, ctx.date_system()))
     }
 }
 
