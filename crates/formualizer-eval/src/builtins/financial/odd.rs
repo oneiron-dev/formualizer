@@ -13,11 +13,20 @@ use super::coupon::{
     Basis, add_months, date, days_us_30_360, frequency, number_schema, number_value, numbers,
 };
 use crate::args::ArgSchema;
+use crate::engine::CancelToken;
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, CalcValue, FunctionContext};
 use chrono::{Datelike, NaiveDate};
-use formualizer_common::ExcelError;
+use formualizer_common::{ExcelError, ExcelErrorKind};
 use formualizer_macros::func_caps;
+
+fn cancellation_checkpoint(cancel: Option<&CancelToken>) -> Result<(), ExcelError> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        Err(ExcelError::new(ExcelErrorKind::Cancelled))
+    } else {
+        Ok(())
+    }
+}
 
 fn is_month_end(date: NaiveDate) -> bool {
     date.succ_opt()
@@ -221,25 +230,32 @@ fn odd_first_price(b: &OddFirst, rate: f64, yld: f64, redemption: f64) -> f64 {
 
 /// The yield at which `price_at` gives `price`: Newton's method with a
 /// central-difference slope, from 5%, kept above -frequency.
-fn solve_rate(price: f64, price_at: impl Fn(f64) -> f64, floor: f64) -> Option<f64> {
+fn solve_rate(
+    price: f64,
+    price_at: impl Fn(f64) -> f64,
+    floor: f64,
+    cancel: Option<&CancelToken>,
+) -> Result<Option<f64>, ExcelError> {
     let mut y = 0.05;
     for _ in 0..300 {
+        cancellation_checkpoint(cancel)?;
         let p = price_at(y);
         let h = 1e-7 * y.abs().max(1e-3);
         let slope = (price_at(y + h) - price_at(y - h)) / (2.0 * h);
         if !slope.is_finite() || slope == 0.0 {
-            return None;
+            return Ok(None);
         }
         let mut next = y - (p - price) / slope;
         if next <= floor {
             next = (y + floor) / 2.0;
         }
         if (next - y).abs() <= 1e-15 * next.abs().max(1e-10) {
-            return Some(next);
+            return Ok(Some(next));
         }
         y = next;
     }
-    ((price_at(y) - price).abs() <= 1e-9 * price).then_some(y)
+    cancellation_checkpoint(cancel)?;
+    Ok(((price_at(y) - price).abs() <= 1e-9 * price).then_some(y))
 }
 
 /// Returns the price per 100 face value of a security with an odd first
@@ -355,6 +371,7 @@ impl Function for OddfyieldFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
         let value = (|| {
             let [s, m, i, fc, rate, price, redemption, freq, basis] = numbers(args, [0.0; 9])?;
             let b = odd_first([s, m, i, fc], freq, basis, ctx)?;
@@ -362,10 +379,18 @@ impl Function for OddfyieldFn {
                 return Err(ExcelError::new_num());
             }
             let floor = -(b.frequency as f64);
-            solve_rate(price, |y| odd_first_price(&b, rate, y, redemption), floor)
-                .ok_or_else(ExcelError::new_num)
+            solve_rate(
+                price,
+                |y| odd_first_price(&b, rate, y, redemption),
+                floor,
+                cancel.as_ref(),
+            )?
+            .ok_or_else(ExcelError::new_num)
         })();
-        Ok(number_value(value))
+        match value {
+            Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+            value => Ok(number_value(value)),
+        }
     }
 }
 

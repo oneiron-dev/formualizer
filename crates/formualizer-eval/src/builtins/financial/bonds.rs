@@ -8,11 +8,20 @@ use super::coupon::{
     number_schema, number_value, numbers, period, periods_back,
 };
 use crate::args::ArgSchema;
+use crate::engine::CancelToken;
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, CalcValue, FunctionContext};
 use chrono::{Datelike, NaiveDate};
-use formualizer_common::ExcelError;
+use formualizer_common::{ExcelError, ExcelErrorKind};
 use formualizer_macros::func_caps;
+
+fn cancellation_checkpoint(cancel: Option<&CancelToken>) -> Result<(), ExcelError> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        Err(ExcelError::new(ExcelErrorKind::Cancelled))
+    } else {
+        Ok(())
+    }
+}
 
 /// The par value ACCRINT and ACCRINTM take when the argument is left empty.
 const DEFAULT_PAR: f64 = 1000.0;
@@ -419,7 +428,13 @@ fn single_coupon_yield(b: &Bond, rate: f64, price: f64, redemption: f64) -> f64 
 /// The yield at which `bond_price` is `price`: Newton's method on the price,
 /// which is convex and falling in the yield, so the iterates approach the root
 /// from below once the first step is taken.
-fn solve_yield(b: &Bond, rate: f64, price: f64, redemption: f64) -> Option<f64> {
+fn solve_yield(
+    b: &Bond,
+    rate: f64,
+    price: f64,
+    redemption: f64,
+    cancel: Option<&CancelToken>,
+) -> Result<Option<f64>, ExcelError> {
     let f = b.frequency as f64;
     let at = |y: f64| {
         bond_price(
@@ -449,20 +464,22 @@ fn solve_yield(b: &Bond, rate: f64, price: f64, redemption: f64) -> Option<f64> 
     let floor = -f;
     let mut y = 0.05_f64.max(rate);
     for _ in 0..200 {
+        cancellation_checkpoint(cancel)?;
         let d = slope(y);
         if !d.is_finite() || d == 0.0 {
-            return None;
+            return Ok(None);
         }
         let mut next = y - (at(y) - price) / d;
         if next <= floor {
             next = (y + floor) / 2.0;
         }
         if (next - y).abs() <= 1e-15 * next.abs().max(1e-10) {
-            return Some(next);
+            return Ok(Some(next));
         }
         y = next;
     }
-    ((at(y) - price).abs() <= 1e-9 * price).then_some(y)
+    cancellation_checkpoint(cancel)?;
+    Ok(((at(y) - price).abs() <= 1e-9 * price).then_some(y))
 }
 
 /// Returns the yield of a security that pays periodic interest.
@@ -515,6 +532,7 @@ impl Function for YieldFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
         let value = (|| {
             let [settlement, maturity, rate, price, redemption, freq, basis] =
                 numbers(args, [0.0; 7])?;
@@ -525,9 +543,13 @@ impl Function for YieldFn {
             if b.coupons <= 1 {
                 return Ok(single_coupon_yield(&b, rate, price, redemption));
             }
-            solve_yield(&b, rate, price, redemption).ok_or_else(ExcelError::new_num)
+            solve_yield(&b, rate, price, redemption, cancel.as_ref())?
+                .ok_or_else(ExcelError::new_num)
         })();
-        Ok(number_value(value))
+        match value {
+            Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+            value => Ok(number_value(value)),
+        }
     }
 }
 
