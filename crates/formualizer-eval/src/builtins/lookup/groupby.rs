@@ -189,12 +189,23 @@ fn key_part(v: &LiteralValue) -> String {
 }
 
 /// The distinct keys in first-appearance order, and each row's key index.
-fn distinct_keys(keys: &[Vec<LiteralValue>]) -> (Vec<Vec<LiteralValue>>, Vec<usize>) {
+fn distinct_keys(
+    keys: &[Vec<LiteralValue>],
+    cancel: Option<&CancelToken>,
+) -> Result<(Vec<Vec<LiteralValue>>, Vec<usize>), GroupFailure> {
+    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
     let mut index: HashMap<Vec<String>, usize> = HashMap::new();
     let mut distinct = Vec::new();
     let mut of_row = Vec::with_capacity(keys.len());
     for key in keys {
-        let id: Vec<String> = key.iter().map(key_part).collect();
+        cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+        let id: Vec<String> = key
+            .iter()
+            .map(|value| {
+                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                Ok(key_part(value))
+            })
+            .collect::<Result<Vec<_>, GroupFailure>>()?;
         let next = distinct.len();
         let k = *index.entry(id).or_insert(next);
         if k == next {
@@ -202,7 +213,7 @@ fn distinct_keys(keys: &[Vec<LiteralValue>]) -> (Vec<Vec<LiteralValue>>, Vec<usi
         }
         of_row.push(k);
     }
-    (distinct, of_row)
+    Ok((distinct, of_row))
 }
 
 fn same_prefix(a: &[LiteralValue], b: &[LiteralValue], len: usize) -> bool {
@@ -228,7 +239,9 @@ fn order_keys(
     spec: Option<&[i64]>,
     extra: &dyn Fn(usize, usize) -> LiteralValue,
     columns: usize,
-) -> Vec<usize> {
+    cancel: Option<&CancelToken>,
+) -> Result<Vec<usize>, GroupFailure> {
+    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
     let mut order: Vec<usize> = (0..distinct.len()).collect();
     let default: Vec<i64> = (1..=columns as i64).collect();
     let spec = spec.unwrap_or(&default);
@@ -248,11 +261,13 @@ fn order_keys(
         }
         Ordering::Equal
     });
+    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
     if columns > 1 {
         // Keep each parent group contiguous, in order of first appearance.
         let position: Vec<usize> = {
             let mut p = vec![0; distinct.len()];
             for (i, &k) in order.iter().enumerate() {
+                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
                 p[k] = i;
             }
             p
@@ -267,14 +282,21 @@ fn order_keys(
         };
         let rank: Vec<Vec<usize>> = (0..distinct.len())
             .map(|k| {
-                let mut r: Vec<usize> = (1..columns).map(|len| first(k, len)).collect();
+                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                let mut r: Vec<usize> = (1..columns)
+                    .map(|len| {
+                        cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                        Ok(first(k, len))
+                    })
+                    .collect::<Result<Vec<_>, GroupFailure>>()?;
                 r.push(position[k]);
-                r
+                Ok(r)
             })
-            .collect();
+            .collect::<Result<Vec<_>, GroupFailure>>()?;
         order.sort_by(|&a, &b| rank[a].cmp(&rank[b]));
     }
-    order
+    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+    Ok(order)
 }
 
 /// Lays out an axis: the sorted groups, subtotals for the first
@@ -285,76 +307,90 @@ fn axis_entries(
     order: &[usize],
     depth: i64,
     columns: usize,
-) -> Vec<Entry> {
+    cancel: Option<&CancelToken>,
+) -> Result<Vec<Entry>, GroupFailure> {
+    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
     let top = depth < 0;
     let levels = (depth.unsigned_abs() as usize)
         .saturating_sub(1)
         .min(columns.saturating_sub(1));
-    let label = |k: usize, len: usize| -> Vec<LiteralValue> {
+    let label = |k: usize, len: usize| -> Result<Vec<LiteralValue>, GroupFailure> {
         (0..columns)
             .map(|c| {
-                if c < len {
+                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                Ok(if c < len {
                     distinct[k][c].clone()
                 } else {
                     blank()
-                }
+                })
             })
             .collect()
     };
-    let members = |k: usize, len: usize| -> Vec<usize> {
-        order
-            .iter()
-            .copied()
-            .filter(|&o| same_prefix(&distinct[o], &distinct[k], len))
-            .collect()
+    let members = |k: usize, len: usize| -> Result<Vec<usize>, GroupFailure> {
+        let mut members = Vec::new();
+        for &o in order {
+            cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+            if same_prefix(&distinct[o], &distinct[k], len) {
+                members.push(o);
+            }
+        }
+        Ok(members)
     };
-    let total = || Entry {
-        label: (0..columns)
-            .map(|c| {
-                if c == 0 {
-                    LiteralValue::Text("Total".into())
-                } else {
-                    blank()
-                }
-            })
-            .collect(),
-        keys: order.to_vec(),
+    let total = || -> Result<Entry, GroupFailure> {
+        cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+        Ok(Entry {
+            label: (0..columns)
+                .map(|c| {
+                    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                    Ok(if c == 0 {
+                        LiteralValue::Text("Total".into())
+                    } else {
+                        blank()
+                    })
+                })
+                .collect::<Result<Vec<_>, GroupFailure>>()?,
+            keys: order.to_vec(),
+        })
     };
     let mut entries = Vec::new();
     if top && depth != 0 {
-        entries.push(total());
+        entries.push(total()?);
     }
     for (i, &k) in order.iter().enumerate() {
+        cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
         if top {
             for len in 1..=levels {
+                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
                 if i == 0 || !same_prefix(&distinct[order[i - 1]], &distinct[k], len) {
                     entries.push(Entry {
-                        label: label(k, len),
-                        keys: members(k, len),
+                        label: label(k, len)?,
+                        keys: members(k, len)?,
                     });
                 }
             }
         }
         entries.push(Entry {
-            label: label(k, columns),
+            label: label(k, columns)?,
             keys: vec![k],
         });
         if !top {
             for len in (1..=levels).rev() {
+                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
                 if i + 1 == order.len() || !same_prefix(&distinct[order[i + 1]], &distinct[k], len)
                 {
                     entries.push(Entry {
-                        label: label(k, len),
-                        keys: members(k, len),
+                        label: label(k, len)?,
+                        keys: members(k, len)?,
                     });
                 }
             }
         }
     }
     if !top && depth != 0 {
-        entries.push(total());
+        entries.push(total()?);
     }
-    entries
+    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+    Ok(entries)
 }
 
 /// Header detection when field_headers is omitted: the values have a header
@@ -387,13 +423,16 @@ fn kept_rows(
     total_rows: usize,
     start: usize,
     filter: Option<LiteralValue>,
-) -> Result<Vec<usize>, ExcelError> {
+    cancel: Option<&CancelToken>,
+) -> Result<Vec<usize>, GroupFailure> {
+    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
     let keep: Option<Vec<LiteralValue>> = filter.map(|f| match f {
         LiteralValue::Array(rows) => rows.into_iter().flatten().collect(),
         v => vec![v],
     });
     let mut rows = Vec::new();
     for r in start..total_rows {
+        cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
         let include = match &keep {
             None => true,
             Some(flags) => {
@@ -403,9 +442,9 @@ fn kept_rows(
                     r - start
                 };
                 match flags.get(idx) {
-                    Some(LiteralValue::Error(e)) => return Err(e.clone()),
+                    Some(LiteralValue::Error(e)) => return Err(GroupFailure::Value(e.clone())),
                     Some(v) => crate::coercion::to_logical(v).unwrap_or(false),
-                    None => return Err(value_error("filter_array does not match the data")),
+                    None => return Err(value_error("filter_array does not match the data").into()),
                 }
             }
         };
@@ -414,7 +453,9 @@ fn kept_rows(
         }
     }
     if rows.is_empty() {
-        return Err(ExcelError::new(ExcelErrorKind::Calc).with_message("No rows to group"));
+        return Err(ExcelError::new(ExcelErrorKind::Calc)
+            .with_message("No rows to group")
+            .into());
     }
     Ok(rows)
 }
@@ -515,13 +556,23 @@ impl Aggregate<'_, '_, '_> {
     }
 }
 
-fn rows_of(keys: &[usize], rows_by_key: &[Vec<usize>]) -> Vec<usize> {
-    let mut rows: Vec<usize> = keys
-        .iter()
-        .flat_map(|&k| rows_by_key[k].iter().copied())
-        .collect();
+fn rows_of(
+    keys: &[usize],
+    rows_by_key: &[Vec<usize>],
+    cancel: Option<&CancelToken>,
+) -> Result<Vec<usize>, GroupFailure> {
+    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+    let mut rows = Vec::new();
+    for &key in keys {
+        cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+        for &row in &rows_by_key[key] {
+            cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+            rows.push(row);
+        }
+    }
     rows.sort_unstable();
-    rows
+    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+    Ok(rows)
 }
 
 fn validate_spec(spec: &Option<Vec<i64>>, limit: usize) -> Result<(), ExcelError> {
@@ -562,6 +613,7 @@ fn groupby(
         fields.len(),
         usize::from(has_headers),
         optional_arg(args, 6)?,
+        cancel,
     )?;
 
     cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
@@ -577,7 +629,7 @@ fn groupby(
                 .collect::<Result<Vec<_>, GroupFailure>>()
         })
         .collect::<Result<Vec<_>, GroupFailure>>()?;
-    let (distinct, key_of) = distinct_keys(&keys);
+    let (distinct, key_of) = distinct_keys(&keys, cancel)?;
     let mut rows_by_key = vec![Vec::new(); distinct.len()];
     for (i, &r) in rows.iter().enumerate() {
         cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
@@ -601,7 +653,8 @@ fn groupby(
         spec.as_deref(),
         &|k, c| detail[k][c].clone(),
         key_cols,
-    );
+        cancel,
+    )?;
 
     let mut out = Vec::new();
     if show_headers {
@@ -623,13 +676,13 @@ fn groupby(
         }));
         out.push(header);
     }
-    for entry in axis_entries(&distinct, &order, depth, key_cols) {
+    for entry in axis_entries(&distinct, &order, depth, key_cols, cancel)? {
         cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
         let mut line = entry.label;
         if entry.keys.len() == 1 {
             line.extend(detail[entry.keys[0]].iter().cloned());
         } else {
-            let members = rows_of(&entry.keys, &rows_by_key);
+            let members = rows_of(&entry.keys, &rows_by_key, cancel)?;
             for c in 0..value_cols {
                 cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
                 line.push(
@@ -677,6 +730,7 @@ fn pivotby(
         values.len(),
         usize::from(has_headers),
         optional_arg(args, 9)?,
+        cancel,
     )?;
     let relative_to = optional_int(args, 10)?.unwrap_or(0);
     if !(0..=4).contains(&relative_to) {
@@ -697,7 +751,7 @@ fn pivotby(
                     .collect::<Result<Vec<_>, GroupFailure>>()
             })
             .collect::<Result<Vec<_>, GroupFailure>>()?;
-        let (distinct, key_of) = distinct_keys(&keys);
+        let (distinct, key_of) = distinct_keys(&keys, cancel)?;
         let mut rows_by_key = vec![Vec::new(); distinct.len()];
         for (i, &r) in rows.iter().enumerate() {
             cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
@@ -709,15 +763,27 @@ fn pivotby(
     let (col_keys, rows_by_col_key) = axis(&col_fields, col_cols)?;
     let row_totals = |k: usize, c: usize| aggregate.apply(&rows_by_row_key[k], &rows, c);
     let col_totals = |k: usize, c: usize| aggregate.apply(&rows_by_col_key[k], &rows, c);
-    let row_order = order_keys(&row_keys, row_spec.as_deref(), &row_totals, row_cols);
-    let col_order = order_keys(&col_keys, col_spec.as_deref(), &col_totals, col_cols);
-    let row_entries = axis_entries(&row_keys, &row_order, row_depth, row_cols);
-    let col_entries = axis_entries(&col_keys, &col_order, col_depth, col_cols);
+    let row_order = order_keys(
+        &row_keys,
+        row_spec.as_deref(),
+        &row_totals,
+        row_cols,
+        cancel,
+    )?;
+    let col_order = order_keys(
+        &col_keys,
+        col_spec.as_deref(),
+        &col_totals,
+        col_cols,
+        cancel,
+    )?;
+    let row_entries = axis_entries(&row_keys, &row_order, row_depth, row_cols, cancel)?;
+    let col_entries = axis_entries(&col_keys, &col_order, col_depth, col_cols, cancel)?;
     let col_members: Vec<Vec<usize>> = col_entries
         .iter()
         .map(|e| {
             cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
-            Ok(rows_of(&e.keys, &rows_by_col_key))
+            rows_of(&e.keys, &rows_by_col_key, cancel)
         })
         .collect::<Result<Vec<_>, GroupFailure>>()?;
 
@@ -764,15 +830,17 @@ fn pivotby(
     }
     for entry in row_entries {
         cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
-        let members = rows_of(&entry.keys, &rows_by_row_key);
+        let members = rows_of(&entry.keys, &rows_by_row_key, cancel)?;
         let mut line = entry.label;
         for cols in &col_members {
             cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
-            let both: Vec<usize> = members
-                .iter()
-                .copied()
-                .filter(|r| cols.binary_search(r).is_ok())
-                .collect();
+            let mut both = Vec::new();
+            for &member in &members {
+                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                if cols.binary_search(&member).is_ok() {
+                    both.push(member);
+                }
+            }
             let relative = match relative_to {
                 1 | 4 => members.clone(),
                 2 => rows.clone(),
