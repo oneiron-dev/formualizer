@@ -2,6 +2,7 @@ use super::super::utils::{ARG_ANY_ONE, criteria_match, numeric_criteria_mask};
 use super::{AggregateArgument, resolve_aggregate_argument};
 use crate::args::ArgSchema;
 use crate::compute_prelude::{boolean, filter_array};
+use crate::engine::CancelToken;
 use crate::function::Function;
 use crate::function_contract::{CriteriaValueRange, FunctionArityRule, FunctionDependencyContract};
 use crate::traits::{ArgumentHandle, FunctionContext};
@@ -60,6 +61,14 @@ Design notes:
   * Criteria parsing reused via crate::args::parse_criteria and criteria_match helper in utils.
   * Streaming optimization deferred (TODO(perf)).
 */
+
+fn cancellation_checkpoint(cancel: Option<&CancelToken>) -> Result<(), ExcelError> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        Err(ExcelError::new(ExcelErrorKind::Cancelled))
+    } else {
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AggregationType {
@@ -274,6 +283,8 @@ fn eval_if_family<'a, 'b>(
     agg_type: AggregationType,
     multi: bool,
 ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+    let cancel = ctx.cancellation_token();
+    cancellation_checkpoint(cancel.as_ref())?;
     // COUNTIFS pairs start at 0; SUMIFS/AVERAGEIFS lead with the value range.
     let counts = matches!(agg_type, AggregationType::Count);
     let range_position = |i: usize| match (multi, counts) {
@@ -368,6 +379,7 @@ fn eval_if_family<'a, 'b>(
             // past the last stored row still count (see the tail below).
             let mut logical = (0u64, 0u64);
             for i in (0..args.len()).step_by(2) {
+                cancellation_checkpoint(cancel.as_ref())?;
                 let (argument, logical_dims) = resolve_count_extent(&args[i], ctx)?;
                 let (mut rv, mut val) = match argument {
                     AggregateArgument::Range(view) => (Some(view), None),
@@ -414,6 +426,7 @@ fn eval_if_family<'a, 'b>(
                 shapes.push(declared_dims(&args[0], view)?);
             }
             for i in (1..args.len()).step_by(2) {
+                cancellation_checkpoint(cancel.as_ref())?;
                 let (mut rv, mut val) = resolve_range_or_scalar!(&args[i]);
 
                 // Broadcast semantics: treat 1x1 criteria ranges as scalar criteria.
@@ -490,6 +503,7 @@ fn eval_if_family<'a, 'b>(
         let mut visited_rows = 0usize;
         for res in driver.iter_row_chunks() {
             let cs = res?;
+            cancellation_checkpoint(cancel.as_ref())?;
             let row_start = cs.row_start;
             let row_len = cs.row_len;
             visited_rows = visited_rows.max(row_start + row_len);
@@ -506,10 +520,12 @@ fn eval_if_family<'a, 'b>(
                 .map(|v| v.slice_numbers(row_start, row_len));
 
             for c in 0..dims.1 {
+                cancellation_checkpoint(cancel.as_ref())?;
                 let mut mask_opt: Option<BooleanArray> = None;
                 let mut impossible = false;
 
                 for (j, (_, pred, scalar_val)) in crit_specs.iter().enumerate() {
+                    cancellation_checkpoint(cancel.as_ref())?;
                     if crit_specs[j].0.is_none() {
                         if let Some(sv) = scalar_val {
                             if !criteria_match(pred, sv) {
@@ -630,6 +646,7 @@ fn eval_if_family<'a, 'b>(
                                                     row_len,
                                                 );
                                             for i in 0..row_len {
+                                                cancellation_checkpoint(cancel.as_ref())?;
                                                 if m0.is_valid(i) {
                                                     bb.append_value(m0.value(i));
                                                 } else {
@@ -651,6 +668,7 @@ fn eval_if_family<'a, 'b>(
                                             );
                                         let view = crit_specs[j].0.as_ref().unwrap();
                                         for i in 0..row_len {
+                                            cancellation_checkpoint(cancel.as_ref())?;
                                             bb.append_value(criteria_match(
                                                 pred,
                                                 &view.get_cell(row_start + i, c),
@@ -667,6 +685,7 @@ fn eval_if_family<'a, 'b>(
                                         );
                                     let view = crit_specs[j].0.as_ref().unwrap();
                                     for i in 0..row_len {
+                                        cancellation_checkpoint(cancel.as_ref())?;
                                         bb.append_value(criteria_match(
                                             pred,
                                             &view.get_cell(row_start + i, c),
@@ -690,6 +709,7 @@ fn eval_if_family<'a, 'b>(
                                                 row_len,
                                             );
                                         for i in 0..row_len {
+                                            cancellation_checkpoint(cancel.as_ref())?;
                                             if m0.is_valid(i) {
                                                 bb.append_value(m0.value(i));
                                             } else {
@@ -708,6 +728,7 @@ fn eval_if_family<'a, 'b>(
                                         );
                                     let view = crit_specs[j].0.as_ref().unwrap();
                                     for i in 0..row_len {
+                                        cancellation_checkpoint(cancel.as_ref())?;
                                         bb.append_value(criteria_match(
                                             pred,
                                             &view.get_cell(row_start + i, c),
@@ -721,6 +742,7 @@ fn eval_if_family<'a, 'b>(
                                     arrow_array::builder::BooleanBuilder::with_capacity(row_len);
                                 let view = crit_specs[j].0.as_ref().unwrap();
                                 for i in 0..row_len {
+                                    cancellation_checkpoint(cancel.as_ref())?;
                                     bb.append_value(criteria_match(
                                         pred,
                                         &view.get_cell(row_start + i, c),
@@ -734,6 +756,7 @@ fn eval_if_family<'a, 'b>(
                                 arrow_array::builder::BooleanBuilder::with_capacity(row_len);
                             let view = crit_specs[j].0.as_ref().unwrap();
                             for i in 0..row_len {
+                                cancellation_checkpoint(cancel.as_ref())?;
                                 bb.append_value(criteria_match(
                                     pred,
                                     &view.get_cell(row_start + i, c),
@@ -747,6 +770,7 @@ fn eval_if_family<'a, 'b>(
                                 arrow_array::builder::BooleanBuilder::with_capacity(row_len);
                             if let Some(ref view) = crit_specs[j].0 {
                                 for i in 0..row_len {
+                                    cancellation_checkpoint(cancel.as_ref())?;
                                     bb.append_value(criteria_match(
                                         pred,
                                         &view.get_cell(row_start + i, c),
@@ -756,6 +780,7 @@ fn eval_if_family<'a, 'b>(
                                 let val = scalar_val.as_ref().unwrap_or(&LiteralValue::Empty);
                                 let matches = criteria_match(pred, val);
                                 for _ in 0..row_len {
+                                    cancellation_checkpoint(cancel.as_ref())?;
                                     bb.append_value(matches);
                                 }
                             }
@@ -782,6 +807,7 @@ fn eval_if_family<'a, 'b>(
                         .as_ref()
                         .and_then(|cols| cols.get(c).and_then(|a| a.as_ref()));
                     for i in 0..row_len {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         let matched = mask_opt
                             .as_ref()
                             .is_none_or(|mask| mask.is_valid(i) && mask.value(i));

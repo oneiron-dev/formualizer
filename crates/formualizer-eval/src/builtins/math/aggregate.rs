@@ -1,13 +1,21 @@
 use super::super::utils::{ARG_RANGE_NUM_LENIENT_ONE, coerce_num};
 use super::{AggregateArgument, resolve_aggregate_argument};
 use crate::args::ArgSchema;
-use crate::engine::VisibilityMaskMode;
+use crate::engine::{CancelToken, VisibilityMaskMode};
 use crate::function::Function;
 use crate::function_contract::FunctionDependencyContract;
 use crate::traits::{ArgumentHandle, FunctionContext};
 use arrow_array::Array;
 use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
+
+fn cancellation_checkpoint(cancel: Option<&CancelToken>) -> Result<(), ExcelError> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        Err(ExcelError::new(ExcelErrorKind::Cancelled))
+    } else {
+        Ok(())
+    }
+}
 
 /* ─────────────────────────── SUM() ──────────────────────────── */
 
@@ -540,6 +548,8 @@ impl Function for SumProductFn {
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         use crate::broadcast::{broadcast_shape, project_index};
 
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         if args.is_empty() {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(0.0)));
         }
@@ -552,6 +562,7 @@ impl Function for SumProductFn {
                     AggregateArgument::Range(rv) => {
                         let mut rows: Vec<Vec<LiteralValue>> = Vec::new();
                         rv.for_each_row(&mut |row| {
+                            cancellation_checkpoint(cancel.as_ref())?;
                             rows.push(row.to_vec());
                             Ok(())
                         })?;
@@ -570,6 +581,7 @@ impl Function for SumProductFn {
         let mut shapes: Vec<(usize, usize)> = Vec::with_capacity(args.len());
         let mut entries_of_arrays: Vec<bool> = Vec::with_capacity(args.len());
         for a in args.iter() {
+            cancellation_checkpoint(cancel.as_ref())?;
             let (arr, is_array) = to_array(a)?;
             let shape = (arr.len(), arr.first().map(|r| r.len()).unwrap_or(0));
             arrays.push(arr);
@@ -590,13 +602,16 @@ impl Function for SumProductFn {
         // Iterate target shape, multiply coerced values across args, sum total
         let mut total = 0.0f64;
         for r in 0..target.0 {
+            cancellation_checkpoint(cancel.as_ref())?;
             for c in 0..target.1 {
+                cancellation_checkpoint(cancel.as_ref())?;
                 let mut prod = 1.0f64;
                 for ((arr, &shape), &is_array) in arrays
                     .iter()
                     .zip(shapes.iter())
                     .zip(entries_of_arrays.iter())
                 {
+                    cancellation_checkpoint(cancel.as_ref())?;
                     let (rr, cc) = project_index((r, c), shape);
                     let lv = arr
                         .get(rr)
