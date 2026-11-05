@@ -1444,6 +1444,15 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
             .clone()
     }
 
+    pub(crate) fn resolved_as_scalar_error(&self) -> bool {
+        matches!(
+            self.cached_resolved.get(),
+            Some(Ok(ResolvedArgument::Value(CalcValue::Scalar(
+                LiteralValue::Error(_)
+            ))))
+        )
+    }
+
     pub(crate) fn with_context_cancel_token(&self, view: RangeView<'b>) -> RangeView<'b> {
         match self.interp.context.cancellation_token() {
             Some(token) => view.with_cancel_token(Some(token)),

@@ -126,6 +126,12 @@ fn cancellation_checkpoint(cancel: Option<&CancelToken>) -> Result<(), ExcelErro
     Ok(())
 }
 
+// Range conversion also returns scalar error values as Err. Its cached
+// resolution keeps those values distinct from evaluation cancellation.
+fn native_argument_cancellation(arg: &ArgumentHandle<'_, '_>, error: &ExcelError) -> bool {
+    error.kind == ExcelErrorKind::Cancelled && !arg.resolved_as_scalar_error()
+}
+
 fn find_semantic_empty(
     view: &crate::engine::range_view::RangeView<'_>,
     len: usize,
@@ -558,7 +564,7 @@ impl XLookupFn {
     ) -> Result<XlookupMatch<'b>, ExcelError> {
         let lookup_view = match args[1].range_view_or_scalar() {
             Ok(v) => v,
-            Err(e) if e.kind == ExcelErrorKind::Cancelled => return Err(e),
+            Err(e) if native_argument_cancellation(&args[1], &e) => return Err(e),
             Err(e) => {
                 return Ok(XlookupMatch::Settled(crate::traits::CalcValue::Scalar(
                     LiteralValue::Error(e),
@@ -567,7 +573,7 @@ impl XLookupFn {
         };
         let ret_view = match args[2].range_view_or_scalar() {
             Ok(v) => v,
-            Err(e) if e.kind == ExcelErrorKind::Cancelled => return Err(e),
+            Err(e) if native_argument_cancellation(&args[2], &e) => return Err(e),
             Err(e) => {
                 return Ok(XlookupMatch::Settled(crate::traits::CalcValue::Scalar(
                     LiteralValue::Error(e),
@@ -1049,7 +1055,7 @@ impl Function for XMatchFn {
         }
         let lookup_view = match args[1].range_view_or_scalar() {
             Ok(v) => v,
-            Err(e) if e.kind == ExcelErrorKind::Cancelled => return Err(e),
+            Err(e) if native_argument_cancellation(&args[1], &e) => return Err(e),
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
 
@@ -2101,7 +2107,7 @@ impl Function for FilterFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         if args.len() < 2 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -2114,7 +2120,7 @@ impl Function for FilterFn {
         let (array_rows, array_cols) = array_view.dims();
         if array_rows == 0 || array_cols == 0 {
             return Ok(crate::traits::CalcValue::Range(
-                crate::engine::range_view::RangeView::from_owned_rows(vec![], _ctx.date_system()),
+                crate::engine::range_view::RangeView::from_owned_rows(vec![], ctx.date_system()),
             ));
         }
 
@@ -2127,13 +2133,16 @@ impl Function for FilterFn {
                 ExcelError::new(ExcelErrorKind::Value),
             )));
         }
+        let cancel = ctx.cancellation_token();
         let mut keep = Vec::with_capacity(include_rows.max(include_cols));
         for i in 0..include_rows.max(include_cols) {
+            cancellation_checkpoint(cancel.as_ref())?;
             let flag = if by_rows {
                 include_view.get_cell(i, 0)
             } else {
                 include_view.get_cell(0, i)
             };
+            cancellation_checkpoint(cancel.as_ref())?;
             keep.push(match flag {
                 LiteralValue::Boolean(b) => b,
                 LiteralValue::Empty => false,
@@ -2151,21 +2160,29 @@ impl Function for FilterFn {
 
         let mut result: Vec<Vec<LiteralValue>> = Vec::new();
         for r in 0..array_rows {
+            cancellation_checkpoint(cancel.as_ref())?;
             if by_rows && !keep[r] {
                 continue;
             }
             let row_out: Vec<LiteralValue> = (0..array_cols)
-                .filter(|&c| by_rows || keep[c])
-                .map(|c| array_view.get_cell(r, c))
-                .collect();
+                .filter_map(|c| {
+                    if let Err(error) = cancellation_checkpoint(cancel.as_ref()) {
+                        return Some(Err(error));
+                    }
+                    (by_rows || keep[c]).then(|| Ok(array_view.get_cell(r, c)))
+                })
+                .collect::<Result<_, ExcelError>>()?;
             if !row_out.is_empty() {
                 result.push(row_out);
             }
         }
 
+        cancellation_checkpoint(cancel.as_ref())?;
         if result.is_empty() {
             if args.len() >= 3 {
-                return args[2].value();
+                let value = args[2].value()?;
+                cancellation_checkpoint(cancel.as_ref())?;
+                return Ok(value);
             }
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new(ExcelErrorKind::Calc),
@@ -2173,7 +2190,7 @@ impl Function for FilterFn {
         }
 
         Ok(crate::traits::CalcValue::Range(
-            crate::engine::range_view::RangeView::from_owned_rows(result, _ctx.date_system()),
+            crate::engine::range_view::RangeView::from_owned_rows(result, ctx.date_system()),
         ))
     }
 }
@@ -2289,33 +2306,38 @@ impl Function for UniqueFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         let view = match args[0].range_view_or_scalar() {
             Ok(v) => v,
+            Err(e) if native_argument_cancellation(&args[0], &e) => return Err(e),
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
         let (rows, cols) = view.dims();
         if rows == 0 || cols == 0 {
             return Ok(crate::traits::CalcValue::Range(
-                crate::engine::range_view::RangeView::from_owned_rows(vec![], _ctx.date_system()),
+                crate::engine::range_view::RangeView::from_owned_rows(vec![], ctx.date_system()),
             ));
         }
 
-        let flag = |i: usize| -> Result<bool, ExcelError> {
+        let flag = |i: usize| -> Result<Result<bool, ExcelError>, ExcelError> {
             match args.get(i) {
-                Some(arg) if !arg.is_omitted() => {
-                    crate::coercion::to_logical(&arg.value()?.into_literal())
-                }
-                _ => Ok(false),
+                Some(arg) if !arg.is_omitted() => match arg.value() {
+                    Ok(value) => Ok(crate::coercion::to_logical(&value.into_literal())),
+                    Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+                    Err(error) => Ok(Err(error)),
+                },
+                _ => Ok(Ok(false)),
             }
         };
-        let (by_col, exactly_once) = match (flag(1), flag(2)) {
+        let (by_col, exactly_once) = match (flag(1)?, flag(2)?) {
             (Ok(b), Ok(e)) => (b, e),
             (Err(e), _) | (_, Err(e)) => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
             }
         };
+
+        let cancel = ctx.cancellation_token();
 
         // Rows (or columns) compare the way Excel's UNIQUE does: text
         // ignores case and a number equals the same number of any type.
@@ -2333,22 +2355,30 @@ impl Function for UniqueFn {
             }
         };
         let (lines, width) = if by_col { (cols, rows) } else { (rows, cols) };
-        let line = |i: usize| -> Vec<LiteralValue> {
+        let line = |i: usize| -> Result<Vec<LiteralValue>, ExcelError> {
             (0..width)
                 .map(|j| {
-                    if by_col {
+                    cancellation_checkpoint(cancel.as_ref())?;
+                    Ok(if by_col {
                         view.get_cell(j, i)
                     } else {
                         view.get_cell(i, j)
-                    }
+                    })
                 })
                 .collect()
         };
         let mut order: Vec<(Vec<String>, Vec<LiteralValue>)> = Vec::new();
         let mut counts: HashMap<Vec<String>, usize> = HashMap::new();
         for i in 0..lines {
-            let values = line(i);
-            let key: Vec<String> = values.iter().map(key_of).collect();
+            cancellation_checkpoint(cancel.as_ref())?;
+            let values = line(i)?;
+            let key: Vec<String> = values
+                .iter()
+                .map(|value| {
+                    cancellation_checkpoint(cancel.as_ref())?;
+                    Ok(key_of(value))
+                })
+                .collect::<Result<_, ExcelError>>()?;
             let count = counts.entry(key.clone()).or_insert(0);
             if *count == 0 {
                 order.push((key, values));
@@ -2357,9 +2387,14 @@ impl Function for UniqueFn {
         }
         let kept: Vec<Vec<LiteralValue>> = order
             .into_iter()
-            .filter(|(key, _)| !exactly_once || counts[key] == 1)
-            .map(|(_, values)| values)
-            .collect();
+            .filter_map(|(key, values)| {
+                if let Err(error) = cancellation_checkpoint(cancel.as_ref()) {
+                    return Some(Err(error));
+                }
+                (!exactly_once || counts[&key] == 1).then_some(Ok(values))
+            })
+            .collect::<Result<_, ExcelError>>()?;
+        cancellation_checkpoint(cancel.as_ref())?;
         if kept.is_empty() {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new(ExcelErrorKind::Calc),
@@ -2367,12 +2402,21 @@ impl Function for UniqueFn {
         }
         let out = if by_col {
             (0..rows)
-                .map(|r| kept.iter().map(|col| col[r].clone()).collect())
-                .collect()
+                .map(|r| {
+                    cancellation_checkpoint(cancel.as_ref())?;
+                    kept.iter()
+                        .map(|col| {
+                            cancellation_checkpoint(cancel.as_ref())?;
+                            Ok(col[r].clone())
+                        })
+                        .collect::<Result<Vec<_>, ExcelError>>()
+                })
+                .collect::<Result<_, ExcelError>>()?
         } else {
             kept
         };
-        Ok(collapse_if_scalar(out, _ctx.date_system()))
+        cancellation_checkpoint(cancel.as_ref())?;
+        Ok(collapse_if_scalar(out, ctx.date_system()))
     }
 }
 
