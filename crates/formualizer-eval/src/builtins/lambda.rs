@@ -11,7 +11,7 @@ use formualizer_parse::parser::{ASTNode, ASTNodeType, ReferenceType};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-fn cancellation_checkpoint(cancel: Option<&CancelToken>) -> Result<(), ExcelError> {
+pub(crate) fn cancellation_checkpoint(cancel: Option<&CancelToken>) -> Result<(), ExcelError> {
     if cancel.is_some_and(CancelToken::is_cancelled) {
         Err(ExcelError::new(ExcelErrorKind::Cancelled))
     } else {
@@ -792,7 +792,7 @@ pub(crate) fn invoke(
     }
 }
 
-fn invoke_cancellable(
+pub(crate) fn invoke_cancellable(
     arg: &ArgumentHandle<'_, '_>,
     callable: &Arc<dyn CustomCallable>,
     values: &[LiteralValue],

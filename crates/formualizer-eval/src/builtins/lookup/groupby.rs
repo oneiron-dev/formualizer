@@ -2,7 +2,10 @@
 //! LAMBDA or a function named as a value, such as `SUM`.
 
 use super::super::utils::collapse_if_scalar;
-use crate::builtins::lambda::{element_value, function_arg, invoke};
+use crate::builtins::lambda::{
+    cancellation_checkpoint, element_value, function_arg, invoke, invoke_cancellable,
+};
+use crate::engine::CancelToken;
 use crate::function::{FnCaps, Function};
 use crate::traits::{ArgumentHandle, CalcValue, CustomCallable, FunctionContext};
 use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
@@ -11,6 +14,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 type Grid = Vec<Vec<LiteralValue>>;
+
+#[derive(Debug)]
+enum GroupFailure {
+    Value(ExcelError),
+    Native(ExcelError),
+}
+
+impl From<ExcelError> for GroupFailure {
+    fn from(error: ExcelError) -> Self {
+        Self::Value(error)
+    }
+}
 
 fn value_error(msg: &str) -> ExcelError {
     ExcelError::new(ExcelErrorKind::Value).with_message(msg.to_string())
@@ -416,6 +431,29 @@ impl Aggregate<'_, '_, '_> {
             )
         })
     }
+
+    fn apply_cancellable(
+        &self,
+        rows: &[usize],
+        relative: &[usize],
+        col: usize,
+    ) -> Result<LiteralValue, ExcelError> {
+        let result = if self.callable.accepts(1) {
+            invoke_cancellable(self.arg, &self.callable, &[self.column(rows, col)])?
+        } else {
+            invoke_cancellable(
+                self.arg,
+                &self.callable,
+                &[self.column(rows, col), self.column(relative, col)],
+            )?
+        };
+        Ok(element_value(result).unwrap_or_else(|| {
+            LiteralValue::Error(
+                ExcelError::new(ExcelErrorKind::Calc)
+                    .with_message("Nested arrays are not supported"),
+            )
+        }))
+    }
 }
 
 fn rows_of(keys: &[usize], rows_by_key: &[Vec<usize>]) -> Vec<usize> {
@@ -440,11 +478,14 @@ fn validate_spec(spec: &Option<Vec<i64>>, limit: usize) -> Result<(), ExcelError
 
 /// `GROUPBY(row_fields, values, function, [field_headers], [total_depth],
 /// [sort_order], [filter_array], [field_relationship])`
-fn groupby(args: &[ArgumentHandle<'_, '_>]) -> Result<Grid, ExcelError> {
+fn groupby(
+    args: &[ArgumentHandle<'_, '_>],
+    cancel: Option<&CancelToken>,
+) -> Result<Grid, GroupFailure> {
     let fields = grid_arg(&args[0])?;
     let values = grid_arg(&args[1])?;
     if fields.len() != values.len() {
-        return Err(value_error("row_fields and values must have the same rows"));
+        return Err(value_error("row_fields and values must have the same rows").into());
     }
     let aggregate = Aggregate {
         arg: &args[2],
@@ -464,22 +505,38 @@ fn groupby(args: &[ArgumentHandle<'_, '_>]) -> Result<Grid, ExcelError> {
         optional_arg(args, 6)?,
     )?;
 
+    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
     let keys: Vec<Vec<LiteralValue>> = rows
         .iter()
-        .map(|&r| (0..key_cols).map(|c| cell(&fields, r, c)).collect())
-        .collect();
+        .map(|&r| {
+            cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+            (0..key_cols)
+                .map(|c| {
+                    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                    Ok(cell(&fields, r, c))
+                })
+                .collect::<Result<Vec<_>, GroupFailure>>()
+        })
+        .collect::<Result<Vec<_>, GroupFailure>>()?;
     let (distinct, key_of) = distinct_keys(&keys);
     let mut rows_by_key = vec![Vec::new(); distinct.len()];
     for (i, &r) in rows.iter().enumerate() {
+        cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
         rows_by_key[key_of[i]].push(r);
     }
     let detail: Vec<Vec<LiteralValue>> = (0..distinct.len())
         .map(|k| {
+            cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
             (0..value_cols)
-                .map(|c| aggregate.apply(&rows_by_key[k], &rows, c))
-                .collect()
+                .map(|c| {
+                    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                    aggregate
+                        .apply_cancellable(&rows_by_key[k], &rows, c)
+                        .map_err(GroupFailure::Native)
+                })
+                .collect::<Result<Vec<_>, GroupFailure>>()
         })
-        .collect();
+        .collect::<Result<Vec<_>, GroupFailure>>()?;
     let order = order_keys(
         &distinct,
         spec.as_deref(),
@@ -508,29 +565,41 @@ fn groupby(args: &[ArgumentHandle<'_, '_>]) -> Result<Grid, ExcelError> {
         out.push(header);
     }
     for entry in axis_entries(&distinct, &order, depth, key_cols) {
+        cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
         let mut line = entry.label;
         if entry.keys.len() == 1 {
             line.extend(detail[entry.keys[0]].iter().cloned());
         } else {
             let members = rows_of(&entry.keys, &rows_by_key);
-            line.extend((0..value_cols).map(|c| aggregate.apply(&members, &rows, c)));
+            for c in 0..value_cols {
+                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                line.push(
+                    aggregate
+                        .apply_cancellable(&members, &rows, c)
+                        .map_err(GroupFailure::Native)?,
+                );
+            }
         }
         out.push(line);
     }
+    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
     Ok(out)
 }
 
 /// `PIVOTBY(row_fields, col_fields, values, function, [field_headers],
 /// [row_total_depth], [row_sort_order], [col_total_depth], [col_sort_order],
 /// [filter_array], [relative_to])`
-fn pivotby(args: &[ArgumentHandle<'_, '_>]) -> Result<Grid, ExcelError> {
+fn pivotby(
+    args: &[ArgumentHandle<'_, '_>],
+    cancel: Option<&CancelToken>,
+) -> Result<Grid, GroupFailure> {
     let row_fields = grid_arg(&args[0])?;
     let col_fields = grid_arg(&args[1])?;
     let values = grid_arg(&args[2])?;
     if row_fields.len() != values.len() || col_fields.len() != values.len() {
-        return Err(value_error(
-            "row_fields, col_fields and values must have the same rows",
-        ));
+        return Err(
+            value_error("row_fields, col_fields and values must have the same rows").into(),
+        );
     }
     let aggregate = Aggregate {
         arg: &args[3],
@@ -552,23 +621,33 @@ fn pivotby(args: &[ArgumentHandle<'_, '_>]) -> Result<Grid, ExcelError> {
     )?;
     let relative_to = optional_int(args, 10)?.unwrap_or(0);
     if !(0..=4).contains(&relative_to) {
-        return Err(value_error("relative_to must be 0-4"));
+        return Err(value_error("relative_to must be 0-4").into());
     }
 
+    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
     let axis = |fields: &Grid, cols: usize| {
         let keys: Vec<Vec<LiteralValue>> = rows
             .iter()
-            .map(|&r| (0..cols).map(|c| cell(fields, r, c)).collect())
-            .collect();
+            .map(|&r| {
+                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                (0..cols)
+                    .map(|c| {
+                        cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                        Ok(cell(fields, r, c))
+                    })
+                    .collect::<Result<Vec<_>, GroupFailure>>()
+            })
+            .collect::<Result<Vec<_>, GroupFailure>>()?;
         let (distinct, key_of) = distinct_keys(&keys);
         let mut rows_by_key = vec![Vec::new(); distinct.len()];
         for (i, &r) in rows.iter().enumerate() {
+            cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
             rows_by_key[key_of[i]].push(r);
         }
-        (distinct, rows_by_key)
+        Ok::<_, GroupFailure>((distinct, rows_by_key))
     };
-    let (row_keys, rows_by_row_key) = axis(&row_fields, row_cols);
-    let (col_keys, rows_by_col_key) = axis(&col_fields, col_cols);
+    let (row_keys, rows_by_row_key) = axis(&row_fields, row_cols)?;
+    let (col_keys, rows_by_col_key) = axis(&col_fields, col_cols)?;
     let row_totals = |k: usize, c: usize| aggregate.apply(&rows_by_row_key[k], &rows, c);
     let col_totals = |k: usize, c: usize| aggregate.apply(&rows_by_col_key[k], &rows, c);
     let row_order = order_keys(&row_keys, row_spec.as_deref(), &row_totals, row_cols);
@@ -577,14 +656,19 @@ fn pivotby(args: &[ArgumentHandle<'_, '_>]) -> Result<Grid, ExcelError> {
     let col_entries = axis_entries(&col_keys, &col_order, col_depth, col_cols);
     let col_members: Vec<Vec<usize>> = col_entries
         .iter()
-        .map(|e| rows_of(&e.keys, &rows_by_col_key))
-        .collect();
+        .map(|e| {
+            cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+            Ok(rows_of(&e.keys, &rows_by_col_key))
+        })
+        .collect::<Result<Vec<_>, GroupFailure>>()?;
 
     let mut out = Vec::new();
     for level in 0..col_cols {
+        cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
         let mut line = vec![blank(); row_cols];
         if show_headers && level + 1 == col_cols && value_cols == 1 {
             for (c, slot) in line.iter_mut().enumerate() {
+                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
                 *slot = if has_headers {
                     cell(&row_fields, 0, c)
                 } else {
@@ -593,6 +677,7 @@ fn pivotby(args: &[ArgumentHandle<'_, '_>]) -> Result<Grid, ExcelError> {
             }
         }
         for entry in &col_entries {
+            cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
             for v in 0..value_cols {
                 line.push(if v == 0 {
                     entry.label[level].clone()
@@ -604,8 +689,10 @@ fn pivotby(args: &[ArgumentHandle<'_, '_>]) -> Result<Grid, ExcelError> {
         out.push(line);
     }
     if value_cols > 1 {
+        cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
         let mut line = vec![blank(); row_cols];
         for _ in &col_entries {
+            cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
             for v in 0..value_cols {
                 line.push(if has_headers {
                     cell(&values, 0, v)
@@ -617,9 +704,11 @@ fn pivotby(args: &[ArgumentHandle<'_, '_>]) -> Result<Grid, ExcelError> {
         out.push(line);
     }
     for entry in row_entries {
+        cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
         let members = rows_of(&entry.keys, &rows_by_row_key);
         let mut line = entry.label;
         for cols in &col_members {
+            cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
             let both: Vec<usize> = members
                 .iter()
                 .copied()
@@ -631,15 +720,19 @@ fn pivotby(args: &[ArgumentHandle<'_, '_>]) -> Result<Grid, ExcelError> {
                 _ => cols.clone(),
             };
             for v in 0..value_cols {
+                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
                 line.push(if both.is_empty() {
                     blank()
                 } else {
-                    aggregate.apply(&both, &relative, v)
+                    aggregate
+                        .apply_cancellable(&both, &relative, v)
+                        .map_err(GroupFailure::Native)?
                 });
             }
         }
         out.push(line);
     }
+    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
     Ok(out)
 }
 
@@ -681,13 +774,20 @@ macro_rules! group_fn {
                 ctx: &dyn FunctionContext<'b>,
             ) -> Result<CalcValue<'b>, ExcelError> {
                 let result = if args.len() < $min || args.len() > $max {
-                    Err(value_error(concat!("Wrong number of arguments to ", $name)))
+                    Err(GroupFailure::Value(value_error(concat!(
+                        "Wrong number of arguments to ",
+                        $name
+                    ))))
                 } else {
-                    $eval(args)
+                    let cancel = ctx.cancellation_token();
+                    $eval(args, cancel.as_ref())
                 };
                 Ok(match result {
                     Ok(rows) => collapse_if_scalar(rows, ctx.date_system()),
-                    Err(e) => CalcValue::Scalar(LiteralValue::Error(e)),
+                    Err(GroupFailure::Value(error)) => {
+                        CalcValue::Scalar(LiteralValue::Error(error))
+                    }
+                    Err(GroupFailure::Native(error)) => return Err(error),
                 })
             }
         }
