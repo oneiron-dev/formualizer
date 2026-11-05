@@ -2,10 +2,29 @@
 
 use super::super::utils::collapse_if_scalar;
 use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
+use crate::engine::CancelToken;
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, FunctionContext};
 use formualizer_common::{ArgKind, ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
+
+enum ArrayShapeFailure {
+    Native(ExcelError),
+    Value(ExcelError),
+}
+
+impl From<ExcelError> for ArrayShapeFailure {
+    fn from(error: ExcelError) -> Self {
+        Self::Value(error)
+    }
+}
+
+fn cancellation_checkpoint(cancel: Option<&CancelToken>) -> Result<(), ExcelError> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        return Err(ExcelError::new(ExcelErrorKind::Cancelled));
+    }
+    Ok(())
+}
 
 /// Converts an array or range into a single column.
 ///
@@ -112,46 +131,73 @@ fn schema() -> &'static [ArgSchema] {
     &SCHEMA
 }
 
-fn materialize_arg<'b>(arg: &ArgumentHandle<'_, 'b>) -> Result<Vec<Vec<LiteralValue>>, ExcelError> {
-    if let Ok(view) = arg.range_view() {
+fn materialize_arg<'b>(
+    arg: &ArgumentHandle<'_, 'b>,
+    cancel: Option<&CancelToken>,
+) -> Result<Vec<Vec<LiteralValue>>, ArrayShapeFailure> {
+    cancellation_checkpoint(cancel).map_err(ArrayShapeFailure::Native)?;
+    let view = match arg.range_view() {
+        Ok(view) => Some(view),
+        Err(error) if error.kind == ExcelErrorKind::Cancelled => {
+            return Err(ArrayShapeFailure::Native(error));
+        }
+        Err(_) => None,
+    };
+    if let Some(view) = view {
         let mut rows = Vec::new();
         view.for_each_row(&mut |row| {
+            cancellation_checkpoint(cancel)?;
             rows.push(row.to_vec());
             Ok(())
-        })?;
+        })
+        .map_err(ArrayShapeFailure::Native)?;
         return Ok(rows);
     }
 
-    Ok(match arg.value()?.into_literal() {
-        LiteralValue::Array(rows) => rows,
-        v => vec![vec![v]],
-    })
+    Ok(
+        match arg
+            .value()
+            .map_err(ArrayShapeFailure::Native)?
+            .into_literal()
+        {
+            LiteralValue::Array(rows) => rows,
+            v => vec![vec![v]],
+        },
+    )
 }
 
-fn ignore_mode<'b>(args: &[ArgumentHandle<'_, 'b>]) -> Result<i64, ExcelError> {
+fn ignore_mode<'b>(args: &[ArgumentHandle<'_, 'b>]) -> Result<i64, ArrayShapeFailure> {
     if args.len() < 2 {
         return Ok(0);
     }
-    let raw = args[1].value()?.into_literal();
+    let raw = args[1]
+        .value()
+        .map_err(ArrayShapeFailure::Native)?
+        .into_literal();
     let n = match raw {
         LiteralValue::Int(i) => i,
         LiteralValue::Number(n) => n as i64,
-        LiteralValue::Error(e) => return Err(e),
+        LiteralValue::Error(e) => return Err(e.into()),
         other => crate::coercion::to_number_argument(&other)? as i64,
     };
     if !(0..=3).contains(&n) {
-        return Err(
-            ExcelError::new(ExcelErrorKind::Value).with_message("ignore must be 0, 1, 2, or 3")
-        );
+        return Err(ExcelError::new(ExcelErrorKind::Value)
+            .with_message("ignore must be 0, 1, 2, or 3")
+            .into());
     }
     Ok(n)
 }
 
-fn scan_by_column<'b>(args: &[ArgumentHandle<'_, 'b>]) -> Result<bool, ExcelError> {
+fn scan_by_column<'b>(args: &[ArgumentHandle<'_, 'b>]) -> Result<bool, ArrayShapeFailure> {
     if args.len() < 3 {
         return Ok(false);
     }
-    crate::coercion::to_logical(&args[2].value()?.into_literal())
+    Ok(crate::coercion::to_logical(
+        &args[2]
+            .value()
+            .map_err(ArrayShapeFailure::Native)?
+            .into_literal(),
+    )?)
 }
 
 fn include_cell(v: &LiteralValue, ignore: i64) -> bool {
@@ -165,21 +211,28 @@ fn include_cell(v: &LiteralValue, ignore: i64) -> bool {
     }
 }
 
-fn flatten_array<'b>(args: &[ArgumentHandle<'_, 'b>]) -> Result<Vec<LiteralValue>, ExcelError> {
+fn flatten_array<'b>(
+    args: &[ArgumentHandle<'_, 'b>],
+    cancel: Option<&CancelToken>,
+) -> Result<Vec<LiteralValue>, ArrayShapeFailure> {
     if args.is_empty() || args.len() > 3 {
-        return Err(ExcelError::new(ExcelErrorKind::Value));
+        return Err(ExcelError::new(ExcelErrorKind::Value).into());
     }
-    let data = materialize_arg(&args[0])?;
+    cancellation_checkpoint(cancel).map_err(ArrayShapeFailure::Native)?;
+    let data = materialize_arg(&args[0], cancel)?;
     let ignore = ignore_mode(args)?;
     let scan_by_col = scan_by_column(args)?;
 
     let rows = data.len();
     let cols = data.iter().map(Vec::len).max().unwrap_or(0);
+    cancellation_checkpoint(cancel).map_err(ArrayShapeFailure::Native)?;
     let mut flat = Vec::with_capacity(rows.saturating_mul(cols));
 
     if scan_by_col {
         for c in 0..cols {
+            cancellation_checkpoint(cancel).map_err(ArrayShapeFailure::Native)?;
             for row in &data {
+                cancellation_checkpoint(cancel).map_err(ArrayShapeFailure::Native)?;
                 let v = row.get(c).cloned().unwrap_or(LiteralValue::Empty);
                 if include_cell(&v, ignore) {
                     flat.push(v);
@@ -188,7 +241,9 @@ fn flatten_array<'b>(args: &[ArgumentHandle<'_, 'b>]) -> Result<Vec<LiteralValue
         }
     } else {
         for row in &data {
+            cancellation_checkpoint(cancel).map_err(ArrayShapeFailure::Native)?;
             for c in 0..cols {
+                cancellation_checkpoint(cancel).map_err(ArrayShapeFailure::Native)?;
                 let v = row.get(c).cloned().unwrap_or(LiteralValue::Empty);
                 if include_cell(&v, ignore) {
                     flat.push(v);
@@ -199,8 +254,10 @@ fn flatten_array<'b>(args: &[ArgumentHandle<'_, 'b>]) -> Result<Vec<LiteralValue
 
     if flat.is_empty() {
         return Err(ExcelError::new(ExcelErrorKind::Calc)
-            .with_message("TOCOL/TOROW returned an empty array"));
+            .with_message("TOCOL/TOROW returned an empty array")
+            .into());
     }
+    cancellation_checkpoint(cancel).map_err(ArrayShapeFailure::Native)?;
     Ok(flat)
 }
 
@@ -233,12 +290,23 @@ impl Function for ToColFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        match flatten_array(args) {
-            Ok(flat) => Ok(collapse_if_scalar(
-                flat.into_iter().map(|v| vec![v]).collect(),
-                ctx.date_system(),
-            )),
-            Err(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+        let cancel = ctx.cancellation_token();
+        match flatten_array(args, cancel.as_ref()) {
+            Ok(flat) => {
+                let out = flat
+                    .into_iter()
+                    .map(|v| {
+                        cancellation_checkpoint(cancel.as_ref())?;
+                        Ok(vec![v])
+                    })
+                    .collect::<Result<Vec<_>, ExcelError>>()?;
+                cancellation_checkpoint(cancel.as_ref())?;
+                Ok(collapse_if_scalar(out, ctx.date_system()))
+            }
+            Err(ArrayShapeFailure::Native(e)) if e.kind == ExcelErrorKind::Cancelled => Err(e),
+            Err(ArrayShapeFailure::Native(e) | ArrayShapeFailure::Value(e)) => {
+                Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)))
+            }
         }
     }
 }
@@ -272,9 +340,16 @@ impl Function for ToRowFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        match flatten_array(args) {
-            Ok(flat) => Ok(collapse_if_scalar(vec![flat], ctx.date_system())),
-            Err(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+        let cancel = ctx.cancellation_token();
+        match flatten_array(args, cancel.as_ref()) {
+            Ok(flat) => {
+                cancellation_checkpoint(cancel.as_ref())?;
+                Ok(collapse_if_scalar(vec![flat], ctx.date_system()))
+            }
+            Err(ArrayShapeFailure::Native(e)) if e.kind == ExcelErrorKind::Cancelled => Err(e),
+            Err(ArrayShapeFailure::Native(e) | ArrayShapeFailure::Value(e)) => {
+                Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)))
+            }
         }
     }
 }
@@ -305,9 +380,13 @@ fn reshape_schema(optional: usize) -> Vec<ArgSchema> {
 fn optional_arg<'b>(
     args: &[ArgumentHandle<'_, 'b>],
     index: usize,
-) -> Result<Option<LiteralValue>, ExcelError> {
+) -> Result<Option<LiteralValue>, ArrayShapeFailure> {
     match args.get(index) {
-        Some(arg) if !arg.is_omitted() => Ok(Some(arg.value()?.into_literal())),
+        Some(arg) if !arg.is_omitted() => Ok(Some(
+            arg.value()
+                .map_err(ArrayShapeFailure::Native)?
+                .into_literal(),
+        )),
         _ => Ok(None),
     }
 }
@@ -324,7 +403,7 @@ fn size_value(value: LiteralValue) -> Result<f64, ExcelError> {
 fn pad_value<'b>(
     args: &[ArgumentHandle<'_, 'b>],
     index: usize,
-) -> Result<LiteralValue, ExcelError> {
+) -> Result<LiteralValue, ArrayShapeFailure> {
     Ok(optional_arg(args, index)?
         .unwrap_or_else(|| LiteralValue::Error(ExcelError::new(ExcelErrorKind::Na))))
 }
@@ -366,8 +445,10 @@ impl Function for ExpandFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let result = (|| {
-            let data = materialize_arg(&args[0])?;
+        let cancel = ctx.cancellation_token();
+        let result: Result<Vec<Vec<LiteralValue>>, ArrayShapeFailure> = (|| {
+            cancellation_checkpoint(cancel.as_ref()).map_err(ArrayShapeFailure::Native)?;
+            let data = materialize_arg(&args[0], cancel.as_ref())?;
             let height = data.len();
             let width = data.iter().map(Vec::len).max().unwrap_or(0);
             let rows = match optional_arg(args, 1)? {
@@ -380,29 +461,41 @@ impl Function for ExpandFn {
             };
             if rows < height as f64 || cols < width as f64 {
                 return Err(ExcelError::new(ExcelErrorKind::Value)
-                    .with_message("EXPAND cannot shrink an array"));
+                    .with_message("EXPAND cannot shrink an array")
+                    .into());
             }
             if rows > MAX_ROWS || cols > MAX_COLS {
-                return Err(ExcelError::new(ExcelErrorKind::Num));
+                return Err(ExcelError::new(ExcelErrorKind::Num).into());
             }
             let pad = pad_value(args, 3)?;
             let (rows, cols) = (rows as usize, cols as usize);
-            Ok((0..rows)
-                .map(|r| {
+            cancellation_checkpoint(cancel.as_ref()).map_err(ArrayShapeFailure::Native)?;
+            (0..rows)
+                .map(|r| -> Result<Vec<LiteralValue>, ArrayShapeFailure> {
+                    cancellation_checkpoint(cancel.as_ref()).map_err(ArrayShapeFailure::Native)?;
                     (0..cols)
                         .map(|c| {
-                            data.get(r)
+                            cancellation_checkpoint(cancel.as_ref())
+                                .map_err(ArrayShapeFailure::Native)?;
+                            Ok(data
+                                .get(r)
                                 .and_then(|row| row.get(c))
                                 .cloned()
-                                .unwrap_or_else(|| pad.clone())
+                                .unwrap_or_else(|| pad.clone()))
                         })
                         .collect()
                 })
-                .collect())
+                .collect()
         })();
         match result {
-            Ok(rows) => Ok(collapse_if_scalar(rows, ctx.date_system())),
-            Err(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+            Ok(rows) => {
+                cancellation_checkpoint(cancel.as_ref())?;
+                Ok(collapse_if_scalar(rows, ctx.date_system()))
+            }
+            Err(ArrayShapeFailure::Native(e)) if e.kind == ExcelErrorKind::Cancelled => Err(e),
+            Err(ArrayShapeFailure::Native(e) | ArrayShapeFailure::Value(e)) => {
+                Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)))
+            }
         }
     }
 }
@@ -412,20 +505,35 @@ impl Function for ExpandFn {
 fn wrap_vector<'b>(
     args: &[ArgumentHandle<'_, 'b>],
     by_col: bool,
-) -> Result<Vec<Vec<LiteralValue>>, ExcelError> {
-    let data = materialize_arg(&args[0])?;
+    cancel: Option<&CancelToken>,
+) -> Result<Vec<Vec<LiteralValue>>, ArrayShapeFailure> {
+    cancellation_checkpoint(cancel).map_err(ArrayShapeFailure::Native)?;
+    let data = materialize_arg(&args[0], cancel)?;
     let height = data.len();
     let width = data.iter().map(Vec::len).max().unwrap_or(0);
     if height > 1 && width > 1 {
         return Err(ExcelError::new(ExcelErrorKind::Value)
-            .with_message("WRAPROWS/WRAPCOLS need a single row or column"));
+            .with_message("WRAPROWS/WRAPCOLS need a single row or column")
+            .into());
     }
-    let values: Vec<LiteralValue> = data.into_iter().flatten().collect();
-    let wrap = size_value(args[1].value()?.into_literal())?;
+    let values: Vec<LiteralValue> = data
+        .into_iter()
+        .flatten()
+        .map(|value| {
+            cancellation_checkpoint(cancel).map_err(ArrayShapeFailure::Native)?;
+            Ok(value)
+        })
+        .collect::<Result<_, ArrayShapeFailure>>()?;
+    let wrap = size_value(
+        args[1]
+            .value()
+            .map_err(ArrayShapeFailure::Native)?
+            .into_literal(),
+    )?;
     if wrap < 1.0 {
-        return Err(
-            ExcelError::new(ExcelErrorKind::Num).with_message("wrap_count must be at least 1")
-        );
+        return Err(ExcelError::new(ExcelErrorKind::Num)
+            .with_message("wrap_count must be at least 1")
+            .into());
     }
     let pad = pad_value(args, 2)?;
     let (max_wrap, max_lines) = if by_col {
@@ -434,12 +542,12 @@ fn wrap_vector<'b>(
         (MAX_COLS, MAX_ROWS)
     };
     if wrap > max_wrap {
-        return Err(ExcelError::new(ExcelErrorKind::Num));
+        return Err(ExcelError::new(ExcelErrorKind::Num).into());
     }
     let wrap = wrap as usize;
     let lines = values.len().div_ceil(wrap).max(1);
     if lines as f64 > max_lines {
-        return Err(ExcelError::new(ExcelErrorKind::Num));
+        return Err(ExcelError::new(ExcelErrorKind::Num).into());
     }
     let at = |line: usize, pos: usize| {
         values
@@ -447,15 +555,32 @@ fn wrap_vector<'b>(
             .cloned()
             .unwrap_or_else(|| pad.clone())
     };
-    Ok(if by_col {
+    cancellation_checkpoint(cancel).map_err(ArrayShapeFailure::Native)?;
+    if by_col {
         (0..wrap)
-            .map(|r| (0..lines).map(|c| at(c, r)).collect())
+            .map(|r| -> Result<Vec<LiteralValue>, ArrayShapeFailure> {
+                cancellation_checkpoint(cancel).map_err(ArrayShapeFailure::Native)?;
+                (0..lines)
+                    .map(|c| {
+                        cancellation_checkpoint(cancel).map_err(ArrayShapeFailure::Native)?;
+                        Ok(at(c, r))
+                    })
+                    .collect()
+            })
             .collect()
     } else {
         (0..lines)
-            .map(|r| (0..wrap).map(|c| at(r, c)).collect())
+            .map(|r| -> Result<Vec<LiteralValue>, ArrayShapeFailure> {
+                cancellation_checkpoint(cancel).map_err(ArrayShapeFailure::Native)?;
+                (0..wrap)
+                    .map(|c| {
+                        cancellation_checkpoint(cancel).map_err(ArrayShapeFailure::Native)?;
+                        Ok(at(r, c))
+                    })
+                    .collect()
+            })
             .collect()
-    })
+    }
 }
 
 /// Wraps a row or column of values into rows of `wrap_count` values.
@@ -506,9 +631,18 @@ macro_rules! wrap_fn {
                 args: &'c [ArgumentHandle<'a, 'b>],
                 ctx: &dyn FunctionContext<'b>,
             ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-                match wrap_vector(args, $by_col) {
-                    Ok(rows) => Ok(collapse_if_scalar(rows, ctx.date_system())),
-                    Err(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+                let cancel = ctx.cancellation_token();
+                match wrap_vector(args, $by_col, cancel.as_ref()) {
+                    Ok(rows) => {
+                        cancellation_checkpoint(cancel.as_ref())?;
+                        Ok(collapse_if_scalar(rows, ctx.date_system()))
+                    }
+                    Err(ArrayShapeFailure::Native(e)) if e.kind == ExcelErrorKind::Cancelled => {
+                        Err(e)
+                    }
+                    Err(ArrayShapeFailure::Native(e) | ArrayShapeFailure::Value(e)) => {
+                        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)))
+                    }
                 }
             }
         }
