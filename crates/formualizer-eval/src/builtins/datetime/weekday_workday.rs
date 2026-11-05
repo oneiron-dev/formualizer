@@ -1,14 +1,23 @@
 //! WEEKDAY, WEEKNUM, DATEDIF, NETWORKDAYS, WORKDAY functions
 
 use crate::args::ArgSchema;
+use crate::engine::CancelToken;
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, CalcValue, FunctionContext};
 use arrow_array::Array;
 use chrono::{Datelike, NaiveDate, Weekday};
 use formualizer_common::{
-    DateSystem, ExcelError, LiteralValue, date_to_serial_for, try_serial_to_date_for,
+    DateSystem, ExcelError, ExcelErrorKind, LiteralValue, date_to_serial_for, try_serial_to_date_for,
 };
 use formualizer_macros::func_caps;
+
+fn cancellation_checkpoint(cancel: Option<&CancelToken>) -> Result<(), ExcelError> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        Err(ExcelError::new(ExcelErrorKind::Cancelled))
+    } else {
+        Ok(())
+    }
+}
 
 /// Number of days between the Excel 1900 and Excel 1904 epochs.
 ///
@@ -615,45 +624,73 @@ fn collect_holidays(
     args: &[ArgumentHandle],
     arg_start: usize,
     system: DateSystem,
-) -> Vec<NaiveDate> {
+    cancel: Option<&CancelToken>,
+) -> Result<Vec<NaiveDate>, ExcelError> {
+    cancellation_checkpoint(cancel)?;
     let mut holidays = Vec::new();
     for arg in args.iter().skip(arg_start) {
+        cancellation_checkpoint(cancel)?;
         match arg.value() {
             // A date-formatted scalar such as DATE(2024,1,3) arrives annotated.
             Ok(CalcValue::Scalar(lit) | CalcValue::AnnotatedScalar(lit, _)) => {
-                collect_holidays_from_literal(&lit, &mut holidays, system)
+                collect_holidays_from_literal(&lit, &mut holidays, system, cancel)?;
             }
             Ok(CalcValue::Range(rv)) => {
-                if let Ok(slices) = rv.numbers_slices().collect::<Result<Vec<_>, _>>() {
-                    for (_row_start, _row_len, cols) in slices {
-                        for col in cols {
-                            let len = col.len();
-                            let values = col.values();
-                            for i in 0..len {
-                                if !col.is_null(i)
-                                    && let Ok(d) = try_serial_to_date_for(system, values[i])
-                                {
-                                    holidays.push(d);
+                let slices = rv
+                    .numbers_slices()
+                    .map(|slice| {
+                        cancellation_checkpoint(cancel)?;
+                        slice
+                    })
+                    .collect::<Result<Vec<_>, _>>();
+                match slices {
+                    Ok(slices) => {
+                        for (_row_start, _row_len, cols) in slices {
+                            cancellation_checkpoint(cancel)?;
+                            for col in cols {
+                                cancellation_checkpoint(cancel)?;
+                                let len = col.len();
+                                let values = col.values();
+                                for i in 0..len {
+                                    cancellation_checkpoint(cancel)?;
+                                    if !col.is_null(i)
+                                        && let Ok(d) = try_serial_to_date_for(system, values[i])
+                                    {
+                                        holidays.push(d);
+                                    }
                                 }
                             }
                         }
                     }
+                    Err(error) if matches!(error.kind, ExcelErrorKind::Cancelled) => {
+                        return Err(error);
+                    }
+                    Err(_) => {}
                 }
             }
             _ => {}
         }
     }
+    cancellation_checkpoint(cancel)?;
     holidays.sort_unstable();
     holidays.dedup();
-    holidays
+    cancellation_checkpoint(cancel)?;
+    Ok(holidays)
 }
 
-fn collect_holidays_from_literal(lit: &LiteralValue, out: &mut Vec<NaiveDate>, system: DateSystem) {
+fn collect_holidays_from_literal(
+    lit: &LiteralValue,
+    out: &mut Vec<NaiveDate>,
+    system: DateSystem,
+    cancel: Option<&CancelToken>,
+) -> Result<(), ExcelError> {
+    cancellation_checkpoint(cancel)?;
     match lit {
         LiteralValue::Array(rows) => {
             for row in rows {
+                cancellation_checkpoint(cancel)?;
                 for cell in row {
-                    collect_holidays_from_literal(cell, out, system);
+                    collect_holidays_from_literal(cell, out, system, cancel)?;
                 }
             }
         }
@@ -663,6 +700,7 @@ fn collect_holidays_from_literal(lit: &LiteralValue, out: &mut Vec<NaiveDate>, s
             }
         }
     }
+    Ok(())
 }
 
 fn literal_to_date(lit: &LiteralValue, system: DateSystem) -> Option<NaiveDate> {
@@ -746,6 +784,8 @@ impl Function for NetworkdaysFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let system = ctx.date_system();
         let start_serial = coerce_to_serial(&args[0], system)?;
         let end_serial = coerce_to_serial(&args[1], system)?;
@@ -753,7 +793,7 @@ impl Function for NetworkdaysFn {
         let start_date = try_serial_to_date_for(system, start_serial)?;
         let end_date = try_serial_to_date_for(system, end_serial)?;
 
-        let holidays = collect_holidays(args, 2, system);
+        let holidays = collect_holidays(args, 2, system, cancel.as_ref())?;
 
         let (start, end, sign) = if start_date <= end_date {
             (start_date, end_date, 1i64)
@@ -764,6 +804,7 @@ impl Function for NetworkdaysFn {
         let mut count = 0i64;
         let mut current = start;
         while current <= end {
+            cancellation_checkpoint(cancel.as_ref())?;
             if !is_weekend(&current) && holidays.binary_search(&current).is_err() {
                 count += 1;
             }
@@ -844,19 +885,22 @@ impl Function for WorkdayFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let system = ctx.date_system();
         let start_serial = coerce_to_serial(&args[0], system)?;
         let days = coerce_to_int(&args[1])?;
 
         let start_date = try_serial_to_date_for(system, start_serial)?;
 
-        let holidays = collect_holidays(args, 2, system);
+        let holidays = collect_holidays(args, 2, system, cancel.as_ref())?;
 
         let mut current = start_date;
         let mut remaining = days.abs();
         let direction: i64 = if days >= 0 { 1 } else { -1 };
 
         while remaining > 0 {
+            cancellation_checkpoint(cancel.as_ref())?;
             current = if direction > 0 {
                 current.succ_opt().ok_or_else(ExcelError::new_num)?
             } else {
@@ -955,6 +999,8 @@ impl Function for NetworkdaysIntlFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let system = ctx.date_system();
         let start_serial = coerce_to_serial(&args[0], system)?;
         let end_serial = coerce_to_serial(&args[1], system)?;
@@ -976,7 +1022,7 @@ impl Function for NetworkdaysIntlFn {
             DEFAULT_WEEKEND_MASK
         };
 
-        let holidays = collect_holidays(args, 3, system);
+        let holidays = collect_holidays(args, 3, system, cancel.as_ref())?;
 
         let (start, end, sign) = if start_date <= end_date {
             (start_date, end_date, 1i64)
@@ -987,6 +1033,7 @@ impl Function for NetworkdaysIntlFn {
         let mut count = 0i64;
         let mut current = start;
         while current <= end {
+            cancellation_checkpoint(cancel.as_ref())?;
             if !is_weekend_masked(&current, &mask) && holidays.binary_search(&current).is_err() {
                 count += 1;
             }
@@ -1079,6 +1126,8 @@ impl Function for WorkdayIntlFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let system = ctx.date_system();
         let start_serial = coerce_to_serial(&args[0], system)?;
         let days = coerce_to_int(&args[1])?;
@@ -1099,13 +1148,14 @@ impl Function for WorkdayIntlFn {
             DEFAULT_WEEKEND_MASK
         };
 
-        let holidays = collect_holidays(args, 3, system);
+        let holidays = collect_holidays(args, 3, system, cancel.as_ref())?;
 
         let mut current = start_date;
         let mut remaining = days.abs();
         let direction: i64 = if days >= 0 { 1 } else { -1 };
 
         while remaining > 0 {
+            cancellation_checkpoint(cancel.as_ref())?;
             current = if direction > 0 {
                 current.succ_opt().ok_or_else(ExcelError::new_num)?
             } else {
