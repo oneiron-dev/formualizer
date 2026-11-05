@@ -1993,8 +1993,11 @@ impl Function for MultinomialFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let mut values: Vec<i64> = Vec::new();
         for arg in args {
+            cancellation_checkpoint(cancel.as_ref())?;
             // A value typed into the list is a number argument: its text
             // converts as VALUE() converts it, date and time text included
             // (`MULTINOMIAL("12:00",1)` is 1). Cells of a range and elements
@@ -2003,6 +2006,7 @@ impl Function for MultinomialFn {
                 AggregateArgument::Range(view) => {
                     let mut cells = Vec::new();
                     view.for_each_cell(&mut |cell| {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         cells.push(cell.clone());
                         Ok(())
                     })?;
@@ -2017,6 +2021,7 @@ impl Function for MultinomialFn {
                 AggregateArgument::Scalar(value) => (vec![value], true),
             };
             for value in items {
+                cancellation_checkpoint(cancel.as_ref())?;
                 let n = match value {
                     LiteralValue::Error(e) => {
                         return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
@@ -2033,7 +2038,13 @@ impl Function for MultinomialFn {
             }
         }
 
-        let sum: i64 = values.iter().sum();
+        let sum: i64 = values
+            .iter()
+            .map(|value| {
+                cancellation_checkpoint(cancel.as_ref())?;
+                Ok(*value)
+            })
+            .sum::<Result<i64, ExcelError>>()?;
         let num = match factorial_checked(sum) {
             Some(v) => v,
             None => {
@@ -2045,6 +2056,7 @@ impl Function for MultinomialFn {
 
         let mut den = 1.0;
         for n in values {
+            cancellation_checkpoint(cancel.as_ref())?;
             let fact = match factorial_checked(n) {
                 Some(v) => v,
                 None => {
@@ -2132,6 +2144,8 @@ impl Function for SeriesSumFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let x = match args[0].value()?.into_literal() {
             LiteralValue::Error(e) => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
@@ -2154,6 +2168,7 @@ impl Function for SeriesSumFn {
         let mut coeffs: Vec<f64> = Vec::new();
         match resolve_aggregate_argument(&args[3], ctx)? {
             AggregateArgument::Range(view) => view.for_each_cell(&mut |cell| {
+                cancellation_checkpoint(cancel.as_ref())?;
                 match cell {
                     LiteralValue::Error(e) => return Err(e.clone()),
                     other => coeffs.push(crate::coercion::to_number_lenient(other)?),
@@ -2173,6 +2188,7 @@ impl Function for SeriesSumFn {
 
         let mut sum = 0.0;
         for (i, c) in coeffs.into_iter().enumerate() {
+            cancellation_checkpoint(cancel.as_ref())?;
             sum += c * x.powf(n + (i as f64) * m);
         }
 

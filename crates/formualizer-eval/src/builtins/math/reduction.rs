@@ -1,12 +1,21 @@
 use super::super::utils::{ARG_RANGE_NUM_LENIENT_ONE, coerce_num};
 use super::{AggregateArgument, resolve_aggregate_argument};
 use crate::args::ArgSchema;
+use crate::engine::CancelToken;
 use crate::function::Function;
 use crate::function_contract::FunctionDependencyContract;
 use crate::traits::{ArgumentHandle, FunctionContext};
 use arrow_array::Array;
-use formualizer_common::{ExcelError, LiteralValue};
+use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
+
+fn cancellation_checkpoint(cancel: Option<&CancelToken>) -> Result<(), ExcelError> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        Err(ExcelError::new(ExcelErrorKind::Cancelled))
+    } else {
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 pub struct MinFn; // MIN(...)
@@ -96,18 +105,24 @@ impl Function for MinFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let mut mv: Option<f64> = None;
         let mut mv_format = None;
         for a in args {
+            cancellation_checkpoint(cancel.as_ref())?;
             let argument_format = a.value()?.format_id();
             match resolve_aggregate_argument(a, ctx)? {
                 AggregateArgument::Range(view) => {
                     // Propagate errors from range first
                     for res in view.errors_slices() {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         let (_, _, err_cols) = res?;
                         for col in err_cols {
+                            cancellation_checkpoint(cancel.as_ref())?;
                             if col.null_count() < col.len() {
                                 for i in 0..col.len() {
+                                    cancellation_checkpoint(cancel.as_ref())?;
                                     if !col.is_null(i) {
                                         return Ok(crate::traits::CalcValue::Scalar(
                                             LiteralValue::Error(ExcelError::new(
@@ -121,8 +136,10 @@ impl Function for MinFn {
                     }
 
                     for res in view.numbers_slices() {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         let (_, _, num_cols) = res?;
                         for col in num_cols {
+                            cancellation_checkpoint(cancel.as_ref())?;
                             if let Some(n) = arrow::compute::kernels::aggregate::min(col.as_ref())
                                 && mv.is_none_or(|current| n < current)
                             {
@@ -248,18 +265,24 @@ impl Function for MaxFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let mut mv: Option<f64> = None;
         let mut mv_format = None;
         for a in args {
+            cancellation_checkpoint(cancel.as_ref())?;
             let argument_format = a.value()?.format_id();
             match resolve_aggregate_argument(a, ctx)? {
                 AggregateArgument::Range(view) => {
                     // Propagate errors from range first
                     for res in view.errors_slices() {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         let (_, _, err_cols) = res?;
                         for col in err_cols {
+                            cancellation_checkpoint(cancel.as_ref())?;
                             if col.null_count() < col.len() {
                                 for i in 0..col.len() {
+                                    cancellation_checkpoint(cancel.as_ref())?;
                                     if !col.is_null(i) {
                                         return Ok(crate::traits::CalcValue::Scalar(
                                             LiteralValue::Error(ExcelError::new(
@@ -273,8 +296,10 @@ impl Function for MaxFn {
                     }
 
                     for res in view.numbers_slices() {
+                        cancellation_checkpoint(cancel.as_ref())?;
                         let (_, _, num_cols) = res?;
                         for col in num_cols {
+                            cancellation_checkpoint(cancel.as_ref())?;
                             if let Some(n) = arrow::compute::kernels::aggregate::max(col.as_ref())
                                 && mv.is_none_or(|current| n > current)
                             {
