@@ -3,10 +3,19 @@
 
 use crate::args::ArgSchema;
 use crate::coercion::to_serial_strict;
+use crate::engine::CancelToken;
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, CalcValue, FunctionContext};
 use formualizer_common::{DateSystem, ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
+
+fn cancellation_checkpoint(cancel: Option<&CancelToken>) -> Result<(), ExcelError> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        Err(ExcelError::new(ExcelErrorKind::Cancelled))
+    } else {
+        Ok(())
+    }
+}
 
 /// Numeric coercion for financial arguments.
 ///
@@ -713,7 +722,7 @@ impl Function for RateFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
         let nper = coerce_num(&args[0])?;
         let pmt = coerce_num(&args[1])?;
@@ -739,7 +748,9 @@ impl Function for RateFn {
         let max_iter = 100;
         let tolerance = 1e-10;
 
+        let cancel = ctx.cancellation_token();
         for _ in 0..max_iter {
+            cancellation_checkpoint(cancel.as_ref())?;
             let type_adj = if pmt_type != 0 { 1.0 + rate } else { 1.0 };
 
             if rate.abs() < 1e-10 {
@@ -1219,7 +1230,11 @@ fn irr_npv_deriv(cashflows: &[f64], rate: f64) -> (f64, f64) {
 /// 2. If Newton diverges, bracket the root by scanning probe points,
 ///    then use Brent's method (superlinear convergence with guaranteed
 ///    bracketing) to find the root precisely.
-fn irr_solve(cashflows: &[f64], guess: f64) -> Option<f64> {
+fn irr_solve(
+    cashflows: &[f64],
+    guess: f64,
+    cancel: Option<&CancelToken>,
+) -> Result<Option<f64>, ExcelError> {
     const MAX_NR: usize = 100;
     const MAX_BRENT: usize = 200;
     const TOL: f64 = 1e-12;
@@ -1228,6 +1243,7 @@ fn irr_solve(cashflows: &[f64], guess: f64) -> Option<f64> {
     // --- Phase 1: Newton-Raphson from the given guess ---
     let mut rate = guess;
     for _ in 0..MAX_NR {
+        cancellation_checkpoint(cancel)?;
         let (npv, d_npv) = irr_npv_deriv(cashflows, rate);
         if d_npv.abs() < TOL {
             break; // flat derivative, fall through to Brent
@@ -1235,7 +1251,7 @@ fn irr_solve(cashflows: &[f64], guess: f64) -> Option<f64> {
         let new_rate = rate - npv / d_npv;
         // Accept if converged and rate > -1 (pole at -1)
         if (new_rate - rate).abs() < TOL && new_rate > -1.0 {
-            return Some(new_rate);
+            return Ok(Some(new_rate));
         }
         // If Newton shoots below -1 or to NaN/Inf, bail out
         if new_rate <= -1.0 || !new_rate.is_finite() {
@@ -1255,6 +1271,7 @@ fn irr_solve(cashflows: &[f64], guess: f64) -> Option<f64> {
     let mut npv_lo = f64::NAN;
 
     for &r in probes {
+        cancellation_checkpoint(cancel)?;
         let npv = irr_npv(cashflows, r);
         if !npv.is_finite() {
             continue;
@@ -1273,7 +1290,7 @@ fn irr_solve(cashflows: &[f64], guess: f64) -> Option<f64> {
     }
 
     if hi.is_nan() {
-        return None; // no sign change found — no real IRR
+        return Ok(None); // no sign change found — no real IRR
     }
 
     // Brent's method (following scipy's brentq / Brent's zeroin algorithm).
@@ -1281,14 +1298,16 @@ fn irr_solve(cashflows: &[f64], guess: f64) -> Option<f64> {
     // xpre/xcur maintain the bracket; xblk is the contrapoint.
     let mut xpre = lo;
     let mut xcur = hi;
+    cancellation_checkpoint(cancel)?;
     let mut fpre = irr_npv(cashflows, xpre);
+    cancellation_checkpoint(cancel)?;
     let mut fcur = irr_npv(cashflows, xcur);
 
     if fpre == 0.0 {
-        return Some(xpre);
+        return Ok(Some(xpre));
     }
     if fcur == 0.0 {
-        return Some(xcur);
+        return Ok(Some(xcur));
     }
 
     let mut xblk = 0.0;
@@ -1297,6 +1316,7 @@ fn irr_solve(cashflows: &[f64], guess: f64) -> Option<f64> {
     let mut scur = 0.0;
 
     for _ in 0..MAX_BRENT {
+        cancellation_checkpoint(cancel)?;
         // If xpre and xcur bracket the root, reset the contrapoint
         if fpre * fcur < 0.0 {
             xblk = xpre;
@@ -1319,7 +1339,7 @@ fn irr_solve(cashflows: &[f64], guess: f64) -> Option<f64> {
         let sbis = (xblk - xcur) * 0.5;
 
         if fcur == 0.0 || sbis.abs() < delta {
-            return Some(xcur);
+            return Ok(Some(xcur));
         }
 
         if spre.abs() >= delta && fcur.abs() < fpre.abs() {
@@ -1358,7 +1378,7 @@ fn irr_solve(cashflows: &[f64], guess: f64) -> Option<f64> {
         }
         fcur = irr_npv(cashflows, xcur);
     }
-    Some(xcur)
+    Ok(Some(xcur))
 }
 
 /// Calculates periodic internal rate of return for regularly spaced cash flows.
@@ -1474,7 +1494,8 @@ impl Function for IrrFn {
             0.1
         };
 
-        match irr_solve(&cashflows, guess) {
+        let cancel = ctx.cancellation_token();
+        match irr_solve(&cashflows, guess, cancel.as_ref())? {
             Some(rate) => Ok(CalcValue::Scalar(LiteralValue::Number(rate))),
             None => Ok(CalcValue::Scalar(
                 LiteralValue::Error(ExcelError::new_num()),
@@ -2218,7 +2239,9 @@ impl Function for XirrFn {
         const MAX_ITER: i32 = 100;
         const EPSILON: f64 = 1e-10;
 
+        let cancel = ctx.cancellation_token();
         for _ in 0..MAX_ITER {
+            cancellation_checkpoint(cancel.as_ref())?;
             let xnpv = calculate_xnpv(rate, &values, &dates);
             let d_xnpv = calculate_xnpv_derivative(rate, &values, &dates);
 
