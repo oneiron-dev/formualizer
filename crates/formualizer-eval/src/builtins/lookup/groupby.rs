@@ -56,12 +56,18 @@ fn grid_arg(
     })?;
     cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
     let mut rows = Vec::new();
-    view.for_each_row(&mut |row| {
-        cancellation_checkpoint(cancel)?;
+    let (row_count, columns) = view.dims();
+    let mut row = Vec::with_capacity(columns);
+    for r in 0..row_count {
+        cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+        row.clear();
+        for c in 0..columns {
+            cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+            row.push(view.get_cell(r, c));
+        }
+        cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
         rows.push(row.to_vec());
-        Ok(())
-    })
-    .map_err(raw_argument_failure)?;
+    }
     Ok(rows)
 }
 
@@ -216,11 +222,19 @@ fn distinct_keys(
     Ok((distinct, of_row))
 }
 
-fn same_prefix(a: &[LiteralValue], b: &[LiteralValue], len: usize) -> bool {
-    a.iter()
-        .zip(b)
-        .take(len)
-        .all(|(x, y)| key_part(x) == key_part(y))
+fn same_prefix(
+    a: &[LiteralValue],
+    b: &[LiteralValue],
+    len: usize,
+    cancel: Option<&CancelToken>,
+) -> Result<bool, GroupFailure> {
+    for (x, y) in a.iter().zip(b).take(len) {
+        cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+        if key_part(x) != key_part(y) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// One line of a result axis: a group, a subtotal of the groups sharing the
@@ -272,13 +286,16 @@ fn order_keys(
             }
             p
         };
-        let first = |k: usize, len: usize| {
-            order
-                .iter()
-                .filter(|&&o| same_prefix(&distinct[o], &distinct[k], len))
-                .map(|&o| position[o])
-                .min()
-                .unwrap_or(0)
+        let first = |k: usize, len: usize| -> Result<usize, GroupFailure> {
+            let mut first: Option<usize> = None;
+            for &o in &order {
+                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                if same_prefix(&distinct[o], &distinct[k], len, cancel)? {
+                    let candidate = position[o];
+                    first = Some(first.map_or(candidate, |current| current.min(candidate)));
+                }
+            }
+            Ok(first.unwrap_or(0))
         };
         let rank: Vec<Vec<usize>> = (0..distinct.len())
             .map(|k| {
@@ -286,7 +303,7 @@ fn order_keys(
                 let mut r: Vec<usize> = (1..columns)
                     .map(|len| {
                         cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
-                        Ok(first(k, len))
+                        first(k, len)
                     })
                     .collect::<Result<Vec<_>, GroupFailure>>()?;
                 r.push(position[k]);
@@ -330,7 +347,7 @@ fn axis_entries(
         let mut members = Vec::new();
         for &o in order {
             cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
-            if same_prefix(&distinct[o], &distinct[k], len) {
+            if same_prefix(&distinct[o], &distinct[k], len, cancel)? {
                 members.push(o);
             }
         }
@@ -361,7 +378,7 @@ fn axis_entries(
         if top {
             for len in 1..=levels {
                 cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
-                if i == 0 || !same_prefix(&distinct[order[i - 1]], &distinct[k], len) {
+                if i == 0 || !same_prefix(&distinct[order[i - 1]], &distinct[k], len, cancel)? {
                     entries.push(Entry {
                         label: label(k, len)?,
                         keys: members(k, len)?,
@@ -376,7 +393,8 @@ fn axis_entries(
         if !top {
             for len in (1..=levels).rev() {
                 cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
-                if i + 1 == order.len() || !same_prefix(&distinct[order[i + 1]], &distinct[k], len)
+                if i + 1 == order.len()
+                    || !same_prefix(&distinct[order[i + 1]], &distinct[k], len, cancel)?
                 {
                     entries.push(Entry {
                         label: label(k, len)?,
@@ -426,10 +444,21 @@ fn kept_rows(
     cancel: Option<&CancelToken>,
 ) -> Result<Vec<usize>, GroupFailure> {
     cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
-    let keep: Option<Vec<LiteralValue>> = filter.map(|f| match f {
-        LiteralValue::Array(rows) => rows.into_iter().flatten().collect(),
-        v => vec![v],
-    });
+    let keep: Option<Vec<LiteralValue>> = match filter {
+        Some(LiteralValue::Array(rows)) => {
+            let mut flags = Vec::new();
+            for row in rows {
+                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                for value in row {
+                    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                    flags.push(value);
+                }
+            }
+            Some(flags)
+        }
+        Some(value) => Some(vec![value]),
+        None => None,
+    };
     let mut rows = Vec::new();
     for r in start..total_rows {
         cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
