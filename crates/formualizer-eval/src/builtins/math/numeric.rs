@@ -3,11 +3,20 @@ use super::super::utils::{
 };
 use super::{AggregateArgument, resolve_aggregate_argument};
 use crate::args::ArgSchema;
+use crate::engine::CancelToken;
 use crate::function::Function;
 use crate::function_contract::FunctionDependencyContract;
 use crate::traits::{ArgumentHandle, FunctionContext};
-use formualizer_common::{ExcelError, LiteralValue};
+use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
+
+fn cancellation_checkpoint(cancel: Option<&CancelToken>) -> Result<(), ExcelError> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        Err(ExcelError::new(ExcelErrorKind::Cancelled))
+    } else {
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 pub struct AbsFn;
@@ -2235,11 +2244,15 @@ impl Function for SumsqFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let date_system = ctx.date_system();
         let mut total = 0.0;
         for arg in args {
+            cancellation_checkpoint(cancel.as_ref())?;
             match resolve_aggregate_argument(arg, ctx)? {
                 AggregateArgument::Range(view) => view.for_each_cell(&mut |cell| {
+                    cancellation_checkpoint(cancel.as_ref())?;
                     match cell {
                         LiteralValue::Error(e) => return Err(e.clone()),
                         LiteralValue::Number(n) => total += n * n,
@@ -3159,10 +3172,13 @@ impl Function for IsoCeilingFn {
 fn collect_nums_from_arg<'a, 'b>(
     arg: &'a crate::traits::ArgumentHandle<'a, 'b>,
     ctx: &dyn FunctionContext<'b>,
+    cancel: Option<&CancelToken>,
 ) -> Result<Vec<f64>, ExcelError> {
+    cancellation_checkpoint(cancel)?;
     let mut out = Vec::new();
     match resolve_aggregate_argument(arg, ctx)? {
         AggregateArgument::Range(view) => view.for_each_cell(&mut |cell| {
+            cancellation_checkpoint(cancel)?;
             match cell {
                 LiteralValue::Error(e) => return Err(e.clone()),
                 LiteralValue::Number(n) => out.push(*n),
@@ -3232,19 +3248,28 @@ impl Function for SumX2MY2Fn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         if args.len() != 2 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_value(),
             )));
         }
-        let xs = collect_nums_from_arg(&args[0], ctx)?;
-        let ys = collect_nums_from_arg(&args[1], ctx)?;
+        let xs = collect_nums_from_arg(&args[0], ctx, cancel.as_ref())?;
+        let ys = collect_nums_from_arg(&args[1], ctx, cancel.as_ref())?;
         if xs.len() != ys.len() {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_na(),
             )));
         }
-        let total: f64 = xs.iter().zip(ys.iter()).map(|(x, y)| x * x - y * y).sum();
+        let total: f64 = xs
+            .iter()
+            .zip(ys.iter())
+            .map(|(x, y)| {
+                cancellation_checkpoint(cancel.as_ref())?;
+                Ok(x * x - y * y)
+            })
+            .sum::<Result<f64, ExcelError>>()?;
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
             total,
         )))
@@ -3302,19 +3327,28 @@ impl Function for SumX2PY2Fn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         if args.len() != 2 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_value(),
             )));
         }
-        let xs = collect_nums_from_arg(&args[0], ctx)?;
-        let ys = collect_nums_from_arg(&args[1], ctx)?;
+        let xs = collect_nums_from_arg(&args[0], ctx, cancel.as_ref())?;
+        let ys = collect_nums_from_arg(&args[1], ctx, cancel.as_ref())?;
         if xs.len() != ys.len() {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_na(),
             )));
         }
-        let total: f64 = xs.iter().zip(ys.iter()).map(|(x, y)| x * x + y * y).sum();
+        let total: f64 = xs
+            .iter()
+            .zip(ys.iter())
+            .map(|(x, y)| {
+                cancellation_checkpoint(cancel.as_ref())?;
+                Ok(x * x + y * y)
+            })
+            .sum::<Result<f64, ExcelError>>()?;
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
             total,
         )))
@@ -3372,19 +3406,28 @@ impl Function for SumXMY2Fn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         if args.len() != 2 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_value(),
             )));
         }
-        let xs = collect_nums_from_arg(&args[0], ctx)?;
-        let ys = collect_nums_from_arg(&args[1], ctx)?;
+        let xs = collect_nums_from_arg(&args[0], ctx, cancel.as_ref())?;
+        let ys = collect_nums_from_arg(&args[1], ctx, cancel.as_ref())?;
         if xs.len() != ys.len() {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_na(),
             )));
         }
-        let total: f64 = xs.iter().zip(ys.iter()).map(|(x, y)| (x - y).powi(2)).sum();
+        let total: f64 = xs
+            .iter()
+            .zip(ys.iter())
+            .map(|(x, y)| {
+                cancellation_checkpoint(cancel.as_ref())?;
+                Ok((x - y).powi(2))
+            })
+            .sum::<Result<f64, ExcelError>>()?;
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Number(
             total,
         )))

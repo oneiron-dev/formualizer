@@ -1,9 +1,18 @@
 use super::super::utils::{ARG_NUM_LENIENT_ONE, ARG_NUM_LENIENT_TWO, coerce_num};
 use crate::args::ArgSchema;
+use crate::engine::CancelToken;
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, CalcValue, FunctionContext};
-use formualizer_common::{ExcelError, LiteralValue};
+use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
+
+fn cancellation_checkpoint(cancel: Option<&CancelToken>) -> Result<(), ExcelError> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        Err(ExcelError::new(ExcelErrorKind::Cancelled))
+    } else {
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 pub struct FactFn;
@@ -175,15 +184,20 @@ impl Function for GcdFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
-        fn gcd(a: u64, b: u64) -> u64 {
-            if b == 0 { a } else { gcd(b, a % b) }
+        fn gcd(a: u64, b: u64, cancel: Option<&CancelToken>) -> Result<u64, ExcelError> {
+            cancellation_checkpoint(cancel)?;
+            if b == 0 { Ok(a) } else { gcd(b, a % b, cancel) }
         }
+
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
 
         let mut result: Option<u64> = None;
 
         for arg in args {
+            cancellation_checkpoint(cancel.as_ref())?;
             let v = arg.value()?.into_literal();
             let n = match v {
                 LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
@@ -201,7 +215,7 @@ impl Function for GcdFn {
 
             result = Some(match result {
                 None => n,
-                Some(r) => gcd(r, n),
+                Some(r) => gcd(r, n, cancel.as_ref())?,
             });
         }
 
@@ -282,28 +296,33 @@ impl Function for LcmFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
-        fn gcd(a: u64, b: u64) -> u64 {
-            if b == 0 { a } else { gcd(b, a % b) }
+        fn gcd(a: u64, b: u64, cancel: Option<&CancelToken>) -> Result<u64, ExcelError> {
+            cancellation_checkpoint(cancel)?;
+            if b == 0 { Ok(a) } else { gcd(b, a % b, cancel) }
         }
         /// Microsoft: "If lcm(a,b) >= 2^53, LCM returns the #NUM! error
         /// value." Checked at every step of the reduction, so the product
         /// never overflows.
         const LCM_LIMIT: u64 = 1 << 53;
-        fn lcm(a: u64, b: u64) -> Option<u64> {
+        fn lcm(a: u64, b: u64, cancel: Option<&CancelToken>) -> Result<Option<u64>, ExcelError> {
             if a == 0 || b == 0 {
-                Some(0)
+                Ok(Some(0))
             } else {
-                (a / gcd(a, b))
+                Ok((a / gcd(a, b, cancel)?)
                     .checked_mul(b)
-                    .filter(|&multiple| multiple < LCM_LIMIT)
+                    .filter(|&multiple| multiple < LCM_LIMIT))
             }
         }
+
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
 
         let mut result: Option<u64> = None;
 
         for arg in args {
+            cancellation_checkpoint(cancel.as_ref())?;
             let v = arg.value()?.into_literal();
             let n = match v {
                 LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
@@ -320,7 +339,7 @@ impl Function for LcmFn {
 
             result = Some(match result {
                 None => n,
-                Some(r) => match lcm(r, n) {
+                Some(r) => match lcm(r, n, cancel.as_ref())? {
                     Some(multiple) => multiple,
                     None => {
                         return Ok(CalcValue::Scalar(
@@ -404,8 +423,10 @@ impl Function for CombinFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         // Check minimum required arguments
         if args.len() < 2 {
             return Ok(CalcValue::Scalar(LiteralValue::Error(
@@ -441,6 +462,7 @@ impl Function for CombinFn {
 
         let mut result = 1.0_f64;
         for i in 0..k {
+            cancellation_checkpoint(cancel.as_ref())?;
             result = result * (n - i) as f64 / (i + 1) as f64;
         }
 
@@ -515,8 +537,10 @@ impl Function for PermutFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         // Check minimum required arguments
         if args.len() < 2 {
             return Ok(CalcValue::Scalar(LiteralValue::Error(
@@ -548,6 +572,7 @@ impl Function for PermutFn {
         // P(n, k) = n! / (n-k)! = n * (n-1) * ... * (n-k+1)
         let mut result = 1.0_f64;
         for i in 0..k {
+            cancellation_checkpoint(cancel.as_ref())?;
             result *= (n - i) as f64;
         }
 
@@ -604,8 +629,10 @@ impl Function for FactDoubleFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let v = args[0].value()?.into_literal();
         let n = match v {
             LiteralValue::Error(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
@@ -623,6 +650,7 @@ impl Function for FactDoubleFn {
         let mut result = 1.0_f64;
         let mut i = n;
         while i > 0 {
+            cancellation_checkpoint(cancel.as_ref())?;
             result *= i as f64;
             i -= 2;
         }
@@ -678,8 +706,10 @@ impl Function for CombinaFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         if args.len() < 2 {
             return Ok(CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new_value(),
@@ -711,6 +741,7 @@ impl Function for CombinaFn {
         let nn = nn as u64;
         let mut result = 1.0_f64;
         for i in 0..kk {
+            cancellation_checkpoint(cancel.as_ref())?;
             result = result * (nn - i) as f64 / (i + 1) as f64;
         }
         Ok(CalcValue::Scalar(LiteralValue::Number(result.round())))
