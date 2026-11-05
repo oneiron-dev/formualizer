@@ -8,6 +8,7 @@
 
 use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
 use crate::builtins::utils::collapse_if_scalar;
+use crate::engine::CancelToken;
 use crate::function::{Function, FunctionResolution, resolution_to_reference};
 use crate::traits::{ArgumentHandle, FunctionContext};
 use formualizer_common::{ArgKind, ExcelError, ExcelErrorKind, LiteralValue};
@@ -19,6 +20,13 @@ pub struct ChooseFn;
 pub struct ChooseColsFn;
 #[derive(Debug)]
 pub struct ChooseRowsFn;
+
+fn cancellation_checkpoint(cancel: Option<&CancelToken>) -> Result<(), ExcelError> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        return Err(ExcelError::new(ExcelErrorKind::Cancelled));
+    }
+    Ok(())
+}
 
 /// Returns one value from a list using a 1-based index.
 ///
@@ -428,7 +436,7 @@ impl Function for ChooseColsFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         if args.len() < 2 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -439,12 +447,16 @@ impl Function for ChooseColsFn {
         let (rows, cols) = view.dims();
         if rows == 0 || cols == 0 {
             return Ok(crate::traits::CalcValue::Range(
-                crate::engine::range_view::RangeView::from_owned_rows(vec![], _ctx.date_system()),
+                crate::engine::range_view::RangeView::from_owned_rows(vec![], ctx.date_system()),
             ));
         }
 
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
+
         let mut indices: Vec<usize> = Vec::new();
         for a in &args[1..] {
+            cancellation_checkpoint(cancel.as_ref())?;
             let v = a.value()?.into_literal();
             if let LiteralValue::Error(e) = v {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
@@ -475,16 +487,20 @@ impl Function for ChooseColsFn {
             }
             indices.push(adj as usize);
         }
+        cancellation_checkpoint(cancel.as_ref())?;
         let mut out: Vec<Vec<LiteralValue>> = Vec::with_capacity(rows);
         for r in 0..rows {
+            cancellation_checkpoint(cancel.as_ref())?;
             let mut new_row = Vec::with_capacity(indices.len());
             for &c in &indices {
+                cancellation_checkpoint(cancel.as_ref())?;
                 new_row.push(view.get_cell(r, c));
             }
             out.push(new_row);
         }
 
-        Ok(collapse_if_scalar(out, _ctx.date_system()))
+        cancellation_checkpoint(cancel.as_ref())?;
+        Ok(collapse_if_scalar(out, ctx.date_system()))
     }
 }
 
@@ -584,7 +600,7 @@ impl Function for ChooseRowsFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         if args.len() < 2 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -595,12 +611,16 @@ impl Function for ChooseRowsFn {
         let (rows, cols) = view.dims();
         if rows == 0 || cols == 0 {
             return Ok(crate::traits::CalcValue::Range(
-                crate::engine::range_view::RangeView::from_owned_rows(vec![], _ctx.date_system()),
+                crate::engine::range_view::RangeView::from_owned_rows(vec![], ctx.date_system()),
             ));
         }
 
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
+
         let mut indices: Vec<usize> = Vec::new();
         for a in &args[1..] {
+            cancellation_checkpoint(cancel.as_ref())?;
             let v = a.value()?.into_literal();
             if let LiteralValue::Error(e) = v {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e)));
@@ -631,16 +651,20 @@ impl Function for ChooseRowsFn {
             }
             indices.push(adj as usize);
         }
+        cancellation_checkpoint(cancel.as_ref())?;
         let mut out: Vec<Vec<LiteralValue>> = Vec::with_capacity(indices.len());
         for &r in &indices {
+            cancellation_checkpoint(cancel.as_ref())?;
             let mut row_vals = Vec::with_capacity(cols);
             for c in 0..cols {
+                cancellation_checkpoint(cancel.as_ref())?;
                 row_vals.push(view.get_cell(r, c));
             }
             out.push(row_vals);
         }
 
-        Ok(collapse_if_scalar(out, _ctx.date_system()))
+        cancellation_checkpoint(cancel.as_ref())?;
+        Ok(collapse_if_scalar(out, ctx.date_system()))
     }
 }
 
