@@ -2689,26 +2689,32 @@ impl Function for TransposeFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         let view = match args[0].range_view_or_scalar() {
             Ok(v) => v,
+            Err(e) if native_argument_cancellation(&args[0], &e) => return Err(e),
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
         let (rows, cols) = view.dims();
         if rows == 0 || cols == 0 {
             return Ok(crate::traits::CalcValue::Range(
-                crate::engine::range_view::RangeView::from_owned_rows(vec![], _ctx.date_system()),
+                crate::engine::range_view::RangeView::from_owned_rows(vec![], ctx.date_system()),
             ));
         }
 
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let mut out: Vec<Vec<LiteralValue>> = vec![Vec::with_capacity(rows); cols];
         for (c, col) in out.iter_mut().enumerate().take(cols) {
+            cancellation_checkpoint(cancel.as_ref())?;
             for r in 0..rows {
+                cancellation_checkpoint(cancel.as_ref())?;
                 col.push(view.get_cell(r, c));
             }
         }
-        Ok(collapse_if_scalar(out, _ctx.date_system()))
+        cancellation_checkpoint(cancel.as_ref())?;
+        Ok(collapse_if_scalar(out, ctx.date_system()))
     }
 }
 
@@ -2823,16 +2829,17 @@ impl Function for TakeFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         let view = match args[0].range_view_or_scalar() {
             Ok(v) => v,
+            Err(e) if native_argument_cancellation(&args[0], &e) => return Err(e),
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
         let (rows, cols) = view.dims();
         if rows == 0 || cols == 0 {
             return Ok(crate::traits::CalcValue::Range(
-                crate::engine::range_view::RangeView::from_owned_rows(vec![], _ctx.date_system()),
+                crate::engine::range_view::RangeView::from_owned_rows(vec![], ctx.date_system()),
             ));
         }
 
@@ -2882,20 +2889,25 @@ impl Function for TakeFn {
 
         if row_start >= row_end || col_start >= col_end {
             return Ok(crate::traits::CalcValue::Range(
-                crate::engine::range_view::RangeView::from_owned_rows(vec![], _ctx.date_system()),
+                crate::engine::range_view::RangeView::from_owned_rows(vec![], ctx.date_system()),
             ));
         }
 
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let mut out: Vec<Vec<LiteralValue>> = Vec::with_capacity(row_end - row_start);
         for r in row_start..row_end {
+            cancellation_checkpoint(cancel.as_ref())?;
             let mut row_out: Vec<LiteralValue> = Vec::with_capacity(col_end - col_start);
             for c in col_start..col_end {
+                cancellation_checkpoint(cancel.as_ref())?;
                 row_out.push(view.get_cell(r, c));
             }
             out.push(row_out);
         }
 
-        Ok(collapse_if_scalar(out, _ctx.date_system()))
+        cancellation_checkpoint(cancel.as_ref())?;
+        Ok(collapse_if_scalar(out, ctx.date_system()))
     }
 }
 
@@ -3007,16 +3019,17 @@ impl Function for DropFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         let view = match args[0].range_view_or_scalar() {
             Ok(v) => v,
+            Err(e) if native_argument_cancellation(&args[0], &e) => return Err(e),
             Err(e) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         };
         let (rows, cols) = view.dims();
         if rows == 0 || cols == 0 {
             return Ok(crate::traits::CalcValue::Range(
-                crate::engine::range_view::RangeView::from_owned_rows(vec![], _ctx.date_system()),
+                crate::engine::range_view::RangeView::from_owned_rows(vec![], ctx.date_system()),
             ));
         }
 
@@ -3055,20 +3068,25 @@ impl Function for DropFn {
 
         if row_start >= row_end || col_start >= col_end {
             return Ok(crate::traits::CalcValue::Range(
-                crate::engine::range_view::RangeView::from_owned_rows(vec![], _ctx.date_system()),
+                crate::engine::range_view::RangeView::from_owned_rows(vec![], ctx.date_system()),
             ));
         }
 
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let mut out: Vec<Vec<LiteralValue>> = Vec::with_capacity(row_end - row_start);
         for r in row_start..row_end {
+            cancellation_checkpoint(cancel.as_ref())?;
             let mut row_out: Vec<LiteralValue> = Vec::with_capacity(col_end - col_start);
             for c in col_start..col_end {
+                cancellation_checkpoint(cancel.as_ref())?;
                 row_out.push(view.get_cell(r, c));
             }
             out.push(row_out);
         }
 
-        Ok(collapse_if_scalar(out, _ctx.date_system()))
+        cancellation_checkpoint(cancel.as_ref())?;
+        Ok(collapse_if_scalar(out, ctx.date_system()))
     }
 }
 
