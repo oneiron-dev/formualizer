@@ -2,10 +2,19 @@
 
 use super::super::utils::{ARG_ANY_ONE, ARG_ANY_TWO};
 use crate::args::ArgSchema;
+use crate::engine::CancelToken;
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, CalcValue, FunctionContext};
 use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
+
+fn cancellation_checkpoint(cancel: Option<&CancelToken>) -> Result<(), ExcelError> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        Err(ExcelError::new(ExcelErrorKind::Cancelled))
+    } else {
+        Ok(())
+    }
+}
 
 /// A numeric matrix from a range or array argument. Every element must be a
 /// number: text, logical and blank elements are `#VALUE!`, errors propagate.
@@ -78,7 +87,7 @@ impl Function for MmultFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
         let error = |e: ExcelError| Ok(CalcValue::Scalar(LiteralValue::Error(e)));
         if args.len() != 2 {
@@ -93,14 +102,22 @@ impl Function for MmultFn {
         if inner == 0 || width == 0 || inner != b.len() {
             return error(ExcelError::new_value());
         }
+        let cancel = ctx.cancellation_token();
         let product: Vec<Vec<LiteralValue>> = a
             .iter()
             .map(|row| {
+                cancellation_checkpoint(cancel.as_ref())?;
                 (0..width)
-                    .map(|j| LiteralValue::Number((0..inner).map(|k| row[k] * b[k][j]).sum()))
-                    .collect()
+                    .map(|j| {
+                        cancellation_checkpoint(cancel.as_ref())?;
+                        Ok(LiteralValue::Number(
+                            (0..inner).map(|k| row[k] * b[k][j]).sum(),
+                        ))
+                    })
+                    .collect::<Result<_, ExcelError>>()
             })
-            .collect();
+            .collect::<Result<_, ExcelError>>()?;
+        cancellation_checkpoint(cancel.as_ref())?;
         if product.len() == 1 && width == 1 {
             return Ok(CalcValue::Scalar(product[0][0].clone()));
         }
@@ -131,19 +148,21 @@ struct Lu {
     odd_swaps: bool,
 }
 
-fn lu_factor(mut a: Vec<Vec<f64>>) -> Option<Lu> {
+fn lu_factor(mut a: Vec<Vec<f64>>, cancel: Option<&CancelToken>) -> Result<Option<Lu>, ExcelError> {
     let n = a.len();
     let mut perm: Vec<usize> = (0..n).collect();
     let mut odd_swaps = false;
     for k in 0..n {
+        cancellation_checkpoint(cancel)?;
         let mut p = k;
         for i in k + 1..n {
+            cancellation_checkpoint(cancel)?;
             if a[i][k].abs() > a[p][k].abs() {
                 p = i;
             }
         }
         if a[p][k] == 0.0 {
-            return None;
+            return Ok(None);
         }
         if p != k {
             a.swap(p, k);
@@ -151,6 +170,7 @@ fn lu_factor(mut a: Vec<Vec<f64>>) -> Option<Lu> {
             odd_swaps = !odd_swaps;
         }
         for i in k + 1..n {
+            cancellation_checkpoint(cancel)?;
             let l = a[i][k] / a[k][k];
             a[i][k] = l;
             for j in k + 1..n {
@@ -158,11 +178,11 @@ fn lu_factor(mut a: Vec<Vec<f64>>) -> Option<Lu> {
             }
         }
     }
-    Some(Lu {
+    Ok(Some(Lu {
         lu: a,
         perm,
         odd_swaps,
-    })
+    }))
 }
 
 fn num_result(n: f64) -> LiteralValue {
@@ -214,7 +234,7 @@ impl Function for MdetermFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
         if args.len() != 1 {
             return Ok(CalcValue::Scalar(LiteralValue::Error(
@@ -225,11 +245,13 @@ impl Function for MdetermFn {
             Ok(matrix) => matrix,
             Err(e) => return Ok(CalcValue::Scalar(LiteralValue::Error(e))),
         };
-        let det = match lu_factor(matrix) {
+        let cancel = ctx.cancellation_token();
+        let det = match lu_factor(matrix, cancel.as_ref())? {
             None => 0.0,
             Some(lu) => {
                 let mut det = 1.0;
                 for (k, row) in lu.lu.iter().enumerate() {
+                    cancellation_checkpoint(cancel.as_ref())?;
                     det *= row[k];
                 }
                 if lu.odd_swaps { -det } else { det }
@@ -283,7 +305,7 @@ impl Function for MinverseFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
         let error = |e: ExcelError| Ok(CalcValue::Scalar(LiteralValue::Error(e)));
         if args.len() != 1 {
@@ -294,14 +316,18 @@ impl Function for MinverseFn {
             Err(e) => return error(e),
         };
         let n = matrix.len();
-        let Some(Lu { lu, perm, .. }) = lu_factor(matrix) else {
+        let cancel = ctx.cancellation_token();
+        let Some(Lu { lu, perm, .. }) = lu_factor(matrix, cancel.as_ref())? else {
             return error(ExcelError::new_num());
         };
+        cancellation_checkpoint(cancel.as_ref())?;
         let mut inverse = vec![vec![0.0; n]; n];
         let mut y = vec![0.0; n];
         let mut x = vec![0.0; n];
         for col in 0..n {
+            cancellation_checkpoint(cancel.as_ref())?;
             for i in 0..n {
+                cancellation_checkpoint(cancel.as_ref())?;
                 let mut s = if perm[i] == col { 1.0 } else { 0.0 };
                 for j in 0..i {
                     s -= lu[i][j] * y[j];
@@ -309,6 +335,7 @@ impl Function for MinverseFn {
                 y[i] = s;
             }
             for i in (0..n).rev() {
+                cancellation_checkpoint(cancel.as_ref())?;
                 let mut s = y[i];
                 for j in i + 1..n {
                     s -= lu[i][j] * x[j];
@@ -316,6 +343,7 @@ impl Function for MinverseFn {
                 x[i] = s / lu[i][i];
             }
             for i in 0..n {
+                cancellation_checkpoint(cancel.as_ref())?;
                 if !x[i].is_finite() {
                     return error(ExcelError::new_num());
                 }
@@ -327,8 +355,12 @@ impl Function for MinverseFn {
         }
         let rows = inverse
             .into_iter()
-            .map(|row| row.into_iter().map(LiteralValue::Number).collect())
-            .collect();
+            .map(|row| {
+                cancellation_checkpoint(cancel.as_ref())?;
+                Ok(row.into_iter().map(LiteralValue::Number).collect())
+            })
+            .collect::<Result<_, ExcelError>>()?;
+        cancellation_checkpoint(cancel.as_ref())?;
         Ok(crate::lift::array_result(rows, args[0].date_system()))
     }
 }
@@ -375,7 +407,7 @@ impl Function for MunitFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
         let error = |e: ExcelError| Ok(CalcValue::Scalar(LiteralValue::Error(e)));
         if args.len() != 1 {
@@ -401,13 +433,16 @@ impl Function for MunitFn {
         if n == 1 {
             return Ok(CalcValue::Scalar(LiteralValue::Number(1.0)));
         }
+        let cancel = ctx.cancellation_token();
         let rows = (0..n)
             .map(|i| {
-                (0..n)
+                cancellation_checkpoint(cancel.as_ref())?;
+                Ok((0..n)
                     .map(|j| LiteralValue::Number(if i == j { 1.0 } else { 0.0 }))
-                    .collect()
+                    .collect())
             })
-            .collect();
+            .collect::<Result<_, ExcelError>>()?;
+        cancellation_checkpoint(cancel.as_ref())?;
         Ok(crate::lift::array_result(rows, args[0].date_system()))
     }
 }
