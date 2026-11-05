@@ -3,12 +3,21 @@
 use super::coupon::{Basis, date, logical, number_schema, number_value, numbers};
 use crate::args::ArgSchema;
 use crate::coercion::to_serial_strict;
+use crate::engine::CancelToken;
 use crate::function::Function;
 use crate::traits::{ArgumentHandle, CalcValue, FunctionContext};
 use chrono::{Datelike, NaiveDate};
 use formualizer_common::ExcelErrorKind;
 use formualizer_common::{ExcelError, LiteralValue};
 use formualizer_macros::func_caps;
+
+fn cancellation_checkpoint(cancel: Option<&CancelToken>) -> Result<(), ExcelError> {
+    if cancel.is_some_and(CancelToken::is_cancelled) {
+        Err(ExcelError::new(ExcelErrorKind::Cancelled))
+    } else {
+        Ok(())
+    }
+}
 
 /// Numeric coercion for depreciation arguments. Shares the crate-central
 /// value -> number policy with the rest of the financial builtins so a date
@@ -281,8 +290,10 @@ impl Function for DbFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let cost = coerce_num(&args[0])?;
         let salvage = coerce_num(&args[1])?;
         let life = coerce_num(&args[2])?;
@@ -323,6 +334,7 @@ impl Function for DbFn {
         let value = cost;
 
         for p in 1..=period_int {
+            cancellation_checkpoint(cancel.as_ref())?;
             let depreciation = if p == 1 {
                 // First period: prorated
                 value * rate * month / 12.0
@@ -499,12 +511,15 @@ fn vdb_from_start(
     life1: f64,
     period: f64,
     factor: f64,
-) -> (f64, bool) {
+    cancel: Option<&CancelToken>,
+) -> Result<(f64, bool), ExcelError> {
+    cancellation_checkpoint(cancel)?;
     let end = period.ceil();
     let last = end as u64;
     let mut depreciable = cost - salvage;
     let (mut total, mut sln, mut straight) = (0.0, 0.0, false);
     for i in 1..=last {
+        cancellation_checkpoint(cancel)?;
         let mut term = if straight {
             sln
         } else {
@@ -523,7 +538,7 @@ fn vdb_from_start(
         }
         total += term;
     }
-    (total, straight)
+    Ok((total, straight))
 }
 
 /// Returns the depreciation of an asset for any period, including partial
@@ -589,8 +604,10 @@ impl Function for VdbFn {
     fn eval<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
-        _ctx: &dyn FunctionContext<'b>,
+        ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let value = (|| {
             let mut numbers = [0.0, 0.0, 0.0, 0.0, 0.0, 2.0];
             for (slot, arg) in numbers.iter_mut().zip(args) {
@@ -609,6 +626,7 @@ impl Function for VdbFn {
                 let (first, last) = (start.floor(), end.ceil());
                 let mut total = 0.0;
                 for i in (first as u64 + 1)..=(last as u64) {
+                    cancellation_checkpoint(cancel.as_ref())?;
                     let mut term = vdb_ddb(cost, salvage, life, i as f64, factor);
                     if i == first as u64 + 1 {
                         term *= end.min(first + 1.0) - start;
@@ -624,9 +642,17 @@ impl Function for VdbFn {
                 let to = |period: f64| (cost - salvage) * period.min(1.0);
                 return Ok(to(end) - to(start));
             }
-            let book = cost - vdb_from_start(cost, salvage, life, life, start, factor).0;
-            let (value, straight) =
-                vdb_from_start(book, salvage, life, life - start, end - start, factor);
+            let book =
+                cost - vdb_from_start(cost, salvage, life, life, start, factor, cancel.as_ref())?.0;
+            let (value, straight) = vdb_from_start(
+                book,
+                salvage,
+                life,
+                life - start,
+                end - start,
+                factor,
+                cancel.as_ref(),
+            )?;
             if straight && start.fract() != 0.0 {
                 return Err(ExcelError::new(ExcelErrorKind::NImpl).with_message(
                     "VDB from a fractional start_period into the straight-line part",
@@ -634,7 +660,10 @@ impl Function for VdbFn {
             }
             Ok(value)
         })();
-        Ok(number_value(value))
+        match value {
+            Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+            value => Ok(number_value(value)),
+        }
     }
 }
 
@@ -836,6 +865,8 @@ impl Function for AmordegrcFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<CalcValue<'b>, ExcelError> {
+        let cancel = ctx.cancellation_token();
+        cancellation_checkpoint(cancel.as_ref())?;
         let value = amortization(args, ctx).and_then(|a| {
             let life = 1.0 / a.rate;
             let coefficient = if life <= 2.0 {
@@ -863,6 +894,7 @@ impl Function for AmordegrcFn {
             let mut depreciation = 0.0;
             let mut counted = 0.0;
             while counted < a.period {
+                cancellation_checkpoint(cancel.as_ref())?;
                 counted += 1.0;
                 depreciation = if periods - counted == 2.0 {
                     rate = 1.0;
@@ -877,7 +909,10 @@ impl Function for AmordegrcFn {
             }
             Ok(depreciation.round())
         });
-        Ok(number_value(value))
+        match value {
+            Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+            value => Ok(number_value(value)),
+        }
     }
 }
 
