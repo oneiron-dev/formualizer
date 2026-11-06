@@ -71,8 +71,13 @@ fn grid_arg(
     Ok(rows)
 }
 
-fn width(grid: &Grid) -> usize {
-    grid.iter().map(Vec::len).max().unwrap_or(0)
+fn width(grid: &Grid, cancel: Option<&CancelToken>) -> Result<usize, GroupFailure> {
+    let mut width: usize = 0;
+    for row in grid {
+        cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+        width = width.max(row.len());
+    }
+    Ok(width)
 }
 
 fn cell(grid: &Grid, r: usize, c: usize) -> LiteralValue {
@@ -116,21 +121,35 @@ fn optional_int(
 fn sort_spec(
     args: &[ArgumentHandle<'_, '_>],
     index: usize,
+    cancel: Option<&CancelToken>,
 ) -> Result<Option<Vec<i64>>, GroupFailure> {
     let Some(value) = optional_arg(args, index)? else {
         return Ok(None);
     };
     let items: Vec<LiteralValue> = match value {
-        LiteralValue::Array(rows) => rows.into_iter().flatten().collect(),
+        LiteralValue::Array(rows) => {
+            let mut items = Vec::new();
+            for row in rows {
+                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                for value in row {
+                    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                    items.push(value);
+                }
+            }
+            items
+        }
         v => vec![v],
     };
     items
         .iter()
-        .map(|v| match v {
-            LiteralValue::Error(error) => Err(GroupFailure::Value(error.clone())),
-            value => crate::coercion::to_number_argument(value)
-                .map(|number| number.trunc() as i64)
-                .map_err(GroupFailure::Value),
+        .map(|v| {
+            cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+            match v {
+                LiteralValue::Error(error) => Err(GroupFailure::Value(error.clone())),
+                value => crate::coercion::to_number_argument(value)
+                    .map(|number| number.trunc() as i64)
+                    .map_err(GroupFailure::Value),
+            }
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Some)
@@ -604,13 +623,18 @@ fn rows_of(
     Ok(rows)
 }
 
-fn validate_spec(spec: &Option<Vec<i64>>, limit: usize) -> Result<(), ExcelError> {
-    if let Some(spec) = spec
-        && spec
-            .iter()
-            .any(|&s| s == 0 || s.unsigned_abs() as usize > limit)
-    {
-        return Err(value_error("sort_order is out of range"));
+fn validate_spec(
+    spec: &Option<Vec<i64>>,
+    limit: usize,
+    cancel: Option<&CancelToken>,
+) -> Result<(), GroupFailure> {
+    if let Some(spec) = spec {
+        for &s in spec {
+            cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+            if s == 0 || s.unsigned_abs() as usize > limit {
+                return Err(value_error("sort_order is out of range").into());
+            }
+        }
     }
     Ok(())
 }
@@ -631,13 +655,13 @@ fn groupby(
         callable: aggregator(&args[2])?,
         values: &values,
     };
-    let (key_cols, value_cols) = (width(&fields), width(&values));
+    let (key_cols, value_cols) = (width(&fields, cancel)?, width(&values, cancel)?);
     let (has_headers, show_headers) = header_mode(optional_int(args, 3)?, &values)?;
     let table = optional_int(args, 7)? == Some(1);
     let depth = optional_int(args, 4)?.unwrap_or(if table { 1 } else { key_cols as i64 });
     let depth = if table { depth.clamp(-1, 1) } else { depth };
-    let spec = sort_spec(args, 5)?;
-    validate_spec(&spec, key_cols + value_cols)?;
+    let spec = sort_spec(args, 5, cancel)?;
+    validate_spec(&spec, key_cols + value_cols, cancel)?;
     let rows = kept_rows(
         fields.len(),
         usize::from(has_headers),
@@ -689,27 +713,32 @@ fn groupby(
     if show_headers {
         let mut header: Vec<LiteralValue> = (0..key_cols)
             .map(|c| {
-                if has_headers {
+                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                Ok(if has_headers {
                     cell(&fields, 0, c)
                 } else {
                     LiteralValue::Text(format!("Row Field {}", c + 1))
-                }
+                })
             })
-            .collect();
-        header.extend((0..value_cols).map(|c| {
-            if has_headers {
+            .collect::<Result<Vec<_>, GroupFailure>>()?;
+        for c in 0..value_cols {
+            cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+            header.push(if has_headers {
                 cell(&values, 0, c)
             } else {
                 LiteralValue::Text(format!("Value {}", c + 1))
-            }
-        }));
+            });
+        }
         out.push(header);
     }
     for entry in axis_entries(&distinct, &order, depth, key_cols, cancel)? {
         cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
         let mut line = entry.label;
         if entry.keys.len() == 1 {
-            line.extend(detail[entry.keys[0]].iter().cloned());
+            for value in &detail[entry.keys[0]] {
+                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                line.push(value.clone());
+            }
         } else {
             let members = rows_of(&entry.keys, &rows_by_key, cancel)?;
             for c in 0..value_cols {
@@ -747,14 +776,18 @@ fn pivotby(
         callable: aggregator(&args[3])?,
         values: &values,
     };
-    let (row_cols, col_cols, value_cols) = (width(&row_fields), width(&col_fields), width(&values));
+    let (row_cols, col_cols, value_cols) = (
+        width(&row_fields, cancel)?,
+        width(&col_fields, cancel)?,
+        width(&values, cancel)?,
+    );
     let (has_headers, show_headers) = header_mode(optional_int(args, 4)?, &values)?;
     let row_depth = optional_int(args, 5)?.unwrap_or(row_cols as i64);
-    let row_spec = sort_spec(args, 6)?;
+    let row_spec = sort_spec(args, 6, cancel)?;
     let col_depth = optional_int(args, 7)?.unwrap_or(col_cols as i64);
-    let col_spec = sort_spec(args, 8)?;
-    validate_spec(&row_spec, row_cols + value_cols)?;
-    validate_spec(&col_spec, col_cols + value_cols)?;
+    let col_spec = sort_spec(args, 8, cancel)?;
+    validate_spec(&row_spec, row_cols + value_cols, cancel)?;
+    validate_spec(&col_spec, col_cols + value_cols, cancel)?;
     let rows = kept_rows(
         values.len(),
         usize::from(has_headers),
@@ -833,6 +866,7 @@ fn pivotby(
         for entry in &col_entries {
             cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
             for v in 0..value_cols {
+                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
                 line.push(if v == 0 {
                     entry.label[level].clone()
                 } else {
@@ -848,6 +882,7 @@ fn pivotby(
         for _ in &col_entries {
             cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
             for v in 0..value_cols {
+                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
                 line.push(if has_headers {
                     cell(&values, 0, v)
                 } else {
@@ -870,11 +905,18 @@ fn pivotby(
                     both.push(member);
                 }
             }
-            let relative = match relative_to {
-                1 | 4 => members.clone(),
-                2 => rows.clone(),
-                _ => cols.clone(),
+            let relative_source = match relative_to {
+                1 | 4 => &members,
+                2 => &rows,
+                _ => cols,
             };
+            let relative: Vec<usize> = relative_source
+                .iter()
+                .map(|&row| {
+                    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                    Ok(row)
+                })
+                .collect::<Result<Vec<_>, GroupFailure>>()?;
             for v in 0..value_cols {
                 cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
                 line.push(if both.is_empty() {
