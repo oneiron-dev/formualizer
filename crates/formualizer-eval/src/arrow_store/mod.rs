@@ -481,6 +481,24 @@ impl IngestBuilder {
         Ok(())
     }
 
+    fn append_text_cancellable(
+        builder: &mut StringBuilder,
+        text: &str,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<(), ExcelError> {
+        if cancel.is_none() {
+            builder.append_value(text);
+            return Ok(());
+        }
+        for (offset, ch) in text.char_indices() {
+            Self::check_cancelled(cancel)?;
+            std::fmt::Write::write_str(builder, &text[offset..offset + ch.len_utf8()])
+                .expect("Arrow string buffer write");
+        }
+        builder.append_value("");
+        Ok(())
+    }
+
     pub fn new(
         sheet_name: &str,
         ncols: usize,
@@ -806,7 +824,7 @@ impl IngestBuilder {
                 LiteralValue::Text(s) => {
                     self.num_builders[c].append_null();
                     self.bool_builders[c].append_null();
-                    self.text_builders[c].append_value(s);
+                    Self::append_text_cancellable(&mut self.text_builders[c], s, cancel)?;
                     self.lane_counts[c].n_text += 1;
                     self.err_builders[c].append_null();
                 }
