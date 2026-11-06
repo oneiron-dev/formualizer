@@ -203,25 +203,32 @@ impl DataStore {
             ValueType::Array => {
                 if let Some(idx) = value_ref.arena_index() {
                     let array_ref = super::array::ArrayRef::from_raw(idx);
-                    if let Some(array_2d) = self.arrays.get_2d(array_ref) {
-                        let mut result = Vec::with_capacity(array_2d.len());
-                        for row in array_2d {
+                    let Some((rows, cols)) = self.arrays.dimensions(array_ref) else {
+                        return Ok(LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)));
+                    };
+                    let Some(elements) = self.arrays.elements(array_ref) else {
+                        return Ok(LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)));
+                    };
+                    if rows == 0 || cols == 0 {
+                        return Ok(LiteralValue::Array(Vec::new()));
+                    }
+                    let mut result = Vec::with_capacity(rows as usize);
+                    for row in 0..rows {
+                        if cancel.is_cancelled() {
+                            return Err(ExcelError::new(ExcelErrorKind::Cancelled));
+                        }
+                        let start = (row * cols) as usize;
+                        let end = start + cols as usize;
+                        let mut copied = Vec::with_capacity(cols as usize);
+                        for &value in &elements[start..end] {
                             if cancel.is_cancelled() {
                                 return Err(ExcelError::new(ExcelErrorKind::Cancelled));
                             }
-                            let mut copied = Vec::with_capacity(row.len());
-                            for value in row {
-                                if cancel.is_cancelled() {
-                                    return Err(ExcelError::new(ExcelErrorKind::Cancelled));
-                                }
-                                copied.push(self.try_retrieve_value(value, Some(cancel))?);
-                            }
-                            result.push(copied);
+                            copied.push(self.try_retrieve_value(value, Some(cancel))?);
                         }
-                        Ok(LiteralValue::Array(result))
-                    } else {
-                        Ok(LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)))
+                        result.push(copied);
                     }
+                    Ok(LiteralValue::Array(result))
                 } else {
                     Ok(LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)))
                 }
