@@ -27953,6 +27953,10 @@ impl ShimSpillManager {
                 let mut min_c = u32::MAX;
                 let mut max_c = 0u32;
                 for cell in targets {
+                    if let Err(error) = cancellation_checkpoint(cancel) {
+                        self.release_owner(anchor_vertex);
+                        return Err(error);
+                    }
                     let r = cell.coord.row();
                     let c = cell.coord.col();
                     min_r = min_r.min(r);
@@ -27971,6 +27975,10 @@ impl ShimSpillManager {
                 .expect("anchor cell ref for spill commit");
 
             for cell in targets {
+                if let Err(error) = cancellation_checkpoint(cancel) {
+                    self.release_owner(anchor_vertex);
+                    return Err(error);
+                }
                 // Never treat the anchor as a blocker.
                 if *cell == anchor_cell {
                     continue;
