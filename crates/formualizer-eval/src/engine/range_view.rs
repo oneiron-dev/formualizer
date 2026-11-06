@@ -1146,7 +1146,7 @@ impl<'a> RangeView<'a> {
                 let rel_off = (self.sr + cs.row_start) - chunk_starts[ch_idx];
                 let seg_range = rel_off..(rel_off + cs.row_len);
 
-                let base_lowered = ch.text_lower_or_null();
+                let base_lowered = ch.try_text_lower_or_null(self.cancel_token.as_ref())?;
                 let base_seg = base_lowered.slice(rel_off, cs.row_len);
                 let base_sa = base_seg
                     .as_any()

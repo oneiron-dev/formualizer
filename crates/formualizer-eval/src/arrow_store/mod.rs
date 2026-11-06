@@ -250,14 +250,23 @@ impl ColumnChunk {
 
     /// Lowercased text lane, with nulls preserved. Cached per chunk.
     pub fn text_lower_or_null(&self) -> ArrayRef {
+        self.try_text_lower_or_null(None)
+            .expect("uncancelled lowered text construction")
+    }
+
+    pub(crate) fn try_text_lower_or_null(
+        &self,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<ArrayRef, ExcelError> {
         if let Some(a) = self.lowered_text.get() {
-            return a.clone();
+            return Ok(a.clone());
         }
         // Lowercase when text present; else return null Utf8
         let out: ArrayRef = if let Some(txt) = &self.text {
             let sa = txt.as_any().downcast_ref::<StringArray>().unwrap();
             let mut b = arrow_array::builder::StringBuilder::with_capacity(sa.len(), sa.len() * 8);
             for i in 0..sa.len() {
+                IngestBuilder::check_cancelled(cancel)?;
                 if sa.is_null(i) {
                     b.append_null();
                 } else {
@@ -270,7 +279,7 @@ impl ColumnChunk {
             new_null_array(&DataType::Utf8, self.len())
         };
         self.lowered_text.get_or_init(|| out.clone());
-        out
+        Ok(out)
     }
 
     /// Grow this chunk's logical length to `new_len` (padding with empty/null values).
