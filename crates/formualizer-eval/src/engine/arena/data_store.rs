@@ -172,6 +172,64 @@ impl DataStore {
         }
     }
 
+    pub(crate) fn try_retrieve_value(
+        &self,
+        value_ref: ValueRef,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<LiteralValue, ExcelError> {
+        let Some(cancel) = cancel else {
+            return Ok(self.retrieve_value(value_ref));
+        };
+        if cancel.is_cancelled() {
+            return Err(ExcelError::new(ExcelErrorKind::Cancelled));
+        }
+        use super::value_ref::ValueType;
+
+        match value_ref.value_type() {
+            ValueType::String => {
+                if let Some(idx) = value_ref.arena_index() {
+                    let string_id = StringId::from_raw(idx);
+                    let text = self.strings.resolve(string_id);
+                    Ok(LiteralValue::Text(
+                        crate::arrow_store::IngestBuilder::copy_text_cancellable(
+                            text,
+                            Some(cancel),
+                        )?,
+                    ))
+                } else {
+                    Ok(LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)))
+                }
+            }
+            ValueType::Array => {
+                if let Some(idx) = value_ref.arena_index() {
+                    let array_ref = super::array::ArrayRef::from_raw(idx);
+                    if let Some(array_2d) = self.arrays.get_2d(array_ref) {
+                        let mut result = Vec::with_capacity(array_2d.len());
+                        for row in array_2d {
+                            if cancel.is_cancelled() {
+                                return Err(ExcelError::new(ExcelErrorKind::Cancelled));
+                            }
+                            let mut copied = Vec::with_capacity(row.len());
+                            for value in row {
+                                if cancel.is_cancelled() {
+                                    return Err(ExcelError::new(ExcelErrorKind::Cancelled));
+                                }
+                                copied.push(self.try_retrieve_value(value, Some(cancel))?);
+                            }
+                            result.push(copied);
+                        }
+                        Ok(LiteralValue::Array(result))
+                    } else {
+                        Ok(LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)))
+                    }
+                } else {
+                    Ok(LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)))
+                }
+            }
+            _ => Ok(self.retrieve_value(value_ref)),
+        }
+    }
+
     /// Retrieve a LiteralValue from a ValueRef
     pub fn retrieve_value(&self, value_ref: ValueRef) -> LiteralValue {
         use super::value_ref::ValueType;

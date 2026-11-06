@@ -2644,6 +2644,33 @@ impl DependencyGraph {
             })
     }
 
+    pub(crate) fn try_get_cell_value(
+        &self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Option<LiteralValue>, ExcelError> {
+        if !self.value_cache_enabled {
+            #[cfg(debug_assertions)]
+            {
+                self.graph_value_read_attempts
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(None);
+        }
+        let Some(sheet_id) = self.sheet_reg.get_id(sheet) else {
+            return Ok(None);
+        };
+        let coord = Coord::from_excel(row, col, true, true);
+        let addr = CellRef::new(sheet_id, coord);
+
+        self.get_vertex_id_for_address(&addr)
+            .and_then(|&vertex_id| self.vertex_values.get(&vertex_id))
+            .map(|&value_ref| self.data_store.try_retrieve_value(value_ref, cancel))
+            .transpose()
+    }
+
     /// Mark vertex dirty and propagate to dependents
     fn mark_dirty(&mut self, vertex_id: VertexId) -> Vec<VertexId> {
         self.mark_dirty_many(&[vertex_id])
@@ -3669,9 +3696,13 @@ impl DependencyGraph {
                 return Err(ExcelError::new(ExcelErrorKind::Cancelled));
             }
             // op.row/op.col are internal 0-based; get_cell_value is a public 1-based API.
-            let old = self
-                .get_cell_value(&op.sheet, op.row + 1, op.col + 1)
-                .unwrap_or(LiteralValue::Empty);
+            let old = if let Some(cancel) = cancel {
+                self.try_get_cell_value(&op.sheet, op.row + 1, op.col + 1, Some(cancel))?
+                    .unwrap_or(LiteralValue::Empty)
+            } else {
+                self.get_cell_value(&op.sheet, op.row + 1, op.col + 1)
+                    .unwrap_or(LiteralValue::Empty)
+            };
             let present = true; // unified model: we always treat as present
             old_values.push((
                 (
