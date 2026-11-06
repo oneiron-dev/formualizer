@@ -508,6 +508,21 @@ impl IngestBuilder {
         Ok(())
     }
 
+    fn copy_text_cancellable(
+        text: &str,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<String, ExcelError> {
+        if cancel.is_none() {
+            return Ok(text.to_string());
+        }
+        let mut copied = String::with_capacity(text.len());
+        for ch in text.chars() {
+            Self::check_cancelled(cancel)?;
+            copied.push(ch);
+        }
+        Ok(copied)
+    }
+
     fn fold_text_cancellable(
         text: &str,
         cancel: Option<&crate::engine::CancelToken>,
@@ -3680,14 +3695,20 @@ impl<'a> OverlayCascade<'a> {
         cancel: Option<&crate::engine::CancelToken>,
     ) -> Result<(), ExcelError> {
         Self::try_apply_fragment_layer(layer, range.clone(), slots, cancel, |payload, idx| {
-            Ok(payload.text_at(idx).map(ToString::to_string))
+            payload
+                .text_at(idx)
+                .map(|text| IngestBuilder::copy_text_cancellable(text, cancel))
+                .transpose()
         })?;
         for (off, value) in layer.iter_points() {
             IngestBuilder::check_cancelled(cancel)?;
             if range.contains(off) {
                 slots.set(
                     *off - range.start,
-                    value.text_lane_value().map(ToString::to_string),
+                    value
+                        .text_lane_value()
+                        .map(|text| IngestBuilder::copy_text_cancellable(text, cancel))
+                        .transpose()?,
                 );
                 record_overlay_select_stats(|stats| stats.point_entries_applied += 1);
             }
