@@ -523,6 +523,26 @@ impl IngestBuilder {
         Ok(copied)
     }
 
+    fn zip_text_cancellable(
+        mask: &BooleanArray,
+        values: &StringArray,
+        base: &StringArray,
+        cancel: &crate::engine::CancelToken,
+    ) -> Result<ArrayRef, ExcelError> {
+        let len = mask.len();
+        let mut output = StringBuilder::with_capacity(len, len.saturating_mul(8));
+        for idx in 0..len {
+            Self::check_cancelled(Some(cancel))?;
+            let source = if mask.value(idx) { values } else { base };
+            if source.is_null(idx) {
+                output.append_null();
+            } else {
+                Self::append_text_cancellable(&mut output, source.value(idx), Some(cancel))?;
+            }
+        }
+        Ok(Arc::new(output.finish()) as ArrayRef)
+    }
+
     fn fold_text_cancellable(
         text: &str,
         cancel: Option<&crate::engine::CancelToken>,
@@ -2995,7 +3015,11 @@ impl<'a> OverlayCascade<'a> {
         record_overlay_select_stats(|stats| stats.zip_select_calls += 1);
         let mask = mask_b.finish();
         let values = values_b.finish();
-        Ok(crate::compute_prelude::zip_select(&mask, &values, base).expect("zip text overlay"))
+        if let Some(cancel) = cancel {
+            IngestBuilder::zip_text_cancellable(&mask, &values, base, cancel)
+        } else {
+            Ok(crate::compute_prelude::zip_select(&mask, &values, base).expect("zip text overlay"))
+        }
     }
 
     pub(crate) fn select_errors(
@@ -3241,8 +3265,12 @@ impl<'a> OverlayCascade<'a> {
         record_overlay_select_stats(|stats| stats.zip_select_calls += 1);
         let mask = mask_b.finish();
         let values = values_b.finish();
-        let zipped = crate::compute_prelude::zip_select(&mask, &values, base)
-            .expect("zip lowered text overlay");
+        let zipped = if let Some(cancel) = cancel {
+            IngestBuilder::zip_text_cancellable(&mask, &values, base, cancel)?
+        } else {
+            crate::compute_prelude::zip_select(&mask, &values, base)
+                .expect("zip lowered text overlay")
+        };
         Ok(Arc::new(
             zipped
                 .as_any()
@@ -3280,8 +3308,12 @@ impl<'a> OverlayCascade<'a> {
         record_overlay_select_stats(|stats| stats.zip_select_calls += 1);
         let mask = mask_b.finish();
         let values = values_b.finish();
-        let zipped = crate::compute_prelude::zip_select(&mask, &values, base)
-            .expect("zip lowered text overlay");
+        let zipped = if let Some(cancel) = cancel {
+            IngestBuilder::zip_text_cancellable(&mask, &values, base, cancel)?
+        } else {
+            crate::compute_prelude::zip_select(&mask, &values, base)
+                .expect("zip lowered text overlay")
+        };
         Ok(Arc::new(
             zipped
                 .as_any()
