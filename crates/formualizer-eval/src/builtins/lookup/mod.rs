@@ -11,6 +11,7 @@ mod choose;
 mod core;
 mod dynamic;
 mod groupby;
+pub(crate) use groupby::clone_value as clone_value_cancellable;
 mod legacy; // classic LOOKUP function (vector & array forms)
 pub(crate) mod lookup_utils; // shared helper utilities for lookup family
 mod reference_info; // modern lookup & dynamic array subset (XLOOKUP, FILTER, UNIQUE)

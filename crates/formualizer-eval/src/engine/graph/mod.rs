@@ -3643,14 +3643,12 @@ impl DependencyGraph {
                         },
                         row: row0 + r_off as u32,
                         col: col0 + c_off as u32,
-                        new_value: match (cancel, v) {
-                            (Some(cancel), LiteralValue::Text(text)) => LiteralValue::Text(
-                                crate::arrow_store::IngestBuilder::copy_text_cancellable(
-                                    text,
-                                    Some(cancel),
-                                )?,
-                            ),
-                            _ => v.clone(),
+                        new_value: match cancel {
+                            Some(cancel) => crate::builtins::lookup::clone_value_cancellable(
+                                v,
+                                Some(cancel),
+                            )?,
+                            None => v.clone(),
                         },
                     });
                 }

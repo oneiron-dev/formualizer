@@ -61,7 +61,7 @@ fn blank_line(
     Ok(line)
 }
 
-fn clone_value(
+pub(crate) fn clone_value(
     value: &LiteralValue,
     cancel: Option<&CancelToken>,
 ) -> Result<LiteralValue, ExcelError> {
