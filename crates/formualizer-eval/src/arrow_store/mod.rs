@@ -679,10 +679,21 @@ impl IngestBuilder {
 
     /// Append a single row of values. Length must match `ncols`.
     pub fn append_row(&mut self, row: &[LiteralValue]) -> Result<(), ExcelError> {
+        self.append_row_cancellable(row, None)
+    }
+
+    pub(crate) fn append_row_cancellable(
+        &mut self,
+        row: &[LiteralValue],
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<(), ExcelError> {
         assert_eq!(row.len(), self.ncols, "row width mismatch");
         self.provision_if_needed();
 
         for (c, v) in row.iter().enumerate() {
+            if cancel.is_some_and(crate::engine::CancelToken::is_cancelled) {
+                return Err(ExcelError::new(formualizer_common::ExcelErrorKind::Cancelled));
+            }
             self.format_builders[c].push(match v {
                 LiteralValue::Date(_) => FormatId::DATE.0,
                 LiteralValue::DateTime(_) => FormatId::DATETIME.0,

@@ -1397,7 +1397,9 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
             .get_or_init(|| self.compute_reference_or_value())
             .clone();
         if let Ok(crate::function::FunctionResolution::Value(value)) = &resolved {
-            let _ = self.cached_value.set(Ok(value.clone()));
+            if self.cached_value.get().is_none() {
+                let _ = self.cached_value.set(Ok(value.clone()));
+            }
         }
         resolved
     }

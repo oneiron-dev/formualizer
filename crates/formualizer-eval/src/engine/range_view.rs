@@ -425,7 +425,7 @@ impl<'a> RangeView<'a> {
                 ));
             }
             r.resize(ncols, LiteralValue::Empty);
-            ib.append_row(&r).expect("append_row for RangeView");
+            ib.append_row_cancellable(&r, cancel_token.as_ref())?;
         }
 
         let sheet = Arc::new(ib.finish());
