@@ -64,13 +64,13 @@ fn blank_line(
 fn clone_value(
     value: &LiteralValue,
     cancel: Option<&CancelToken>,
-) -> Result<LiteralValue, GroupFailure> {
-    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+) -> Result<LiteralValue, ExcelError> {
+    cancellation_checkpoint(cancel)?;
     match value {
         LiteralValue::Text(text) => {
             let mut copied = String::with_capacity(text.len());
             for ch in text.chars() {
-                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                cancellation_checkpoint(cancel)?;
                 copied.push(ch);
             }
             Ok(LiteralValue::Text(copied))
@@ -78,7 +78,7 @@ fn clone_value(
         LiteralValue::Array(rows) => {
             let mut copied = Vec::with_capacity(rows.len());
             for row in rows {
-                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                cancellation_checkpoint(cancel)?;
                 copied.push(clone_values(row, cancel)?);
             }
             Ok(LiteralValue::Array(copied))
@@ -90,11 +90,11 @@ fn clone_value(
 fn clone_values(
     values: &[LiteralValue],
     cancel: Option<&CancelToken>,
-) -> Result<Vec<LiteralValue>, GroupFailure> {
-    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+) -> Result<Vec<LiteralValue>, ExcelError> {
+    cancellation_checkpoint(cancel)?;
     let mut copied = Vec::with_capacity(values.len());
     for value in values {
-        cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+        cancellation_checkpoint(cancel)?;
         copied.push(clone_value(value, cancel)?);
     }
     Ok(copied)
@@ -123,7 +123,7 @@ fn grid_arg(
             row.push(view.get_cell(r, c));
         }
         cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
-        rows.push(clone_values(&row, cancel)?);
+        rows.push(clone_values(&row, cancel).map_err(GroupFailure::Native)?);
     }
     Ok(rows)
 }
@@ -142,6 +142,18 @@ fn cell(grid: &Grid, r: usize, c: usize) -> LiteralValue {
         .and_then(|row| row.get(c))
         .cloned()
         .unwrap_or(LiteralValue::Empty)
+}
+
+fn cell_cancellable(
+    grid: &Grid,
+    r: usize,
+    c: usize,
+    cancel: Option<&CancelToken>,
+) -> Result<LiteralValue, ExcelError> {
+    match grid.get(r).and_then(|row| row.get(c)) {
+        Some(value) => clone_value(value, cancel),
+        None => Ok(LiteralValue::Empty),
+    }
 }
 
 /// An optional argument's value; `None` when absent or left empty.
@@ -291,7 +303,7 @@ fn distinct_keys(
         let next = distinct.len();
         let k = *index.entry(id).or_insert(next);
         if k == next {
-            distinct.push(clone_values(key, cancel)?);
+            distinct.push(clone_values(key, cancel).map_err(GroupFailure::Native)?);
         }
         of_row.push(k);
     }
@@ -427,7 +439,7 @@ fn axis_entries(
             .map(|c| {
                 cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
                 Ok(if c < len {
-                    distinct[k][c].clone()
+                    clone_value(&distinct[k][c], cancel).map_err(GroupFailure::Native)?
                 } else {
                     blank()
                 })
@@ -511,11 +523,13 @@ fn axis_entries(
 /// Header detection when field_headers is omitted: the values have a header
 /// when their first value is text and the second a number.
 fn detect_headers(values: &Grid) -> bool {
-    matches!(cell(values, 0, 0), LiteralValue::Text(ref s) if !s.is_empty())
-        && matches!(
-            cell(values, 1, 0),
-            LiteralValue::Number(_) | LiteralValue::Int(_)
-        )
+    matches!(
+        values.first().and_then(|row| row.first()),
+        Some(LiteralValue::Text(s)) if !s.is_empty()
+    ) && matches!(
+        values.get(1).and_then(|row| row.first()),
+        Some(LiteralValue::Number(_) | LiteralValue::Int(_))
+    )
 }
 
 /// `(has_headers, show_headers)` from the field_headers argument.
@@ -643,7 +657,7 @@ impl Aggregate<'_, '_, '_> {
             .iter()
             .map(|&r| {
                 cancellation_checkpoint(cancel)?;
-                Ok(vec![cell(self.values, r, col)])
+                Ok(vec![cell_cancellable(self.values, r, col, cancel)?])
             })
             .collect::<Result<Vec<_>, ExcelError>>()?;
         cancellation_checkpoint(cancel)?;
@@ -755,13 +769,18 @@ fn groupby(
             (0..key_cols)
                 .map(|c| {
                     cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
-                    Ok(cell(&fields, r, c))
+                    cell_cancellable(&fields, r, c, cancel).map_err(GroupFailure::Native)
                 })
                 .collect::<Result<Vec<_>, GroupFailure>>()
         })
         .collect::<Result<Vec<_>, GroupFailure>>()?;
     let (distinct, key_of) = distinct_keys(&keys, cancel)?;
-    let mut rows_by_key = vec![Vec::new(); distinct.len()];
+    let mut rows_by_key: Vec<Vec<usize>> = (0..distinct.len())
+        .map(|_| {
+            cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+            Ok(Vec::new())
+        })
+        .collect::<Result<Vec<_>, GroupFailure>>()?;
     for (i, &r) in rows.iter().enumerate() {
         cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
         rows_by_key[key_of[i]].push(r);
@@ -793,7 +812,7 @@ fn groupby(
             .map(|c| {
                 cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
                 Ok(if has_headers {
-                    cell(&fields, 0, c)
+                    cell_cancellable(&fields, 0, c, cancel).map_err(GroupFailure::Native)?
                 } else {
                     LiteralValue::Text(format!("Row Field {}", c + 1))
                 })
@@ -802,7 +821,7 @@ fn groupby(
         for c in 0..value_cols {
             cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
             header.push(if has_headers {
-                cell(&values, 0, c)
+                cell_cancellable(&values, 0, c, cancel).map_err(GroupFailure::Native)?
             } else {
                 LiteralValue::Text(format!("Value {}", c + 1))
             });
@@ -815,7 +834,7 @@ fn groupby(
         if entry.keys.len() == 1 {
             for value in &detail[entry.keys[0]] {
                 cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
-                line.push(value.clone());
+                line.push(clone_value(value, cancel).map_err(GroupFailure::Native)?);
             }
         } else {
             let members = rows_of(&entry.keys, &rows_by_key, cancel)?;
@@ -886,13 +905,18 @@ fn pivotby(
                 (0..cols)
                     .map(|c| {
                         cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
-                        Ok(cell(fields, r, c))
+                        cell_cancellable(fields, r, c, cancel).map_err(GroupFailure::Native)
                     })
                     .collect::<Result<Vec<_>, GroupFailure>>()
             })
             .collect::<Result<Vec<_>, GroupFailure>>()?;
         let (distinct, key_of) = distinct_keys(&keys, cancel)?;
-        let mut rows_by_key = vec![Vec::new(); distinct.len()];
+        let mut rows_by_key: Vec<Vec<usize>> = (0..distinct.len())
+            .map(|_| {
+                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                Ok(Vec::new())
+            })
+            .collect::<Result<Vec<_>, GroupFailure>>()?;
         for (i, &r) in rows.iter().enumerate() {
             cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
             rows_by_key[key_of[i]].push(r);
@@ -935,7 +959,7 @@ fn pivotby(
             for (c, slot) in line.iter_mut().enumerate() {
                 cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
                 *slot = if has_headers {
-                    cell(&row_fields, 0, c)
+                    cell_cancellable(&row_fields, 0, c, cancel).map_err(GroupFailure::Native)?
                 } else {
                     LiteralValue::Text(format!("Row Field {}", c + 1))
                 };
@@ -946,7 +970,7 @@ fn pivotby(
             for v in 0..value_cols {
                 cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
                 line.push(if v == 0 {
-                    entry.label[level].clone()
+                    clone_value(&entry.label[level], cancel).map_err(GroupFailure::Native)?
                 } else {
                     blank()
                 });
@@ -962,7 +986,7 @@ fn pivotby(
             for v in 0..value_cols {
                 cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
                 line.push(if has_headers {
-                    cell(&values, 0, v)
+                    cell_cancellable(&values, 0, v, cancel).map_err(GroupFailure::Native)?
                 } else {
                     LiteralValue::Text(format!("Value {}", v + 1))
                 });
