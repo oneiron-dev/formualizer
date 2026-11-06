@@ -31293,18 +31293,59 @@ where
         // Formulas that read these cells may have run before the spill landed;
         // remember the area so they are evaluated again.
         let width = rows.first().map_or(0, |r| r.len()).max(1);
-        let spill_changed = prev_spill_cells.iter().any(|cell| !targets.contains(cell))
-            || targets.iter().enumerate().any(|(idx, cell)| {
-                let new = rows
-                    .get(idx / width)
-                    .and_then(|r| r.get(idx % width))
-                    .cloned()
-                    .unwrap_or(LiteralValue::Empty);
-                let sheet_name = self.graph.sheet_name(cell.sheet_id);
-                self.get_cell_value(sheet_name, cell.coord.row() + 1, cell.coord.col() + 1)
-                    .unwrap_or(LiteralValue::Empty)
-                    != new
-            });
+        let spill_changed =
+            if let (true, Some(cancel)) = (cancellable, self.active_cancel_flag.as_ref()) {
+                let mut changed = false;
+                for cell in &prev_spill_cells {
+                    cancellation_checkpoint(Some(cancel))?;
+                    if !targets.contains(cell) {
+                        changed = true;
+                        break;
+                    }
+                }
+                if !changed {
+                    for (idx, cell) in targets.iter().enumerate() {
+                        cancellation_checkpoint(Some(cancel))?;
+                        let new = match rows.get(idx / width).and_then(|r| r.get(idx % width)) {
+                            Some(LiteralValue::Text(text)) => LiteralValue::Text(
+                                crate::arrow_store::IngestBuilder::copy_text_cancellable(
+                                    text,
+                                    Some(cancel),
+                                )?,
+                            ),
+                            Some(value) => value.clone(),
+                            None => LiteralValue::Empty,
+                        };
+                        let sheet_name = self.graph.sheet_name(cell.sheet_id);
+                        let old = self
+                            .try_get_cell_value(
+                                sheet_name,
+                                cell.coord.row() + 1,
+                                cell.coord.col() + 1,
+                                Some(cancel),
+                            )?
+                            .unwrap_or(LiteralValue::Empty);
+                        if !literal_values_equal_cancellable(&old, &new, Some(cancel))? {
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+                changed
+            } else {
+                prev_spill_cells.iter().any(|cell| !targets.contains(cell))
+                    || targets.iter().enumerate().any(|(idx, cell)| {
+                        let new = rows
+                            .get(idx / width)
+                            .and_then(|r| r.get(idx % width))
+                            .cloned()
+                            .unwrap_or(LiteralValue::Empty);
+                        let sheet_name = self.graph.sheet_name(cell.sheet_id);
+                        self.get_cell_value(sheet_name, cell.coord.row() + 1, cell.coord.col() + 1)
+                            .unwrap_or(LiteralValue::Empty)
+                            != new
+                    })
+            };
         if spill_changed {
             for cells in [&prev_spill_cells[..], targets] {
                 let Some(first) = cells.first() else {
