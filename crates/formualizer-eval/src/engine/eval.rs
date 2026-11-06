@@ -31298,7 +31298,15 @@ where
                 let mut changed = false;
                 for cell in &prev_spill_cells {
                     cancellation_checkpoint(Some(cancel))?;
-                    if !targets.contains(cell) {
+                    let mut present = false;
+                    for target in targets {
+                        cancellation_checkpoint(Some(cancel))?;
+                        if target == cell {
+                            present = true;
+                            break;
+                        }
+                    }
+                    if !present {
                         changed = true;
                         break;
                     }
