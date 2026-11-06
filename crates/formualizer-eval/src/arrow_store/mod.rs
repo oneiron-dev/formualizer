@@ -3215,7 +3215,9 @@ impl<'a> OverlayCascade<'a> {
             IngestBuilder::check_cancelled(cancel)?;
             mask_b.append_value(slots.present[idx]);
             match &slots.values[idx] {
-                Some(value) => values_b.append_value(value),
+                Some(value) => {
+                    IngestBuilder::append_text_cancellable(&mut values_b, value, cancel)?;
+                }
                 None => values_b.append_null(),
             }
         }
@@ -3248,7 +3250,7 @@ impl<'a> OverlayCascade<'a> {
             if let Some(value) = self.get_scalar(off) {
                 mask_b.append_value(true);
                 if let Some(s) = value.try_lowered_text_value(cancel)? {
-                    values_b.append_value(&s);
+                    IngestBuilder::append_text_cancellable(&mut values_b, &s, cancel)?;
                 } else {
                     values_b.append_null();
                 }
