@@ -233,6 +233,18 @@ impl DataStore {
                     Ok(LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)))
                 }
             }
+            ValueType::Error => {
+                if let Some(error_ref_raw) = value_ref.as_error_ref() {
+                    let error_ref = ErrorRef::from_raw(error_ref_raw);
+                    if let Some(error) = self.errors.try_get(error_ref, Some(cancel))? {
+                        Ok(LiteralValue::Error(error))
+                    } else {
+                        Ok(LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)))
+                    }
+                } else {
+                    Ok(LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)))
+                }
+            }
             _ => Ok(self.retrieve_value(value_ref)),
         }
     }

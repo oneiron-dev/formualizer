@@ -96,6 +96,34 @@ impl ErrorArena {
         Some(error)
     }
 
+    pub(crate) fn try_get(
+        &self,
+        error_ref: ErrorRef,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Option<ExcelError>, ExcelError> {
+        let Some(cancel) = cancel else {
+            return Ok(self.get(error_ref));
+        };
+        let Some(error_data) = self.errors.get(error_ref.0 as usize) else {
+            return Ok(None);
+        };
+        let message = error_data
+            .message_id
+            .map(|id| {
+                crate::arrow_store::IngestBuilder::copy_text_cancellable(
+                    self.strings.resolve(id),
+                    Some(cancel),
+                )
+            })
+            .transpose()?;
+
+        let mut error = ExcelError::new(error_data.kind);
+        if let Some(msg) = message {
+            error = error.with_message(msg);
+        }
+        Ok(Some(error))
+    }
+
     /// Get memory usage statistics
     pub fn memory_usage(&self) -> usize {
         std::mem::size_of::<ErrorData>() * self.errors.capacity()
