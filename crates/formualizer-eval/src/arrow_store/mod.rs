@@ -508,7 +508,7 @@ impl IngestBuilder {
         Ok(())
     }
 
-    fn copy_text_cancellable(
+    pub(crate) fn copy_text_cancellable(
         text: &str,
         cancel: Option<&crate::engine::CancelToken>,
     ) -> Result<String, ExcelError> {

@@ -31651,6 +31651,15 @@ where
         } else {
             None
         };
+        let prepared_graph_value = if let (LiteralValue::Text(text), Some(cancel)) =
+            (value, self.active_cancel_flag.as_ref())
+        {
+            Some(LiteralValue::Text(
+                crate::arrow_store::IngestBuilder::copy_text_cancellable(text, Some(cancel))?,
+            ))
+        } else {
+            None
+        };
         if let Some(d) = delta {
             if let Some(cell) = self.graph.get_cell_ref_for_vertex(vertex_id) {
                 let sheet_name = self.graph.sheet_name(cell.sheet_id);
@@ -31662,7 +31671,10 @@ where
                 }
             }
         }
-        self.graph.update_vertex_value(vertex_id, value.clone());
+        self.graph.update_vertex_value(
+            vertex_id,
+            prepared_graph_value.unwrap_or_else(|| value.clone()),
+        );
         if cancellable {
             if let Some(prepared) = prepared_overlay {
                 self.publish_vertex_value_overlay(prepared, computed_writes)?;
