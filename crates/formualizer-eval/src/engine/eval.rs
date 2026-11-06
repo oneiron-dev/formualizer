@@ -31223,7 +31223,13 @@ where
         let prev_spill_cells = self
             .graph
             .spill_cells_for_anchor(anchor_vertex)
-            .map(|cells| cells.to_vec())
+            .map(
+                |cells| match (cancellable, self.active_cancel_flag.as_ref()) {
+                    (true, Some(cancel)) => copy_spill_cells_cancellable(cells, Some(cancel)),
+                    _ => Ok(cells.to_vec()),
+                },
+            )
+            .transpose()?
             .unwrap_or_default();
         let commit_rows = match (cancellable, self.active_cancel_flag.as_ref()) {
             (true, Some(cancel)) => Some(copy_spill_values_cancellable(&rows, Some(cancel))?),
