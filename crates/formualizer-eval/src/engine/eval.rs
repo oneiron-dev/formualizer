@@ -86,6 +86,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+type PreparedCellOverlay = (CellRef, String, OverlayValue);
 type StagedFormulaEntry = (u32, u32, String);
 type StagedSheetParts = (
     Vec<StagedFormulaEntry>,
@@ -20517,27 +20518,48 @@ where
         value: &LiteralValue,
         computed_writes: Option<&mut ComputedWriteBuffer>,
     ) -> Result<(), ExcelError> {
+        if let Some(prepared) = self.prepare_vertex_value_overlay(vertex_id, value, None)? {
+            self.publish_vertex_value_overlay(prepared, computed_writes)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_vertex_value_overlay(
+        &self,
+        vertex_id: VertexId,
+        value: &LiteralValue,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Option<PreparedCellOverlay>, ExcelError> {
         if !(self.config.arrow_storage_enabled
             && self.config.delta_overlay_enabled
             && self.config.write_formula_overlay_enabled)
         {
-            return Ok(());
+            return Ok(None);
         }
         if self.computed_overlay_mirroring_disabled {
-            return Ok(());
+            return Ok(None);
         }
         if !matches!(
             self.graph.get_vertex_kind(vertex_id),
             VertexKind::FormulaScalar | VertexKind::FormulaArray
         ) {
-            return Ok(());
+            return Ok(None);
         }
         let Some(cell) = self.graph.get_cell_ref(vertex_id) else {
-            return Ok(());
+            return Ok(None);
         };
         let sheet_name = self.graph.sheet_name(cell.sheet_id).to_string();
         let date_system = self.arrow_sheet_date_system(&sheet_name);
-        let ov = Self::literal_to_overlay_value(value, date_system);
+        let ov = OverlayValue::from_literal_value_cancellable(value, date_system, cancel)?;
+        Ok(Some((cell, sheet_name, ov)))
+    }
+
+    fn publish_vertex_value_overlay(
+        &mut self,
+        prepared: PreparedCellOverlay,
+        computed_writes: Option<&mut ComputedWriteBuffer>,
+    ) -> Result<(), ExcelError> {
+        let (cell, sheet_name, ov) = prepared;
         if let Some(buffer) = computed_writes {
             let format_id = self.derived_formats.read().unwrap().get(&cell).copied();
             buffer.push_cell_with_format(
@@ -31617,12 +31639,19 @@ where
         delta: Option<&mut DeltaCollector>,
         mut computed_writes: Option<&mut ComputedWriteBuffer>,
     ) -> Result<(), ExcelError> {
-        if let Some(d) = delta
-            && d.mode != DeltaMode::Off
+        let delta = delta.filter(|d| d.mode != DeltaMode::Off);
+        if delta.is_some()
+            && let Some(buffer) = computed_writes.as_deref_mut()
         {
-            if let Some(buffer) = computed_writes.as_deref_mut() {
-                self.flush_computed_write_buffer(buffer)?;
-            }
+            self.flush_computed_write_buffer(buffer)?;
+        }
+        let cancellable = self.active_cancel_flag.is_some();
+        let prepared_overlay = if cancellable {
+            self.prepare_vertex_value_overlay(vertex_id, value, self.active_cancel_flag.as_ref())?
+        } else {
+            None
+        };
+        if let Some(d) = delta {
             if let Some(cell) = self.graph.get_cell_ref_for_vertex(vertex_id) {
                 let sheet_name = self.graph.sheet_name(cell.sheet_id);
                 let old = self
@@ -31634,7 +31663,13 @@ where
             }
         }
         self.graph.update_vertex_value(vertex_id, value.clone());
-        self.record_vertex_value_to_overlay(vertex_id, value, computed_writes)?;
+        if cancellable {
+            if let Some(prepared) = prepared_overlay {
+                self.publish_vertex_value_overlay(prepared, computed_writes)?;
+            }
+        } else {
+            self.record_vertex_value_to_overlay(vertex_id, value, computed_writes)?;
+        }
         Ok(())
     }
 

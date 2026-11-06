@@ -1250,6 +1250,20 @@ pub enum OverlayValue {
 }
 
 impl OverlayValue {
+    pub(crate) fn from_literal_value_cancellable(
+        value: &LiteralValue,
+        date_system: crate::engine::DateSystem,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Self, ExcelError> {
+        if let (LiteralValue::Text(text), Some(cancel)) = (value, cancel) {
+            return Ok(Self::Text(Arc::from(IngestBuilder::copy_text_cancellable(
+                text,
+                Some(cancel),
+            )?)));
+        }
+        Ok(Self::from_literal_value(value, date_system))
+    }
+
     pub fn from_literal_value(
         value: &LiteralValue,
         date_system: crate::engine::DateSystem,
