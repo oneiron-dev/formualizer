@@ -457,7 +457,7 @@ impl<'a> RangeView<'a> {
             ib.append_row_cancellable(&r, cancel_token.as_ref())?;
         }
 
-        let sheet = Arc::new(ib.finish());
+        let sheet = Arc::new(ib.try_finish(cancel_token.as_ref())?);
 
         if nrows == 0 || ncols == 0 {
             return Ok(RangeView {

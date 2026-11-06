@@ -857,7 +857,7 @@ impl IngestBuilder {
         self.total_rows += 1;
 
         if self.row_in_chunk >= self.chunk_rows {
-            self.finish_chunk();
+            self.finish_chunk_cancellable(cancel)?;
         }
 
         Ok(())
@@ -895,10 +895,19 @@ impl IngestBuilder {
     }
 
     fn finish_chunk(&mut self) {
+        self.finish_chunk_cancellable(None)
+            .expect("uncancelled IngestBuilder chunk finish");
+    }
+
+    fn finish_chunk_cancellable(
+        &mut self,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<(), ExcelError> {
         if self.row_in_chunk == 0 {
-            return;
+            return Ok(());
         }
         for c in 0..self.ncols {
+            Self::check_cancelled(cancel)?;
             let len = self.row_in_chunk;
             let numbers_arc: Option<Arc<Float64Array>> = if self.lane_counts[c].n_num == 0 {
                 None
@@ -955,14 +964,24 @@ impl IngestBuilder {
         }
         self.row_in_chunk = 0;
         self.needs_provision = true;
+        Ok(())
     }
 
-    pub fn finish(mut self) -> ArrowSheet {
+    pub fn finish(self) -> ArrowSheet {
+        self.try_finish(None)
+            .expect("uncancelled IngestBuilder finish")
+    }
+
+    pub(crate) fn try_finish(
+        mut self,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<ArrowSheet, ExcelError> {
         // flush partial chunk; builders for a next chunk are never provisioned
-        self.finish_chunk();
+        self.finish_chunk_cancellable(cancel)?;
 
         let mut columns = Vec::with_capacity(self.ncols);
         for (idx, chunks) in self.chunks.into_iter().enumerate() {
+            Self::check_cancelled(cancel)?;
             columns.push(ArrowColumn {
                 chunks,
                 sparse_chunks: FxHashMap::default(),
@@ -974,6 +993,7 @@ impl IngestBuilder {
         if let Some(col0) = columns.first() {
             let chunks_len0 = col0.chunks.len();
             for (ci, col) in columns.iter().enumerate() {
+                Self::check_cancelled(cancel)?;
                 if col.chunks.len() != chunks_len0 {
                     panic!(
                         "ArrowSheet chunk misalignment: column {} chunks={} != {}",
@@ -985,8 +1005,10 @@ impl IngestBuilder {
             }
             let mut cur = 0usize;
             for i in 0..chunks_len0 {
+                Self::check_cancelled(cancel)?;
                 let len_i = col0.chunks[i].type_tag.len();
                 for (ci, col) in columns.iter().enumerate() {
+                    Self::check_cancelled(cancel)?;
                     let got = col.chunks[i].type_tag.len();
                     if got != len_i {
                         panic!(
@@ -998,14 +1020,14 @@ impl IngestBuilder {
                 cur += len_i;
             }
         }
-        ArrowSheet {
+        Ok(ArrowSheet {
             name: self.name,
             date_system: self.date_system,
             columns,
             nrows: self.total_rows,
             chunk_starts,
             chunk_rows: self.chunk_rows,
-        }
+        })
     }
 }
 
