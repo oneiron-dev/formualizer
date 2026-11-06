@@ -500,11 +500,35 @@ impl<'a> RangeView<'a> {
         if !matches!(self.backing, RangeBacking::Owned(_)) {
             return Ok(self);
         }
+        let check_cancelled = |cancel: Option<&CancelToken>| -> Result<(), ExcelError> {
+            if cancel.is_some_and(CancelToken::is_cancelled) {
+                return Err(ExcelError::new(
+                    formualizer_common::ExcelErrorKind::Cancelled,
+                ));
+            }
+            Ok(())
+        };
         let changes = |n: f64| crate::coercion::underflow_to_zero(n).to_bits() != n.to_bits();
         let mut found = false;
         for slice in self.numbers_slices() {
             let (_, _, cols) = slice?;
-            if cols.iter().any(|col| col.iter().flatten().any(changes)) {
+            let changed = if self.cancel_token.is_none() {
+                cols.iter().any(|col| col.iter().flatten().any(changes))
+            } else {
+                let mut changed = false;
+                'columns: for col in &cols {
+                    check_cancelled(self.cancel_token.as_ref())?;
+                    for number in col.iter() {
+                        check_cancelled(self.cancel_token.as_ref())?;
+                        if number.is_some_and(changes) {
+                            changed = true;
+                            break 'columns;
+                        }
+                    }
+                }
+                changed
+            };
+            if changed {
                 found = true;
                 break;
             }
@@ -514,8 +538,10 @@ impl<'a> RangeView<'a> {
         }
         let mut rows = Vec::with_capacity(self.rows);
         for r in 0..self.rows {
+            check_cancelled(self.cancel_token.as_ref())?;
             let mut row = Vec::with_capacity(self.cols);
             for c in 0..self.cols {
+                check_cancelled(self.cancel_token.as_ref())?;
                 let mut value = self.get_cell(r, c);
                 crate::coercion::normalize_zero_value(&mut value);
                 row.push(value);
