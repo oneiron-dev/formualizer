@@ -3561,7 +3561,14 @@ impl DependencyGraph {
         let anchor_cell = self
             .get_cell_ref(anchor)
             .expect("anchor cell ref for spill commit");
-        let anchor_sheet_name = self.sheet_name(anchor_cell.sheet_id).to_string();
+        let anchor_sheet_name = if let Some(cancel) = cancel {
+            crate::arrow_store::IngestBuilder::copy_text_cancellable(
+                self.sheet_name(anchor_cell.sheet_id),
+                Some(cancel),
+            )?
+        } else {
+            self.sheet_name(anchor_cell.sheet_id).to_string()
+        };
         let anchor_row = anchor_cell.coord.row();
         let anchor_col = anchor_cell.coord.col();
 
