@@ -458,44 +458,95 @@ struct LaneCounts {
 }
 
 impl IngestBuilder {
+    fn check_cancelled(cancel: Option<&crate::engine::CancelToken>) -> Result<(), ExcelError> {
+        if cancel.is_some_and(crate::engine::CancelToken::is_cancelled) {
+            return Err(ExcelError::new(formualizer_common::ExcelErrorKind::Cancelled));
+        }
+        Ok(())
+    }
+
     pub fn new(
         sheet_name: &str,
         ncols: usize,
         chunk_rows: usize,
         date_system: crate::engine::DateSystem,
     ) -> Self {
+        Self::try_new(sheet_name, ncols, chunk_rows, date_system, None)
+            .expect("uncancelled IngestBuilder construction")
+    }
+
+    pub(crate) fn try_new(
+        sheet_name: &str,
+        ncols: usize,
+        chunk_rows: usize,
+        date_system: crate::engine::DateSystem,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Self, ExcelError> {
         let mut chunks = Vec::with_capacity(ncols);
-        chunks.resize_with(ncols, Vec::new);
-        Self {
+        for _ in 0..ncols {
+            Self::check_cancelled(cancel)?;
+            chunks.push(Vec::new());
+        }
+        Ok(Self {
             name: Arc::from(sheet_name.to_string()),
             ncols,
             chunk_rows: chunk_rows.max(1),
             date_system,
             num_builders: (0..ncols)
-                .map(|_| Float64Builder::with_capacity(chunk_rows))
-                .collect(),
+                .map(|_| {
+                    Self::check_cancelled(cancel)?;
+                    Ok(Float64Builder::with_capacity(chunk_rows))
+                })
+                .collect::<Result<Vec<_>, ExcelError>>()?,
             bool_builders: (0..ncols)
-                .map(|_| BooleanBuilder::with_capacity(chunk_rows))
-                .collect(),
+                .map(|_| {
+                    Self::check_cancelled(cancel)?;
+                    Ok(BooleanBuilder::with_capacity(chunk_rows))
+                })
+                .collect::<Result<Vec<_>, ExcelError>>()?,
             // Text payload bytes are reserved lazily: most lanes never see text,
             // and a text lane grows its value buffer on first use.
             text_builders: (0..ncols)
-                .map(|_| StringBuilder::with_capacity(chunk_rows, 0))
-                .collect(),
+                .map(|_| {
+                    Self::check_cancelled(cancel)?;
+                    Ok(StringBuilder::with_capacity(chunk_rows, 0))
+                })
+                .collect::<Result<Vec<_>, ExcelError>>()?,
             err_builders: (0..ncols)
-                .map(|_| UInt8Builder::with_capacity(chunk_rows))
-                .collect(),
+                .map(|_| {
+                    Self::check_cancelled(cancel)?;
+                    Ok(UInt8Builder::with_capacity(chunk_rows))
+                })
+                .collect::<Result<Vec<_>, ExcelError>>()?,
             tag_builders: (0..ncols)
-                .map(|_| UInt8Builder::with_capacity(chunk_rows))
-                .collect(),
-            format_builders: (0..ncols).map(|_| Vec::with_capacity(chunk_rows)).collect(),
-            lane_counts: vec![LaneCounts::default(); ncols],
-            next_text_bytes: vec![0; ncols],
+                .map(|_| {
+                    Self::check_cancelled(cancel)?;
+                    Ok(UInt8Builder::with_capacity(chunk_rows))
+                })
+                .collect::<Result<Vec<_>, ExcelError>>()?,
+            format_builders: (0..ncols)
+                .map(|_| {
+                    Self::check_cancelled(cancel)?;
+                    Ok(Vec::with_capacity(chunk_rows))
+                })
+                .collect::<Result<Vec<_>, ExcelError>>()?,
+            lane_counts: (0..ncols)
+                .map(|_| {
+                    Self::check_cancelled(cancel)?;
+                    Ok(LaneCounts::default())
+                })
+                .collect::<Result<Vec<_>, ExcelError>>()?,
+            next_text_bytes: (0..ncols)
+                .map(|_| {
+                    Self::check_cancelled(cancel)?;
+                    Ok(0)
+                })
+                .collect::<Result<Vec<_>, ExcelError>>()?,
             needs_provision: false,
             chunks,
             row_in_chunk: 0,
             total_rows: 0,
-        }
+        })
     }
 
     /// Zero-allocation row append from typed cell tokens (no LiteralValue).
@@ -688,12 +739,10 @@ impl IngestBuilder {
         cancel: Option<&crate::engine::CancelToken>,
     ) -> Result<(), ExcelError> {
         assert_eq!(row.len(), self.ncols, "row width mismatch");
-        self.provision_if_needed();
+        self.provision_if_needed_cancellable(cancel)?;
 
         for (c, v) in row.iter().enumerate() {
-            if cancel.is_some_and(crate::engine::CancelToken::is_cancelled) {
-                return Err(ExcelError::new(formualizer_common::ExcelErrorKind::Cancelled));
-            }
+            Self::check_cancelled(cancel)?;
             self.format_builders[c].push(match v {
                 LiteralValue::Date(_) => FormatId::DATE.0,
                 LiteralValue::DateTime(_) => FormatId::DATETIME.0,
@@ -819,11 +868,20 @@ impl IngestBuilder {
     /// boundary) never allocates builders that [`Self::finish`] would drop.
     #[inline]
     fn provision_if_needed(&mut self) {
+        self.provision_if_needed_cancellable(None)
+            .expect("uncancelled IngestBuilder provisioning");
+    }
+
+    fn provision_if_needed_cancellable(
+        &mut self,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<(), ExcelError> {
         if !self.needs_provision {
-            return;
+            return Ok(());
         }
         self.needs_provision = false;
         for c in 0..self.ncols {
+            Self::check_cancelled(cancel)?;
             self.num_builders[c] = Float64Builder::with_capacity(self.chunk_rows);
             self.bool_builders[c] = BooleanBuilder::with_capacity(self.chunk_rows);
             // The text payload reserve follows what this column's previous chunk used.
@@ -833,6 +891,7 @@ impl IngestBuilder {
             self.tag_builders[c] = UInt8Builder::with_capacity(self.chunk_rows);
             self.format_builders[c] = Vec::with_capacity(self.chunk_rows);
         }
+        Ok(())
     }
 
     fn finish_chunk(&mut self) {

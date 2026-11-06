@@ -416,7 +416,8 @@ impl<'a> RangeView<'a> {
         let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
 
         let chunk_rows = 32 * 1024;
-        let mut ib = IngestBuilder::new("__tmp", ncols, chunk_rows, date_system);
+        let mut ib =
+            IngestBuilder::try_new("__tmp", ncols, chunk_rows, date_system, cancel_token.as_ref())?;
 
         for mut r in rows {
             if cancel_token.as_ref().is_some_and(CancelToken::is_cancelled) {
