@@ -3590,8 +3590,18 @@ impl DependencyGraph {
 
         // Clears for cells no longer used
         for cell in prev_cells.iter() {
+            if cancel.is_some_and(crate::engine::CancelToken::is_cancelled) {
+                return Err(ExcelError::new(ExcelErrorKind::Cancelled));
+            }
             if !new_set.contains(cell) {
-                let sheet = self.sheet_name(cell.sheet_id).to_string();
+                let sheet = if let Some(cancel) = cancel {
+                    crate::arrow_store::IngestBuilder::copy_text_cancellable(
+                        self.sheet_name(cell.sheet_id),
+                        Some(cancel),
+                    )?
+                } else {
+                    self.sheet_name(cell.sheet_id).to_string()
+                };
                 ops.push(Op {
                     sheet,
                     row: cell.coord.row(),
@@ -3606,14 +3616,42 @@ impl DependencyGraph {
             let first = target_cells.first().copied().unwrap();
             let row0 = first.coord.row();
             let col0 = first.coord.col();
-            let sheet = self.sheet_name(first.sheet_id).to_string();
+            let sheet = if let Some(cancel) = cancel {
+                crate::arrow_store::IngestBuilder::copy_text_cancellable(
+                    self.sheet_name(first.sheet_id),
+                    Some(cancel),
+                )?
+            } else {
+                self.sheet_name(first.sheet_id).to_string()
+            };
             for (r_off, row_vals) in values.iter().enumerate() {
+                if cancel.is_some_and(crate::engine::CancelToken::is_cancelled) {
+                    return Err(ExcelError::new(ExcelErrorKind::Cancelled));
+                }
                 for (c_off, v) in row_vals.iter().enumerate() {
+                    if cancel.is_some_and(crate::engine::CancelToken::is_cancelled) {
+                        return Err(ExcelError::new(ExcelErrorKind::Cancelled));
+                    }
                     ops.push(Op {
-                        sheet: sheet.clone(),
+                        sheet: if let Some(cancel) = cancel {
+                            crate::arrow_store::IngestBuilder::copy_text_cancellable(
+                                &sheet,
+                                Some(cancel),
+                            )?
+                        } else {
+                            sheet.clone()
+                        },
                         row: row0 + r_off as u32,
                         col: col0 + c_off as u32,
-                        new_value: v.clone(),
+                        new_value: match (cancel, v) {
+                            (Some(cancel), LiteralValue::Text(text)) => LiteralValue::Text(
+                                crate::arrow_store::IngestBuilder::copy_text_cancellable(
+                                    text,
+                                    Some(cancel),
+                                )?,
+                            ),
+                            _ => v.clone(),
+                        },
                     });
                 }
             }
@@ -3629,13 +3667,27 @@ impl DependencyGraph {
 
         // Capture old values before applying
         for op in &ops {
+            if cancel.is_some_and(crate::engine::CancelToken::is_cancelled) {
+                return Err(ExcelError::new(ExcelErrorKind::Cancelled));
+            }
             // op.row/op.col are internal 0-based; get_cell_value is a public 1-based API.
             let old = self
                 .get_cell_value(&op.sheet, op.row + 1, op.col + 1)
                 .unwrap_or(LiteralValue::Empty);
             let present = true; // unified model: we always treat as present
             old_values.push((
-                (op.sheet.clone(), op.row, op.col),
+                (
+                    if let Some(cancel) = cancel {
+                        crate::arrow_store::IngestBuilder::copy_text_cancellable(
+                            &op.sheet,
+                            Some(cancel),
+                        )?
+                    } else {
+                        op.sheet.clone()
+                    },
+                    op.row,
+                    op.col,
+                ),
                 OldVal {
                     present,
                     value: old,
