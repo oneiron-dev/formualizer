@@ -21158,14 +21158,27 @@ where
 
     /// Unified internal read API for a single cell value (Arrow-truth).
     pub(crate) fn read_cell_value(&self, sheet: &str, row: u32, col: u32) -> Option<LiteralValue> {
-        let asheet = self.sheet_store().sheet(sheet)?;
+        self.try_read_cell_value(sheet, row, col, None)
+            .expect("cell read without cancellation cannot fail")
+    }
+
+    pub(crate) fn try_read_cell_value(
+        &self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Option<LiteralValue>, ExcelError> {
+        let Some(asheet) = self.sheet_store().sheet(sheet) else {
+            return Ok(None);
+        };
         let r0 = row.saturating_sub(1) as usize;
         let c0 = col.saturating_sub(1) as usize;
-        let v = asheet.get_cell_value(r0, c0);
+        let v = asheet.try_get_cell_value(r0, c0, cancel)?;
         if matches!(v, LiteralValue::Empty) {
-            None
+            Ok(None)
         } else {
-            Some(v)
+            Ok(Some(v))
         }
     }
 
@@ -31664,7 +31677,12 @@ where
             if let Some(cell) = self.graph.get_cell_ref_for_vertex(vertex_id) {
                 let sheet_name = self.graph.sheet_name(cell.sheet_id);
                 let old = self
-                    .read_cell_value(sheet_name, cell.coord.row() + 1, cell.coord.col() + 1)
+                    .try_read_cell_value(
+                        sheet_name,
+                        cell.coord.row() + 1,
+                        cell.coord.col() + 1,
+                        self.active_cancel_flag.as_ref(),
+                    )?
                     .unwrap_or(LiteralValue::Empty);
                 if old != *value {
                     d.record_cell(cell.sheet_id, cell.coord.row(), cell.coord.col());

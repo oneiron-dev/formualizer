@@ -1372,6 +1372,21 @@ impl OverlayValue {
         })
     }
 
+    pub(crate) fn try_to_literal_for(
+        &self,
+        date_system: crate::engine::DateSystem,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<LiteralValue, ExcelError> {
+        if let (OverlayValue::Text(text), Some(cancel)) = (self, cancel) {
+            Ok(LiteralValue::Text(IngestBuilder::copy_text_cancellable(
+                text,
+                Some(cancel),
+            )?))
+        } else {
+            Ok(self.to_literal_for(date_system))
+        }
+    }
+
     pub(crate) fn to_literal_for(&self, date_system: crate::engine::DateSystem) -> LiteralValue {
         match self {
             OverlayValue::Empty => LiteralValue::Empty,
@@ -1453,6 +1468,14 @@ impl<'a> OverlayScalar<'a> {
 
     pub(crate) fn to_literal_for(&self, date_system: crate::engine::DateSystem) -> LiteralValue {
         self.as_value().to_literal_for(date_system)
+    }
+
+    pub(crate) fn try_to_literal_for(
+        &self,
+        date_system: crate::engine::DateSystem,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<LiteralValue, ExcelError> {
+        self.as_value().try_to_literal_for(date_system, cancel)
     }
 
     #[cfg(test)]
@@ -4367,35 +4390,45 @@ impl ArrowSheet {
     /// This avoids constructing a 1x1 RangeView and is intended for tight read loops.
     #[inline]
     pub fn get_cell_value(&self, abs_row: usize, abs_col: usize) -> LiteralValue {
+        self.try_get_cell_value(abs_row, abs_col, None)
+            .expect("cell read without cancellation cannot fail")
+    }
+
+    pub(crate) fn try_get_cell_value(
+        &self,
+        abs_row: usize,
+        abs_col: usize,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<LiteralValue, ExcelError> {
         let sheet_rows = self.nrows as usize;
         if abs_row >= sheet_rows {
-            return LiteralValue::Empty;
+            return Ok(LiteralValue::Empty);
         }
         if abs_col >= self.columns.len() {
-            return LiteralValue::Empty;
+            return Ok(LiteralValue::Empty);
         }
         let Some((ch_idx, in_off)) = self.chunk_of_row(abs_row) else {
-            return LiteralValue::Empty;
+            return Ok(LiteralValue::Empty);
         };
         let col_ref = &self.columns[abs_col];
         let Some(ch) = col_ref.chunk(ch_idx) else {
-            return LiteralValue::Empty;
+            return Ok(LiteralValue::Empty);
         };
 
         // Overlay takes precedence: user edits over computed over base.
         let cascade = OverlayCascade::new(&ch.overlay, &ch.computed_overlay);
         if let Some(ov) = cascade.get_scalar(in_off) {
-            return ov.to_literal_for(self.date_system);
+            return ov.try_to_literal_for(self.date_system, cancel);
         }
 
         // Read tag and route to lane.
         let tag_u8 = ch.type_tag.value(in_off);
-        match TypeTag::from_u8(tag_u8) {
+        Ok(match TypeTag::from_u8(tag_u8) {
             TypeTag::Empty => LiteralValue::Empty,
             TypeTag::Number => {
                 if let Some(arr) = &ch.numbers {
                     if arr.is_null(in_off) {
-                        return LiteralValue::Empty;
+                        return Ok(LiteralValue::Empty);
                     }
                     LiteralValue::Number(arr.value(in_off))
                 } else {
@@ -4416,7 +4449,7 @@ impl ArrowSheet {
             TypeTag::Boolean => {
                 if let Some(arr) = &ch.booleans {
                     if arr.is_null(in_off) {
-                        return LiteralValue::Empty;
+                        return Ok(LiteralValue::Empty);
                     }
                     LiteralValue::Boolean(arr.value(in_off))
                 } else {
@@ -4426,13 +4459,16 @@ impl ArrowSheet {
             TypeTag::Text => {
                 if let Some(arr) = &ch.text {
                     if arr.is_null(in_off) {
-                        return LiteralValue::Empty;
+                        return Ok(LiteralValue::Empty);
                     }
                     let sa = arr
                         .as_any()
                         .downcast_ref::<arrow_array::StringArray>()
                         .unwrap();
-                    LiteralValue::Text(sa.value(in_off).to_string())
+                    LiteralValue::Text(IngestBuilder::copy_text_cancellable(
+                        sa.value(in_off),
+                        cancel,
+                    )?)
                 } else {
                     LiteralValue::Empty
                 }
@@ -4440,7 +4476,7 @@ impl ArrowSheet {
             TypeTag::Error => {
                 if let Some(arr) = &ch.errors {
                     if arr.is_null(in_off) {
-                        return LiteralValue::Empty;
+                        return Ok(LiteralValue::Empty);
                     }
                     let kind = unmap_error_code(arr.value(in_off));
                     LiteralValue::Error(ExcelError::new(kind))
@@ -4449,7 +4485,7 @@ impl ArrowSheet {
                 }
             }
             TypeTag::Pending => LiteralValue::Pending,
-        }
+        })
     }
 
     /// Ensure capacity to address at least `target_rows` rows by extending the row chunk map.
