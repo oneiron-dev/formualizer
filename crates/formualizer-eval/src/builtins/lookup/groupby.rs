@@ -43,6 +43,50 @@ fn blank() -> LiteralValue {
     LiteralValue::Text(String::new())
 }
 
+fn blank_line(
+    columns: usize,
+    cancel: Option<&CancelToken>,
+) -> Result<Vec<LiteralValue>, GroupFailure> {
+    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+    let seed = blank();
+    let mut line = Vec::with_capacity(columns);
+    if columns != 0 {
+        for _ in 1..columns {
+            cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+            line.push(seed.clone());
+        }
+        cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+        line.push(seed);
+    }
+    Ok(line)
+}
+
+fn clone_value(
+    value: &LiteralValue,
+    cancel: Option<&CancelToken>,
+) -> Result<LiteralValue, GroupFailure> {
+    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+    match value {
+        LiteralValue::Text(text) => {
+            let mut copied = String::with_capacity(text.len());
+            for ch in text.chars() {
+                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                copied.push(ch);
+            }
+            Ok(LiteralValue::Text(copied))
+        }
+        LiteralValue::Array(rows) => {
+            let mut copied = Vec::with_capacity(rows.len());
+            for row in rows {
+                cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                copied.push(clone_values(row, cancel)?);
+            }
+            Ok(LiteralValue::Array(copied))
+        }
+        _ => Ok(value.clone()),
+    }
+}
+
 fn clone_values(
     values: &[LiteralValue],
     cancel: Option<&CancelToken>,
@@ -51,7 +95,7 @@ fn clone_values(
     let mut copied = Vec::with_capacity(values.len());
     for value in values {
         cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
-        copied.push(value.clone());
+        copied.push(clone_value(value, cancel)?);
     }
     Ok(copied)
 }
@@ -886,7 +930,7 @@ fn pivotby(
     let mut out = Vec::new();
     for level in 0..col_cols {
         cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
-        let mut line = vec![blank(); row_cols];
+        let mut line = blank_line(row_cols, cancel)?;
         if show_headers && level + 1 == col_cols && value_cols == 1 {
             for (c, slot) in line.iter_mut().enumerate() {
                 cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
@@ -912,7 +956,7 @@ fn pivotby(
     }
     if value_cols > 1 {
         cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
-        let mut line = vec![blank(); row_cols];
+        let mut line = blank_line(row_cols, cancel)?;
         for _ in &col_entries {
             cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
             for v in 0..value_cols {
