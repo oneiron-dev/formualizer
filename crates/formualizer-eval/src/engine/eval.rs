@@ -3220,6 +3220,21 @@ fn cancellation_checkpoint(cancel: Option<&crate::engine::CancelToken>) -> Resul
     }
 }
 
+fn copy_spill_cells_cancellable(
+    cells: &[CellRef],
+    cancel: Option<&crate::engine::CancelToken>,
+) -> Result<Vec<CellRef>, ExcelError> {
+    let Some(cancel) = cancel else {
+        return Ok(cells.to_vec());
+    };
+    let mut copied = Vec::with_capacity(cells.len());
+    for cell in cells {
+        cancellation_checkpoint(Some(cancel))?;
+        copied.push(*cell);
+    }
+    Ok(copied)
+}
+
 fn literal_values_equal_cancellable(
     left: &LiteralValue,
     right: &LiteralValue,
@@ -21109,14 +21124,29 @@ where
 
     /// Get a cell value through the single temporal egress boundary.
     pub fn get_cell_value(&self, sheet: &str, row: u32, col: u32) -> Option<LiteralValue> {
-        let raw = self.read_cell_value(sheet, row, col)?;
+        self.try_get_cell_value(sheet, row, col, None)
+            .expect("cell read without cancellation cannot fail")
+    }
+
+    fn try_get_cell_value(
+        &self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Option<LiteralValue>, ExcelError> {
+        let Some(raw) = self.try_read_cell_value(sheet, row, col, cancel)? else {
+            return Ok(None);
+        };
         let format = self.effective_format_id(sheet, row, col);
         let class = format.and_then(|id| self.format_registry.class(id));
-        Self::normalize_public_cell_read(Self::materialize_temporal_egress(
-            raw,
-            class,
-            self.config.temporal_egress,
-            self.config.date_system,
+        Ok(Self::normalize_public_cell_read(
+            Self::materialize_temporal_egress(
+                raw,
+                class,
+                self.config.temporal_egress,
+                self.config.date_system,
+            ),
         ))
     }
 
@@ -31739,19 +31769,9 @@ where
             self.flush_computed_write_buffer(buffer)?;
         }
 
-        let spill_cells = if let Some(cells) = self.graph.spill_cells_for_anchor(anchor_vertex) {
-            if let Some(cancel) = self.active_cancel_flag.as_ref() {
-                let mut copied = Vec::with_capacity(cells.len());
-                for cell in cells {
-                    cancellation_checkpoint(Some(cancel))?;
-                    copied.push(*cell);
-                }
-                copied
-            } else {
-                cells.to_vec()
-            }
-        } else {
-            Vec::new()
+        let spill_cells = match self.graph.spill_cells_for_anchor(anchor_vertex) {
+            Some(cells) => copy_spill_cells_cancellable(cells, self.active_cancel_flag.as_ref())?,
+            None => Vec::new(),
         };
         if spill_cells.is_empty() {
             return Ok(());
@@ -31759,7 +31779,7 @@ where
 
         // Snapshot for ChangeLog before clearing.
         let snapshot = if log.is_some() {
-            self.snapshot_spill_for_anchor(anchor_vertex)
+            self.try_snapshot_spill_for_anchor(anchor_vertex, self.active_cancel_flag.as_ref())?
         } else {
             None
         };
@@ -31864,9 +31884,21 @@ where
     /// Extracted from `VertexEditor::snapshot_spill_for_anchor` to be usable
     /// without creating a `VertexEditor`.
     fn snapshot_spill_for_anchor(&self, anchor: VertexId) -> Option<SpillSnapshot> {
-        let cells = self.graph.spill_cells_for_anchor(anchor)?.to_vec();
+        self.try_snapshot_spill_for_anchor(anchor, None)
+            .expect("spill snapshot without cancellation cannot fail")
+    }
+
+    fn try_snapshot_spill_for_anchor(
+        &self,
+        anchor: VertexId,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Option<SpillSnapshot>, ExcelError> {
+        let Some(cells) = self.graph.spill_cells_for_anchor(anchor) else {
+            return Ok(None);
+        };
+        let cells = copy_spill_cells_cancellable(cells, cancel)?;
         if cells.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let max = self.config.spill.max_spill_cells as usize;
@@ -31884,10 +31916,16 @@ where
         let mut max_col = col0;
         let mut by_coord: FxHashMap<(u32, u32), LiteralValue> = FxHashMap::default();
         for cell in &cells {
+            cancellation_checkpoint(cancel)?;
             max_row = max_row.max(cell.coord.row());
             max_col = max_col.max(cell.coord.col());
             let v = self
-                .get_cell_value(&sheet_name, cell.coord.row() + 1, cell.coord.col() + 1)
+                .try_get_cell_value(
+                    &sheet_name,
+                    cell.coord.row() + 1,
+                    cell.coord.col() + 1,
+                    cancel,
+                )?
                 .unwrap_or(LiteralValue::Empty);
             by_coord.insert((cell.coord.row(), cell.coord.col()), v);
         }
@@ -31896,22 +31934,26 @@ where
         let cols = (max_col - col0 + 1) as usize;
         let mut values: Vec<Vec<LiteralValue>> = Vec::with_capacity(rows);
         for r in 0..rows {
+            cancellation_checkpoint(cancel)?;
             let mut row: Vec<LiteralValue> = Vec::with_capacity(cols);
             for c in 0..cols {
-                row.push(
-                    by_coord
-                        .get(&(row0 + r as u32, col0 + c as u32))
-                        .cloned()
-                        .unwrap_or(LiteralValue::Empty),
-                );
+                cancellation_checkpoint(cancel)?;
+                let value = match by_coord.get(&(row0 + r as u32, col0 + c as u32)) {
+                    Some(LiteralValue::Text(text)) if cancel.is_some() => LiteralValue::Text(
+                        crate::arrow_store::IngestBuilder::copy_text_cancellable(text, cancel)?,
+                    ),
+                    Some(value) => value.clone(),
+                    None => LiteralValue::Empty,
+                };
+                row.push(value);
             }
             values.push(row);
         }
 
-        Some(SpillSnapshot {
+        Ok(Some(SpillSnapshot {
             target_cells: cells,
             values,
-        })
+        }))
     }
 
     fn flush_before_range_dependent_vertex(
