@@ -1601,6 +1601,25 @@ impl OverlayFragmentPayload {
         self.overlay_value(idx).map(OverlayScalar::Owned)
     }
 
+    fn try_get_literal(
+        &self,
+        idx: usize,
+        date_system: crate::engine::DateSystem,
+        cancel: &crate::engine::CancelToken,
+    ) -> Result<Option<LiteralValue>, ExcelError> {
+        if self.type_tag_at(idx) == Some(TypeTag::Text) {
+            let Some(text) = self.text_at(idx) else {
+                return Ok(None);
+            };
+            return Ok(Some(LiteralValue::Text(
+                IngestBuilder::copy_text_cancellable(text, Some(cancel))?,
+            )));
+        }
+        self.get_scalar(idx)
+            .map(|value| value.try_to_literal_for(date_system, Some(cancel)))
+            .transpose()
+    }
+
     #[inline]
     fn number_at(&self, idx: usize) -> Option<f64> {
         let arr = self.numbers.as_ref()?;
@@ -1907,12 +1926,12 @@ impl OverlayFragment {
         self.get_scalar(off).is_some()
     }
 
-    fn get_scalar(&self, off: usize) -> Option<OverlayScalar<'_>> {
+    fn payload_and_index(&self, off: usize) -> Option<(&OverlayFragmentPayload, usize)> {
         match self {
             OverlayFragment::SparseOffsets { offsets, payload } => {
                 let off = u32::try_from(off).ok()?;
                 let idx = offsets.binary_search(&off).ok()?;
-                payload.get_scalar(idx)
+                Some((payload, idx))
             }
             OverlayFragment::DenseRange {
                 start,
@@ -1924,7 +1943,7 @@ impl OverlayFragment {
                 if rel >= *len as usize {
                     return None;
                 }
-                payload.get_scalar(rel)
+                Some((payload, rel))
             }
             OverlayFragment::RunRange {
                 start,
@@ -1939,9 +1958,26 @@ impl OverlayFragment {
                 }
                 let rel_u32 = u32::try_from(rel).ok()?;
                 let run_idx = run_ends.partition_point(|end| *end <= rel_u32);
-                payload.get_scalar(run_idx)
+                Some((payload, run_idx))
             }
         }
+    }
+
+    fn get_scalar(&self, off: usize) -> Option<OverlayScalar<'_>> {
+        let (payload, idx) = self.payload_and_index(off)?;
+        payload.get_scalar(idx)
+    }
+
+    fn try_get_literal(
+        &self,
+        off: usize,
+        date_system: crate::engine::DateSystem,
+        cancel: &crate::engine::CancelToken,
+    ) -> Result<Option<LiteralValue>, ExcelError> {
+        let Some((payload, idx)) = self.payload_and_index(off) else {
+            return Ok(None);
+        };
+        payload.try_get_literal(idx, date_system, cancel)
     }
 
     fn subtract_fragment(&self, replacement: &OverlayFragment) -> Vec<OverlayFragment> {
@@ -2357,6 +2393,25 @@ impl Overlay {
             .get(&off)
             .map(OverlayScalar::Borrowed)
             .or_else(|| self.fragments.iter().rev().find_map(|f| f.get_scalar(off)))
+    }
+
+    fn try_get_literal(
+        &self,
+        off: usize,
+        date_system: crate::engine::DateSystem,
+        cancel: &crate::engine::CancelToken,
+    ) -> Result<Option<LiteralValue>, ExcelError> {
+        if let Some(value) = self.points.get(&off) {
+            return value
+                .try_to_literal_for(date_system, Some(cancel))
+                .map(Some);
+        }
+        for fragment in self.fragments.iter().rev() {
+            if let Some(value) = fragment.try_get_literal(off, date_system, cancel)? {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
     }
 
     #[inline]
@@ -2826,6 +2881,18 @@ impl<'a> OverlayCascade<'a> {
         self.user
             .get_scalar(off)
             .or_else(|| self.computed.get_scalar(off))
+    }
+
+    fn try_get_literal(
+        &self,
+        off: usize,
+        date_system: crate::engine::DateSystem,
+        cancel: &crate::engine::CancelToken,
+    ) -> Result<Option<LiteralValue>, ExcelError> {
+        if let Some(value) = self.user.try_get_literal(off, date_system, cancel)? {
+            return Ok(Some(value));
+        }
+        self.computed.try_get_literal(off, date_system, cancel)
     }
 
     #[inline]
@@ -4417,7 +4484,11 @@ impl ArrowSheet {
 
         // Overlay takes precedence: user edits over computed over base.
         let cascade = OverlayCascade::new(&ch.overlay, &ch.computed_overlay);
-        if let Some(ov) = cascade.get_scalar(in_off) {
+        if let Some(cancel) = cancel {
+            if let Some(value) = cascade.try_get_literal(in_off, self.date_system, cancel)? {
+                return Ok(value);
+            }
+        } else if let Some(ov) = cascade.get_scalar(in_off) {
             return ov.try_to_literal_for(self.date_system, cancel);
         }
 
