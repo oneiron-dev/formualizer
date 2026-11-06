@@ -3369,7 +3369,7 @@ impl<'a> OverlayCascade<'a> {
                 if let Some(value) = payload.text_at(run_idx) {
                     for _ in 0..repeat {
                         IngestBuilder::check_cancelled(cancel)?;
-                        b.append_value(value);
+                        IngestBuilder::append_text_cancellable(&mut b, value, cancel)?;
                     }
                 } else {
                     for _ in 0..repeat {
@@ -3451,7 +3451,7 @@ impl<'a> OverlayCascade<'a> {
                 if let Some(value) = value {
                     for _ in 0..repeat {
                         IngestBuilder::check_cancelled(cancel)?;
-                        b.append_value(&value);
+                        IngestBuilder::append_text_cancellable(&mut b, &value, cancel)?;
                     }
                 } else {
                     for _ in 0..repeat {
@@ -3555,7 +3555,7 @@ impl<'a> OverlayCascade<'a> {
         for idx in start..start.saturating_add(len) {
             IngestBuilder::check_cancelled(cancel)?;
             if let Some(value) = Self::payload_lowered_text_at(payload, idx) {
-                b.append_value(&value);
+                IngestBuilder::append_text_cancellable(&mut b, &value, cancel)?;
             } else {
                 b.append_null();
             }
