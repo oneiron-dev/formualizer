@@ -31897,6 +31897,15 @@ where
         };
         let rows = copy_spill_values_cancellable(&values, self.active_cancel_flag.as_ref())?;
 
+        let logged_target_cells = if log.is_some() && self.active_cancel_flag.is_some() {
+            Some(copy_spill_cells_cancellable(
+                target_cells,
+                self.active_cancel_flag.as_ref(),
+            )?)
+        } else {
+            None
+        };
+
         // Delegate to existing commit_spill_and_mirror for delta + overlay logic.
         self.commit_spill_and_mirror(
             anchor_vertex,
@@ -31912,7 +31921,7 @@ where
                 anchor: anchor_vertex,
                 old: old_snapshot,
                 new: SpillSnapshot {
-                    target_cells: target_cells.to_vec(),
+                    target_cells: logged_target_cells.unwrap_or_else(|| target_cells.to_vec()),
                     values,
                 },
             });
