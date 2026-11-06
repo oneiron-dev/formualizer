@@ -51,6 +51,13 @@ pub(crate) fn simple_lowercase(c: char) -> char {
     }
 }
 
+pub(crate) fn fold_text_case_char(c: char) -> char {
+    match simple_lowercase(c) {
+        'ς' => 'σ',
+        lower => lower,
+    }
+}
+
 /// `text` folded for Excel's case-insensitive text matching (criteria and
 /// lookups): every character becomes its simple lowercase
 /// ([`simple_lowercase`]), so folding never changes how many characters the
@@ -62,12 +69,7 @@ pub fn fold_text_case(text: &str) -> String {
     if text.is_ascii() {
         return text.to_ascii_lowercase();
     }
-    text.chars()
-        .map(|c| match simple_lowercase(c) {
-            'ς' => 'σ',
-            lower => lower,
-        })
-        .collect()
+    text.chars().map(fold_text_case_char).collect()
 }
 
 /// The decimal number `text` spells (`"5"`, `"-2.5E-1"`, `".5"`), when it is

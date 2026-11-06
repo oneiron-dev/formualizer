@@ -270,7 +270,7 @@ impl ColumnChunk {
                 if sa.is_null(i) {
                     b.append_null();
                 } else {
-                    b.append_value(crate::locale::fold_text_case(sa.value(i)));
+                    IngestBuilder::append_lowered_text_cancellable(&mut b, sa.value(i), cancel)?;
                 }
             }
             let lowered = b.finish();
@@ -502,6 +502,24 @@ impl IngestBuilder {
         for (offset, ch) in text.char_indices() {
             Self::check_cancelled(cancel)?;
             std::fmt::Write::write_str(builder, &text[offset..offset + ch.len_utf8()])
+                .expect("Arrow string buffer write");
+        }
+        builder.append_value("");
+        Ok(())
+    }
+
+    fn append_lowered_text_cancellable(
+        builder: &mut StringBuilder,
+        text: &str,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<(), ExcelError> {
+        if cancel.is_none() {
+            builder.append_value(crate::locale::fold_text_case(text));
+            return Ok(());
+        }
+        for ch in text.chars() {
+            Self::check_cancelled(cancel)?;
+            std::fmt::Write::write_char(builder, crate::locale::fold_text_case_char(ch))
                 .expect("Arrow string buffer write");
         }
         builder.append_value("");
