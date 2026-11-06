@@ -27920,6 +27920,7 @@ impl ShimSpillManager {
         targets: &[CellRef],
         rows: Vec<Vec<LiteralValue>>,
         overwritable_formulas: Option<&rustc_hash::FxHashSet<VertexId>>,
+        cancel: Option<&crate::engine::CancelToken>,
         mut value_probe: F,
     ) -> Result<(), ExcelError>
     where
@@ -28008,12 +28009,12 @@ impl ShimSpillManager {
             }
         }
 
-        let commit_res = graph.commit_spill_region_atomic_with_fault(
-            anchor_vertex,
-            targets.to_vec(),
-            rows,
-            None,
-        );
+        let commit_res = match copy_spill_cells_cancellable(targets, cancel) {
+            Ok(targets) => {
+                graph.commit_spill_region_atomic_with_fault(anchor_vertex, targets, rows, None)
+            }
+            Err(error) => Err(error),
+        };
         if let Some(id) = self.active_locks.remove(&anchor_vertex) {
             self.region_locks.release(id);
         }
@@ -31385,6 +31386,10 @@ where
             targets,
             commit_rows.unwrap_or_else(|| rows.clone()),
             overwritable_formulas,
+            match (cancellable, self.active_cancel_flag.as_ref()) {
+                (true, Some(cancel)) => Some(cancel),
+                _ => None,
+            },
             |g, cell| {
                 let sheet_name = g.sheet_name(cell.sheet_id);
                 let asheet = arrow_sheets.sheet(sheet_name)?;
