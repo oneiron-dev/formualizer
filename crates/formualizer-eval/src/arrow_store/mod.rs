@@ -2686,27 +2686,37 @@ impl<'a> OverlayCascade<'a> {
         range: core::ops::Range<usize>,
         base: &Float64Array,
     ) -> Arc<Float64Array> {
+        self.try_select_numbers(range, base, None)
+            .expect("uncancelled overlay selection")
+    }
+
+    pub(crate) fn try_select_numbers(
+        &self,
+        range: core::ops::Range<usize>,
+        base: &Float64Array,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Arc<Float64Array>, ExcelError> {
         if let Some(fragment) = self.user.full_cover_dense_fragment(range.clone()) {
             record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
-            return Self::dense_numbers(fragment, range);
+            return Ok(Self::dense_numbers(fragment, range));
         }
         if let Some(fragment) = self.user.full_cover_run_fragment(range.clone()) {
             record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-            return Self::run_numbers(fragment, range);
+            return Ok(Self::run_numbers(fragment, range));
         }
         if !self.user.has_any_in_range(range.clone()) {
             if let Some(fragment) = self.computed.full_cover_dense_fragment(range.clone()) {
                 record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
-                return Self::dense_numbers(fragment, range);
+                return Ok(Self::dense_numbers(fragment, range));
             }
             if let Some(fragment) = self.computed.full_cover_run_fragment(range.clone()) {
                 record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-                return Self::run_numbers(fragment, range);
+                return Ok(Self::run_numbers(fragment, range));
             }
         }
 
         if !self.has_any_in_range(range.clone()) {
-            return Arc::new(base.clone());
+            return Ok(Arc::new(base.clone()));
         }
 
         record_overlay_select_stats(|stats| stats.partial_overlay_builds += 1);
@@ -2715,12 +2725,13 @@ impl<'a> OverlayCascade<'a> {
         Self::apply_number_layer(self.computed, range.clone(), &mut slots);
         Self::apply_number_layer(self.user, range.clone(), &mut slots);
         if !slots.any_present() {
-            return Arc::new(base.clone());
+            return Ok(Arc::new(base.clone()));
         }
 
         let mut mask_b = BooleanBuilder::with_capacity(len);
         let mut values_b = Float64Builder::with_capacity(len);
         for idx in 0..len {
+            IngestBuilder::check_cancelled(cancel)?;
             mask_b.append_value(slots.present[idx]);
             match slots.values[idx] {
                 Some(value) => values_b.append_value(value),
@@ -2732,13 +2743,13 @@ impl<'a> OverlayCascade<'a> {
         let values = values_b.finish();
         let zipped =
             crate::compute_prelude::zip_select(&mask, &values, base).expect("zip numeric overlay");
-        Arc::new(
+        Ok(Arc::new(
             zipped
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .expect("numeric overlay zip type")
                 .clone(),
-        )
+        ))
     }
 
     pub(crate) fn select_booleans(
@@ -2746,27 +2757,37 @@ impl<'a> OverlayCascade<'a> {
         range: core::ops::Range<usize>,
         base: &BooleanArray,
     ) -> Arc<BooleanArray> {
+        self.try_select_booleans(range, base, None)
+            .expect("uncancelled overlay selection")
+    }
+
+    pub(crate) fn try_select_booleans(
+        &self,
+        range: core::ops::Range<usize>,
+        base: &BooleanArray,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Arc<BooleanArray>, ExcelError> {
         if let Some(fragment) = self.user.full_cover_dense_fragment(range.clone()) {
             record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
-            return Self::dense_booleans(fragment, range);
+            return Ok(Self::dense_booleans(fragment, range));
         }
         if let Some(fragment) = self.user.full_cover_run_fragment(range.clone()) {
             record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-            return Self::run_booleans(fragment, range);
+            return Ok(Self::run_booleans(fragment, range));
         }
         if !self.user.has_any_in_range(range.clone()) {
             if let Some(fragment) = self.computed.full_cover_dense_fragment(range.clone()) {
                 record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
-                return Self::dense_booleans(fragment, range);
+                return Ok(Self::dense_booleans(fragment, range));
             }
             if let Some(fragment) = self.computed.full_cover_run_fragment(range.clone()) {
                 record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-                return Self::run_booleans(fragment, range);
+                return Ok(Self::run_booleans(fragment, range));
             }
         }
 
         if !self.has_any_in_range(range.clone()) {
-            return Arc::new(base.clone());
+            return Ok(Arc::new(base.clone()));
         }
 
         record_overlay_select_stats(|stats| stats.partial_overlay_builds += 1);
@@ -2775,12 +2796,13 @@ impl<'a> OverlayCascade<'a> {
         Self::apply_boolean_layer(self.computed, range.clone(), &mut slots);
         Self::apply_boolean_layer(self.user, range.clone(), &mut slots);
         if !slots.any_present() {
-            return Arc::new(base.clone());
+            return Ok(Arc::new(base.clone()));
         }
 
         let mut mask_b = BooleanBuilder::with_capacity(len);
         let mut values_b = BooleanBuilder::with_capacity(len);
         for idx in 0..len {
+            IngestBuilder::check_cancelled(cancel)?;
             mask_b.append_value(slots.present[idx]);
             match slots.values[idx] {
                 Some(value) => values_b.append_value(value),
@@ -2792,13 +2814,13 @@ impl<'a> OverlayCascade<'a> {
         let values = values_b.finish();
         let zipped =
             crate::compute_prelude::zip_select(&mask, &values, base).expect("zip boolean overlay");
-        Arc::new(
+        Ok(Arc::new(
             zipped
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .expect("boolean overlay zip type")
                 .clone(),
-        )
+        ))
     }
 
     pub(crate) fn select_text(
@@ -2806,27 +2828,37 @@ impl<'a> OverlayCascade<'a> {
         range: core::ops::Range<usize>,
         base: &StringArray,
     ) -> ArrayRef {
+        self.try_select_text(range, base, None)
+            .expect("uncancelled overlay selection")
+    }
+
+    pub(crate) fn try_select_text(
+        &self,
+        range: core::ops::Range<usize>,
+        base: &StringArray,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<ArrayRef, ExcelError> {
         if let Some(fragment) = self.user.full_cover_dense_fragment(range.clone()) {
             record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
-            return Self::dense_text(fragment, range);
+            return Ok(Self::dense_text(fragment, range));
         }
         if let Some(fragment) = self.user.full_cover_run_fragment(range.clone()) {
             record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-            return Self::run_text(fragment, range);
+            return Ok(Self::run_text(fragment, range));
         }
         if !self.user.has_any_in_range(range.clone()) {
             if let Some(fragment) = self.computed.full_cover_dense_fragment(range.clone()) {
                 record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
-                return Self::dense_text(fragment, range);
+                return Ok(Self::dense_text(fragment, range));
             }
             if let Some(fragment) = self.computed.full_cover_run_fragment(range.clone()) {
                 record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-                return Self::run_text(fragment, range);
+                return Ok(Self::run_text(fragment, range));
             }
         }
 
         if !self.has_any_in_range(range.clone()) {
-            return Arc::new(base.clone()) as ArrayRef;
+            return Ok(Arc::new(base.clone()) as ArrayRef);
         }
 
         record_overlay_select_stats(|stats| stats.partial_overlay_builds += 1);
@@ -2835,12 +2867,13 @@ impl<'a> OverlayCascade<'a> {
         Self::apply_text_layer(self.computed, range.clone(), &mut slots);
         Self::apply_text_layer(self.user, range.clone(), &mut slots);
         if !slots.any_present() {
-            return Arc::new(base.clone()) as ArrayRef;
+            return Ok(Arc::new(base.clone()) as ArrayRef);
         }
 
         let mut mask_b = BooleanBuilder::with_capacity(len);
         let mut values_b = StringBuilder::with_capacity(len, len.saturating_mul(8));
         for idx in 0..len {
+            IngestBuilder::check_cancelled(cancel)?;
             mask_b.append_value(slots.present[idx]);
             match &slots.values[idx] {
                 Some(value) => values_b.append_value(value),
@@ -2850,7 +2883,7 @@ impl<'a> OverlayCascade<'a> {
         record_overlay_select_stats(|stats| stats.zip_select_calls += 1);
         let mask = mask_b.finish();
         let values = values_b.finish();
-        crate::compute_prelude::zip_select(&mask, &values, base).expect("zip text overlay")
+        Ok(crate::compute_prelude::zip_select(&mask, &values, base).expect("zip text overlay"))
     }
 
     pub(crate) fn select_errors(
@@ -2858,27 +2891,37 @@ impl<'a> OverlayCascade<'a> {
         range: core::ops::Range<usize>,
         base: &UInt8Array,
     ) -> Arc<UInt8Array> {
+        self.try_select_errors(range, base, None)
+            .expect("uncancelled overlay selection")
+    }
+
+    pub(crate) fn try_select_errors(
+        &self,
+        range: core::ops::Range<usize>,
+        base: &UInt8Array,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Arc<UInt8Array>, ExcelError> {
         if let Some(fragment) = self.user.full_cover_dense_fragment(range.clone()) {
             record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
-            return Self::dense_errors(fragment, range);
+            return Ok(Self::dense_errors(fragment, range));
         }
         if let Some(fragment) = self.user.full_cover_run_fragment(range.clone()) {
             record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-            return Self::run_errors(fragment, range);
+            return Ok(Self::run_errors(fragment, range));
         }
         if !self.user.has_any_in_range(range.clone()) {
             if let Some(fragment) = self.computed.full_cover_dense_fragment(range.clone()) {
                 record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
-                return Self::dense_errors(fragment, range);
+                return Ok(Self::dense_errors(fragment, range));
             }
             if let Some(fragment) = self.computed.full_cover_run_fragment(range.clone()) {
                 record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-                return Self::run_errors(fragment, range);
+                return Ok(Self::run_errors(fragment, range));
             }
         }
 
         if !self.has_any_in_range(range.clone()) {
-            return Arc::new(base.clone());
+            return Ok(Arc::new(base.clone()));
         }
 
         record_overlay_select_stats(|stats| stats.partial_overlay_builds += 1);
@@ -2887,12 +2930,13 @@ impl<'a> OverlayCascade<'a> {
         Self::apply_error_layer(self.computed, range.clone(), &mut slots);
         Self::apply_error_layer(self.user, range.clone(), &mut slots);
         if !slots.any_present() {
-            return Arc::new(base.clone());
+            return Ok(Arc::new(base.clone()));
         }
 
         let mut mask_b = BooleanBuilder::with_capacity(len);
         let mut values_b = UInt8Builder::with_capacity(len);
         for idx in 0..len {
+            IngestBuilder::check_cancelled(cancel)?;
             mask_b.append_value(slots.present[idx]);
             match slots.values[idx] {
                 Some(value) => values_b.append_value(value),
@@ -2904,13 +2948,13 @@ impl<'a> OverlayCascade<'a> {
         let values = values_b.finish();
         let zipped =
             crate::compute_prelude::zip_select(&mask, &values, base).expect("zip error overlay");
-        Arc::new(
+        Ok(Arc::new(
             zipped
                 .as_any()
                 .downcast_ref::<UInt8Array>()
                 .expect("error overlay zip type")
                 .clone(),
-        )
+        ))
     }
 
     pub(crate) fn select_type_tags(
@@ -2918,27 +2962,37 @@ impl<'a> OverlayCascade<'a> {
         range: core::ops::Range<usize>,
         base: &UInt8Array,
     ) -> Arc<UInt8Array> {
+        self.try_select_type_tags(range, base, None)
+            .expect("uncancelled overlay selection")
+    }
+
+    pub(crate) fn try_select_type_tags(
+        &self,
+        range: core::ops::Range<usize>,
+        base: &UInt8Array,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Arc<UInt8Array>, ExcelError> {
         if let Some(fragment) = self.user.full_cover_dense_fragment(range.clone()) {
             record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
-            return Self::dense_type_tags(fragment, range);
+            return Ok(Self::dense_type_tags(fragment, range));
         }
         if let Some(fragment) = self.user.full_cover_run_fragment(range.clone()) {
             record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-            return Self::run_type_tags(fragment, range);
+            return Ok(Self::run_type_tags(fragment, range));
         }
         if !self.user.has_any_in_range(range.clone()) {
             if let Some(fragment) = self.computed.full_cover_dense_fragment(range.clone()) {
                 record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
-                return Self::dense_type_tags(fragment, range);
+                return Ok(Self::dense_type_tags(fragment, range));
             }
             if let Some(fragment) = self.computed.full_cover_run_fragment(range.clone()) {
                 record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-                return Self::run_type_tags(fragment, range);
+                return Ok(Self::run_type_tags(fragment, range));
             }
         }
 
         if !self.has_any_in_range(range.clone()) {
-            return Arc::new(base.clone());
+            return Ok(Arc::new(base.clone()));
         }
 
         record_overlay_select_stats(|stats| stats.partial_overlay_builds += 1);
@@ -2947,12 +3001,13 @@ impl<'a> OverlayCascade<'a> {
         Self::apply_type_tag_layer(self.computed, range.clone(), &mut slots);
         Self::apply_type_tag_layer(self.user, range.clone(), &mut slots);
         if !slots.any_present() {
-            return Arc::new(base.clone());
+            return Ok(Arc::new(base.clone()));
         }
 
         let mut mask_b = BooleanBuilder::with_capacity(len);
         let mut values_b = UInt8Builder::with_capacity(len);
         for idx in 0..len {
+            IngestBuilder::check_cancelled(cancel)?;
             mask_b.append_value(slots.present[idx]);
             match slots.values[idx] {
                 Some(value) => values_b.append_value(value),
@@ -2964,13 +3019,13 @@ impl<'a> OverlayCascade<'a> {
         let values = values_b.finish();
         let zipped =
             crate::compute_prelude::zip_select(&mask, &values, base).expect("zip type-tag overlay");
-        Arc::new(
+        Ok(Arc::new(
             zipped
                 .as_any()
                 .downcast_ref::<UInt8Array>()
                 .expect("type-tag overlay zip type")
                 .clone(),
-        )
+        ))
     }
 
     pub(crate) fn select_lowered_text(
@@ -2978,30 +3033,40 @@ impl<'a> OverlayCascade<'a> {
         range: core::ops::Range<usize>,
         base: &StringArray,
     ) -> Arc<StringArray> {
+        self.try_select_lowered_text(range, base, None)
+            .expect("uncancelled overlay selection")
+    }
+
+    pub(crate) fn try_select_lowered_text(
+        &self,
+        range: core::ops::Range<usize>,
+        base: &StringArray,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Arc<StringArray>, ExcelError> {
         if let Some(fragment) = self.user.full_cover_dense_fragment(range.clone()) {
             record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
-            return Self::dense_lowered_text(fragment, range);
+            return Ok(Self::dense_lowered_text(fragment, range));
         }
         if let Some(fragment) = self.user.full_cover_run_fragment(range.clone()) {
             record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-            return Self::run_lowered_text(fragment, range);
+            return Ok(Self::run_lowered_text(fragment, range));
         }
         if !self.user.has_any_in_range(range.clone()) {
             if let Some(fragment) = self.computed.full_cover_dense_fragment(range.clone()) {
                 record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
-                return Self::dense_lowered_text(fragment, range);
+                return Ok(Self::dense_lowered_text(fragment, range));
             }
             if let Some(fragment) = self.computed.full_cover_run_fragment(range.clone()) {
                 record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-                return Self::run_lowered_text(fragment, range);
+                return Ok(Self::run_lowered_text(fragment, range));
             }
         }
 
         if !self.has_any_in_range(range.clone()) {
-            return Arc::new(base.clone());
+            return Ok(Arc::new(base.clone()));
         }
         if self.user.fragments.is_empty() && self.computed.fragments.is_empty() {
-            return self.select_lowered_text_point_scalar(range, base);
+            return self.try_select_lowered_text_point_scalar(range, base, cancel);
         }
 
         record_overlay_select_stats(|stats| stats.partial_overlay_builds += 1);
@@ -3010,12 +3075,13 @@ impl<'a> OverlayCascade<'a> {
         Self::apply_lowered_text_layer(self.computed, range.clone(), &mut slots);
         Self::apply_lowered_text_layer(self.user, range.clone(), &mut slots);
         if !slots.any_present() {
-            return Arc::new(base.clone());
+            return Ok(Arc::new(base.clone()));
         }
 
         let mut mask_b = BooleanBuilder::with_capacity(len);
         let mut values_b = StringBuilder::with_capacity(len, len.saturating_mul(8));
         for idx in 0..len {
+            IngestBuilder::check_cancelled(cancel)?;
             mask_b.append_value(slots.present[idx]);
             match &slots.values[idx] {
                 Some(value) => values_b.append_value(value),
@@ -3027,25 +3093,27 @@ impl<'a> OverlayCascade<'a> {
         let values = values_b.finish();
         let zipped = crate::compute_prelude::zip_select(&mask, &values, base)
             .expect("zip lowered text overlay");
-        Arc::new(
+        Ok(Arc::new(
             zipped
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .expect("lowered text overlay zip type")
                 .clone(),
-        )
+        ))
     }
 
-    fn select_lowered_text_point_scalar(
+    fn try_select_lowered_text_point_scalar(
         &self,
         range: core::ops::Range<usize>,
         base: &StringArray,
-    ) -> Arc<StringArray> {
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Arc<StringArray>, ExcelError> {
         let len = range.end.saturating_sub(range.start);
         let mut mask_b = BooleanBuilder::with_capacity(len);
         let mut values_b = StringBuilder::with_capacity(len, len.saturating_mul(8));
         record_overlay_select_stats(|stats| stats.row_scalar_fallbacks += len);
         for off in range {
+            IngestBuilder::check_cancelled(cancel)?;
             if let Some(value) = self.get_scalar(off) {
                 mask_b.append_value(true);
                 if let Some(s) = value.lowered_text_value() {
@@ -3064,13 +3132,13 @@ impl<'a> OverlayCascade<'a> {
         let values = values_b.finish();
         let zipped = crate::compute_prelude::zip_select(&mask, &values, base)
             .expect("zip lowered text overlay");
-        Arc::new(
+        Ok(Arc::new(
             zipped
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .expect("lowered text overlay zip type")
                 .clone(),
-        )
+        ))
     }
 
     fn dense_numbers(

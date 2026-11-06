@@ -971,7 +971,7 @@ impl<'a> RangeView<'a> {
                 let range = segment.chunk_offset..segment.chunk_offset + segment.row_len;
                 let cascade = arrow_store::OverlayCascade::new(&ch.overlay, &ch.computed_overlay);
                 out_cols.push(if cascade.has_any_in_range(range.clone()) {
-                    cascade.select_numbers(range, &base)
+                    cascade.try_select_numbers(range, &base, self.cancel_token.as_ref())?
                 } else {
                     Arc::new(base)
                 });
@@ -1038,7 +1038,11 @@ impl<'a> RangeView<'a> {
                         .as_any()
                         .downcast_ref::<arrow_array::BooleanArray>()
                         .unwrap();
-                    out_cols.push(cascade.select_booleans(seg_range, base_ba));
+                    out_cols.push(cascade.try_select_booleans(
+                        seg_range,
+                        base_ba,
+                        self.cancel_token.as_ref(),
+                    )?);
                 } else {
                     out_cols.push(base_arc);
                 }
@@ -1096,7 +1100,11 @@ impl<'a> RangeView<'a> {
                         .as_any()
                         .downcast_ref::<arrow_array::StringArray>()
                         .unwrap();
-                    out_cols.push(cascade.select_text(seg_range, base_sa));
+                    out_cols.push(cascade.try_select_text(
+                        seg_range,
+                        base_sa,
+                        self.cancel_token.as_ref(),
+                    )?);
                 } else {
                     out_cols.push(base.clone());
                 }
@@ -1155,7 +1163,11 @@ impl<'a> RangeView<'a> {
 
                 let cascade = arrow_store::OverlayCascade::new(&ch.overlay, &ch.computed_overlay);
                 if cascade.has_any_in_range(seg_range.clone()) {
-                    out_cols.push(cascade.select_lowered_text(seg_range, base_sa));
+                    out_cols.push(cascade.try_select_lowered_text(
+                        seg_range,
+                        base_sa,
+                        self.cancel_token.as_ref(),
+                    )?);
                 } else {
                     out_cols.push(Arc::new(base_sa.clone()));
                 }
@@ -1202,7 +1214,7 @@ impl<'a> RangeView<'a> {
                 let range = segment.chunk_offset..segment.chunk_offset + segment.row_len;
                 let cascade = arrow_store::OverlayCascade::new(&ch.overlay, &ch.computed_overlay);
                 out_cols.push(if cascade.has_any_in_range(range.clone()) {
-                    cascade.select_errors(range, &base)
+                    cascade.try_select_errors(range, &base, self.cancel_token.as_ref())?
                 } else {
                     Arc::new(base)
                 });
@@ -1263,7 +1275,11 @@ impl<'a> RangeView<'a> {
                         .as_any()
                         .downcast_ref::<arrow_array::UInt8Array>()
                         .unwrap();
-                    out_cols.push(cascade.select_type_tags(seg_range, base_ta));
+                    out_cols.push(cascade.try_select_type_tags(
+                        seg_range,
+                        base_ta,
+                        self.cancel_token.as_ref(),
+                    )?);
                 } else {
                     out_cols.push(base_arc);
                 }
