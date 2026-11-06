@@ -27924,7 +27924,7 @@ impl ShimSpillManager {
         mut value_probe: F,
     ) -> Result<(), ExcelError>
     where
-        F: FnMut(&DependencyGraph, &CellRef) -> Option<LiteralValue>,
+        F: FnMut(&DependencyGraph, &CellRef) -> Result<Option<LiteralValue>, ExcelError>,
     {
         use formualizer_common::{ExcelErrorExtra, ExcelErrorKind};
 
@@ -28001,7 +28001,14 @@ impl ShimSpillManager {
                     }
                 }
 
-                if let Some(v) = value_probe(graph, cell)
+                let value = match value_probe(graph, cell) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.release_owner(anchor_vertex);
+                        return Err(error);
+                    }
+                };
+                if let Some(v) = value
                     && !matches!(v, LiteralValue::Empty)
                 {
                     if let Some(id) = self.active_locks.remove(&anchor_vertex) {
@@ -31388,27 +31395,34 @@ where
         // Commit via shim (releases locks). When the graph value cache is disabled (Arrow-canonical
         // values), plan/commit must consult Arrow storage to detect non-empty value blockers.
         let arrow_sheets = &self.arrow_sheets;
+        let cancel = match (cancellable, self.active_cancel_flag.as_ref()) {
+            (true, Some(cancel)) => Some(cancel),
+            _ => None,
+        };
         self.spill_mgr.commit_array_with_value_probe(
             &mut self.graph,
             anchor_vertex,
             targets,
             commit_rows.unwrap_or_else(|| rows.clone()),
             overwritable_formulas,
-            match (cancellable, self.active_cancel_flag.as_ref()) {
-                (true, Some(cancel)) => Some(cancel),
-                _ => None,
-            },
+            cancel,
             |g, cell| {
                 let sheet_name = g.sheet_name(cell.sheet_id);
-                let asheet = arrow_sheets.sheet(sheet_name)?;
+                let Some(asheet) = arrow_sheets.sheet(sheet_name) else {
+                    return Ok(None);
+                };
                 let r0 = cell.coord.row() as usize;
                 let c0 = cell.coord.col() as usize;
-                let v = asheet.get_cell_value(r0, c0);
-                if matches!(v, LiteralValue::Empty) {
+                let v = if let Some(cancel) = cancel {
+                    asheet.try_get_cell_value(r0, c0, Some(cancel))?
+                } else {
+                    asheet.get_cell_value(r0, c0)
+                };
+                Ok(if matches!(v, LiteralValue::Empty) {
                     None
                 } else {
                     Some(v)
-                }
+                })
             },
         )?;
 
