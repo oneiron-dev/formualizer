@@ -3376,6 +3376,21 @@ impl DependencyGraph {
         target_cells: &[CellRef],
         overwritable_formulas: Option<&rustc_hash::FxHashSet<VertexId>>,
     ) -> Result<(), ExcelError> {
+        self.try_plan_spill_region_allowing_formula_overwrite(
+            anchor,
+            target_cells,
+            overwritable_formulas,
+            None,
+        )
+    }
+
+    pub(crate) fn try_plan_spill_region_allowing_formula_overwrite(
+        &self,
+        anchor: VertexId,
+        target_cells: &[CellRef],
+        overwritable_formulas: Option<&rustc_hash::FxHashSet<VertexId>>,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<(), ExcelError> {
         use formualizer_common::{ExcelErrorExtra, ExcelErrorKind};
         // Compute expected spill shape from the target rectangle for better diagnostics
         let (expected_rows, expected_cols) = if target_cells.is_empty() {
@@ -3386,6 +3401,9 @@ impl DependencyGraph {
             let mut min_c = u32::MAX;
             let mut max_c = 0u32;
             for cell in target_cells {
+                if cancel.is_some_and(crate::engine::CancelToken::is_cancelled) {
+                    return Err(ExcelError::new(ExcelErrorKind::Cancelled));
+                }
                 let r = cell.coord.row();
                 let c = cell.coord.col();
                 if r < min_r {
@@ -3408,6 +3426,9 @@ impl DependencyGraph {
         };
         // Allow overlapping with previously owned spill cells by this anchor
         for cell in target_cells {
+            if cancel.is_some_and(crate::engine::CancelToken::is_cancelled) {
+                return Err(ExcelError::new(ExcelErrorKind::Cancelled));
+            }
             // If cell is already owned by this anchor's previous spill, it's allowed.
             let owned_by_anchor = match self.spill_cell_to_anchor.get(cell) {
                 Some(&existing_anchor) if existing_anchor == anchor => true,
@@ -3448,8 +3469,13 @@ impl DependencyGraph {
                     _ => {
                         // If a non-empty value exists (and not this anchor), block
                         if let Some(vref) = self.vertex_values.get(&vid) {
-                            let v = self.data_store.retrieve_value(*vref);
-                            if !matches!(v, LiteralValue::Empty) {
+                            let empty = if cancel.is_some() {
+                                matches!(vref.value_type(), super::arena::ValueType::Empty)
+                            } else {
+                                let v = self.data_store.retrieve_value(*vref);
+                                matches!(v, LiteralValue::Empty)
+                            };
+                            if !empty {
                                 return Err(ExcelError::new(ExcelErrorKind::Spill)
                                     .with_message("BlockedByValue")
                                     .with_extra(ExcelErrorExtra::Spill {

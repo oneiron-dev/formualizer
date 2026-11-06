@@ -27931,11 +27931,20 @@ impl ShimSpillManager {
         // Re-run plan on concrete targets before committing to respect blockers.
         // This plan checks formula/spill ownership in the graph, but when the graph value cache
         // is disabled (Arrow-canonical mode), it cannot see non-empty value blockers.
-        let plan_res = graph.plan_spill_region_allowing_formula_overwrite(
-            anchor_vertex,
-            targets,
-            overwritable_formulas,
-        );
+        let plan_res = if let Some(cancel) = cancel {
+            graph.try_plan_spill_region_allowing_formula_overwrite(
+                anchor_vertex,
+                targets,
+                overwritable_formulas,
+                Some(cancel),
+            )
+        } else {
+            graph.plan_spill_region_allowing_formula_overwrite(
+                anchor_vertex,
+                targets,
+                overwritable_formulas,
+            )
+        };
         if let Err(e) = plan_res {
             if let Some(id) = self.active_locks.remove(&anchor_vertex) {
                 self.region_locks.release(id);
@@ -31382,6 +31391,9 @@ where
                     first.coord.col(),
                 );
                 for cell in cells {
+                    if let (true, Some(cancel)) = (cancellable, self.active_cancel_flag.as_ref()) {
+                        cancellation_checkpoint(Some(cancel))?;
+                    }
                     r1 = r1.min(cell.coord.row());
                     c1 = c1.min(cell.coord.col());
                     r2 = r2.max(cell.coord.row());
