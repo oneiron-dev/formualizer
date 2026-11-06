@@ -3220,6 +3220,29 @@ fn cancellation_checkpoint(cancel: Option<&crate::engine::CancelToken>) -> Resul
     }
 }
 
+fn literal_values_equal_cancellable(
+    left: &LiteralValue,
+    right: &LiteralValue,
+    cancel: Option<&crate::engine::CancelToken>,
+) -> Result<bool, ExcelError> {
+    if let (LiteralValue::Text(left), LiteralValue::Text(right), Some(cancel)) =
+        (left, right, cancel)
+    {
+        if left.len() != right.len() {
+            return Ok(false);
+        }
+        for (left, right) in left.bytes().zip(right.bytes()) {
+            cancellation_checkpoint(Some(cancel))?;
+            if left != right {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    } else {
+        Ok(left == right)
+    }
+}
+
 fn compute_criteria_mask(
     view: &RangeView<'_>,
     col_in_view: usize,
@@ -31684,7 +31707,8 @@ where
                         self.active_cancel_flag.as_ref(),
                     )?
                     .unwrap_or(LiteralValue::Empty);
-                if old != *value {
+                if !literal_values_equal_cancellable(&old, value, self.active_cancel_flag.as_ref())?
+                {
                     d.record_cell(cell.sheet_id, cell.coord.row(), cell.coord.col());
                 }
             }
