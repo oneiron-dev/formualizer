@@ -2737,7 +2737,7 @@ impl<'a> OverlayCascade<'a> {
             .try_full_cover_run_fragment(range.clone(), cancel)?
         {
             record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-            return Ok(Self::run_numbers(fragment, range));
+            return Self::try_run_numbers(fragment, range, cancel);
         }
         if !self.user.try_has_any_in_range(range.clone(), cancel)? {
             if let Some(fragment) = self
@@ -2752,7 +2752,7 @@ impl<'a> OverlayCascade<'a> {
                 .try_full_cover_run_fragment(range.clone(), cancel)?
             {
                 record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-                return Ok(Self::run_numbers(fragment, range));
+                return Self::try_run_numbers(fragment, range, cancel);
             }
         }
 
@@ -2820,7 +2820,7 @@ impl<'a> OverlayCascade<'a> {
             .try_full_cover_run_fragment(range.clone(), cancel)?
         {
             record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-            return Ok(Self::run_booleans(fragment, range));
+            return Self::try_run_booleans(fragment, range, cancel);
         }
         if !self.user.try_has_any_in_range(range.clone(), cancel)? {
             if let Some(fragment) = self
@@ -2835,7 +2835,7 @@ impl<'a> OverlayCascade<'a> {
                 .try_full_cover_run_fragment(range.clone(), cancel)?
             {
                 record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-                return Ok(Self::run_booleans(fragment, range));
+                return Self::try_run_booleans(fragment, range, cancel);
             }
         }
 
@@ -2903,7 +2903,7 @@ impl<'a> OverlayCascade<'a> {
             .try_full_cover_run_fragment(range.clone(), cancel)?
         {
             record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-            return Ok(Self::run_text(fragment, range));
+            return Self::try_run_text(fragment, range, cancel);
         }
         if !self.user.try_has_any_in_range(range.clone(), cancel)? {
             if let Some(fragment) = self
@@ -2918,7 +2918,7 @@ impl<'a> OverlayCascade<'a> {
                 .try_full_cover_run_fragment(range.clone(), cancel)?
             {
                 record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-                return Ok(Self::run_text(fragment, range));
+                return Self::try_run_text(fragment, range, cancel);
             }
         }
 
@@ -2978,7 +2978,7 @@ impl<'a> OverlayCascade<'a> {
             .try_full_cover_run_fragment(range.clone(), cancel)?
         {
             record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-            return Ok(Self::run_errors(fragment, range));
+            return Self::try_run_errors(fragment, range, cancel);
         }
         if !self.user.try_has_any_in_range(range.clone(), cancel)? {
             if let Some(fragment) = self
@@ -2993,7 +2993,7 @@ impl<'a> OverlayCascade<'a> {
                 .try_full_cover_run_fragment(range.clone(), cancel)?
             {
                 record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-                return Ok(Self::run_errors(fragment, range));
+                return Self::try_run_errors(fragment, range, cancel);
             }
         }
 
@@ -3061,7 +3061,7 @@ impl<'a> OverlayCascade<'a> {
             .try_full_cover_run_fragment(range.clone(), cancel)?
         {
             record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-            return Ok(Self::run_type_tags(fragment, range));
+            return Self::try_run_type_tags(fragment, range, cancel);
         }
         if !self.user.try_has_any_in_range(range.clone(), cancel)? {
             if let Some(fragment) = self
@@ -3076,7 +3076,7 @@ impl<'a> OverlayCascade<'a> {
                 .try_full_cover_run_fragment(range.clone(), cancel)?
             {
                 record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-                return Ok(Self::run_type_tags(fragment, range));
+                return Self::try_run_type_tags(fragment, range, cancel);
             }
         }
 
@@ -3144,7 +3144,7 @@ impl<'a> OverlayCascade<'a> {
             .try_full_cover_run_fragment(range.clone(), cancel)?
         {
             record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-            return Ok(Self::run_lowered_text(fragment, range));
+            return Self::try_run_lowered_text(fragment, range, cancel);
         }
         if !self.user.try_has_any_in_range(range.clone(), cancel)? {
             if let Some(fragment) = self
@@ -3159,7 +3159,7 @@ impl<'a> OverlayCascade<'a> {
                 .try_full_cover_run_fragment(range.clone(), cancel)?
             {
                 record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
-                return Ok(Self::run_lowered_text(fragment, range));
+                return Self::try_run_lowered_text(fragment, range, cancel);
             }
         }
 
@@ -3295,114 +3295,173 @@ impl<'a> OverlayCascade<'a> {
         (rel_start, range.end.saturating_sub(range.start), payload)
     }
 
-    fn run_numbers(
+    fn try_run_numbers(
         fragment: &OverlayFragment,
         range: core::ops::Range<usize>,
-    ) -> Arc<Float64Array> {
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Arc<Float64Array>, ExcelError> {
         let mut b = Float64Builder::with_capacity(range.end.saturating_sub(range.start));
-        Self::for_each_run_payload_index(fragment, range, |payload, run_idx, repeat| {
-            if let Some(value) = payload.number_at(run_idx) {
-                for _ in 0..repeat {
-                    b.append_value(value);
+        Self::try_for_each_run_payload_index(
+            fragment,
+            range,
+            cancel,
+            |payload, run_idx, repeat| {
+                if let Some(value) = payload.number_at(run_idx) {
+                    for _ in 0..repeat {
+                        IngestBuilder::check_cancelled(cancel)?;
+                        b.append_value(value);
+                    }
+                } else {
+                    for _ in 0..repeat {
+                        IngestBuilder::check_cancelled(cancel)?;
+                        b.append_null();
+                    }
                 }
-            } else {
-                for _ in 0..repeat {
-                    b.append_null();
-                }
-            }
-        });
-        Arc::new(b.finish())
+                Ok(())
+            },
+        )?;
+        Ok(Arc::new(b.finish()))
     }
 
-    fn run_booleans(
+    fn try_run_booleans(
         fragment: &OverlayFragment,
         range: core::ops::Range<usize>,
-    ) -> Arc<BooleanArray> {
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Arc<BooleanArray>, ExcelError> {
         let mut b = BooleanBuilder::with_capacity(range.end.saturating_sub(range.start));
-        Self::for_each_run_payload_index(fragment, range, |payload, run_idx, repeat| {
-            if let Some(value) = payload.boolean_at(run_idx) {
-                for _ in 0..repeat {
-                    b.append_value(value);
+        Self::try_for_each_run_payload_index(
+            fragment,
+            range,
+            cancel,
+            |payload, run_idx, repeat| {
+                if let Some(value) = payload.boolean_at(run_idx) {
+                    for _ in 0..repeat {
+                        IngestBuilder::check_cancelled(cancel)?;
+                        b.append_value(value);
+                    }
+                } else {
+                    for _ in 0..repeat {
+                        IngestBuilder::check_cancelled(cancel)?;
+                        b.append_null();
+                    }
                 }
-            } else {
-                for _ in 0..repeat {
-                    b.append_null();
-                }
-            }
-        });
-        Arc::new(b.finish())
+                Ok(())
+            },
+        )?;
+        Ok(Arc::new(b.finish()))
     }
 
-    fn run_text(fragment: &OverlayFragment, range: core::ops::Range<usize>) -> ArrayRef {
+    fn try_run_text(
+        fragment: &OverlayFragment,
+        range: core::ops::Range<usize>,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<ArrayRef, ExcelError> {
         let mut b = StringBuilder::with_capacity(
             range.end.saturating_sub(range.start),
             range.end.saturating_sub(range.start).saturating_mul(8),
         );
-        Self::for_each_run_payload_index(fragment, range, |payload, run_idx, repeat| {
-            if let Some(value) = payload.text_at(run_idx) {
-                for _ in 0..repeat {
-                    b.append_value(value);
+        Self::try_for_each_run_payload_index(
+            fragment,
+            range,
+            cancel,
+            |payload, run_idx, repeat| {
+                if let Some(value) = payload.text_at(run_idx) {
+                    for _ in 0..repeat {
+                        IngestBuilder::check_cancelled(cancel)?;
+                        b.append_value(value);
+                    }
+                } else {
+                    for _ in 0..repeat {
+                        IngestBuilder::check_cancelled(cancel)?;
+                        b.append_null();
+                    }
                 }
-            } else {
-                for _ in 0..repeat {
-                    b.append_null();
-                }
-            }
-        });
-        Arc::new(b.finish()) as ArrayRef
+                Ok(())
+            },
+        )?;
+        Ok(Arc::new(b.finish()) as ArrayRef)
     }
 
-    fn run_errors(fragment: &OverlayFragment, range: core::ops::Range<usize>) -> Arc<UInt8Array> {
-        let mut b = UInt8Builder::with_capacity(range.end.saturating_sub(range.start));
-        Self::for_each_run_payload_index(fragment, range, |payload, run_idx, repeat| {
-            if let Some(value) = payload.error_at(run_idx) {
-                for _ in 0..repeat {
-                    b.append_value(value);
-                }
-            } else {
-                for _ in 0..repeat {
-                    b.append_null();
-                }
-            }
-        });
-        Arc::new(b.finish())
-    }
-
-    fn run_type_tags(
+    fn try_run_errors(
         fragment: &OverlayFragment,
         range: core::ops::Range<usize>,
-    ) -> Arc<UInt8Array> {
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Arc<UInt8Array>, ExcelError> {
         let mut b = UInt8Builder::with_capacity(range.end.saturating_sub(range.start));
-        Self::for_each_run_payload_index(fragment, range, |payload, run_idx, repeat| {
-            let tag = payload.type_tag_at(run_idx).unwrap_or(TypeTag::Empty) as u8;
-            for _ in 0..repeat {
-                b.append_value(tag);
-            }
-        });
-        Arc::new(b.finish())
+        Self::try_for_each_run_payload_index(
+            fragment,
+            range,
+            cancel,
+            |payload, run_idx, repeat| {
+                if let Some(value) = payload.error_at(run_idx) {
+                    for _ in 0..repeat {
+                        IngestBuilder::check_cancelled(cancel)?;
+                        b.append_value(value);
+                    }
+                } else {
+                    for _ in 0..repeat {
+                        IngestBuilder::check_cancelled(cancel)?;
+                        b.append_null();
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        Ok(Arc::new(b.finish()))
     }
 
-    fn run_lowered_text(
+    fn try_run_type_tags(
         fragment: &OverlayFragment,
         range: core::ops::Range<usize>,
-    ) -> Arc<StringArray> {
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Arc<UInt8Array>, ExcelError> {
+        let mut b = UInt8Builder::with_capacity(range.end.saturating_sub(range.start));
+        Self::try_for_each_run_payload_index(
+            fragment,
+            range,
+            cancel,
+            |payload, run_idx, repeat| {
+                let tag = payload.type_tag_at(run_idx).unwrap_or(TypeTag::Empty) as u8;
+                for _ in 0..repeat {
+                    IngestBuilder::check_cancelled(cancel)?;
+                    b.append_value(tag);
+                }
+                Ok(())
+            },
+        )?;
+        Ok(Arc::new(b.finish()))
+    }
+
+    fn try_run_lowered_text(
+        fragment: &OverlayFragment,
+        range: core::ops::Range<usize>,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Arc<StringArray>, ExcelError> {
         let mut b = StringBuilder::with_capacity(
             range.end.saturating_sub(range.start),
             range.end.saturating_sub(range.start).saturating_mul(8),
         );
-        Self::for_each_run_payload_index(fragment, range, |payload, run_idx, repeat| {
-            let value = Self::payload_lowered_text_at(payload, run_idx);
-            if let Some(value) = value {
-                for _ in 0..repeat {
-                    b.append_value(&value);
+        Self::try_for_each_run_payload_index(
+            fragment,
+            range,
+            cancel,
+            |payload, run_idx, repeat| {
+                let value = Self::payload_lowered_text_at(payload, run_idx);
+                if let Some(value) = value {
+                    for _ in 0..repeat {
+                        IngestBuilder::check_cancelled(cancel)?;
+                        b.append_value(&value);
+                    }
+                } else {
+                    for _ in 0..repeat {
+                        IngestBuilder::check_cancelled(cancel)?;
+                        b.append_null();
+                    }
                 }
-            } else {
-                for _ in 0..repeat {
-                    b.append_null();
-                }
-            }
-        });
-        Arc::new(b.finish())
+                Ok(())
+            },
+        )?;
+        Ok(Arc::new(b.finish()))
     }
 
     fn payload_numbers_slice(
@@ -3766,11 +3825,12 @@ impl<'a> OverlayCascade<'a> {
         Ok(())
     }
 
-    fn for_each_run_payload_index(
+    fn try_for_each_run_payload_index(
         fragment: &OverlayFragment,
         range: core::ops::Range<usize>,
-        mut f: impl FnMut(&OverlayFragmentPayload, usize, usize),
-    ) {
+        cancel: Option<&crate::engine::CancelToken>,
+        mut f: impl FnMut(&OverlayFragmentPayload, usize, usize) -> Result<(), ExcelError>,
+    ) -> Result<(), ExcelError> {
         let OverlayFragment::RunRange {
             start,
             len,
@@ -3785,22 +3845,24 @@ impl<'a> OverlayCascade<'a> {
         let inter_start = frag_start.max(range.start);
         let inter_end = frag_end.min(range.end);
         if inter_start >= inter_end {
-            return;
+            return Ok(());
         }
         let mut prev_end = 0usize;
         for (run_idx, run_end) in run_ends.iter().enumerate() {
+            IngestBuilder::check_cancelled(cancel)?;
             let run_start_abs = frag_start.saturating_add(prev_end);
             let run_end_abs = frag_start.saturating_add(*run_end as usize);
             let start_abs = run_start_abs.max(inter_start);
             let end_abs = run_end_abs.min(inter_end);
             if start_abs < end_abs {
-                f(payload, run_idx, end_abs - start_abs);
+                f(payload, run_idx, end_abs - start_abs)?;
             }
             prev_end = *run_end as usize;
             if run_end_abs >= inter_end {
                 break;
             }
         }
+        Ok(())
     }
 }
 
