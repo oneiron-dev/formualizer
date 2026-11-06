@@ -3235,6 +3235,34 @@ fn copy_spill_cells_cancellable(
     Ok(copied)
 }
 
+fn copy_spill_values_cancellable(
+    values: &[Vec<LiteralValue>],
+    cancel: Option<&crate::engine::CancelToken>,
+) -> Result<Vec<Vec<LiteralValue>>, ExcelError> {
+    let Some(cancel) = cancel else {
+        return Ok(values.to_vec());
+    };
+    let mut copied = Vec::with_capacity(values.len());
+    for row in values {
+        cancellation_checkpoint(Some(cancel))?;
+        let mut copied_row = Vec::with_capacity(row.len());
+        for value in row {
+            cancellation_checkpoint(Some(cancel))?;
+            copied_row.push(match value {
+                LiteralValue::Text(text) => LiteralValue::Text(
+                    crate::arrow_store::ingest::IngestBuilder::copy_text_cancellable(
+                        text,
+                        Some(cancel),
+                    )?,
+                ),
+                _ => value.clone(),
+            });
+        }
+        copied.push(copied_row);
+    }
+    Ok(copied)
+}
+
 fn literal_values_equal_cancellable(
     left: &LiteralValue,
     right: &LiteralValue,
@@ -31684,10 +31712,15 @@ where
                 target_cells,
                 values,
             } => {
+                let values = if self.active_cancel_flag.is_some() {
+                    std::borrow::Cow::Borrowed(values.as_slice())
+                } else {
+                    std::borrow::Cow::Owned(values.clone())
+                };
                 self.apply_spill_commit(
                     *anchor_vertex,
                     target_cells,
-                    values.clone(),
+                    values,
                     delta,
                     log,
                     computed_writes,
@@ -31839,7 +31872,7 @@ where
         &mut self,
         anchor_vertex: VertexId,
         target_cells: &[CellRef],
-        values: Vec<Vec<LiteralValue>>,
+        values: std::borrow::Cow<'_, [Vec<LiteralValue>]>,
         delta: Option<&mut DeltaCollector>,
         log: Option<&mut ChangeLog>,
         computed_writes: Option<&mut ComputedWriteBuffer>,
@@ -31856,11 +31889,19 @@ where
             None
         };
 
+        let values = match values {
+            std::borrow::Cow::Borrowed(values) => {
+                copy_spill_values_cancellable(values, self.active_cancel_flag.as_ref())?
+            }
+            std::borrow::Cow::Owned(values) => values,
+        };
+        let rows = copy_spill_values_cancellable(&values, self.active_cancel_flag.as_ref())?;
+
         // Delegate to existing commit_spill_and_mirror for delta + overlay logic.
         self.commit_spill_and_mirror(
             anchor_vertex,
             target_cells,
-            values.clone(),
+            rows,
             delta,
             None, // overwritable_formulas already validated in plan phase
         )?;
