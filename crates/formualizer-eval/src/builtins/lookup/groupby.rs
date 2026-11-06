@@ -43,6 +43,19 @@ fn blank() -> LiteralValue {
     LiteralValue::Text(String::new())
 }
 
+fn clone_values(
+    values: &[LiteralValue],
+    cancel: Option<&CancelToken>,
+) -> Result<Vec<LiteralValue>, GroupFailure> {
+    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+    let mut copied = Vec::with_capacity(values.len());
+    for value in values {
+        cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+        copied.push(value.clone());
+    }
+    Ok(copied)
+}
+
 fn grid_arg(
     arg: &ArgumentHandle<'_, '_>,
     cancel: Option<&CancelToken>,
@@ -66,7 +79,7 @@ fn grid_arg(
             row.push(view.get_cell(r, c));
         }
         cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
-        rows.push(row.to_vec());
+        rows.push(clone_values(&row, cancel)?);
     }
     Ok(rows)
 }
@@ -234,7 +247,7 @@ fn distinct_keys(
         let next = distinct.len();
         let k = *index.entry(id).or_insert(next);
         if k == next {
-            distinct.push(key.clone());
+            distinct.push(clone_values(key, cancel)?);
         }
         of_row.push(k);
     }
@@ -275,8 +288,18 @@ fn order_keys(
     cancel: Option<&CancelToken>,
 ) -> Result<Vec<usize>, GroupFailure> {
     cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
-    let mut order: Vec<usize> = (0..distinct.len()).collect();
-    let default: Vec<i64> = (1..=columns as i64).collect();
+    let mut order: Vec<usize> = (0..distinct.len())
+        .map(|key| {
+            cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+            Ok(key)
+        })
+        .collect::<Result<Vec<_>, GroupFailure>>()?;
+    let default: Vec<i64> = (1..=columns as i64)
+        .map(|column| {
+            cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+            Ok(column)
+        })
+        .collect::<Result<Vec<_>, GroupFailure>>()?;
     let spec = spec.unwrap_or(&default);
     order.sort_by(|&a, &b| {
         for &s in spec {
@@ -298,7 +321,12 @@ fn order_keys(
     if columns > 1 {
         // Keep each parent group contiguous, in order of first appearance.
         let position: Vec<usize> = {
-            let mut p = vec![0; distinct.len()];
+            let mut p: Vec<usize> = (0..distinct.len())
+                .map(|_| {
+                    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                    Ok(0)
+                })
+                .collect::<Result<Vec<_>, GroupFailure>>()?;
             for (i, &k) in order.iter().enumerate() {
                 cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
                 p[k] = i;
@@ -385,7 +413,13 @@ fn axis_entries(
                     })
                 })
                 .collect::<Result<Vec<_>, GroupFailure>>()?,
-            keys: order.to_vec(),
+            keys: order
+                .iter()
+                .map(|&key| {
+                    cancellation_checkpoint(cancel).map_err(GroupFailure::Native)?;
+                    Ok(key)
+                })
+                .collect::<Result<Vec<_>, GroupFailure>>()?,
         })
     };
     let mut entries = Vec::new();
