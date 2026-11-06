@@ -3137,7 +3137,7 @@ impl<'a> OverlayCascade<'a> {
             .try_full_cover_dense_fragment(range.clone(), cancel)?
         {
             record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
-            return Ok(Self::dense_lowered_text(fragment, range));
+            return Self::try_dense_lowered_text(fragment, range, cancel);
         }
         if let Some(fragment) = self
             .user
@@ -3152,7 +3152,7 @@ impl<'a> OverlayCascade<'a> {
                 .try_full_cover_dense_fragment(range.clone(), cancel)?
             {
                 record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
-                return Ok(Self::dense_lowered_text(fragment, range));
+                return Self::try_dense_lowered_text(fragment, range, cancel);
             }
             if let Some(fragment) = self
                 .computed
@@ -3276,12 +3276,13 @@ impl<'a> OverlayCascade<'a> {
         Self::payload_type_tags_slice(payload, rel_start, len)
     }
 
-    fn dense_lowered_text(
+    fn try_dense_lowered_text(
         fragment: &OverlayFragment,
         range: core::ops::Range<usize>,
-    ) -> Arc<StringArray> {
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Arc<StringArray>, ExcelError> {
         let (rel_start, len, payload) = Self::dense_payload_window(fragment, range);
-        Self::payload_lowered_text_materialize(payload, rel_start, len)
+        Self::try_payload_lowered_text_materialize(payload, rel_start, len, cancel)
     }
 
     fn dense_payload_window(
@@ -3544,20 +3545,22 @@ impl<'a> OverlayCascade<'a> {
         )
     }
 
-    fn payload_lowered_text_materialize(
+    fn try_payload_lowered_text_materialize(
         payload: &OverlayFragmentPayload,
         start: usize,
         len: usize,
-    ) -> Arc<StringArray> {
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Arc<StringArray>, ExcelError> {
         let mut b = StringBuilder::with_capacity(len, len.saturating_mul(8));
         for idx in start..start.saturating_add(len) {
+            IngestBuilder::check_cancelled(cancel)?;
             if let Some(value) = Self::payload_lowered_text_at(payload, idx) {
                 b.append_value(&value);
             } else {
                 b.append_null();
             }
         }
-        Arc::new(b.finish())
+        Ok(Arc::new(b.finish()))
     }
 
     fn payload_lowered_text_at(payload: &OverlayFragmentPayload, idx: usize) -> Option<String> {
