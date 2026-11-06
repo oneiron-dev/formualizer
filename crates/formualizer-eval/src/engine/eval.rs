@@ -31884,7 +31884,11 @@ where
 
         // Snapshot for ChangeLog before commit.
         let old_snapshot = if log.is_some() {
-            self.snapshot_spill_for_anchor(anchor_vertex)
+            if let Some(cancel) = self.active_cancel_flag.as_ref() {
+                self.try_snapshot_spill_for_anchor(anchor_vertex, Some(cancel))?
+            } else {
+                self.snapshot_spill_for_anchor(anchor_vertex)
+            }
         } else {
             None
         };
