@@ -3504,6 +3504,23 @@ impl DependencyGraph {
         values: Vec<Vec<LiteralValue>>,
         fault_after_ops: Option<usize>,
     ) -> Result<(), ExcelError> {
+        self.try_commit_spill_region_atomic_with_fault(
+            anchor,
+            target_cells,
+            values,
+            fault_after_ops,
+            None,
+        )
+    }
+
+    pub(crate) fn try_commit_spill_region_atomic_with_fault(
+        &mut self,
+        anchor: VertexId,
+        target_cells: Vec<CellRef>,
+        values: Vec<Vec<LiteralValue>>,
+        fault_after_ops: Option<usize>,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<(), ExcelError> {
         let budgets = self.self_admission_budgets();
         if crate::engine::resource_ledger::graph_admission_enabled(&budgets) {
             let admission = self.preview_spill_materialization(&target_cells)?;
@@ -3522,17 +3539,44 @@ impl DependencyGraph {
         let anchor_col = anchor_cell.coord.col();
 
         // Capture previous owned cells for this anchor
-        let prev_cells = self
-            .spill_anchor_to_cells
-            .get(&anchor)
-            .cloned()
-            .unwrap_or_default();
+        let prev_cells = if let Some(cancel) = cancel {
+            self.spill_anchor_to_cells
+                .get(&anchor)
+                .map(|cells| crate::engine::eval::copy_spill_cells_cancellable(cells, Some(cancel)))
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            self.spill_anchor_to_cells
+                .get(&anchor)
+                .cloned()
+                .unwrap_or_default()
+        };
         // Use CoordBuildHasher on CellRef keys to avoid FxHasher clustering on
         // packed Coord values.
-        let new_set: std::collections::HashSet<CellRef, CoordBuildHasher> =
-            target_cells.iter().copied().collect();
-        let prev_set: std::collections::HashSet<CellRef, CoordBuildHasher> =
-            prev_cells.iter().copied().collect();
+        let collect_cell_set = |cells: &[CellRef],
+                                cancel: &crate::engine::CancelToken|
+         -> Result<
+            std::collections::HashSet<CellRef, CoordBuildHasher>,
+            ExcelError,
+        > {
+            let mut set =
+                std::collections::HashSet::with_capacity_and_hasher(cells.len(), CoordBuildHasher);
+            for cell in cells {
+                if cancel.is_cancelled() {
+                    return Err(ExcelError::new(ExcelErrorKind::Cancelled));
+                }
+                set.insert(*cell);
+            }
+            Ok(set)
+        };
+        let new_set: std::collections::HashSet<CellRef, CoordBuildHasher> = match cancel {
+            Some(cancel) => collect_cell_set(&target_cells, cancel)?,
+            None => target_cells.iter().copied().collect(),
+        };
+        let prev_set: std::collections::HashSet<CellRef, CoordBuildHasher> = match cancel {
+            Some(cancel) => collect_cell_set(&prev_cells, cancel)?,
+            None => prev_cells.iter().copied().collect(),
+        };
 
         // Compose operation list: clears first (prev - new), then writes for new rectangle
         #[derive(Clone)]

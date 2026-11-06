@@ -3220,7 +3220,7 @@ fn cancellation_checkpoint(cancel: Option<&crate::engine::CancelToken>) -> Resul
     }
 }
 
-fn copy_spill_cells_cancellable(
+pub(crate) fn copy_spill_cells_cancellable(
     cells: &[CellRef],
     cancel: Option<&crate::engine::CancelToken>,
 ) -> Result<Vec<CellRef>, ExcelError> {
@@ -28035,7 +28035,17 @@ impl ShimSpillManager {
 
         let commit_res = match copy_spill_cells_cancellable(targets, cancel) {
             Ok(targets) => {
-                graph.commit_spill_region_atomic_with_fault(anchor_vertex, targets, rows, None)
+                if let Some(cancel) = cancel {
+                    graph.try_commit_spill_region_atomic_with_fault(
+                        anchor_vertex,
+                        targets,
+                        rows,
+                        None,
+                        Some(cancel),
+                    )
+                } else {
+                    graph.commit_spill_region_atomic_with_fault(anchor_vertex, targets, rows, None)
+                }
             }
             Err(error) => Err(error),
         };
