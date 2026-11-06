@@ -2460,11 +2460,28 @@ impl Overlay {
 
     #[inline]
     pub(crate) fn has_any_in_range(&self, range: core::ops::Range<usize>) -> bool {
-        self.points.keys().any(|k| range.contains(k))
-            || self
-                .fragments
-                .iter()
-                .any(|fragment| fragment.has_any_in_range(range.clone()))
+        self.try_has_any_in_range(range, None)
+            .expect("uncancelled overlay discovery")
+    }
+
+    fn try_has_any_in_range(
+        &self,
+        range: core::ops::Range<usize>,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<bool, ExcelError> {
+        for key in self.points.keys() {
+            IngestBuilder::check_cancelled(cancel)?;
+            if range.contains(key) {
+                return Ok(true);
+            }
+        }
+        for fragment in &self.fragments {
+            IngestBuilder::check_cancelled(cancel)?;
+            if fragment.has_any_in_range(range.clone()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     #[inline]
@@ -2678,7 +2695,19 @@ impl<'a> OverlayCascade<'a> {
 
     #[inline]
     pub(crate) fn has_any_in_range(&self, range: core::ops::Range<usize>) -> bool {
-        self.user.has_any_in_range(range.clone()) || self.computed.has_any_in_range(range)
+        self.try_has_any_in_range(range, None)
+            .expect("uncancelled overlay discovery")
+    }
+
+    pub(crate) fn try_has_any_in_range(
+        &self,
+        range: core::ops::Range<usize>,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<bool, ExcelError> {
+        if self.user.try_has_any_in_range(range.clone(), cancel)? {
+            return Ok(true);
+        }
+        self.computed.try_has_any_in_range(range, cancel)
     }
 
     pub(crate) fn select_numbers(
@@ -2696,26 +2725,38 @@ impl<'a> OverlayCascade<'a> {
         base: &Float64Array,
         cancel: Option<&crate::engine::CancelToken>,
     ) -> Result<Arc<Float64Array>, ExcelError> {
-        if let Some(fragment) = self.user.full_cover_dense_fragment(range.clone()) {
+        if let Some(fragment) = self
+            .user
+            .try_full_cover_dense_fragment(range.clone(), cancel)?
+        {
             record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
             return Ok(Self::dense_numbers(fragment, range));
         }
-        if let Some(fragment) = self.user.full_cover_run_fragment(range.clone()) {
+        if let Some(fragment) = self
+            .user
+            .try_full_cover_run_fragment(range.clone(), cancel)?
+        {
             record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
             return Ok(Self::run_numbers(fragment, range));
         }
-        if !self.user.has_any_in_range(range.clone()) {
-            if let Some(fragment) = self.computed.full_cover_dense_fragment(range.clone()) {
+        if !self.user.try_has_any_in_range(range.clone(), cancel)? {
+            if let Some(fragment) = self
+                .computed
+                .try_full_cover_dense_fragment(range.clone(), cancel)?
+            {
                 record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
                 return Ok(Self::dense_numbers(fragment, range));
             }
-            if let Some(fragment) = self.computed.full_cover_run_fragment(range.clone()) {
+            if let Some(fragment) = self
+                .computed
+                .try_full_cover_run_fragment(range.clone(), cancel)?
+            {
                 record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
                 return Ok(Self::run_numbers(fragment, range));
             }
         }
 
-        if !self.has_any_in_range(range.clone()) {
+        if !self.try_has_any_in_range(range.clone(), cancel)? {
             return Ok(Arc::new(base.clone()));
         }
 
@@ -2767,26 +2808,38 @@ impl<'a> OverlayCascade<'a> {
         base: &BooleanArray,
         cancel: Option<&crate::engine::CancelToken>,
     ) -> Result<Arc<BooleanArray>, ExcelError> {
-        if let Some(fragment) = self.user.full_cover_dense_fragment(range.clone()) {
+        if let Some(fragment) = self
+            .user
+            .try_full_cover_dense_fragment(range.clone(), cancel)?
+        {
             record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
             return Ok(Self::dense_booleans(fragment, range));
         }
-        if let Some(fragment) = self.user.full_cover_run_fragment(range.clone()) {
+        if let Some(fragment) = self
+            .user
+            .try_full_cover_run_fragment(range.clone(), cancel)?
+        {
             record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
             return Ok(Self::run_booleans(fragment, range));
         }
-        if !self.user.has_any_in_range(range.clone()) {
-            if let Some(fragment) = self.computed.full_cover_dense_fragment(range.clone()) {
+        if !self.user.try_has_any_in_range(range.clone(), cancel)? {
+            if let Some(fragment) = self
+                .computed
+                .try_full_cover_dense_fragment(range.clone(), cancel)?
+            {
                 record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
                 return Ok(Self::dense_booleans(fragment, range));
             }
-            if let Some(fragment) = self.computed.full_cover_run_fragment(range.clone()) {
+            if let Some(fragment) = self
+                .computed
+                .try_full_cover_run_fragment(range.clone(), cancel)?
+            {
                 record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
                 return Ok(Self::run_booleans(fragment, range));
             }
         }
 
-        if !self.has_any_in_range(range.clone()) {
+        if !self.try_has_any_in_range(range.clone(), cancel)? {
             return Ok(Arc::new(base.clone()));
         }
 
@@ -2838,26 +2891,38 @@ impl<'a> OverlayCascade<'a> {
         base: &StringArray,
         cancel: Option<&crate::engine::CancelToken>,
     ) -> Result<ArrayRef, ExcelError> {
-        if let Some(fragment) = self.user.full_cover_dense_fragment(range.clone()) {
+        if let Some(fragment) = self
+            .user
+            .try_full_cover_dense_fragment(range.clone(), cancel)?
+        {
             record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
             return Ok(Self::dense_text(fragment, range));
         }
-        if let Some(fragment) = self.user.full_cover_run_fragment(range.clone()) {
+        if let Some(fragment) = self
+            .user
+            .try_full_cover_run_fragment(range.clone(), cancel)?
+        {
             record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
             return Ok(Self::run_text(fragment, range));
         }
-        if !self.user.has_any_in_range(range.clone()) {
-            if let Some(fragment) = self.computed.full_cover_dense_fragment(range.clone()) {
+        if !self.user.try_has_any_in_range(range.clone(), cancel)? {
+            if let Some(fragment) = self
+                .computed
+                .try_full_cover_dense_fragment(range.clone(), cancel)?
+            {
                 record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
                 return Ok(Self::dense_text(fragment, range));
             }
-            if let Some(fragment) = self.computed.full_cover_run_fragment(range.clone()) {
+            if let Some(fragment) = self
+                .computed
+                .try_full_cover_run_fragment(range.clone(), cancel)?
+            {
                 record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
                 return Ok(Self::run_text(fragment, range));
             }
         }
 
-        if !self.has_any_in_range(range.clone()) {
+        if !self.try_has_any_in_range(range.clone(), cancel)? {
             return Ok(Arc::new(base.clone()) as ArrayRef);
         }
 
@@ -2901,26 +2966,38 @@ impl<'a> OverlayCascade<'a> {
         base: &UInt8Array,
         cancel: Option<&crate::engine::CancelToken>,
     ) -> Result<Arc<UInt8Array>, ExcelError> {
-        if let Some(fragment) = self.user.full_cover_dense_fragment(range.clone()) {
+        if let Some(fragment) = self
+            .user
+            .try_full_cover_dense_fragment(range.clone(), cancel)?
+        {
             record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
             return Ok(Self::dense_errors(fragment, range));
         }
-        if let Some(fragment) = self.user.full_cover_run_fragment(range.clone()) {
+        if let Some(fragment) = self
+            .user
+            .try_full_cover_run_fragment(range.clone(), cancel)?
+        {
             record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
             return Ok(Self::run_errors(fragment, range));
         }
-        if !self.user.has_any_in_range(range.clone()) {
-            if let Some(fragment) = self.computed.full_cover_dense_fragment(range.clone()) {
+        if !self.user.try_has_any_in_range(range.clone(), cancel)? {
+            if let Some(fragment) = self
+                .computed
+                .try_full_cover_dense_fragment(range.clone(), cancel)?
+            {
                 record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
                 return Ok(Self::dense_errors(fragment, range));
             }
-            if let Some(fragment) = self.computed.full_cover_run_fragment(range.clone()) {
+            if let Some(fragment) = self
+                .computed
+                .try_full_cover_run_fragment(range.clone(), cancel)?
+            {
                 record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
                 return Ok(Self::run_errors(fragment, range));
             }
         }
 
-        if !self.has_any_in_range(range.clone()) {
+        if !self.try_has_any_in_range(range.clone(), cancel)? {
             return Ok(Arc::new(base.clone()));
         }
 
@@ -2972,26 +3049,38 @@ impl<'a> OverlayCascade<'a> {
         base: &UInt8Array,
         cancel: Option<&crate::engine::CancelToken>,
     ) -> Result<Arc<UInt8Array>, ExcelError> {
-        if let Some(fragment) = self.user.full_cover_dense_fragment(range.clone()) {
+        if let Some(fragment) = self
+            .user
+            .try_full_cover_dense_fragment(range.clone(), cancel)?
+        {
             record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
             return Ok(Self::dense_type_tags(fragment, range));
         }
-        if let Some(fragment) = self.user.full_cover_run_fragment(range.clone()) {
+        if let Some(fragment) = self
+            .user
+            .try_full_cover_run_fragment(range.clone(), cancel)?
+        {
             record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
             return Ok(Self::run_type_tags(fragment, range));
         }
-        if !self.user.has_any_in_range(range.clone()) {
-            if let Some(fragment) = self.computed.full_cover_dense_fragment(range.clone()) {
+        if !self.user.try_has_any_in_range(range.clone(), cancel)? {
+            if let Some(fragment) = self
+                .computed
+                .try_full_cover_dense_fragment(range.clone(), cancel)?
+            {
                 record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
                 return Ok(Self::dense_type_tags(fragment, range));
             }
-            if let Some(fragment) = self.computed.full_cover_run_fragment(range.clone()) {
+            if let Some(fragment) = self
+                .computed
+                .try_full_cover_run_fragment(range.clone(), cancel)?
+            {
                 record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
                 return Ok(Self::run_type_tags(fragment, range));
             }
         }
 
-        if !self.has_any_in_range(range.clone()) {
+        if !self.try_has_any_in_range(range.clone(), cancel)? {
             return Ok(Arc::new(base.clone()));
         }
 
@@ -3043,26 +3132,38 @@ impl<'a> OverlayCascade<'a> {
         base: &StringArray,
         cancel: Option<&crate::engine::CancelToken>,
     ) -> Result<Arc<StringArray>, ExcelError> {
-        if let Some(fragment) = self.user.full_cover_dense_fragment(range.clone()) {
+        if let Some(fragment) = self
+            .user
+            .try_full_cover_dense_fragment(range.clone(), cancel)?
+        {
             record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
             return Ok(Self::dense_lowered_text(fragment, range));
         }
-        if let Some(fragment) = self.user.full_cover_run_fragment(range.clone()) {
+        if let Some(fragment) = self
+            .user
+            .try_full_cover_run_fragment(range.clone(), cancel)?
+        {
             record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
             return Ok(Self::run_lowered_text(fragment, range));
         }
-        if !self.user.has_any_in_range(range.clone()) {
-            if let Some(fragment) = self.computed.full_cover_dense_fragment(range.clone()) {
+        if !self.user.try_has_any_in_range(range.clone(), cancel)? {
+            if let Some(fragment) = self
+                .computed
+                .try_full_cover_dense_fragment(range.clone(), cancel)?
+            {
                 record_overlay_select_stats(|stats| stats.direct_dense_slices += 1);
                 return Ok(Self::dense_lowered_text(fragment, range));
             }
-            if let Some(fragment) = self.computed.full_cover_run_fragment(range.clone()) {
+            if let Some(fragment) = self
+                .computed
+                .try_full_cover_run_fragment(range.clone(), cancel)?
+            {
                 record_overlay_select_stats(|stats| stats.direct_run_materializations += 1);
                 return Ok(Self::run_lowered_text(fragment, range));
             }
         }
 
-        if !self.has_any_in_range(range.clone()) {
+        if !self.try_has_any_in_range(range.clone(), cancel)? {
             return Ok(Arc::new(base.clone()));
         }
         if self.user.fragments.is_empty() && self.computed.fragments.is_empty() {
@@ -3714,27 +3815,40 @@ impl OverlayFragmentPayload {
 }
 
 impl Overlay {
-    fn full_cover_dense_fragment(
+    fn try_full_cover_dense_fragment(
         &self,
         range: core::ops::Range<usize>,
-    ) -> Option<&OverlayFragment> {
-        self.full_cover_single_fragment(range, OverlayFragmentShape::Dense)
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Option<&OverlayFragment>, ExcelError> {
+        self.try_full_cover_single_fragment(range, OverlayFragmentShape::Dense, cancel)
     }
 
-    fn full_cover_run_fragment(&self, range: core::ops::Range<usize>) -> Option<&OverlayFragment> {
-        self.full_cover_single_fragment(range, OverlayFragmentShape::Run)
+    fn try_full_cover_run_fragment(
+        &self,
+        range: core::ops::Range<usize>,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Option<&OverlayFragment>, ExcelError> {
+        self.try_full_cover_single_fragment(range, OverlayFragmentShape::Run, cancel)
     }
 
-    fn full_cover_single_fragment(
+    fn try_full_cover_single_fragment(
         &self,
         range: core::ops::Range<usize>,
         shape: OverlayFragmentShape,
-    ) -> Option<&OverlayFragment> {
-        if range.is_empty() || self.points.keys().any(|off| range.contains(off)) {
-            return None;
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Option<&OverlayFragment>, ExcelError> {
+        if range.is_empty() {
+            return Ok(None);
+        }
+        for off in self.points.keys() {
+            IngestBuilder::check_cancelled(cancel)?;
+            if range.contains(off) {
+                return Ok(None);
+            }
         }
         let mut found = None;
         for fragment in &self.fragments {
+            IngestBuilder::check_cancelled(cancel)?;
             if !fragment.has_any_in_range(range.clone()) {
                 continue;
             }
@@ -3751,10 +3865,10 @@ impl Overlay {
             if shape_matches && covers && found.is_none() {
                 found = Some(fragment);
             } else {
-                return None;
+                return Ok(None);
             }
         }
-        found
+        Ok(found)
     }
 }
 fn append_overlay_value_to_lane_builders(

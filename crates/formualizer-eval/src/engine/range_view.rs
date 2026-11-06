@@ -970,11 +970,13 @@ impl<'a> RangeView<'a> {
                     .slice(segment.chunk_offset, segment.row_len);
                 let range = segment.chunk_offset..segment.chunk_offset + segment.row_len;
                 let cascade = arrow_store::OverlayCascade::new(&ch.overlay, &ch.computed_overlay);
-                out_cols.push(if cascade.has_any_in_range(range.clone()) {
-                    cascade.try_select_numbers(range, &base, self.cancel_token.as_ref())?
-                } else {
-                    Arc::new(base)
-                });
+                out_cols.push(
+                    if cascade.try_has_any_in_range(range.clone(), self.cancel_token.as_ref())? {
+                        cascade.try_select_numbers(range, &base, self.cancel_token.as_ref())?
+                    } else {
+                        Arc::new(base)
+                    },
+                );
             }
             Ok((segment.row_start, segment.row_len, out_cols))
         })
@@ -1033,7 +1035,7 @@ impl<'a> RangeView<'a> {
                 let rel_off = (self.sr + cs.row_start) - chunk_starts[ch_idx];
                 let seg_range = rel_off..(rel_off + cs.row_len);
                 let cascade = arrow_store::OverlayCascade::new(&ch.overlay, &ch.computed_overlay);
-                if cascade.has_any_in_range(seg_range.clone()) {
+                if cascade.try_has_any_in_range(seg_range.clone(), self.cancel_token.as_ref())? {
                     let base_ba = base
                         .as_any()
                         .downcast_ref::<arrow_array::BooleanArray>()
@@ -1095,7 +1097,7 @@ impl<'a> RangeView<'a> {
                 let rel_off = (self.sr + cs.row_start) - chunk_starts[ch_idx];
                 let seg_range = rel_off..(rel_off + cs.row_len);
                 let cascade = arrow_store::OverlayCascade::new(&ch.overlay, &ch.computed_overlay);
-                if cascade.has_any_in_range(seg_range.clone()) {
+                if cascade.try_has_any_in_range(seg_range.clone(), self.cancel_token.as_ref())? {
                     let base_sa = base
                         .as_any()
                         .downcast_ref::<arrow_array::StringArray>()
@@ -1162,7 +1164,7 @@ impl<'a> RangeView<'a> {
                     .expect("lowered slice downcast");
 
                 let cascade = arrow_store::OverlayCascade::new(&ch.overlay, &ch.computed_overlay);
-                if cascade.has_any_in_range(seg_range.clone()) {
+                if cascade.try_has_any_in_range(seg_range.clone(), self.cancel_token.as_ref())? {
                     out_cols.push(cascade.try_select_lowered_text(
                         seg_range,
                         base_sa,
@@ -1213,11 +1215,13 @@ impl<'a> RangeView<'a> {
                     .slice(segment.chunk_offset, segment.row_len);
                 let range = segment.chunk_offset..segment.chunk_offset + segment.row_len;
                 let cascade = arrow_store::OverlayCascade::new(&ch.overlay, &ch.computed_overlay);
-                out_cols.push(if cascade.has_any_in_range(range.clone()) {
-                    cascade.try_select_errors(range, &base, self.cancel_token.as_ref())?
-                } else {
-                    Arc::new(base)
-                });
+                out_cols.push(
+                    if cascade.try_has_any_in_range(range.clone(), self.cancel_token.as_ref())? {
+                        cascade.try_select_errors(range, &base, self.cancel_token.as_ref())?
+                    } else {
+                        Arc::new(base)
+                    },
+                );
             }
             Ok((segment.row_start, segment.row_len, out_cols))
         })
@@ -1270,7 +1274,7 @@ impl<'a> RangeView<'a> {
                 let rel_off = (self.sr + cs.row_start) - chunk_starts[ch_idx];
                 let seg_range = rel_off..(rel_off + cs.row_len);
                 let cascade = arrow_store::OverlayCascade::new(&ch.overlay, &ch.computed_overlay);
-                if cascade.has_any_in_range(seg_range.clone()) {
+                if cascade.try_has_any_in_range(seg_range.clone(), self.cancel_token.as_ref())? {
                     let base_ta = base
                         .as_any()
                         .downcast_ref::<arrow_array::UInt8Array>()
