@@ -543,6 +543,46 @@ impl IngestBuilder {
         Ok(Arc::new(output.finish()) as ArrayRef)
     }
 
+    fn zip_primitive_cancellable<T: arrow_array::types::ArrowPrimitiveType>(
+        mask: &BooleanArray,
+        values: &arrow_array::PrimitiveArray<T>,
+        base: &arrow_array::PrimitiveArray<T>,
+        cancel: &crate::engine::CancelToken,
+    ) -> Result<ArrayRef, ExcelError> {
+        let len = mask.len();
+        let mut output = arrow_array::builder::PrimitiveBuilder::<T>::with_capacity(len);
+        for idx in 0..len {
+            Self::check_cancelled(Some(cancel))?;
+            let source = if mask.value(idx) { values } else { base };
+            if source.is_null(idx) {
+                output.append_null();
+            } else {
+                output.append_value(source.value(idx));
+            }
+        }
+        Ok(Arc::new(output.finish()) as ArrayRef)
+    }
+
+    fn zip_boolean_cancellable(
+        mask: &BooleanArray,
+        values: &BooleanArray,
+        base: &BooleanArray,
+        cancel: &crate::engine::CancelToken,
+    ) -> Result<ArrayRef, ExcelError> {
+        let len = mask.len();
+        let mut output = BooleanBuilder::with_capacity(len);
+        for idx in 0..len {
+            Self::check_cancelled(Some(cancel))?;
+            let source = if mask.value(idx) { values } else { base };
+            if source.is_null(idx) {
+                output.append_null();
+            } else {
+                output.append_value(source.value(idx));
+            }
+        }
+        Ok(Arc::new(output.finish()) as ArrayRef)
+    }
+
     fn fold_text_cancellable(
         text: &str,
         cancel: Option<&crate::engine::CancelToken>,
@@ -2847,8 +2887,11 @@ impl<'a> OverlayCascade<'a> {
         record_overlay_select_stats(|stats| stats.zip_select_calls += 1);
         let mask = mask_b.finish();
         let values = values_b.finish();
-        let zipped =
-            crate::compute_prelude::zip_select(&mask, &values, base).expect("zip numeric overlay");
+        let zipped = if let Some(cancel) = cancel {
+            IngestBuilder::zip_primitive_cancellable(&mask, &values, base, cancel)?
+        } else {
+            crate::compute_prelude::zip_select(&mask, &values, base).expect("zip numeric overlay")
+        };
         Ok(Arc::new(
             zipped
                 .as_any()
@@ -2930,8 +2973,11 @@ impl<'a> OverlayCascade<'a> {
         record_overlay_select_stats(|stats| stats.zip_select_calls += 1);
         let mask = mask_b.finish();
         let values = values_b.finish();
-        let zipped =
-            crate::compute_prelude::zip_select(&mask, &values, base).expect("zip boolean overlay");
+        let zipped = if let Some(cancel) = cancel {
+            IngestBuilder::zip_boolean_cancellable(&mask, &values, base, cancel)?
+        } else {
+            crate::compute_prelude::zip_select(&mask, &values, base).expect("zip boolean overlay")
+        };
         Ok(Arc::new(
             zipped
                 .as_any()
@@ -3094,8 +3140,11 @@ impl<'a> OverlayCascade<'a> {
         record_overlay_select_stats(|stats| stats.zip_select_calls += 1);
         let mask = mask_b.finish();
         let values = values_b.finish();
-        let zipped =
-            crate::compute_prelude::zip_select(&mask, &values, base).expect("zip error overlay");
+        let zipped = if let Some(cancel) = cancel {
+            IngestBuilder::zip_primitive_cancellable(&mask, &values, base, cancel)?
+        } else {
+            crate::compute_prelude::zip_select(&mask, &values, base).expect("zip error overlay")
+        };
         Ok(Arc::new(
             zipped
                 .as_any()
@@ -3177,8 +3226,11 @@ impl<'a> OverlayCascade<'a> {
         record_overlay_select_stats(|stats| stats.zip_select_calls += 1);
         let mask = mask_b.finish();
         let values = values_b.finish();
-        let zipped =
-            crate::compute_prelude::zip_select(&mask, &values, base).expect("zip type-tag overlay");
+        let zipped = if let Some(cancel) = cancel {
+            IngestBuilder::zip_primitive_cancellable(&mask, &values, base, cancel)?
+        } else {
+            crate::compute_prelude::zip_select(&mask, &values, base).expect("zip type-tag overlay")
+        };
         Ok(Arc::new(
             zipped
                 .as_any()
