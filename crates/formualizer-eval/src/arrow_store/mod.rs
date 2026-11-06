@@ -79,12 +79,28 @@ pub struct FormatRuns {
 
 impl FormatRuns {
     pub fn from_ids(ids: &[u16]) -> Option<Self> {
-        if ids.iter().all(|id| *id == FormatId::GENERAL.0) {
-            return None;
+        Self::try_from_ids(ids, None).expect("uncancelled FormatRuns construction")
+    }
+
+    fn try_from_ids(
+        ids: &[u16],
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Option<Self>, ExcelError> {
+        let mut all_general = true;
+        for id in ids {
+            IngestBuilder::check_cancelled(cancel)?;
+            if *id != FormatId::GENERAL.0 {
+                all_general = false;
+                break;
+            }
+        }
+        if all_general {
+            return Ok(None);
         }
         let mut run_ends = Vec::new();
         let mut format_ids = Vec::new();
         for (idx, id) in ids.iter().copied().enumerate() {
+            IngestBuilder::check_cancelled(cancel)?;
             if format_ids.last().copied() != Some(id) {
                 format_ids.push(id);
                 if idx > 0 {
@@ -93,10 +109,10 @@ impl FormatRuns {
             }
         }
         run_ends.push(ids.len() as u32);
-        Some(Self {
+        Ok(Some(Self {
             run_ends,
             format_ids,
-        })
+        }))
     }
 
     #[inline]
@@ -941,7 +957,7 @@ impl IngestBuilder {
                 errors: errors_arc,
                 type_tag: Arc::new(tags),
                 formula_id: None,
-                format: FormatRuns::from_ids(&self.format_builders[c]),
+                format: FormatRuns::try_from_ids(&self.format_builders[c], cancel)?,
                 meta: ColumnChunkMeta {
                     len,
                     non_null_num: self.lane_counts[c].n_num,
