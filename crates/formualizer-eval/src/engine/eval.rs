@@ -3250,7 +3250,7 @@ fn copy_spill_values_cancellable(
             cancellation_checkpoint(Some(cancel))?;
             copied_row.push(match value {
                 LiteralValue::Text(text) => LiteralValue::Text(
-                    crate::arrow_store::ingest::IngestBuilder::copy_text_cancellable(
+                    crate::arrow_store::IngestBuilder::copy_text_cancellable(
                         text,
                         Some(cancel),
                     )?,
