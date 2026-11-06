@@ -2722,8 +2722,8 @@ impl<'a> OverlayCascade<'a> {
         record_overlay_select_stats(|stats| stats.partial_overlay_builds += 1);
         let len = range.end.saturating_sub(range.start);
         let mut slots = OverlaySlots::<f64>::new(len);
-        Self::apply_number_layer(self.computed, range.clone(), &mut slots);
-        Self::apply_number_layer(self.user, range.clone(), &mut slots);
+        Self::try_apply_number_layer(self.computed, range.clone(), &mut slots, cancel)?;
+        Self::try_apply_number_layer(self.user, range.clone(), &mut slots, cancel)?;
         if !slots.any_present() {
             return Ok(Arc::new(base.clone()));
         }
@@ -2793,8 +2793,8 @@ impl<'a> OverlayCascade<'a> {
         record_overlay_select_stats(|stats| stats.partial_overlay_builds += 1);
         let len = range.end.saturating_sub(range.start);
         let mut slots = OverlaySlots::<bool>::new(len);
-        Self::apply_boolean_layer(self.computed, range.clone(), &mut slots);
-        Self::apply_boolean_layer(self.user, range.clone(), &mut slots);
+        Self::try_apply_boolean_layer(self.computed, range.clone(), &mut slots, cancel)?;
+        Self::try_apply_boolean_layer(self.user, range.clone(), &mut slots, cancel)?;
         if !slots.any_present() {
             return Ok(Arc::new(base.clone()));
         }
@@ -2864,8 +2864,8 @@ impl<'a> OverlayCascade<'a> {
         record_overlay_select_stats(|stats| stats.partial_overlay_builds += 1);
         let len = range.end.saturating_sub(range.start);
         let mut slots = OverlaySlots::<String>::new(len);
-        Self::apply_text_layer(self.computed, range.clone(), &mut slots);
-        Self::apply_text_layer(self.user, range.clone(), &mut slots);
+        Self::try_apply_text_layer(self.computed, range.clone(), &mut slots, cancel)?;
+        Self::try_apply_text_layer(self.user, range.clone(), &mut slots, cancel)?;
         if !slots.any_present() {
             return Ok(Arc::new(base.clone()) as ArrayRef);
         }
@@ -2927,8 +2927,8 @@ impl<'a> OverlayCascade<'a> {
         record_overlay_select_stats(|stats| stats.partial_overlay_builds += 1);
         let len = range.end.saturating_sub(range.start);
         let mut slots = OverlaySlots::<u8>::new(len);
-        Self::apply_error_layer(self.computed, range.clone(), &mut slots);
-        Self::apply_error_layer(self.user, range.clone(), &mut slots);
+        Self::try_apply_error_layer(self.computed, range.clone(), &mut slots, cancel)?;
+        Self::try_apply_error_layer(self.user, range.clone(), &mut slots, cancel)?;
         if !slots.any_present() {
             return Ok(Arc::new(base.clone()));
         }
@@ -2998,8 +2998,8 @@ impl<'a> OverlayCascade<'a> {
         record_overlay_select_stats(|stats| stats.partial_overlay_builds += 1);
         let len = range.end.saturating_sub(range.start);
         let mut slots = OverlaySlots::<u8>::new(len);
-        Self::apply_type_tag_layer(self.computed, range.clone(), &mut slots);
-        Self::apply_type_tag_layer(self.user, range.clone(), &mut slots);
+        Self::try_apply_type_tag_layer(self.computed, range.clone(), &mut slots, cancel)?;
+        Self::try_apply_type_tag_layer(self.user, range.clone(), &mut slots, cancel)?;
         if !slots.any_present() {
             return Ok(Arc::new(base.clone()));
         }
@@ -3072,8 +3072,8 @@ impl<'a> OverlayCascade<'a> {
         record_overlay_select_stats(|stats| stats.partial_overlay_builds += 1);
         let len = range.end.saturating_sub(range.start);
         let mut slots = OverlaySlots::<String>::new(len);
-        Self::apply_lowered_text_layer(self.computed, range.clone(), &mut slots);
-        Self::apply_lowered_text_layer(self.user, range.clone(), &mut slots);
+        Self::try_apply_lowered_text_layer(self.computed, range.clone(), &mut slots, cancel)?;
+        Self::try_apply_lowered_text_layer(self.user, range.clone(), &mut slots, cancel)?;
         if !slots.any_present() {
             return Ok(Arc::new(base.clone()));
         }
@@ -3430,47 +3430,55 @@ impl<'a> OverlayCascade<'a> {
         Arc::new(arr.as_any().downcast_ref::<UInt8Array>().unwrap().clone())
     }
 
-    fn apply_number_layer(
+    fn try_apply_number_layer(
         layer: &Overlay,
         range: core::ops::Range<usize>,
         slots: &mut OverlaySlots<f64>,
-    ) {
-        Self::apply_fragment_layer(layer, range.clone(), slots, |payload, idx| {
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<(), ExcelError> {
+        Self::try_apply_fragment_layer(layer, range.clone(), slots, cancel, |payload, idx| {
             payload.number_at(idx)
-        });
+        })?;
         for (off, value) in layer.iter_points() {
+            IngestBuilder::check_cancelled(cancel)?;
             if range.contains(off) {
                 slots.set(*off - range.start, value.numeric_lane_value());
                 record_overlay_select_stats(|stats| stats.point_entries_applied += 1);
             }
         }
+        Ok(())
     }
 
-    fn apply_boolean_layer(
+    fn try_apply_boolean_layer(
         layer: &Overlay,
         range: core::ops::Range<usize>,
         slots: &mut OverlaySlots<bool>,
-    ) {
-        Self::apply_fragment_layer(layer, range.clone(), slots, |payload, idx| {
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<(), ExcelError> {
+        Self::try_apply_fragment_layer(layer, range.clone(), slots, cancel, |payload, idx| {
             payload.boolean_at(idx)
-        });
+        })?;
         for (off, value) in layer.iter_points() {
+            IngestBuilder::check_cancelled(cancel)?;
             if range.contains(off) {
                 slots.set(*off - range.start, value.boolean_lane_value());
                 record_overlay_select_stats(|stats| stats.point_entries_applied += 1);
             }
         }
+        Ok(())
     }
 
-    fn apply_text_layer(
+    fn try_apply_text_layer(
         layer: &Overlay,
         range: core::ops::Range<usize>,
         slots: &mut OverlaySlots<String>,
-    ) {
-        Self::apply_fragment_layer(layer, range.clone(), slots, |payload, idx| {
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<(), ExcelError> {
+        Self::try_apply_fragment_layer(layer, range.clone(), slots, cancel, |payload, idx| {
             payload.text_at(idx).map(ToString::to_string)
-        });
+        })?;
         for (off, value) in layer.iter_points() {
+            IngestBuilder::check_cancelled(cancel)?;
             if range.contains(off) {
                 slots.set(
                     *off - range.start,
@@ -3479,73 +3487,93 @@ impl<'a> OverlayCascade<'a> {
                 record_overlay_select_stats(|stats| stats.point_entries_applied += 1);
             }
         }
+        Ok(())
     }
 
-    fn apply_error_layer(
+    fn try_apply_error_layer(
         layer: &Overlay,
         range: core::ops::Range<usize>,
         slots: &mut OverlaySlots<u8>,
-    ) {
-        Self::apply_fragment_layer(layer, range.clone(), slots, |payload, idx| {
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<(), ExcelError> {
+        Self::try_apply_fragment_layer(layer, range.clone(), slots, cancel, |payload, idx| {
             payload.error_at(idx)
-        });
+        })?;
         for (off, value) in layer.iter_points() {
+            IngestBuilder::check_cancelled(cancel)?;
             if range.contains(off) {
                 slots.set(*off - range.start, value.error_lane_value());
                 record_overlay_select_stats(|stats| stats.point_entries_applied += 1);
             }
         }
+        Ok(())
     }
 
-    fn apply_type_tag_layer(
+    fn try_apply_type_tag_layer(
         layer: &Overlay,
         range: core::ops::Range<usize>,
         slots: &mut OverlaySlots<u8>,
-    ) {
-        Self::apply_fragment_layer(layer, range.clone(), slots, |payload, idx| {
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<(), ExcelError> {
+        Self::try_apply_fragment_layer(layer, range.clone(), slots, cancel, |payload, idx| {
             payload.type_tag_at(idx).map(|tag| tag as u8)
-        });
+        })?;
         for (off, value) in layer.iter_points() {
+            IngestBuilder::check_cancelled(cancel)?;
             if range.contains(off) {
                 slots.set(*off - range.start, Some(value.type_tag() as u8));
                 record_overlay_select_stats(|stats| stats.point_entries_applied += 1);
             }
         }
+        Ok(())
     }
 
-    fn apply_lowered_text_layer(
+    fn try_apply_lowered_text_layer(
         layer: &Overlay,
         range: core::ops::Range<usize>,
         slots: &mut OverlaySlots<String>,
-    ) {
-        Self::apply_fragment_layer(layer, range.clone(), slots, Self::payload_lowered_text_at);
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<(), ExcelError> {
+        Self::try_apply_fragment_layer(
+            layer,
+            range.clone(),
+            slots,
+            cancel,
+            Self::payload_lowered_text_at,
+        )?;
         for (off, value) in layer.iter_points() {
+            IngestBuilder::check_cancelled(cancel)?;
             if range.contains(off) {
                 slots.set(*off - range.start, value.lowered_text_value());
                 record_overlay_select_stats(|stats| stats.point_entries_applied += 1);
             }
         }
+        Ok(())
     }
 
-    fn apply_fragment_layer<T>(
+    fn try_apply_fragment_layer<T>(
         layer: &Overlay,
         range: core::ops::Range<usize>,
         slots: &mut OverlaySlots<T>,
+        cancel: Option<&crate::engine::CancelToken>,
         mut value_at: impl FnMut(&OverlayFragmentPayload, usize) -> Option<T>,
-    ) {
+    ) -> Result<(), ExcelError> {
         for fragment in &layer.fragments {
+            IngestBuilder::check_cancelled(cancel)?;
             if !fragment.has_any_in_range(range.clone()) {
                 continue;
             }
             Self::record_fragment_intersection(fragment);
-            Self::for_each_fragment_payload_index(
+            Self::try_for_each_fragment_payload_index(
                 fragment,
                 range.clone(),
+                cancel,
                 |out_idx, payload, payload_idx| {
                     slots.set(out_idx, value_at(payload, payload_idx));
                 },
-            );
+            )?;
         }
+        Ok(())
     }
 
     fn record_fragment_intersection(fragment: &OverlayFragment) {
@@ -3564,13 +3592,14 @@ impl<'a> OverlayCascade<'a> {
         });
     }
 
-    fn for_each_fragment_payload_index(
+    fn try_for_each_fragment_payload_index(
         fragment: &OverlayFragment,
         range: core::ops::Range<usize>,
+        cancel: Option<&crate::engine::CancelToken>,
         mut f: impl FnMut(usize, &OverlayFragmentPayload, usize),
-    ) {
+    ) -> Result<(), ExcelError> {
         if range.is_empty() {
-            return;
+            return Ok(());
         }
         match fragment {
             OverlayFragment::SparseOffsets { offsets, payload } => {
@@ -3578,6 +3607,7 @@ impl<'a> OverlayCascade<'a> {
                 let lo = offsets.partition_point(|off| *off < start);
                 let hi = offsets.partition_point(|off| (*off as usize) < range.end);
                 for (idx, off) in offsets.iter().enumerate().take(hi).skip(lo) {
+                    IngestBuilder::check_cancelled(cancel)?;
                     let out_idx = (*off as usize).saturating_sub(range.start);
                     f(out_idx, payload, idx);
                 }
@@ -3592,9 +3622,10 @@ impl<'a> OverlayCascade<'a> {
                 let inter_start = frag_start.max(range.start);
                 let inter_end = frag_end.min(range.end);
                 if inter_start >= inter_end {
-                    return;
+                    return Ok(());
                 }
                 for abs in inter_start..inter_end {
+                    IngestBuilder::check_cancelled(cancel)?;
                     f(abs - range.start, payload, abs - frag_start);
                 }
             }
@@ -3609,16 +3640,18 @@ impl<'a> OverlayCascade<'a> {
                 let inter_start = frag_start.max(range.start);
                 let inter_end = frag_end.min(range.end);
                 if inter_start >= inter_end {
-                    return;
+                    return Ok(());
                 }
                 let mut prev_end = 0usize;
                 for (run_idx, run_end) in run_ends.iter().enumerate() {
+                    IngestBuilder::check_cancelled(cancel)?;
                     let run_start_abs = frag_start.saturating_add(prev_end);
                     let run_end_abs = frag_start.saturating_add(*run_end as usize);
                     let start_abs = run_start_abs.max(inter_start);
                     let end_abs = run_end_abs.min(inter_end);
                     if start_abs < end_abs {
                         for abs in start_abs..end_abs {
+                            IngestBuilder::check_cancelled(cancel)?;
                             f(abs - range.start, payload, run_idx);
                         }
                     }
@@ -3629,6 +3662,7 @@ impl<'a> OverlayCascade<'a> {
                 }
             }
         }
+        Ok(())
     }
 
     fn for_each_run_payload_index(
