@@ -2407,6 +2407,7 @@ impl Overlay {
                 .map(Some);
         }
         for fragment in self.fragments.iter().rev() {
+            IngestBuilder::check_cancelled(Some(cancel))?;
             if let Some(value) = fragment.try_get_literal(off, date_system, cancel)? {
                 return Ok(Some(value));
             }
