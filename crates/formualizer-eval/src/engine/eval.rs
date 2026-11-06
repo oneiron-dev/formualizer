@@ -31739,11 +31739,20 @@ where
             self.flush_computed_write_buffer(buffer)?;
         }
 
-        let spill_cells = self
-            .graph
-            .spill_cells_for_anchor(anchor_vertex)
-            .map(|cells| cells.to_vec())
-            .unwrap_or_default();
+        let spill_cells = if let Some(cells) = self.graph.spill_cells_for_anchor(anchor_vertex) {
+            if let Some(cancel) = self.active_cancel_flag.as_ref() {
+                let mut copied = Vec::with_capacity(cells.len());
+                for cell in cells {
+                    cancellation_checkpoint(Some(cancel))?;
+                    copied.push(*cell);
+                }
+                copied
+            } else {
+                cells.to_vec()
+            }
+        } else {
+            Vec::new()
+        };
         if spill_cells.is_empty() {
             return Ok(());
         }
