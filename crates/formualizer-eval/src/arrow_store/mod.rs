@@ -3563,11 +3563,6 @@ impl<'a> OverlayCascade<'a> {
         Ok(Arc::new(b.finish()))
     }
 
-    fn payload_lowered_text_at(payload: &OverlayFragmentPayload, idx: usize) -> Option<String> {
-        Self::try_payload_lowered_text_at(payload, idx, None)
-            .expect("uncancelled lowered-text payload")
-    }
-
     fn try_payload_lowered_text_at(
         payload: &OverlayFragmentPayload,
         idx: usize,
@@ -3623,7 +3618,7 @@ impl<'a> OverlayCascade<'a> {
         cancel: Option<&crate::engine::CancelToken>,
     ) -> Result<(), ExcelError> {
         Self::try_apply_fragment_layer(layer, range.clone(), slots, cancel, |payload, idx| {
-            payload.number_at(idx)
+            Ok(payload.number_at(idx))
         })?;
         for (off, value) in layer.iter_points() {
             IngestBuilder::check_cancelled(cancel)?;
@@ -3642,7 +3637,7 @@ impl<'a> OverlayCascade<'a> {
         cancel: Option<&crate::engine::CancelToken>,
     ) -> Result<(), ExcelError> {
         Self::try_apply_fragment_layer(layer, range.clone(), slots, cancel, |payload, idx| {
-            payload.boolean_at(idx)
+            Ok(payload.boolean_at(idx))
         })?;
         for (off, value) in layer.iter_points() {
             IngestBuilder::check_cancelled(cancel)?;
@@ -3661,7 +3656,7 @@ impl<'a> OverlayCascade<'a> {
         cancel: Option<&crate::engine::CancelToken>,
     ) -> Result<(), ExcelError> {
         Self::try_apply_fragment_layer(layer, range.clone(), slots, cancel, |payload, idx| {
-            payload.text_at(idx).map(ToString::to_string)
+            Ok(payload.text_at(idx).map(ToString::to_string))
         })?;
         for (off, value) in layer.iter_points() {
             IngestBuilder::check_cancelled(cancel)?;
@@ -3683,7 +3678,7 @@ impl<'a> OverlayCascade<'a> {
         cancel: Option<&crate::engine::CancelToken>,
     ) -> Result<(), ExcelError> {
         Self::try_apply_fragment_layer(layer, range.clone(), slots, cancel, |payload, idx| {
-            payload.error_at(idx)
+            Ok(payload.error_at(idx))
         })?;
         for (off, value) in layer.iter_points() {
             IngestBuilder::check_cancelled(cancel)?;
@@ -3702,7 +3697,7 @@ impl<'a> OverlayCascade<'a> {
         cancel: Option<&crate::engine::CancelToken>,
     ) -> Result<(), ExcelError> {
         Self::try_apply_fragment_layer(layer, range.clone(), slots, cancel, |payload, idx| {
-            payload.type_tag_at(idx).map(|tag| tag as u8)
+            Ok(payload.type_tag_at(idx).map(|tag| tag as u8))
         })?;
         for (off, value) in layer.iter_points() {
             IngestBuilder::check_cancelled(cancel)?;
@@ -3725,7 +3720,7 @@ impl<'a> OverlayCascade<'a> {
             range.clone(),
             slots,
             cancel,
-            Self::payload_lowered_text_at,
+            |payload, idx| Self::try_payload_lowered_text_at(payload, idx, cancel),
         )?;
         for (off, value) in layer.iter_points() {
             IngestBuilder::check_cancelled(cancel)?;
@@ -3742,7 +3737,7 @@ impl<'a> OverlayCascade<'a> {
         range: core::ops::Range<usize>,
         slots: &mut OverlaySlots<T>,
         cancel: Option<&crate::engine::CancelToken>,
-        mut value_at: impl FnMut(&OverlayFragmentPayload, usize) -> Option<T>,
+        mut value_at: impl FnMut(&OverlayFragmentPayload, usize) -> Result<Option<T>, ExcelError>,
     ) -> Result<(), ExcelError> {
         for fragment in &layer.fragments {
             IngestBuilder::check_cancelled(cancel)?;
@@ -3755,7 +3750,8 @@ impl<'a> OverlayCascade<'a> {
                 range.clone(),
                 cancel,
                 |out_idx, payload, payload_idx| {
-                    slots.set(out_idx, value_at(payload, payload_idx));
+                    slots.set(out_idx, value_at(payload, payload_idx)?);
+                    Ok(())
                 },
             )?;
         }
@@ -3782,7 +3778,7 @@ impl<'a> OverlayCascade<'a> {
         fragment: &OverlayFragment,
         range: core::ops::Range<usize>,
         cancel: Option<&crate::engine::CancelToken>,
-        mut f: impl FnMut(usize, &OverlayFragmentPayload, usize),
+        mut f: impl FnMut(usize, &OverlayFragmentPayload, usize) -> Result<(), ExcelError>,
     ) -> Result<(), ExcelError> {
         if range.is_empty() {
             return Ok(());
@@ -3795,7 +3791,7 @@ impl<'a> OverlayCascade<'a> {
                 for (idx, off) in offsets.iter().enumerate().take(hi).skip(lo) {
                     IngestBuilder::check_cancelled(cancel)?;
                     let out_idx = (*off as usize).saturating_sub(range.start);
-                    f(out_idx, payload, idx);
+                    f(out_idx, payload, idx)?;
                 }
             }
             OverlayFragment::DenseRange {
@@ -3812,7 +3808,7 @@ impl<'a> OverlayCascade<'a> {
                 }
                 for abs in inter_start..inter_end {
                     IngestBuilder::check_cancelled(cancel)?;
-                    f(abs - range.start, payload, abs - frag_start);
+                    f(abs - range.start, payload, abs - frag_start)?;
                 }
             }
             OverlayFragment::RunRange {
@@ -3838,7 +3834,7 @@ impl<'a> OverlayCascade<'a> {
                     if start_abs < end_abs {
                         for abs in start_abs..end_abs {
                             IngestBuilder::check_cancelled(cancel)?;
-                            f(abs - range.start, payload, run_idx);
+                            f(abs - range.start, payload, run_idx)?;
                         }
                     }
                     prev_end = *run_end as usize;
