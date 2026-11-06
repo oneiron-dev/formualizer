@@ -210,6 +210,11 @@ impl Iterator for RowChunkIterator<'_> {
         let seg_len = segment.row_len;
         let mut cols = Vec::with_capacity(view.cols);
         for col_idx in view.sc..=view.ec {
+            if view.cancel_token.as_ref().is_some_and(CancelToken::is_cancelled) {
+                return Some(Err(ExcelError::new(
+                    formualizer_common::ExcelErrorKind::Cancelled,
+                )));
+            }
             #[cfg(test)]
             range_work::record(|w| w.generic_columns += 1);
             if col_idx >= sheet.columns.len() {
@@ -936,6 +941,15 @@ impl<'a> RangeView<'a> {
             let mut out_cols = Vec::with_capacity(self.cols);
             let sheet = self.sheet();
             for col_idx in self.sc..=self.ec {
+                if self
+                    .cancel_token
+                    .as_ref()
+                    .is_some_and(CancelToken::is_cancelled)
+                {
+                    return Err(ExcelError::new(
+                        formualizer_common::ExcelErrorKind::Cancelled,
+                    ));
+                }
                 let Some(ch) = sheet
                     .columns
                     .get(col_idx)
@@ -979,6 +993,15 @@ impl<'a> RangeView<'a> {
             let chunk_starts = &sheet.chunk_starts;
 
             for (local_c, col_idx) in (self.sc..=self.ec).enumerate() {
+                if self
+                    .cancel_token
+                    .as_ref()
+                    .is_some_and(CancelToken::is_cancelled)
+                {
+                    return Err(ExcelError::new(
+                        formualizer_common::ExcelErrorKind::Cancelled,
+                    ));
+                }
                 let base = cs.cols[local_c]
                     .booleans
                     .as_ref()
@@ -1036,6 +1059,15 @@ impl<'a> RangeView<'a> {
             let chunk_starts = &sheet.chunk_starts;
 
             for (local_c, col_idx) in (self.sc..=self.ec).enumerate() {
+                if self
+                    .cancel_token
+                    .as_ref()
+                    .is_some_and(CancelToken::is_cancelled)
+                {
+                    return Err(ExcelError::new(
+                        formualizer_common::ExcelErrorKind::Cancelled,
+                    ));
+                }
                 let base = cs.cols[local_c]
                     .text
                     .as_ref()
@@ -1086,6 +1118,15 @@ impl<'a> RangeView<'a> {
             let chunk_starts = &sheet.chunk_starts;
 
             for (local_c, col_idx) in (self.sc..=self.ec).enumerate() {
+                if self
+                    .cancel_token
+                    .as_ref()
+                    .is_some_and(CancelToken::is_cancelled)
+                {
+                    return Err(ExcelError::new(
+                        formualizer_common::ExcelErrorKind::Cancelled,
+                    ));
+                }
                 // Identify chunk
                 let abs_seg_start = self.sr + cs.row_start;
                 let ch_idx = match chunk_starts.binary_search(&abs_seg_start) {
@@ -1133,6 +1174,15 @@ impl<'a> RangeView<'a> {
             let mut out_cols = Vec::with_capacity(self.cols);
             let sheet = self.sheet();
             for col_idx in self.sc..=self.ec {
+                if self
+                    .cancel_token
+                    .as_ref()
+                    .is_some_and(CancelToken::is_cancelled)
+                {
+                    return Err(ExcelError::new(
+                        formualizer_common::ExcelErrorKind::Cancelled,
+                    ));
+                }
                 let Some(ch) = sheet
                     .columns
                     .get(col_idx)
@@ -1173,6 +1223,15 @@ impl<'a> RangeView<'a> {
             let chunk_starts = &sheet.chunk_starts;
 
             for (local_c, col_idx) in (self.sc..=self.ec).enumerate() {
+                if self
+                    .cancel_token
+                    .as_ref()
+                    .is_some_and(CancelToken::is_cancelled)
+                {
+                    return Err(ExcelError::new(
+                        formualizer_common::ExcelErrorKind::Cancelled,
+                    ));
+                }
                 let base = cs.cols[local_c].type_tag.clone();
                 let base_ta = base
                     .as_any()
