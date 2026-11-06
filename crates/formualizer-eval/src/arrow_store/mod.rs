@@ -3447,7 +3447,7 @@ impl<'a> OverlayCascade<'a> {
             range,
             cancel,
             |payload, run_idx, repeat| {
-                let value = Self::payload_lowered_text_at(payload, run_idx);
+                let value = Self::try_payload_lowered_text_at(payload, run_idx, cancel)?;
                 if let Some(value) = value {
                     for _ in 0..repeat {
                         IngestBuilder::check_cancelled(cancel)?;
@@ -3554,7 +3554,7 @@ impl<'a> OverlayCascade<'a> {
         let mut b = StringBuilder::with_capacity(len, len.saturating_mul(8));
         for idx in start..start.saturating_add(len) {
             IngestBuilder::check_cancelled(cancel)?;
-            if let Some(value) = Self::payload_lowered_text_at(payload, idx) {
+            if let Some(value) = Self::try_payload_lowered_text_at(payload, idx, cancel)? {
                 IngestBuilder::append_text_cancellable(&mut b, &value, cancel)?;
             } else {
                 b.append_null();
@@ -3564,10 +3564,33 @@ impl<'a> OverlayCascade<'a> {
     }
 
     fn payload_lowered_text_at(payload: &OverlayFragmentPayload, idx: usize) -> Option<String> {
-        match payload.type_tag_at(idx)? {
+        Self::try_payload_lowered_text_at(payload, idx, None)
+            .expect("uncancelled lowered-text payload")
+    }
+
+    fn try_payload_lowered_text_at(
+        payload: &OverlayFragmentPayload,
+        idx: usize,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Option<String>, ExcelError> {
+        let Some(tag) = payload.type_tag_at(idx) else {
+            return Ok(None);
+        };
+        Ok(match tag {
             TypeTag::Text => payload
                 .text_at(idx)
-                .map(|value| crate::locale::fold_text_case(value)),
+                .map(|value| -> Result<String, ExcelError> {
+                    if cancel.is_none() {
+                        return Ok(crate::locale::fold_text_case(value));
+                    }
+                    let mut lowered = String::with_capacity(value.len());
+                    for ch in value.chars() {
+                        IngestBuilder::check_cancelled(cancel)?;
+                        lowered.push(crate::locale::fold_text_case_char(ch));
+                    }
+                    Ok(lowered)
+                })
+                .transpose()?,
             TypeTag::Number | TypeTag::DateTime | TypeTag::Duration => {
                 payload.number_at(idx).map(|value| value.to_string())
             }
@@ -3575,7 +3598,7 @@ impl<'a> OverlayCascade<'a> {
                 .boolean_at(idx)
                 .map(|value| if value { "true" } else { "false" }.to_string()),
             TypeTag::Empty | TypeTag::Error | TypeTag::Pending => None,
-        }
+        })
     }
 
     fn null_numbers(len: usize) -> Arc<Float64Array> {
