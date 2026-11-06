@@ -21703,6 +21703,7 @@ where
                                     rows.clone(),
                                     delta.as_deref_mut(),
                                     None,
+                                    false,
                                 ) {
                                     if e.kind != ExcelErrorKind::Spill {
                                         return Err(e);
@@ -27450,6 +27451,7 @@ where
                     rows.clone(),
                     delta.as_deref_mut(),
                     overwritable_formulas,
+                    false,
                 ) {
                     if e.kind != ExcelErrorKind::Spill {
                         return Err(e);
@@ -31215,6 +31217,7 @@ where
         rows: Vec<Vec<LiteralValue>>,
         delta: Option<&mut DeltaCollector>,
         overwritable_formulas: Option<&rustc_hash::FxHashSet<VertexId>>,
+        cancellable: bool,
     ) -> Result<(), ExcelError> {
         self.guard_pending_spill_commit(anchor_vertex, targets)?;
         let prev_spill_cells = self
@@ -31222,6 +31225,10 @@ where
             .spill_cells_for_anchor(anchor_vertex)
             .map(|cells| cells.to_vec())
             .unwrap_or_default();
+        let commit_rows = match (cancellable, self.active_cancel_flag.as_ref()) {
+            (true, Some(cancel)) => Some(copy_spill_values_cancellable(&rows, Some(cancel))?),
+            _ => None,
+        };
 
         if let Some(delta) = delta
             && delta.mode != DeltaMode::Off
@@ -31321,7 +31328,7 @@ where
             &mut self.graph,
             anchor_vertex,
             targets,
-            rows.clone(),
+            commit_rows.unwrap_or_else(|| rows.clone()),
             overwritable_formulas,
             |g, cell| {
                 let sheet_name = g.sheet_name(cell.sheet_id);
@@ -31917,6 +31924,7 @@ where
             rows,
             delta,
             None, // overwritable_formulas already validated in plan phase
+            true,
         )?;
 
         // ChangeLog.
