@@ -413,7 +413,15 @@ impl<'a> RangeView<'a> {
         cancel_token: Option<CancelToken>,
     ) -> Result<RangeView<'static>, ExcelError> {
         let nrows = rows.len();
-        let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        let mut ncols = 0;
+        for row in &rows {
+            if cancel_token.as_ref().is_some_and(CancelToken::is_cancelled) {
+                return Err(ExcelError::new(
+                    formualizer_common::ExcelErrorKind::Cancelled,
+                ));
+            }
+            ncols = ncols.max(row.len());
+        }
 
         let chunk_rows = 32 * 1024;
         let mut ib =
@@ -425,7 +433,27 @@ impl<'a> RangeView<'a> {
                     formualizer_common::ExcelErrorKind::Cancelled,
                 ));
             }
-            r.resize(ncols, LiteralValue::Empty);
+            {
+                let empty = LiteralValue::Empty;
+                let missing = ncols - r.len();
+                if missing > 0 {
+                    r.reserve(missing);
+                    for _ in 1..missing {
+                        if cancel_token.as_ref().is_some_and(CancelToken::is_cancelled) {
+                            return Err(ExcelError::new(
+                                formualizer_common::ExcelErrorKind::Cancelled,
+                            ));
+                        }
+                        r.push(empty.clone());
+                    }
+                    if cancel_token.as_ref().is_some_and(CancelToken::is_cancelled) {
+                        return Err(ExcelError::new(
+                            formualizer_common::ExcelErrorKind::Cancelled,
+                        ));
+                    }
+                    r.push(empty);
+                }
+            }
             ib.append_row_cancellable(&r, cancel_token.as_ref())?;
         }
 
