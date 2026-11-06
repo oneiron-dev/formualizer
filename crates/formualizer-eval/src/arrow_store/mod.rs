@@ -508,6 +508,21 @@ impl IngestBuilder {
         Ok(())
     }
 
+    fn fold_text_cancellable(
+        text: &str,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<String, ExcelError> {
+        if cancel.is_none() {
+            return Ok(crate::locale::fold_text_case(text));
+        }
+        let mut lowered = String::with_capacity(text.len());
+        for ch in text.chars() {
+            Self::check_cancelled(cancel)?;
+            lowered.push(crate::locale::fold_text_case_char(ch));
+        }
+        Ok(lowered)
+    }
+
     fn append_lowered_text_cancellable(
         builder: &mut StringBuilder,
         text: &str,
@@ -1250,14 +1265,22 @@ impl OverlayValue {
     }
 
     pub(crate) fn lowered_text_value(&self) -> Option<String> {
-        match self {
-            OverlayValue::Text(s) => Some(crate::locale::fold_text_case(s)),
+        self.try_lowered_text_value(None)
+            .expect("uncancelled lowered text value")
+    }
+
+    pub(crate) fn try_lowered_text_value(
+        &self,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Option<String>, ExcelError> {
+        Ok(match self {
+            OverlayValue::Text(s) => Some(IngestBuilder::fold_text_cancellable(s, cancel)?),
             OverlayValue::Number(n) | OverlayValue::DateTime(n) | OverlayValue::Duration(n) => {
                 Some(n.to_string())
             }
             OverlayValue::Boolean(b) => Some(if *b { "true" } else { "false" }.to_string()),
             OverlayValue::Empty | OverlayValue::Error(_) | OverlayValue::Pending => None,
-        }
+        })
     }
 
     pub(crate) fn to_literal_for(&self, date_system: crate::engine::DateSystem) -> LiteralValue {
@@ -1330,6 +1353,13 @@ impl<'a> OverlayScalar<'a> {
 
     pub(crate) fn lowered_text_value(&self) -> Option<String> {
         self.as_value().lowered_text_value()
+    }
+
+    pub(crate) fn try_lowered_text_value(
+        &self,
+        cancel: Option<&crate::engine::CancelToken>,
+    ) -> Result<Option<String>, ExcelError> {
+        self.as_value().try_lowered_text_value(cancel)
     }
 
     pub(crate) fn to_literal_for(&self, date_system: crate::engine::DateSystem) -> LiteralValue {
@@ -3217,7 +3247,7 @@ impl<'a> OverlayCascade<'a> {
             IngestBuilder::check_cancelled(cancel)?;
             if let Some(value) = self.get_scalar(off) {
                 mask_b.append_value(true);
-                if let Some(s) = value.lowered_text_value() {
+                if let Some(s) = value.try_lowered_text_value(cancel)? {
                     values_b.append_value(&s);
                 } else {
                     values_b.append_null();
@@ -3574,17 +3604,7 @@ impl<'a> OverlayCascade<'a> {
         Ok(match tag {
             TypeTag::Text => payload
                 .text_at(idx)
-                .map(|value| -> Result<String, ExcelError> {
-                    if cancel.is_none() {
-                        return Ok(crate::locale::fold_text_case(value));
-                    }
-                    let mut lowered = String::with_capacity(value.len());
-                    for ch in value.chars() {
-                        IngestBuilder::check_cancelled(cancel)?;
-                        lowered.push(crate::locale::fold_text_case_char(ch));
-                    }
-                    Ok(lowered)
-                })
+                .map(|value| IngestBuilder::fold_text_cancellable(value, cancel))
                 .transpose()?,
             TypeTag::Number | TypeTag::DateTime | TypeTag::Duration => {
                 payload.number_at(idx).map(|value| value.to_string())
@@ -3725,7 +3745,7 @@ impl<'a> OverlayCascade<'a> {
         for (off, value) in layer.iter_points() {
             IngestBuilder::check_cancelled(cancel)?;
             if range.contains(off) {
-                slots.set(*off - range.start, value.lowered_text_value());
+                slots.set(*off - range.start, value.try_lowered_text_value(cancel)?);
                 record_overlay_select_stats(|stats| stats.point_entries_applied += 1);
             }
         }
